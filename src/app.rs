@@ -12,8 +12,6 @@ const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
 
 const MARGIN_X: f32 = 40.0;
 const MARGIN_TOP: f32 = 60.0;
-const TITLE_FONT_SIZE: f32 = 36.0;
-const TITLE_TO_BODY_GAP: f32 = 18.0;
 const CELL_GAP: f32 = 20.0;
 const FOCUS_PAD: f32 = 6.0;
 const FOCUS_RADIUS: f32 = 8.0;
@@ -98,12 +96,6 @@ impl KeptApp {
 
         let mut y = MARGIN_TOP;
 
-        let title_font = Font::from_typeface(&self.typeface, TITLE_FONT_SIZE);
-        let (_, title_metrics) = title_font.metrics();
-
-        y += -title_metrics.ascent;
-        canvas.draw_str("Kept", Point::new(MARGIN_X, y), &title_font, &text_paint);
-        y += title_metrics.descent + title_metrics.leading + TITLE_TO_BODY_GAP;
 
         let cell_width = (width - MARGIN_X * 2.0).max(80.0);
         for (i, cell) in self.cells.iter_mut().enumerate() {
