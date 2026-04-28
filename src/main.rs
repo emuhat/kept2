@@ -24,7 +24,7 @@ use skia_safe::{
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::WindowEvent,
+    event::{Modifiers, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowAttributes, WindowId},
 };
@@ -46,6 +46,7 @@ struct Application {
     stencil_size: usize,
     previous_frame_start: Instant,
     dpi: f32,
+    modifiers: Modifiers,
     kept_app: KeptApp,
 }
 
@@ -95,6 +96,14 @@ impl ApplicationHandler for Application {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
                 return;
+            }
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.modifiers = new_modifiers;
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if self.kept_app.handle_key(&event, &self.modifiers) {
+                    self.env.window.request_redraw();
+                }
             }
             WindowEvent::Resized(physical_size) => {
                 self.env.surface = create_surface(
@@ -259,6 +268,7 @@ fn main() {
         stencil_size,
         previous_frame_start: Instant::now(),
         dpi,
+        modifiers: Modifiers::default(),
         kept_app: KeptApp::new(),
     };
 
