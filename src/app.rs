@@ -50,6 +50,7 @@ pub struct KeptApp {
     viewport_height: f32,
     last_scroll_time: Option<Instant>,
     font_scale: f32,
+    pending_caret_scroll: bool,
 }
 
 impl KeptApp {
@@ -72,6 +73,7 @@ impl KeptApp {
             viewport_height: 0.0,
             last_scroll_time: None,
             font_scale: 1.0,
+            pending_caret_scroll: false,
         }
     }
 
@@ -84,6 +86,7 @@ impl KeptApp {
         for cell in &mut self.cells {
             cell.set_font_scale(s);
         }
+        self.pending_caret_scroll = true;
         true
     }
 
@@ -152,6 +155,12 @@ impl KeptApp {
         self.max_scroll = (self.doc_height - self.viewport_height).max(0.0);
         self.scroll_y = self.scroll_y.min(self.max_scroll);
 
+        // After cells are laid out (y_origin/height fresh), honor any caret-into-view
+        // request from this tick's events. Effect lands on the next frame.
+        if std::mem::take(&mut self.pending_caret_scroll) {
+            self.scroll_caret_into_view();
+        }
+
         // Scrollbar lives in window coords (no translate), so it doesn't scroll.
         if self.max_scroll > 0.0 {
             let alpha = scrollbar_alpha(self.last_scroll_time);
@@ -212,11 +221,15 @@ impl KeptApp {
                 _ => {}
             }
         }
-        if let Some(cell) = self.cells.get_mut(self.focused) {
+        let handled = if let Some(cell) = self.cells.get_mut(self.focused) {
             cell.handle_key(event, modifiers)
         } else {
             false
+        };
+        if handled {
+            self.pending_caret_scroll = true;
         }
+        handled
     }
 
     fn insert_cell_after_focused(&mut self) -> bool {
@@ -234,7 +247,35 @@ impl KeptApp {
         // An in-progress drag's cell index would be invalidated by the insert;
         // safest to drop it. The user can't realistically be dragging mid-keypress.
         self.dragging_cell = None;
+        // The new cell will be laid out by this tick; the end-of-tick scroll
+        // hook then brings its caret into view.
+        self.pending_caret_scroll = true;
         true
+    }
+
+    /// Bring the primary caret of the focused cell into view if it's outside
+    /// the viewport. Used after edits, caret movement, and zoom changes.
+    fn scroll_caret_into_view(&mut self) {
+        let Some(cell) = self.cells.get(self.focused) else {
+            return;
+        };
+        let Some((top, bot)) = cell.caret_doc_y_band() else {
+            return;
+        };
+        let pad = 8.0_f32;
+        let view_top = self.scroll_y;
+        let view_bot = self.scroll_y + self.viewport_height;
+        let new_scroll = if top < view_top + pad {
+            (top - pad).max(0.0)
+        } else if bot > view_bot - pad {
+            (bot + pad - self.viewport_height).max(0.0)
+        } else {
+            return;
+        };
+        // Don't clamp to current max_scroll: a just-grown doc has a stale
+        // max_scroll and the next tick will recompute it.
+        self.scroll_y = new_scroll.max(0.0);
+        self.last_scroll_time = Some(Instant::now());
     }
 
     /// Bring the focused cell into view if it's outside the current viewport.

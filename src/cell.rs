@@ -196,6 +196,24 @@ impl Cell {
         self.text.trim().is_empty()
     }
 
+    /// (top, bottom) of the primary caret's visual line, in document coordinates.
+    /// Uses fresh `body_metrics` (so it's correct after a font-scale change)
+    /// combined with last-rendered `y_origin`. For the focused cell that's about
+    /// to be re-rendered, `y_origin` is still valid because edits don't move
+    /// cells above it.
+    pub fn caret_doc_y_band(&self) -> Option<(f32, f32)> {
+        let sel = self.sels.items.get(self.sels.primary)?;
+        let font = self.body_font();
+        let (_, m) = font.metrics();
+        let line_step = -m.ascent + m.descent + m.leading;
+        let line_extra = line_step * 0.25;
+        let line_advance = line_step + line_extra;
+        let (line_idx, _) = locate_caret(&self.body_lines, sel.head, sel.affinity);
+        let top_local = (line_idx as f32) * line_advance;
+        let bot_local = top_local + line_advance;
+        Some((top_local + self.y_origin, bot_local + self.y_origin))
+    }
+
     pub fn set_font_scale(&mut self, scale: f32) {
         if (self.font_scale - scale).abs() > f32::EPSILON {
             self.font_scale = scale;
