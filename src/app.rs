@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use skia_safe::{Canvas, Color, Font, FontMgr, Paint, Point, Rect, Typeface};
 use winit::{
@@ -22,6 +23,8 @@ const MARGIN_TOP: f32 = 60.0;
 const BODY_FONT_SIZE: f32 = 18.0;
 const TITLE_FONT_SIZE: f32 = 36.0;
 const CARET_WIDTH: f32 = 1.5;
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const MULTI_CLICK_DIST: f32 = 5.0;
 
 /// Disambiguates a byte index that sits at a soft-wrap boundary. The same byte
 /// equals both `line[i].end` and `line[i+1].start`; affinity picks which side the
@@ -135,6 +138,18 @@ fn transform_index(i: usize, start: usize, del: usize, ins: usize) -> usize {
     }
 }
 
+#[derive(Clone)]
+enum DragKind {
+    Char,
+    Word(Range<usize>),
+    Line(Range<usize>),
+}
+
+struct DragState {
+    sel_idx: usize,
+    kind: DragKind,
+}
+
 pub struct KeptApp {
     typeface: Typeface,
     text: String,
@@ -142,7 +157,10 @@ pub struct KeptApp {
     body_lines: Vec<Range<usize>>,
     body_lines_width: f32,
     line_bands: Vec<(f32, f32)>,
-    mouse_drag: Option<usize>,
+    mouse_drag: Option<DragState>,
+    last_click_time: Option<Instant>,
+    last_click_pos: (f32, f32),
+    click_count: u8,
 }
 
 impl KeptApp {
@@ -158,6 +176,9 @@ impl KeptApp {
             body_lines_width: f32::NAN,
             line_bands: Vec::new(),
             mouse_drag: None,
+            last_click_time: None,
+            last_click_pos: (0.0, 0.0),
+            click_count: 0,
         }
     }
 
@@ -322,50 +343,113 @@ impl KeptApp {
     pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
         let (idx, affinity) = self.hit_test(x, y);
         let mods = modifiers.state();
+        let now = Instant::now();
+
+        // Shift resets the counter (shift-click is always char-level extension);
+        // Alt accumulates so Alt+double-click can add a word-selection.
+        let allow_multi = !mods.shift_key();
+        let within_threshold = self
+            .last_click_time
+            .map(|t| {
+                now.duration_since(t) <= MULTI_CLICK_INTERVAL
+                    && (x - self.last_click_pos.0).abs() <= MULTI_CLICK_DIST
+                    && (y - self.last_click_pos.1).abs() <= MULTI_CLICK_DIST
+            })
+            .unwrap_or(false);
+        self.click_count = if allow_multi && within_threshold {
+            (self.click_count + 1).min(3)
+        } else {
+            1
+        };
+        self.last_click_time = Some(now);
+        self.last_click_pos = (x, y);
 
         if mods.shift_key() {
             if self.sels.primary < self.sels.items.len() {
                 let s = &mut self.sels.items[self.sels.primary];
                 s.head = idx;
                 s.affinity = affinity;
-                self.mouse_drag = Some(self.sels.primary);
+                self.mouse_drag = Some(DragState {
+                    sel_idx: self.sels.primary,
+                    kind: DragKind::Char,
+                });
             }
-        } else if mods.alt_key() {
+            return true;
+        }
+
+        let (anchor, head, head_aff, kind) =
+            resolve_click_unit(&self.text, &self.body_lines, idx, affinity, self.click_count);
+
+        if mods.alt_key() {
             self.sels.items.push(Selection {
-                anchor: idx,
-                head: idx,
-                affinity,
+                anchor,
+                head,
+                affinity: head_aff,
             });
             let new_idx = self.sels.items.len() - 1;
             self.sels.primary = new_idx;
-            self.mouse_drag = Some(new_idx);
+            self.mouse_drag = Some(DragState {
+                sel_idx: new_idx,
+                kind,
+            });
         } else {
             self.sels.items.clear();
             self.sels.items.push(Selection {
-                anchor: idx,
-                head: idx,
-                affinity,
+                anchor,
+                head,
+                affinity: head_aff,
             });
             self.sels.primary = 0;
-            self.mouse_drag = Some(0);
+            self.mouse_drag = Some(DragState { sel_idx: 0, kind });
         }
         true
     }
 
     pub fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool {
-        let Some(sel_idx) = self.mouse_drag else {
-            return false;
+        let (sel_idx, kind) = match self.mouse_drag.as_ref() {
+            Some(d) => (d.sel_idx, d.kind.clone()),
+            None => return false,
         };
         if sel_idx >= self.sels.items.len() {
             return false;
         }
         let (idx, affinity) = self.hit_test(x, y);
+
+        let (new_anchor, new_head, new_aff) = match kind {
+            DragKind::Char => {
+                let s = &self.sels.items[sel_idx];
+                (s.anchor, idx, affinity)
+            }
+            DragKind::Word(initial) => {
+                let hit = find_word_at(&self.text, idx);
+                if hit.start >= initial.start {
+                    (initial.start, hit.end, Affinity::Downstream)
+                } else {
+                    (initial.end, hit.start, Affinity::Downstream)
+                }
+            }
+            DragKind::Line(initial) => {
+                let hit = find_line_at(&self.body_lines, idx, affinity);
+                if hit.start >= initial.start {
+                    let aff = if hit.end == self.text.len() {
+                        Affinity::Downstream
+                    } else {
+                        Affinity::Upstream
+                    };
+                    (initial.start, hit.end, aff)
+                } else {
+                    (initial.end, hit.start, Affinity::Downstream)
+                }
+            }
+        };
+
         let s = &mut self.sels.items[sel_idx];
-        if s.head == idx && s.affinity == affinity {
+        if s.anchor == new_anchor && s.head == new_head && s.affinity == new_aff {
             return false;
         }
-        s.head = idx;
-        s.affinity = affinity;
+        s.anchor = new_anchor;
+        s.head = new_head;
+        s.affinity = new_aff;
         true
     }
 
@@ -697,6 +781,115 @@ fn hit_affinity(line_idx: usize, idx: usize, body_lines: &[Range<usize>]) -> Aff
         Affinity::Upstream
     } else {
         Affinity::Downstream
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Word,
+    Whitespace,
+    Other,
+}
+
+fn char_class(c: char) -> CharClass {
+    if c.is_whitespace() {
+        CharClass::Whitespace
+    } else if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else {
+        CharClass::Other
+    }
+}
+
+/// Find the contiguous run of same-class chars containing `idx`. At a class
+/// boundary (e.g. "apple|"), prefer the Word side over whitespace/punctuation.
+fn find_word_at(text: &str, idx: usize) -> Range<usize> {
+    if text.is_empty() {
+        return 0..0;
+    }
+    let class_at = |i: usize| -> Option<CharClass> {
+        text.get(i..).and_then(|s| s.chars().next()).map(char_class)
+    };
+    let class_left = |i: usize| -> Option<CharClass> {
+        if i == 0 {
+            None
+        } else {
+            class_at(prev_char_boundary(text, i))
+        }
+    };
+
+    let here = class_at(idx);
+    let left = class_left(idx);
+
+    let (probe, class) = match (left, here) {
+        (Some(l), Some(h)) if l != h => {
+            // Boundary: prefer Word side.
+            if l == CharClass::Word {
+                (prev_char_boundary(text, idx), CharClass::Word)
+            } else {
+                (idx, h)
+            }
+        }
+        (_, Some(h)) => (idx, h),
+        (Some(l), None) => (prev_char_boundary(text, idx), l),
+        (None, None) => return idx..idx,
+    };
+
+    let mut start = probe;
+    while start > 0 {
+        let p = prev_char_boundary(text, start);
+        if class_at(p) == Some(class) {
+            start = p;
+        } else {
+            break;
+        }
+    }
+    let mut end = next_char_boundary(text, probe);
+    while end < text.len() && class_at(end) == Some(class) {
+        end = next_char_boundary(text, end);
+    }
+    start..end
+}
+
+/// The visual line range containing `idx`, with affinity disambiguating
+/// soft-wrap boundaries.
+fn find_line_at(body_lines: &[Range<usize>], idx: usize, affinity: Affinity) -> Range<usize> {
+    if body_lines.is_empty() {
+        return 0..0;
+    }
+    let (line_idx, _) = locate_caret(body_lines, idx, affinity);
+    body_lines[line_idx].clone()
+}
+
+/// Map a click count to a selection unit (caret/word/line) at `idx`.
+/// Returns `(anchor, head, head_affinity, drag_kind)` for the new selection.
+fn resolve_click_unit(
+    text: &str,
+    body_lines: &[Range<usize>],
+    idx: usize,
+    affinity: Affinity,
+    click_count: u8,
+) -> (usize, usize, Affinity, DragKind) {
+    match click_count {
+        2 => {
+            let word = find_word_at(text, idx);
+            (
+                word.start,
+                word.end,
+                Affinity::Downstream,
+                DragKind::Word(word),
+            )
+        }
+        3 => {
+            let line = find_line_at(body_lines, idx, affinity);
+            let head_aff = if line.end == text.len() {
+                Affinity::Downstream
+            } else {
+                Affinity::Upstream
+            };
+            (line.start, line.end, head_aff, DragKind::Line(line))
+        }
+        _ => (idx, idx, affinity, DragKind::Char),
     }
 }
 
