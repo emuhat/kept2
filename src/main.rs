@@ -24,7 +24,7 @@ use skia_safe::{
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{Modifiers, WindowEvent},
+    event::{ElementState, Modifiers, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowAttributes, WindowId},
 };
@@ -47,6 +47,7 @@ struct Application {
     previous_frame_start: Instant,
     dpi: f32,
     modifiers: Modifiers,
+    last_mouse_pos: (f32, f32),
     kept_app: KeptApp,
 }
 
@@ -103,6 +104,26 @@ impl ApplicationHandler for Application {
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.kept_app.handle_key(&event, &self.modifiers) {
                     self.env.window.request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let x = position.x as f32 / self.dpi;
+                let y = position.y as f32 / self.dpi;
+                self.last_mouse_pos = (x, y);
+                if self.kept_app.mouse_drag_to(x, y) {
+                    self.env.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    let (x, y) = self.last_mouse_pos;
+                    let changed = match state {
+                        ElementState::Pressed => self.kept_app.mouse_down(x, y, &self.modifiers),
+                        ElementState::Released => self.kept_app.mouse_up(),
+                    };
+                    if changed {
+                        self.env.window.request_redraw();
+                    }
                 }
             }
             WindowEvent::Resized(physical_size) => {
@@ -269,6 +290,7 @@ fn main() {
         previous_frame_start: Instant::now(),
         dpi,
         modifiers: Modifiers::default(),
+        last_mouse_pos: (0.0, 0.0),
         kept_app: KeptApp::new(),
     };
 

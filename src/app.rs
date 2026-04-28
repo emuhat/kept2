@@ -23,15 +23,30 @@ const BODY_FONT_SIZE: f32 = 18.0;
 const TITLE_FONT_SIZE: f32 = 36.0;
 const CARET_WIDTH: f32 = 1.5;
 
+/// Disambiguates a byte index that sits at a soft-wrap boundary. The same byte
+/// equals both `line[i].end` and `line[i+1].start`; affinity picks which side the
+/// caret is on for rendering and "current line" lookups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Affinity {
+    Upstream,
+    #[default]
+    Downstream,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Selection {
     pub anchor: usize,
     pub head: usize,
+    pub affinity: Affinity,
 }
 
 impl Selection {
     pub fn caret(at: usize) -> Self {
-        Self { anchor: at, head: at }
+        Self {
+            anchor: at,
+            head: at,
+            affinity: Affinity::Downstream,
+        }
     }
 
     pub fn is_collapsed(&self) -> bool {
@@ -126,6 +141,8 @@ pub struct KeptApp {
     sels: Selections,
     body_lines: Vec<Range<usize>>,
     body_lines_width: f32,
+    line_bands: Vec<(f32, f32)>,
+    mouse_drag: Option<usize>,
 }
 
 impl KeptApp {
@@ -139,6 +156,8 @@ impl KeptApp {
             sels: Selections::single_caret(0),
             body_lines: Vec::new(),
             body_lines_width: f32::NAN,
+            line_bands: Vec::new(),
+            mouse_drag: None,
         }
     }
 
@@ -177,6 +196,16 @@ impl KeptApp {
             y += -body_metrics.ascent;
             baselines.push(y);
             y += body_metrics.descent + body_metrics.leading + line_extra;
+        }
+
+        // Cache y-bands for hit-testing. Each band spans the full advance from one
+        // baseline's visible top to the next, so clicks in the inter-line gap snap
+        // to whichever line owns that half of the gap.
+        let line_advance = line_step + line_extra;
+        self.line_bands.clear();
+        for &b in &baselines {
+            let top = b + body_metrics.ascent;
+            self.line_bands.push((top, top + line_advance));
         }
 
         // Selection highlights (drawn first so text and carets sit on top).
@@ -220,7 +249,7 @@ impl KeptApp {
         caret_paint.set_anti_alias(false);
         caret_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
         for sel in &self.sels.items {
-            let (li, offset) = locate_caret(&self.body_lines, sel.head);
+            let (li, offset) = locate_caret(&self.body_lines, sel.head, sel.affinity);
             let baseline = baselines[li];
             let x = if self.body_lines.is_empty() {
                 MARGIN_X
@@ -290,20 +319,143 @@ impl KeptApp {
         }
     }
 
+    pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
+        let (idx, affinity) = self.hit_test(x, y);
+        let mods = modifiers.state();
+
+        if mods.shift_key() {
+            if self.sels.primary < self.sels.items.len() {
+                let s = &mut self.sels.items[self.sels.primary];
+                s.head = idx;
+                s.affinity = affinity;
+                self.mouse_drag = Some(self.sels.primary);
+            }
+        } else if mods.alt_key() {
+            self.sels.items.push(Selection {
+                anchor: idx,
+                head: idx,
+                affinity,
+            });
+            let new_idx = self.sels.items.len() - 1;
+            self.sels.primary = new_idx;
+            self.mouse_drag = Some(new_idx);
+        } else {
+            self.sels.items.clear();
+            self.sels.items.push(Selection {
+                anchor: idx,
+                head: idx,
+                affinity,
+            });
+            self.sels.primary = 0;
+            self.mouse_drag = Some(0);
+        }
+        true
+    }
+
+    pub fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool {
+        let Some(sel_idx) = self.mouse_drag else {
+            return false;
+        };
+        if sel_idx >= self.sels.items.len() {
+            return false;
+        }
+        let (idx, affinity) = self.hit_test(x, y);
+        let s = &mut self.sels.items[sel_idx];
+        if s.head == idx && s.affinity == affinity {
+            return false;
+        }
+        s.head = idx;
+        s.affinity = affinity;
+        true
+    }
+
+    pub fn mouse_up(&mut self) -> bool {
+        if self.mouse_drag.take().is_some() {
+            self.sels.normalize();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn hit_test(&self, x: f32, y: f32) -> (usize, Affinity) {
+        if self.body_lines.is_empty() || self.line_bands.is_empty() {
+            return (0, Affinity::Downstream);
+        }
+        let line_idx = self.find_line_at_y(y);
+        let line = &self.body_lines[line_idx];
+        let line_text = &self.text[line.clone()];
+        let local_x = (x - MARGIN_X).max(0.0);
+
+        let body_font = Font::from_typeface(&self.typeface, BODY_FONT_SIZE);
+        let paint = Paint::default();
+
+        let mut prev_offset = 0usize;
+        let mut prev_w = 0.0f32;
+
+        for (offset, _) in line_text.char_indices().skip(1) {
+            let w = body_font
+                .measure_str(&line_text[..offset], Some(&paint))
+                .0;
+            if w >= local_x {
+                let chosen = if (local_x - prev_w) < (w - local_x) {
+                    prev_offset
+                } else {
+                    offset
+                };
+                let idx = line.start + chosen;
+                return (idx, hit_affinity(line_idx, idx, &self.body_lines));
+            }
+            prev_w = w;
+            prev_offset = offset;
+        }
+
+        // x past the last char boundary tracked; pick between prev_offset and end-of-line.
+        let total_w = body_font.measure_str(line_text, Some(&paint)).0;
+        let chosen = if (local_x - prev_w) < (total_w - local_x) {
+            prev_offset
+        } else {
+            line_text.len()
+        };
+        let idx = line.start + chosen;
+        (idx, hit_affinity(line_idx, idx, &self.body_lines))
+    }
+
+    fn find_line_at_y(&self, y: f32) -> usize {
+        if y < self.line_bands[0].0 {
+            return 0;
+        }
+        for (i, &(_top, bot)) in self.line_bands.iter().enumerate() {
+            if y < bot {
+                return i;
+            }
+        }
+        self.line_bands.len() - 1
+    }
+
     fn move_horizontal(&mut self, delta: i32, shift: bool) {
         let text = &self.text;
+        let body_lines = &self.body_lines;
         for sel in &mut self.sels.items {
             if !shift && !sel.is_collapsed() {
                 let r = sel.range();
                 let target = if delta > 0 { r.end } else { r.start };
+                // Preserve head's affinity if collapsing toward head, else default.
+                let new_aff = if (delta > 0 && sel.head >= sel.anchor)
+                    || (delta < 0 && sel.head <= sel.anchor)
+                {
+                    sel.affinity
+                } else {
+                    Affinity::Downstream
+                };
                 sel.anchor = target;
                 sel.head = target;
+                sel.affinity = new_aff;
             } else {
-                sel.head = if delta > 0 {
-                    next_char_boundary(text, sel.head)
-                } else {
-                    prev_char_boundary(text, sel.head)
-                };
+                let (new_head, new_aff) =
+                    step_horizontal(text, body_lines, sel.head, sel.affinity, delta);
+                sel.head = new_head;
+                sel.affinity = new_aff;
                 if !shift {
                     sel.anchor = sel.head;
                 }
@@ -320,7 +472,7 @@ impl KeptApp {
         let body_lines = &self.body_lines;
         let text = &self.text;
         for sel in &mut self.sels.items {
-            let (line_idx, offset) = locate_caret(body_lines, sel.head);
+            let (line_idx, offset) = locate_caret(body_lines, sel.head, sel.affinity);
             let target = (line_idx as i32 + delta).clamp(0, last) as usize;
             if target == line_idx {
                 continue;
@@ -334,6 +486,13 @@ impl KeptApp {
                 new_offset -= 1;
             }
             sel.head = target_line.start + new_offset;
+            sel.affinity = if new_offset == 0 && target > 0 {
+                Affinity::Downstream
+            } else if new_offset == line_len && target + 1 < body_lines.len() {
+                Affinity::Upstream
+            } else {
+                Affinity::Downstream
+            };
             if !shift {
                 sel.anchor = sel.head;
             }
@@ -347,9 +506,19 @@ impl KeptApp {
         }
         let body_lines = &self.body_lines;
         for sel in &mut self.sels.items {
-            let (line_idx, _) = locate_caret(body_lines, sel.head);
+            let (line_idx, _) = locate_caret(body_lines, sel.head, sel.affinity);
             let line = &body_lines[line_idx];
-            sel.head = if end { line.end } else { line.start };
+            if end {
+                sel.head = line.end;
+                sel.affinity = if line_idx + 1 < body_lines.len() {
+                    Affinity::Upstream
+                } else {
+                    Affinity::Downstream
+                };
+            } else {
+                sel.head = line.start;
+                sel.affinity = Affinity::Downstream;
+            }
             if !shift {
                 sel.anchor = sel.head;
             }
@@ -427,6 +596,9 @@ impl KeptApp {
         for sel in &mut self.sels.items {
             sel.anchor = transform_index(sel.anchor, start, del, ins);
             sel.head = transform_index(sel.head, start, del, ins);
+            // Wrap shape may have changed under us; reset to a sane default. The
+            // user's next motion will set affinity meaningfully again.
+            sel.affinity = Affinity::Downstream;
         }
         self.sels.normalize();
         self.rewrap();
@@ -446,14 +618,20 @@ impl KeptApp {
 }
 
 /// Locate which visual line contains `idx` and the byte offset within that line.
-/// Returns `(0, 0)` for an empty `lines` slice; this pairs with the render code's
-/// "at least one baseline" rule.
-fn locate_caret(lines: &[Range<usize>], idx: usize) -> (usize, usize) {
+/// At a soft-wrap boundary (`line[i].end == line[i+1].start`), `affinity` decides:
+/// `Upstream` keeps the caret on line `i` (end of the upper line), `Downstream`
+/// moves it to line `i+1` (start of the lower line).
+fn locate_caret(lines: &[Range<usize>], idx: usize, affinity: Affinity) -> (usize, usize) {
     if lines.is_empty() {
         return (0, 0);
     }
     for (i, line) in lines.iter().enumerate() {
         if idx <= line.end {
+            // `line[i].end == line[i+1].start` is guaranteed by the contiguous-partition
+            // wrap, so no need to compare them; the next line's existence is enough.
+            if idx == line.end && affinity == Affinity::Downstream && i + 1 < lines.len() {
+                return (i + 1, 0);
+            }
             let local = idx.saturating_sub(line.start).min(line.end - line.start);
             return (i, local);
         }
@@ -461,6 +639,65 @@ fn locate_caret(lines: &[Range<usize>], idx: usize) -> (usize, usize) {
     let last = lines.len() - 1;
     let line = &lines[last];
     (last, line.end - line.start)
+}
+
+/// True if `idx` sits at a soft-wrap boundary — i.e., it equals the end of some
+/// non-last line. With our contiguous partition this is the same as `idx ==
+/// line[i].end == line[i+1].start` for some `i`.
+fn is_wrap_boundary(body_lines: &[Range<usize>], idx: usize) -> bool {
+    if body_lines.len() < 2 {
+        return false;
+    }
+    body_lines[..body_lines.len() - 1]
+        .iter()
+        .any(|line| line.end == idx)
+}
+
+/// One left/right step with affinity-aware behavior at wrap boundaries:
+/// - Right at upstream(b) flips to downstream(b) without changing the byte.
+/// - Right that arrives on a boundary lands Upstream (so the user sees
+///   end-of-this-line first, then a second press flips to the next line's start).
+/// - Left is symmetric: downstream(b) flips to upstream(b); a non-boundary step
+///   lands Downstream.
+fn step_horizontal(
+    text: &str,
+    body_lines: &[Range<usize>],
+    head: usize,
+    affinity: Affinity,
+    dir: i32,
+) -> (usize, Affinity) {
+    if dir > 0 {
+        if affinity == Affinity::Upstream && is_wrap_boundary(body_lines, head) {
+            return (head, Affinity::Downstream);
+        }
+        let next = next_char_boundary(text, head);
+        let new_aff = if is_wrap_boundary(body_lines, next) {
+            Affinity::Upstream
+        } else {
+            Affinity::Downstream
+        };
+        (next, new_aff)
+    } else {
+        if affinity == Affinity::Downstream && is_wrap_boundary(body_lines, head) {
+            return (head, Affinity::Upstream);
+        }
+        let prev = prev_char_boundary(text, head);
+        (prev, Affinity::Downstream)
+    }
+}
+
+/// Affinity for a click: if the click landed at the start of `line_idx > 0`,
+/// the user wanted the lower line (Downstream); if at the end of a non-last line,
+/// the upper line (Upstream); otherwise either is equivalent — pick Downstream.
+fn hit_affinity(line_idx: usize, idx: usize, body_lines: &[Range<usize>]) -> Affinity {
+    let line = &body_lines[line_idx];
+    if idx == line.start && line_idx > 0 {
+        Affinity::Downstream
+    } else if idx == line.end && line_idx + 1 < body_lines.len() {
+        Affinity::Upstream
+    } else {
+        Affinity::Downstream
+    }
 }
 
 fn next_char_boundary(text: &str, idx: usize) -> usize {
