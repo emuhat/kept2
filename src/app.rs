@@ -165,12 +165,29 @@ impl KeptApp {
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
-        if event.state == ElementState::Pressed
-            && modifiers.state().control_key()
-            && matches!(event.logical_key, Key::Named(NamedKey::Enter))
-        {
-            self.insert_cell_after_focused();
-            return true;
+        if event.state == ElementState::Pressed && modifiers.state().control_key() {
+            match event.logical_key {
+                Key::Named(NamedKey::Enter) => {
+                    return self.insert_cell_after_focused();
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    if self.focused > 0 {
+                        self.focused -= 1;
+                        self.scroll_to_focused();
+                        return true;
+                    }
+                    return false;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    if self.focused + 1 < self.cells.len() {
+                        self.focused += 1;
+                        self.scroll_to_focused();
+                        return true;
+                    }
+                    return false;
+                }
+                _ => {}
+            }
         }
         if let Some(cell) = self.cells.get_mut(self.focused) {
             cell.handle_key(event, modifiers)
@@ -179,7 +196,13 @@ impl KeptApp {
         }
     }
 
-    fn insert_cell_after_focused(&mut self) {
+    fn insert_cell_after_focused(&mut self) -> bool {
+        // No-op if the focused cell is empty — Ctrl+Enter shouldn't pile up empties.
+        if let Some(cell) = self.cells.get(self.focused) {
+            if cell.is_empty() {
+                return false;
+            }
+        }
         let new_cell = Cell::new(self.typeface.clone(), String::new());
         let insert_at = (self.focused + 1).min(self.cells.len());
         self.cells.insert(insert_at, new_cell);
@@ -187,6 +210,32 @@ impl KeptApp {
         // An in-progress drag's cell index would be invalidated by the insert;
         // safest to drop it. The user can't realistically be dragging mid-keypress.
         self.dragging_cell = None;
+        true
+    }
+
+    /// Bring the focused cell into view if it's outside the current viewport.
+    /// Uses last frame's cell geometry; on the first frame everything is at 0
+    /// which results in scroll_y = 0, which is correct.
+    fn scroll_to_focused(&mut self) {
+        let Some(cell) = self.cells.get(self.focused) else {
+            return;
+        };
+        let pad = 8.0_f32;
+        let cell_top = cell.y_origin();
+        let cell_bot = cell.y_origin() + cell.height();
+        let view_top = self.scroll_y;
+        let view_bot = self.scroll_y + self.viewport_height;
+
+        let new_scroll = if cell_top < view_top + pad {
+            (cell_top - pad).max(0.0)
+        } else if cell_bot > view_bot - pad {
+            (cell_bot + pad - self.viewport_height).max(0.0)
+        } else {
+            return;
+        };
+        self.scroll_y = new_scroll.clamp(0.0, self.max_scroll);
+        // Briefly show the scrollbar so the jump is visible.
+        self.last_scroll_time = Some(Instant::now());
     }
 
     pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {

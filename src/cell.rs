@@ -190,6 +190,10 @@ impl Cell {
         self.height
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty()
+    }
+
     /// Render the cell at `(x, y)` with `width`. Returns the height consumed,
     /// which the container uses to position the next cell. `focused` controls
     /// whether selection highlights and carets render.
@@ -327,11 +331,19 @@ impl Cell {
                 true
             }
             Key::Named(NamedKey::Backspace) => {
-                self.backspace();
+                if modifiers.state().control_key() {
+                    self.word_backspace();
+                } else {
+                    self.backspace();
+                }
                 true
             }
             Key::Named(NamedKey::Delete) => {
-                self.forward_delete();
+                if modifiers.state().control_key() {
+                    self.word_forward_delete();
+                } else {
+                    self.forward_delete();
+                }
                 true
             }
             Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => false,
@@ -639,6 +651,48 @@ impl Cell {
         self.apply_edits_right_to_left(edits);
     }
 
+    fn word_backspace(&mut self) {
+        let mut edits: Vec<Edit> = Vec::new();
+        for sel in &self.sels.items {
+            if sel.is_collapsed() {
+                let range = find_word_left_of(&self.text, sel.head);
+                if range.start < range.end {
+                    edits.push(Edit {
+                        range,
+                        replacement: String::new(),
+                    });
+                }
+            } else {
+                edits.push(Edit {
+                    range: sel.range(),
+                    replacement: String::new(),
+                });
+            }
+        }
+        self.apply_edits_right_to_left(edits);
+    }
+
+    fn word_forward_delete(&mut self) {
+        let mut edits: Vec<Edit> = Vec::new();
+        for sel in &self.sels.items {
+            if sel.is_collapsed() {
+                let range = find_word_right_of(&self.text, sel.head);
+                if range.start < range.end {
+                    edits.push(Edit {
+                        range,
+                        replacement: String::new(),
+                    });
+                }
+            } else {
+                edits.push(Edit {
+                    range: sel.range(),
+                    replacement: String::new(),
+                });
+            }
+        }
+        self.apply_edits_right_to_left(edits);
+    }
+
     fn forward_delete(&mut self) {
         let mut edits: Vec<Edit> = Vec::new();
         for sel in &self.sels.items {
@@ -831,6 +885,45 @@ fn find_word_at(text: &str, idx: usize) -> Range<usize> {
         end = next_char_boundary(text, end);
     }
     start..end
+}
+
+fn class_at_byte(text: &str, i: usize) -> Option<CharClass> {
+    text.get(i..).and_then(|s| s.chars().next()).map(char_class)
+}
+
+/// Range from the start of the run containing the char just before `idx` up to
+/// `idx`. For Ctrl+Backspace: peek left, walk back through the same-class run.
+/// Empty range if `idx == 0`.
+fn find_word_left_of(text: &str, idx: usize) -> Range<usize> {
+    if idx == 0 {
+        return 0..0;
+    }
+    let prev = prev_char_boundary(text, idx);
+    let target = class_at_byte(text, prev);
+    let mut start = prev;
+    while start > 0 {
+        let p = prev_char_boundary(text, start);
+        if class_at_byte(text, p) == target {
+            start = p;
+        } else {
+            break;
+        }
+    }
+    start..idx
+}
+
+/// Range from `idx` to the end of the run starting at `idx`. For Ctrl+Delete.
+/// Empty range if `idx >= text.len()`.
+fn find_word_right_of(text: &str, idx: usize) -> Range<usize> {
+    if idx >= text.len() {
+        return idx..idx;
+    }
+    let target = class_at_byte(text, idx);
+    let mut end = next_char_boundary(text, idx);
+    while end < text.len() && class_at_byte(text, end) == target {
+        end = next_char_boundary(text, end);
+    }
+    idx..end
 }
 
 fn find_line_at(body_lines: &[Range<usize>], idx: usize, affinity: Affinity) -> Range<usize> {
