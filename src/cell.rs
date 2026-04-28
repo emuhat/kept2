@@ -152,6 +152,7 @@ pub struct Cell {
     /// when previous cells grow or shrink.
     last_click_pos: (f32, f32),
     click_count: u8,
+    font_scale: f32,
 }
 
 impl Cell {
@@ -171,6 +172,7 @@ impl Cell {
             last_click_time: None,
             last_click_pos: (0.0, 0.0),
             click_count: 0,
+            font_scale: 1.0,
         }
     }
 
@@ -194,6 +196,18 @@ impl Cell {
         self.text.trim().is_empty()
     }
 
+    pub fn set_font_scale(&mut self, scale: f32) {
+        if (self.font_scale - scale).abs() > f32::EPSILON {
+            self.font_scale = scale;
+            // Wrap depends on font size; invalidate the cache.
+            self.body_lines_width = f32::NAN;
+        }
+    }
+
+    fn body_font(&self) -> Font {
+        Font::from_typeface(&self.typeface, BODY_FONT_SIZE * self.font_scale)
+    }
+
     /// Render the cell at `(x, y)` with `width`. Returns the height consumed,
     /// which the container uses to position the next cell. `focused` controls
     /// whether selection highlights and carets render.
@@ -202,7 +216,7 @@ impl Cell {
         self.y_origin = y;
         self.width = width;
 
-        let body_font = Font::from_typeface(&self.typeface, BODY_FONT_SIZE);
+        let body_font = self.body_font();
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
         text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
@@ -494,7 +508,7 @@ impl Cell {
         let line_text = &self.text[line.clone()];
         let local_x = lx.max(0.0);
 
-        let body_font = Font::from_typeface(&self.typeface, BODY_FONT_SIZE);
+        let body_font = self.body_font();
         let paint = Paint::default();
 
         let mut prev_offset = 0usize;
@@ -752,7 +766,7 @@ impl Cell {
             self.body_lines.clear();
             return;
         }
-        let body_font = Font::from_typeface(&self.typeface, BODY_FONT_SIZE);
+        let body_font = self.body_font();
         let paint = Paint::default();
         self.body_lines = wrap_text(&self.text, &body_font, &paint, self.body_lines_width);
     }

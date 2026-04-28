@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use skia_safe::{Canvas, Color, Font, FontMgr, Paint, PaintStyle, Point, Rect, Typeface};
+use skia_safe::{Canvas, Color, FontMgr, Paint, PaintStyle, Rect, Typeface};
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
     keyboard::{Key, NamedKey},
@@ -22,6 +22,9 @@ const SCROLLBAR_WIDTH: f32 = 4.0;
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 const SCROLLBAR_HOLD: Duration = Duration::from_millis(800);
 const SCROLLBAR_FADE: Duration = Duration::from_millis(700);
+const ZOOM_STEP: f32 = 1.1;
+const ZOOM_MIN: f32 = 0.5;
+const ZOOM_MAX: f32 = 3.0;
 
 const SEED_TEXTS: &[&str] = &[
     "First cell — try clicking between cells. Each one is its own little editor.",
@@ -46,6 +49,7 @@ pub struct KeptApp {
     doc_height: f32,
     viewport_height: f32,
     last_scroll_time: Option<Instant>,
+    font_scale: f32,
 }
 
 impl KeptApp {
@@ -67,7 +71,28 @@ impl KeptApp {
             doc_height: 0.0,
             viewport_height: 0.0,
             last_scroll_time: None,
+            font_scale: 1.0,
         }
+    }
+
+    fn set_font_scale(&mut self, scale: f32) -> bool {
+        let s = scale.clamp(ZOOM_MIN, ZOOM_MAX);
+        if (s - self.font_scale).abs() < f32::EPSILON {
+            return false;
+        }
+        self.font_scale = s;
+        for cell in &mut self.cells {
+            cell.set_font_scale(s);
+        }
+        true
+    }
+
+    fn zoom_in(&mut self) -> bool {
+        self.set_font_scale(self.font_scale * ZOOM_STEP)
+    }
+
+    fn zoom_out(&mut self) -> bool {
+        self.set_font_scale(self.font_scale / ZOOM_STEP)
     }
 
     pub fn scroll_by(&mut self, dy: f32) -> bool {
@@ -158,7 +183,7 @@ impl KeptApp {
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
         if event.state == ElementState::Pressed && modifiers.state().control_key() {
-            match event.logical_key {
+            match &event.logical_key {
                 Key::Named(NamedKey::Enter) => {
                     return self.insert_cell_after_focused();
                 }
@@ -178,6 +203,12 @@ impl KeptApp {
                     }
                     return false;
                 }
+                Key::Character(s) if s.as_str() == "=" || s.as_str() == "+" => {
+                    return self.zoom_in();
+                }
+                Key::Character(s) if s.as_str() == "-" => {
+                    return self.zoom_out();
+                }
                 _ => {}
             }
         }
@@ -195,7 +226,8 @@ impl KeptApp {
                 return false;
             }
         }
-        let new_cell = Cell::new(self.typeface.clone(), String::new());
+        let mut new_cell = Cell::new(self.typeface.clone(), String::new());
+        new_cell.set_font_scale(self.font_scale);
         let insert_at = (self.focused + 1).min(self.cells.len());
         self.cells.insert(insert_at, new_cell);
         self.focused = insert_at;
