@@ -1,166 +1,37 @@
-use std::ops::Range;
-use std::time::{Duration, Instant};
+use skia_safe::{Canvas, Color, Font, FontMgr, Paint, PaintStyle, Point, Rect, Typeface};
+use winit::event::{KeyEvent, Modifiers};
 
-use skia_safe::{Canvas, Color, Font, FontMgr, Paint, Point, Rect, Typeface};
-use winit::{
-    event::{ElementState, KeyEvent, Modifiers},
-    keyboard::{Key, NamedKey},
-};
+use crate::cell::Cell;
 
 const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
 
-const INITIAL_TEXT: &str = "Kept is a small, intentional space for the things you actually want \
-to hold on to — the kind of details that drift out of inboxes and chat threads before you \
-remember why they mattered. It is not a database, not a knowledge graph, not a second brain; \
-it's a sturdy shelf with a few good hooks. Open it on a quiet morning, write down the name \
-of someone you'd like to talk to again, the title of a book a friend mentioned, a question \
-you haven't yet found the right time to ask. Close it. Come back later and find it where \
-you left it, exactly as you put it down, because the only feature this app commits to is \
-keeping.";
-
 const MARGIN_X: f32 = 40.0;
 const MARGIN_TOP: f32 = 60.0;
-const BODY_FONT_SIZE: f32 = 18.0;
 const TITLE_FONT_SIZE: f32 = 36.0;
-const CARET_WIDTH: f32 = 1.5;
-const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
-const MULTI_CLICK_DIST: f32 = 5.0;
+const TITLE_TO_BODY_GAP: f32 = 18.0;
+const CELL_GAP: f32 = 20.0;
+const FOCUS_PAD: f32 = 6.0;
+const FOCUS_RADIUS: f32 = 8.0;
+const FOCUS_STROKE: f32 = 1.5;
 
-/// Disambiguates a byte index that sits at a soft-wrap boundary. The same byte
-/// equals both `line[i].end` and `line[i+1].start`; affinity picks which side the
-/// caret is on for rendering and "current line" lookups.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Affinity {
-    Upstream,
-    #[default]
-    Downstream,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Selection {
-    pub anchor: usize,
-    pub head: usize,
-    pub affinity: Affinity,
-}
-
-impl Selection {
-    pub fn caret(at: usize) -> Self {
-        Self {
-            anchor: at,
-            head: at,
-            affinity: Affinity::Downstream,
-        }
-    }
-
-    pub fn is_collapsed(&self) -> bool {
-        self.anchor == self.head
-    }
-
-    pub fn range(&self) -> Range<usize> {
-        let lo = self.anchor.min(self.head);
-        let hi = self.anchor.max(self.head);
-        lo..hi
-    }
-}
-
-pub struct Selections {
-    pub items: Vec<Selection>,
-    pub primary: usize,
-}
-
-impl Selections {
-    pub fn single_caret(at: usize) -> Self {
-        Self {
-            items: vec![Selection::caret(at)],
-            primary: 0,
-        }
-    }
-
-    /// Sort by `range().start` and merge overlapping/touching selections, preserving
-    /// each merged selection's direction. Re-finds the primary by tracking which range
-    /// contained the previous primary's head.
-    pub fn normalize(&mut self) {
-        if self.items.is_empty() {
-            self.primary = 0;
-            return;
-        }
-        let primary_head = self.items[self.primary].head;
-
-        self.items.sort_by_key(|s| s.range().start);
-
-        let mut merged: Vec<Selection> = Vec::with_capacity(self.items.len());
-        for sel in self.items.drain(..) {
-            if let Some(last) = merged.last_mut() {
-                if sel.range().start <= last.range().end {
-                    let new_lo = last.range().start.min(sel.range().start);
-                    let new_hi = last.range().end.max(sel.range().end);
-                    if last.anchor <= last.head {
-                        last.anchor = new_lo;
-                        last.head = new_hi;
-                    } else {
-                        last.anchor = new_hi;
-                        last.head = new_lo;
-                    }
-                    continue;
-                }
-            }
-            merged.push(sel);
-        }
-        self.items = merged;
-
-        self.primary = self
-            .items
-            .iter()
-            .position(|s| {
-                let r = s.range();
-                r.start <= primary_head && primary_head <= r.end
-            })
-            .unwrap_or(0);
-    }
-}
-
-pub struct Edit {
-    pub range: Range<usize>,
-    pub replacement: String,
-}
-
-/// Standard edit-position transform with right-gravity for pure insertions: a caret
-/// sitting exactly at the insertion point advances past the inserted bytes.
-fn transform_index(i: usize, start: usize, del: usize, ins: usize) -> usize {
-    if i < start {
-        i
-    } else if i == start && del == 0 {
-        i + ins
-    } else if i >= start + del {
-        i - del + ins
-    } else {
-        start + ins
-    }
-}
-
-#[derive(Clone)]
-enum DragKind {
-    Char,
-    Word(Range<usize>),
-    Line(Range<usize>),
-}
-
-struct DragState {
-    sel_idx: usize,
-    kind: DragKind,
-}
+const SEED_TEXTS: &[&str] = &[
+    "First cell — try clicking between cells. Each one is its own little editor.",
+    "Kept is a small, intentional space for the things you actually want to hold on to — the kind \
+of details that drift out of inboxes and chat threads before you remember why they mattered. It \
+is not a database, not a knowledge graph, not a second brain; it's a sturdy shelf with a few good \
+hooks. Open it on a quiet morning, write down the name of someone you'd like to talk to again, \
+the title of a book a friend mentioned, a question you haven't yet found the right time to ask. \
+Close it. Come back later and find it where you left it, exactly as you put it down, because the \
+only feature this app commits to is keeping.",
+    "Third cell. Selections in one cell don't bleed into another. Try double-click and triple-click \
+in here while a different cell is focused — the click count is per-cell.",
+];
 
 pub struct KeptApp {
     typeface: Typeface,
-    text: String,
-    sels: Selections,
-    body_lines: Vec<Range<usize>>,
-    body_lines_width: f32,
-    line_bands: Vec<(f32, f32)>,
-    mouse_drag: Option<DragState>,
-    last_click_time: Option<Instant>,
-    last_click_pos: (f32, f32),
-    click_count: u8,
+    cells: Vec<Cell>,
+    focused: usize,
+    dragging_cell: Option<usize>,
 }
 
 impl KeptApp {
@@ -168,17 +39,15 @@ impl KeptApp {
         let typeface = FontMgr::new()
             .new_from_data(FONT_BYTES, None)
             .expect("failed to load embedded TTF");
+        let cells = SEED_TEXTS
+            .iter()
+            .map(|s| Cell::new(typeface.clone(), (*s).to_string()))
+            .collect();
         Self {
             typeface,
-            text: INITIAL_TEXT.to_string(),
-            sels: Selections::single_caret(0),
-            body_lines: Vec::new(),
-            body_lines_width: f32::NAN,
-            line_bands: Vec::new(),
-            mouse_drag: None,
-            last_click_time: None,
-            last_click_pos: (0.0, 0.0),
-            click_count: 0,
+            cells,
+            focused: 0,
+            dragging_cell: None,
         }
     }
 
@@ -189,780 +58,99 @@ impl KeptApp {
         text_paint.set_anti_alias(true);
         text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
 
-        let title_font = Font::from_typeface(&self.typeface, TITLE_FONT_SIZE);
-        let body_font = Font::from_typeface(&self.typeface, BODY_FONT_SIZE);
-
-        let max_text_width = (width - MARGIN_X * 2.0).max(80.0);
         let mut y = MARGIN_TOP;
 
+        let title_font = Font::from_typeface(&self.typeface, TITLE_FONT_SIZE);
         let (_, title_metrics) = title_font.metrics();
+        
         y += -title_metrics.ascent;
         canvas.draw_str("Kept", Point::new(MARGIN_X, y), &title_font, &text_paint);
-        y += title_metrics.descent + title_metrics.leading + 18.0;
+        y += title_metrics.descent + title_metrics.leading + TITLE_TO_BODY_GAP;
 
-        let (_, body_metrics) = body_font.metrics();
-        let line_step = -body_metrics.ascent + body_metrics.descent + body_metrics.leading;
-        let line_extra = line_step * 0.25;
-
-        if self.body_lines_width != max_text_width {
-            self.body_lines = wrap_text(&self.text, &body_font, &text_paint, max_text_width);
-            self.body_lines_width = max_text_width;
+        let cell_width = (width - MARGIN_X * 2.0).max(80.0);
+        for (i, cell) in self.cells.iter_mut().enumerate() {
+            let h = cell.tick(canvas, MARGIN_X, y, cell_width, i == self.focused);
+            y += h + CELL_GAP;
         }
 
-        // Pre-compute one baseline per visual line. Empty text still gets a single
-        // baseline so the caret has somewhere to land.
-        let line_count = self.body_lines.len().max(1);
-        let mut baselines = Vec::with_capacity(line_count);
-        for _ in 0..line_count {
-            y += -body_metrics.ascent;
-            baselines.push(y);
-            y += body_metrics.descent + body_metrics.leading + line_extra;
-        }
-
-        // Cache y-bands for hit-testing. Each band spans the full advance from one
-        // baseline's visible top to the next, so clicks in the inter-line gap snap
-        // to whichever line owns that half of the gap.
-        let line_advance = line_step + line_extra;
-        self.line_bands.clear();
-        for &b in &baselines {
-            let top = b + body_metrics.ascent;
-            self.line_bands.push((top, top + line_advance));
-        }
-
-        // Selection highlights (drawn first so text and carets sit on top).
-        let mut hl_paint = Paint::default();
-        hl_paint.set_anti_alias(true);
-        hl_paint.set_color(Color::from_argb(0x60, 0x4a, 0x90, 0xe2));
-        for sel in &self.sels.items {
-            if sel.is_collapsed() {
-                continue;
-            }
-            let r = sel.range();
-            for (li, line) in self.body_lines.iter().enumerate() {
-                let s = r.start.max(line.start);
-                let e = r.end.min(line.end);
-                if s >= e {
-                    continue;
-                }
-                let prefix = &self.text[line.start..s];
-                let span = &self.text[s..e];
-                let x0 = MARGIN_X + body_font.measure_str(prefix, Some(&text_paint)).0;
-                let x1 = x0 + body_font.measure_str(span, Some(&text_paint)).0;
-                let baseline = baselines[li];
-                let top = baseline + body_metrics.ascent;
-                let bot = baseline + body_metrics.descent;
-                canvas.draw_rect(Rect::new(x0, top, x1, bot), &hl_paint);
-            }
-        }
-
-        // Body text.
-        for (li, line) in self.body_lines.iter().enumerate() {
-            canvas.draw_str(
-                &self.text[line.clone()],
-                Point::new(MARGIN_X, baselines[li]),
-                &body_font,
-                &text_paint,
+        // Focus rect for the active cell.
+        if let Some(cell) = self.cells.get(self.focused) {
+            let mut focus_paint = Paint::default();
+            focus_paint.set_anti_alias(true);
+            focus_paint.set_style(PaintStyle::Stroke);
+            focus_paint.set_stroke_width(FOCUS_STROKE);
+            focus_paint.set_color(Color::from_argb(0xb0, 0x4a, 0x90, 0xe2));
+            let rect = Rect::new(
+                cell.x_origin() - FOCUS_PAD,
+                cell.y_origin() - FOCUS_PAD,
+                cell.x_origin() + cell.width() + FOCUS_PAD,
+                cell.y_origin() + cell.height() + FOCUS_PAD,
             );
-        }
-
-        // Carets.
-        let mut caret_paint = Paint::default();
-        caret_paint.set_anti_alias(false);
-        caret_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
-        for sel in &self.sels.items {
-            let (li, offset) = locate_caret(&self.body_lines, sel.head, sel.affinity);
-            let baseline = baselines[li];
-            let x = if self.body_lines.is_empty() {
-                MARGIN_X
-            } else {
-                let line = &self.body_lines[li];
-                let prefix_end = (line.start + offset).min(line.end);
-                MARGIN_X
-                    + body_font
-                        .measure_str(&self.text[line.start..prefix_end], Some(&text_paint))
-                        .0
-            };
-            let top = baseline + body_metrics.ascent;
-            let bot = baseline + body_metrics.descent;
-            canvas.draw_rect(Rect::new(x, top, x + CARET_WIDTH, bot), &caret_paint);
+            canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &focus_paint);
         }
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
-        if event.state != ElementState::Pressed {
-            return false;
-        }
-        let shift = modifiers.state().shift_key();
-        match &event.logical_key {
-            Key::Named(NamedKey::ArrowLeft) => {
-                self.move_horizontal(-1, shift);
-                true
-            }
-            Key::Named(NamedKey::ArrowRight) => {
-                self.move_horizontal(1, shift);
-                true
-            }
-            Key::Named(NamedKey::ArrowUp) => {
-                self.move_vertical(-1, shift);
-                true
-            }
-            Key::Named(NamedKey::ArrowDown) => {
-                self.move_vertical(1, shift);
-                true
-            }
-            Key::Named(NamedKey::Home) => {
-                self.move_to_line_edge(false, shift);
-                true
-            }
-            Key::Named(NamedKey::End) => {
-                self.move_to_line_edge(true, shift);
-                true
-            }
-            Key::Named(NamedKey::Backspace) => {
-                self.backspace();
-                true
-            }
-            Key::Named(NamedKey::Delete) => {
-                self.forward_delete();
-                true
-            }
-            // Hard line breaks would need wrap support for empty paragraphs; deferred.
-            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => false,
-            _ => {
-                if let Some(s) = &event.text {
-                    if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
-                        self.insert_text(s);
-                        return true;
-                    }
-                }
-                false
-            }
-        }
-    }
-
-    pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
-        let (idx, affinity) = self.hit_test(x, y);
-        let mods = modifiers.state();
-        let now = Instant::now();
-
-        // Shift resets the counter (shift-click is always char-level extension);
-        // Alt accumulates so Alt+double-click can add a word-selection.
-        let allow_multi = !mods.shift_key();
-        let within_threshold = self
-            .last_click_time
-            .map(|t| {
-                now.duration_since(t) <= MULTI_CLICK_INTERVAL
-                    && (x - self.last_click_pos.0).abs() <= MULTI_CLICK_DIST
-                    && (y - self.last_click_pos.1).abs() <= MULTI_CLICK_DIST
-            })
-            .unwrap_or(false);
-        self.click_count = if allow_multi && within_threshold {
-            (self.click_count + 1).min(3)
-        } else {
-            1
-        };
-        self.last_click_time = Some(now);
-        self.last_click_pos = (x, y);
-
-        if mods.shift_key() {
-            if self.sels.primary < self.sels.items.len() {
-                let s = &mut self.sels.items[self.sels.primary];
-                s.head = idx;
-                s.affinity = affinity;
-                self.mouse_drag = Some(DragState {
-                    sel_idx: self.sels.primary,
-                    kind: DragKind::Char,
-                });
-            }
-            return true;
-        }
-
-        let (anchor, head, head_aff, kind) =
-            resolve_click_unit(&self.text, &self.body_lines, idx, affinity, self.click_count);
-
-        if mods.alt_key() {
-            self.sels.items.push(Selection {
-                anchor,
-                head,
-                affinity: head_aff,
-            });
-            let new_idx = self.sels.items.len() - 1;
-            self.sels.primary = new_idx;
-            self.mouse_drag = Some(DragState {
-                sel_idx: new_idx,
-                kind,
-            });
-        } else {
-            self.sels.items.clear();
-            self.sels.items.push(Selection {
-                anchor,
-                head,
-                affinity: head_aff,
-            });
-            self.sels.primary = 0;
-            self.mouse_drag = Some(DragState { sel_idx: 0, kind });
-        }
-        true
-    }
-
-    pub fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool {
-        let (sel_idx, kind) = match self.mouse_drag.as_ref() {
-            Some(d) => (d.sel_idx, d.kind.clone()),
-            None => return false,
-        };
-        if sel_idx >= self.sels.items.len() {
-            return false;
-        }
-        let (idx, affinity) = self.hit_test(x, y);
-
-        let (new_anchor, new_head, new_aff) = match kind {
-            DragKind::Char => {
-                let s = &self.sels.items[sel_idx];
-                (s.anchor, idx, affinity)
-            }
-            DragKind::Word(initial) => {
-                let hit = find_word_at(&self.text, idx);
-                if hit.start >= initial.start {
-                    (initial.start, hit.end, Affinity::Downstream)
-                } else {
-                    (initial.end, hit.start, Affinity::Downstream)
-                }
-            }
-            DragKind::Line(initial) => {
-                let hit = find_line_at(&self.body_lines, idx, affinity);
-                if hit.start >= initial.start {
-                    let aff = if hit.end == self.text.len() {
-                        Affinity::Downstream
-                    } else {
-                        Affinity::Upstream
-                    };
-                    (initial.start, hit.end, aff)
-                } else {
-                    (initial.end, hit.start, Affinity::Downstream)
-                }
-            }
-        };
-
-        let s = &mut self.sels.items[sel_idx];
-        if s.anchor == new_anchor && s.head == new_head && s.affinity == new_aff {
-            return false;
-        }
-        s.anchor = new_anchor;
-        s.head = new_head;
-        s.affinity = new_aff;
-        true
-    }
-
-    pub fn mouse_up(&mut self) -> bool {
-        if self.mouse_drag.take().is_some() {
-            self.sels.normalize();
-            true
+        if let Some(cell) = self.cells.get_mut(self.focused) {
+            cell.handle_key(event, modifiers)
         } else {
             false
         }
     }
 
-    fn hit_test(&self, x: f32, y: f32) -> (usize, Affinity) {
-        if self.body_lines.is_empty() || self.line_bands.is_empty() {
-            return (0, Affinity::Downstream);
-        }
-        let line_idx = self.find_line_at_y(y);
-        let line = &self.body_lines[line_idx];
-        let line_text = &self.text[line.clone()];
-        let local_x = (x - MARGIN_X).max(0.0);
-
-        let body_font = Font::from_typeface(&self.typeface, BODY_FONT_SIZE);
-        let paint = Paint::default();
-
-        let mut prev_offset = 0usize;
-        let mut prev_w = 0.0f32;
-
-        for (offset, _) in line_text.char_indices().skip(1) {
-            let w = body_font
-                .measure_str(&line_text[..offset], Some(&paint))
-                .0;
-            if w >= local_x {
-                let chosen = if (local_x - prev_w) < (w - local_x) {
-                    prev_offset
-                } else {
-                    offset
-                };
-                let idx = line.start + chosen;
-                return (idx, hit_affinity(line_idx, idx, &self.body_lines));
-            }
-            prev_w = w;
-            prev_offset = offset;
-        }
-
-        // x past the last char boundary tracked; pick between prev_offset and end-of-line.
-        let total_w = body_font.measure_str(line_text, Some(&paint)).0;
-        let chosen = if (local_x - prev_w) < (total_w - local_x) {
-            prev_offset
-        } else {
-            line_text.len()
+    pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
+        let Some(target) = self.find_cell_at(x, y) else {
+            return false;
         };
-        let idx = line.start + chosen;
-        (idx, hit_affinity(line_idx, idx, &self.body_lines))
+        if target != self.focused {
+            self.focused = target;
+        }
+        self.dragging_cell = Some(target);
+        self.cells[target].mouse_down(x, y, modifiers)
     }
 
-    fn find_line_at_y(&self, y: f32) -> usize {
-        if y < self.line_bands[0].0 {
-            return 0;
+    pub fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool {
+        if let Some(idx) = self.dragging_cell {
+            self.cells[idx].mouse_drag_to(x, y)
+        } else {
+            false
         }
-        for (i, &(_top, bot)) in self.line_bands.iter().enumerate() {
-            if y < bot {
-                return i;
-            }
-        }
-        self.line_bands.len() - 1
     }
 
-    fn move_horizontal(&mut self, delta: i32, shift: bool) {
-        let text = &self.text;
-        let body_lines = &self.body_lines;
-        for sel in &mut self.sels.items {
-            if !shift && !sel.is_collapsed() {
-                let r = sel.range();
-                let target = if delta > 0 { r.end } else { r.start };
-                // Preserve head's affinity if collapsing toward head, else default.
-                let new_aff = if (delta > 0 && sel.head >= sel.anchor)
-                    || (delta < 0 && sel.head <= sel.anchor)
-                {
-                    sel.affinity
-                } else {
-                    Affinity::Downstream
-                };
-                sel.anchor = target;
-                sel.head = target;
-                sel.affinity = new_aff;
+    pub fn mouse_up(&mut self) -> bool {
+        if let Some(idx) = self.dragging_cell.take() {
+            self.cells[idx].mouse_up()
+        } else {
+            false
+        }
+    }
+
+    /// Pick the cell that contains `(x, y)`. Each cell's clickable region is its
+    /// rendered rect plus half of `CELL_GAP` on each interior side (so clicks in
+    /// the gap snap to whichever cell owns that half). Returns `None` for clicks
+    /// above the first cell, below the last cell, or outside the cell width.
+    fn find_cell_at(&self, x: f32, y: f32) -> Option<usize> {
+        if self.cells.is_empty() {
+            return None;
+        }
+        let half_gap = CELL_GAP * 0.5;
+        let last = self.cells.len() - 1;
+        for (i, cell) in self.cells.iter().enumerate() {
+            let in_x = x >= cell.x_origin() && x < cell.x_origin() + cell.width();
+            let top = if i == 0 {
+                cell.y_origin()
             } else {
-                let (new_head, new_aff) =
-                    step_horizontal(text, body_lines, sel.head, sel.affinity, delta);
-                sel.head = new_head;
-                sel.affinity = new_aff;
-                if !shift {
-                    sel.anchor = sel.head;
-                }
-            }
-        }
-        self.sels.normalize();
-    }
-
-    fn move_vertical(&mut self, delta: i32, shift: bool) {
-        if self.body_lines.is_empty() {
-            return;
-        }
-        let last = self.body_lines.len() as i32 - 1;
-        let body_lines = &self.body_lines;
-        let text = &self.text;
-        for sel in &mut self.sels.items {
-            let (line_idx, offset) = locate_caret(body_lines, sel.head, sel.affinity);
-            let target = (line_idx as i32 + delta).clamp(0, last) as usize;
-            if target == line_idx {
-                continue;
-            }
-            let target_line = &body_lines[target];
-            let line_len = target_line.end - target_line.start;
-            // Without a goal column, we map the same byte offset onto the target line and
-            // walk back to the nearest char boundary. Visual column is approximate.
-            let mut new_offset = offset.min(line_len);
-            while new_offset > 0 && !text.is_char_boundary(target_line.start + new_offset) {
-                new_offset -= 1;
-            }
-            sel.head = target_line.start + new_offset;
-            sel.affinity = if new_offset == 0 && target > 0 {
-                Affinity::Downstream
-            } else if new_offset == line_len && target + 1 < body_lines.len() {
-                Affinity::Upstream
-            } else {
-                Affinity::Downstream
+                cell.y_origin() - half_gap
             };
-            if !shift {
-                sel.anchor = sel.head;
-            }
-        }
-        self.sels.normalize();
-    }
-
-    fn move_to_line_edge(&mut self, end: bool, shift: bool) {
-        if self.body_lines.is_empty() {
-            return;
-        }
-        let body_lines = &self.body_lines;
-        for sel in &mut self.sels.items {
-            let (line_idx, _) = locate_caret(body_lines, sel.head, sel.affinity);
-            let line = &body_lines[line_idx];
-            if end {
-                sel.head = line.end;
-                sel.affinity = if line_idx + 1 < body_lines.len() {
-                    Affinity::Upstream
-                } else {
-                    Affinity::Downstream
-                };
+            let bot = if i == last {
+                cell.y_origin() + cell.height()
             } else {
-                sel.head = line.start;
-                sel.affinity = Affinity::Downstream;
-            }
-            if !shift {
-                sel.anchor = sel.head;
-            }
-        }
-        self.sels.normalize();
-    }
-
-    fn backspace(&mut self) {
-        let mut edits: Vec<Edit> = Vec::new();
-        for sel in &self.sels.items {
-            if sel.is_collapsed() {
-                if sel.head == 0 {
-                    continue;
-                }
-                let prev = prev_char_boundary(&self.text, sel.head);
-                edits.push(Edit {
-                    range: prev..sel.head,
-                    replacement: String::new(),
-                });
-            } else {
-                edits.push(Edit {
-                    range: sel.range(),
-                    replacement: String::new(),
-                });
-            }
-        }
-        self.apply_edits_right_to_left(edits);
-    }
-
-    fn forward_delete(&mut self) {
-        let mut edits: Vec<Edit> = Vec::new();
-        for sel in &self.sels.items {
-            if sel.is_collapsed() {
-                if sel.head >= self.text.len() {
-                    continue;
-                }
-                let next = next_char_boundary(&self.text, sel.head);
-                edits.push(Edit {
-                    range: sel.head..next,
-                    replacement: String::new(),
-                });
-            } else {
-                edits.push(Edit {
-                    range: sel.range(),
-                    replacement: String::new(),
-                });
-            }
-        }
-        self.apply_edits_right_to_left(edits);
-    }
-
-    fn insert_text(&mut self, s: &str) {
-        let mut edits: Vec<Edit> = Vec::new();
-        for sel in &self.sels.items {
-            edits.push(Edit {
-                range: sel.range(),
-                replacement: s.to_string(),
-            });
-        }
-        self.apply_edits_right_to_left(edits);
-    }
-
-    fn apply_edits_right_to_left(&mut self, mut edits: Vec<Edit>) {
-        edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
-        for edit in &edits {
-            self.apply_edit(edit);
-        }
-    }
-
-    fn apply_edit(&mut self, edit: &Edit) {
-        let start = edit.range.start;
-        let del = edit.range.end - edit.range.start;
-        let ins = edit.replacement.len();
-        self.text.replace_range(edit.range.clone(), &edit.replacement);
-        for sel in &mut self.sels.items {
-            sel.anchor = transform_index(sel.anchor, start, del, ins);
-            sel.head = transform_index(sel.head, start, del, ins);
-            // Wrap shape may have changed under us; reset to a sane default. The
-            // user's next motion will set affinity meaningfully again.
-            sel.affinity = Affinity::Downstream;
-        }
-        self.sels.normalize();
-        self.rewrap();
-    }
-
-    /// Re-run wrap with the cached width so `body_lines` stays consistent with `text`
-    /// between ticks (e.g. for keyboard-driven movement that reads `body_lines`).
-    fn rewrap(&mut self) {
-        if self.body_lines_width.is_nan() {
-            self.body_lines.clear();
-            return;
-        }
-        let body_font = Font::from_typeface(&self.typeface, BODY_FONT_SIZE);
-        let paint = Paint::default();
-        self.body_lines = wrap_text(&self.text, &body_font, &paint, self.body_lines_width);
-    }
-}
-
-/// Locate which visual line contains `idx` and the byte offset within that line.
-/// At a soft-wrap boundary (`line[i].end == line[i+1].start`), `affinity` decides:
-/// `Upstream` keeps the caret on line `i` (end of the upper line), `Downstream`
-/// moves it to line `i+1` (start of the lower line).
-fn locate_caret(lines: &[Range<usize>], idx: usize, affinity: Affinity) -> (usize, usize) {
-    if lines.is_empty() {
-        return (0, 0);
-    }
-    for (i, line) in lines.iter().enumerate() {
-        if idx <= line.end {
-            // `line[i].end == line[i+1].start` is guaranteed by the contiguous-partition
-            // wrap, so no need to compare them; the next line's existence is enough.
-            if idx == line.end && affinity == Affinity::Downstream && i + 1 < lines.len() {
-                return (i + 1, 0);
-            }
-            let local = idx.saturating_sub(line.start).min(line.end - line.start);
-            return (i, local);
-        }
-    }
-    let last = lines.len() - 1;
-    let line = &lines[last];
-    (last, line.end - line.start)
-}
-
-/// True if `idx` sits at a soft-wrap boundary — i.e., it equals the end of some
-/// non-last line. With our contiguous partition this is the same as `idx ==
-/// line[i].end == line[i+1].start` for some `i`.
-fn is_wrap_boundary(body_lines: &[Range<usize>], idx: usize) -> bool {
-    if body_lines.len() < 2 {
-        return false;
-    }
-    body_lines[..body_lines.len() - 1]
-        .iter()
-        .any(|line| line.end == idx)
-}
-
-/// One left/right step with affinity-aware behavior at wrap boundaries:
-/// - Right at upstream(b) flips to downstream(b) without changing the byte.
-/// - Right that arrives on a boundary lands Upstream (so the user sees
-///   end-of-this-line first, then a second press flips to the next line's start).
-/// - Left is symmetric: downstream(b) flips to upstream(b); a non-boundary step
-///   lands Downstream.
-fn step_horizontal(
-    text: &str,
-    body_lines: &[Range<usize>],
-    head: usize,
-    affinity: Affinity,
-    dir: i32,
-) -> (usize, Affinity) {
-    if dir > 0 {
-        if affinity == Affinity::Upstream && is_wrap_boundary(body_lines, head) {
-            return (head, Affinity::Downstream);
-        }
-        let next = next_char_boundary(text, head);
-        let new_aff = if is_wrap_boundary(body_lines, next) {
-            Affinity::Upstream
-        } else {
-            Affinity::Downstream
-        };
-        (next, new_aff)
-    } else {
-        if affinity == Affinity::Downstream && is_wrap_boundary(body_lines, head) {
-            return (head, Affinity::Upstream);
-        }
-        let prev = prev_char_boundary(text, head);
-        (prev, Affinity::Downstream)
-    }
-}
-
-/// Affinity for a click: if the click landed at the start of `line_idx > 0`,
-/// the user wanted the lower line (Downstream); if at the end of a non-last line,
-/// the upper line (Upstream); otherwise either is equivalent — pick Downstream.
-fn hit_affinity(line_idx: usize, idx: usize, body_lines: &[Range<usize>]) -> Affinity {
-    let line = &body_lines[line_idx];
-    if idx == line.start && line_idx > 0 {
-        Affinity::Downstream
-    } else if idx == line.end && line_idx + 1 < body_lines.len() {
-        Affinity::Upstream
-    } else {
-        Affinity::Downstream
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CharClass {
-    Word,
-    Whitespace,
-    Other,
-}
-
-fn char_class(c: char) -> CharClass {
-    if c.is_whitespace() {
-        CharClass::Whitespace
-    } else if c.is_alphanumeric() || c == '_' {
-        CharClass::Word
-    } else {
-        CharClass::Other
-    }
-}
-
-/// Find the contiguous run of same-class chars containing `idx`. At a class
-/// boundary (e.g. "apple|"), prefer the Word side over whitespace/punctuation.
-fn find_word_at(text: &str, idx: usize) -> Range<usize> {
-    if text.is_empty() {
-        return 0..0;
-    }
-    let class_at = |i: usize| -> Option<CharClass> {
-        text.get(i..).and_then(|s| s.chars().next()).map(char_class)
-    };
-    let class_left = |i: usize| -> Option<CharClass> {
-        if i == 0 {
-            None
-        } else {
-            class_at(prev_char_boundary(text, i))
-        }
-    };
-
-    let here = class_at(idx);
-    let left = class_left(idx);
-
-    let (probe, class) = match (left, here) {
-        (Some(l), Some(h)) if l != h => {
-            // Boundary: prefer Word side.
-            if l == CharClass::Word {
-                (prev_char_boundary(text, idx), CharClass::Word)
-            } else {
-                (idx, h)
-            }
-        }
-        (_, Some(h)) => (idx, h),
-        (Some(l), None) => (prev_char_boundary(text, idx), l),
-        (None, None) => return idx..idx,
-    };
-
-    let mut start = probe;
-    while start > 0 {
-        let p = prev_char_boundary(text, start);
-        if class_at(p) == Some(class) {
-            start = p;
-        } else {
-            break;
-        }
-    }
-    let mut end = next_char_boundary(text, probe);
-    while end < text.len() && class_at(end) == Some(class) {
-        end = next_char_boundary(text, end);
-    }
-    start..end
-}
-
-/// The visual line range containing `idx`, with affinity disambiguating
-/// soft-wrap boundaries.
-fn find_line_at(body_lines: &[Range<usize>], idx: usize, affinity: Affinity) -> Range<usize> {
-    if body_lines.is_empty() {
-        return 0..0;
-    }
-    let (line_idx, _) = locate_caret(body_lines, idx, affinity);
-    body_lines[line_idx].clone()
-}
-
-/// Map a click count to a selection unit (caret/word/line) at `idx`.
-/// Returns `(anchor, head, head_affinity, drag_kind)` for the new selection.
-fn resolve_click_unit(
-    text: &str,
-    body_lines: &[Range<usize>],
-    idx: usize,
-    affinity: Affinity,
-    click_count: u8,
-) -> (usize, usize, Affinity, DragKind) {
-    match click_count {
-        2 => {
-            let word = find_word_at(text, idx);
-            (
-                word.start,
-                word.end,
-                Affinity::Downstream,
-                DragKind::Word(word),
-            )
-        }
-        3 => {
-            let line = find_line_at(body_lines, idx, affinity);
-            let head_aff = if line.end == text.len() {
-                Affinity::Downstream
-            } else {
-                Affinity::Upstream
+                cell.y_origin() + cell.height() + half_gap
             };
-            (line.start, line.end, head_aff, DragKind::Line(line))
-        }
-        _ => (idx, idx, affinity, DragKind::Char),
-    }
-}
-
-fn next_char_boundary(text: &str, idx: usize) -> usize {
-    if idx >= text.len() {
-        return text.len();
-    }
-    let mut i = idx + 1;
-    while i < text.len() && !text.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
-fn prev_char_boundary(text: &str, idx: usize) -> usize {
-    if idx == 0 {
-        return 0;
-    }
-    let mut i = idx - 1;
-    while i > 0 && !text.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-/// Wrap `text` into a contiguous partition: every byte belongs to exactly one line,
-/// so trailing whitespace at a wrap boundary stays on the line above it and the
-/// caret can sit inside it. The first word of each line is always accepted, even
-/// if it alone exceeds `max_width`.
-fn wrap_text(text: &str, font: &Font, paint: &Paint, max_width: f32) -> Vec<Range<usize>> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let words = word_ranges(text);
-    if words.is_empty() {
-        return vec![0..text.len()];
-    }
-
-    let mut lines = Vec::new();
-    let mut line_start: usize = 0;
-    let mut have_word = false;
-
-    for word in &words {
-        if !have_word {
-            have_word = true;
-            continue;
-        }
-        let candidate = &text[line_start..word.end];
-        if font.measure_str(candidate, Some(paint)).0 > max_width {
-            // Commit the line up to the start of this word — the gap between the
-            // previous line's last word and this word goes onto the line above.
-            lines.push(line_start..word.start);
-            line_start = word.start;
-        }
-    }
-    lines.push(line_start..text.len());
-    lines
-}
-
-fn word_ranges(text: &str) -> Vec<Range<usize>> {
-    let mut words = Vec::new();
-    let mut start: Option<usize> = None;
-    for (idx, c) in text.char_indices() {
-        if c.is_whitespace() {
-            if let Some(s) = start.take() {
-                words.push(s..idx);
+            if in_x && y >= top && y < bot {
+                return Some(i);
             }
-        } else if start.is_none() {
-            start = Some(idx);
         }
+        None
     }
-    if let Some(s) = start {
-        words.push(s..text.len());
-    }
-    words
 }

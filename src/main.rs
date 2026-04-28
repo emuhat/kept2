@@ -1,4 +1,5 @@
 mod app;
+mod cell;
 
 use std::{
     ffi::CString,
