@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use skia_safe::{Canvas, Color, Font, FontMgr, Paint, Point, Typeface};
 
 const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
@@ -16,7 +18,7 @@ const MARGIN_TOP: f32 = 60.0;
 
 pub struct KeptApp {
     typeface: Typeface,
-    body_lines: Vec<String>,
+    body_lines: Vec<Range<usize>>,
     body_lines_width: f32,
 }
 
@@ -60,37 +62,58 @@ impl KeptApp {
 
         for line in &self.body_lines {
             y += -body_metrics.ascent;
-            canvas.draw_str(line, Point::new(MARGIN_X, y), &body_font, &paint);
+            canvas.draw_str(
+                &PARAGRAPH[line.clone()],
+                Point::new(MARGIN_X, y),
+                &body_font,
+                &paint,
+            );
             y += body_metrics.descent + body_metrics.leading + line_height * 0.25;
         }
     }
 }
 
-fn wrap_text(text: &str, font: &Font, paint: &Paint, max_width: f32) -> Vec<String> {
+fn wrap_text(text: &str, font: &Font, paint: &Paint, max_width: f32) -> Vec<Range<usize>> {
+    let words = word_ranges(text);
+
     let mut lines = Vec::new();
-    let mut current = String::new();
+    let mut line: Option<Range<usize>> = None;
 
-    for word in text.split_whitespace() {
-        if current.is_empty() {
-            current.push_str(word);
-            continue;
-        }
-        let candidate_len = current.len() + 1 + word.len();
-        let mut candidate = String::with_capacity(candidate_len);
-        candidate.push_str(&current);
-        candidate.push(' ');
-        candidate.push_str(word);
-
-        let (candidate_width, _) = font.measure_str(&candidate, Some(paint));
-        if candidate_width <= max_width {
-            current = candidate;
-        } else {
-            lines.push(std::mem::take(&mut current));
-            current.push_str(word);
+    for word in words {
+        match line.as_mut() {
+            None => line = Some(word),
+            Some(current) => {
+                let candidate = &text[current.start..word.end];
+                let (candidate_width, _) = font.measure_str(candidate, Some(paint));
+                if candidate_width <= max_width {
+                    current.end = word.end;
+                } else {
+                    lines.push(line.take().unwrap());
+                    line = Some(word);
+                }
+            }
         }
     }
-    if !current.is_empty() {
-        lines.push(current);
+    if let Some(last) = line {
+        lines.push(last);
     }
     lines
+}
+
+fn word_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut words = Vec::new();
+    let mut start: Option<usize> = None;
+    for (idx, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                words.push(s..idx);
+            }
+        } else if start.is_none() {
+            start = Some(idx);
+        }
+    }
+    if let Some(s) = start {
+        words.push(s..text.len());
+    }
+    words
 }
