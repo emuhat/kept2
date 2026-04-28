@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use skia_safe::{Canvas, Color, Font, FontMgr, Paint, PaintStyle, Point, Rect, Typeface};
 use winit::event::{KeyEvent, Modifiers};
 
@@ -13,6 +15,12 @@ const CELL_GAP: f32 = 20.0;
 const FOCUS_PAD: f32 = 6.0;
 const FOCUS_RADIUS: f32 = 8.0;
 const FOCUS_STROKE: f32 = 1.5;
+const DOC_BOTTOM_PAD: f32 = 24.0;
+const SCROLLBAR_INSET: f32 = 4.0;
+const SCROLLBAR_WIDTH: f32 = 4.0;
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+const SCROLLBAR_HOLD: Duration = Duration::from_millis(800);
+const SCROLLBAR_FADE: Duration = Duration::from_millis(700);
 
 const SEED_TEXTS: &[&str] = &[
     "First cell — try clicking between cells. Each one is its own little editor.",
@@ -32,6 +40,11 @@ pub struct KeptApp {
     cells: Vec<Cell>,
     focused: usize,
     dragging_cell: Option<usize>,
+    scroll_y: f32,
+    max_scroll: f32,
+    doc_height: f32,
+    viewport_height: f32,
+    last_scroll_time: Option<Instant>,
 }
 
 impl KeptApp {
@@ -48,21 +61,43 @@ impl KeptApp {
             cells,
             focused: 0,
             dragging_cell: None,
+            scroll_y: 0.0,
+            max_scroll: 0.0,
+            doc_height: 0.0,
+            viewport_height: 0.0,
+            last_scroll_time: None,
         }
     }
 
-    pub fn tick(&mut self, canvas: &Canvas, width: f32, _height: f32) {
+    pub fn scroll_by(&mut self, dy: f32) -> bool {
+        let new_y = (self.scroll_y + dy).clamp(0.0, self.max_scroll);
+        if new_y == self.scroll_y {
+            return false;
+        }
+        self.scroll_y = new_y;
+        self.last_scroll_time = Some(Instant::now());
+        true
+    }
+
+    pub fn tick(&mut self, canvas: &Canvas, width: f32, height: f32) {
         canvas.clear(Color::from_rgb(0xfa, 0xf7, 0xf2));
+
+        // Clamp scroll using last frame's max_scroll before drawing this frame.
+        self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll);
 
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
         text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
 
+        // Document space — translate so doc y=0 lands at window y = -scroll_y.
+        canvas.save();
+        canvas.translate((0.0, -self.scroll_y));
+
         let mut y = MARGIN_TOP;
 
         let title_font = Font::from_typeface(&self.typeface, TITLE_FONT_SIZE);
         let (_, title_metrics) = title_font.metrics();
-        
+
         y += -title_metrics.ascent;
         canvas.draw_str("Kept", Point::new(MARGIN_X, y), &title_font, &text_paint);
         y += title_metrics.descent + title_metrics.leading + TITLE_TO_BODY_GAP;
@@ -73,7 +108,7 @@ impl KeptApp {
             y += h + CELL_GAP;
         }
 
-        // Focus rect for the active cell.
+        // Focus rect for the active cell (still in document coords).
         if let Some(cell) = self.cells.get(self.focused) {
             let mut focus_paint = Paint::default();
             focus_paint.set_anti_alias(true);
@@ -88,6 +123,42 @@ impl KeptApp {
             );
             canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &focus_paint);
         }
+
+        canvas.restore();
+
+        // Update bookkeeping for scroll math + clamp again in case content shrank.
+        self.doc_height = y - CELL_GAP + DOC_BOTTOM_PAD;
+        self.viewport_height = height.max(0.0);
+        self.max_scroll = (self.doc_height - self.viewport_height).max(0.0);
+        self.scroll_y = self.scroll_y.min(self.max_scroll);
+
+        // Scrollbar lives in window coords (no translate), so it doesn't scroll.
+        if self.max_scroll > 0.0 {
+            let alpha = scrollbar_alpha(self.last_scroll_time);
+            if alpha > 0.0 {
+                let track_top = 6.0_f32;
+                let track_bot = self.viewport_height - 6.0;
+                let track_len = (track_bot - track_top).max(1.0);
+                let raw_thumb = (self.viewport_height / self.doc_height) * track_len;
+                let thumb_h = raw_thumb.max(SCROLLBAR_MIN_THUMB).min(track_len);
+                let thumb_top = track_top
+                    + (self.scroll_y / self.max_scroll) * (track_len - thumb_h);
+                let thumb_bot = thumb_top + thumb_h;
+                let bar_x = width - SCROLLBAR_INSET - SCROLLBAR_WIDTH;
+
+                let mut sb_paint = Paint::default();
+                sb_paint.set_anti_alias(true);
+                let alpha_byte = (alpha * 0xb0 as f32).round() as u8;
+                sb_paint.set_color(Color::from_argb(alpha_byte, 0x1c, 0x1c, 0x1c));
+                let r = SCROLLBAR_WIDTH * 0.5;
+                canvas.draw_round_rect(
+                    Rect::new(bar_x, thumb_top, bar_x + SCROLLBAR_WIDTH, thumb_bot),
+                    r,
+                    r,
+                    &sb_paint,
+                );
+            }
+        }
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
@@ -99,19 +170,21 @@ impl KeptApp {
     }
 
     pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
-        let Some(target) = self.find_cell_at(x, y) else {
+        let doc_y = y + self.scroll_y;
+        let Some(target) = self.find_cell_at(x, doc_y) else {
             return false;
         };
         if target != self.focused {
             self.focused = target;
         }
         self.dragging_cell = Some(target);
-        self.cells[target].mouse_down(x, y, modifiers)
+        self.cells[target].mouse_down(x, doc_y, modifiers)
     }
 
     pub fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool {
+        let doc_y = y + self.scroll_y;
         if let Some(idx) = self.dragging_cell {
-            self.cells[idx].mouse_drag_to(x, y)
+            self.cells[idx].mouse_drag_to(x, doc_y)
         } else {
             false
         }
@@ -125,7 +198,8 @@ impl KeptApp {
         }
     }
 
-    /// Pick the cell that contains `(x, y)`. Each cell's clickable region is its
+    /// Pick the cell that contains `(x, doc_y)` — `doc_y` must already include
+    /// any scroll offset. Each cell's clickable region is its
     /// rendered rect plus half of `CELL_GAP` on each interior side (so clicks in
     /// the gap snap to whichever cell owns that half). Returns `None` for clicks
     /// above the first cell, below the last cell, or outside the cell width.
@@ -152,5 +226,21 @@ impl KeptApp {
             }
         }
         None
+    }
+}
+
+/// Opacity for the scrollbar thumb. Full for `SCROLLBAR_HOLD` after the last
+/// scroll, then linear fade to 0 over `SCROLLBAR_FADE`. Returns 0 if there has
+/// never been a scroll event.
+fn scrollbar_alpha(last: Option<Instant>) -> f32 {
+    let Some(t) = last else { return 0.0 };
+    let elapsed = t.elapsed();
+    if elapsed <= SCROLLBAR_HOLD {
+        1.0
+    } else if elapsed >= SCROLLBAR_HOLD + SCROLLBAR_FADE {
+        0.0
+    } else {
+        let into_fade = elapsed - SCROLLBAR_HOLD;
+        1.0 - (into_fade.as_secs_f32() / SCROLLBAR_FADE.as_secs_f32())
     }
 }

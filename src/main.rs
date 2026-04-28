@@ -25,7 +25,7 @@ use skia_safe::{
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, Modifiers, MouseButton, WindowEvent},
+    event::{ElementState, Modifiers, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowAttributes, WindowId},
 };
@@ -125,6 +125,15 @@ impl ApplicationHandler for Application {
                     if changed {
                         self.env.window.request_redraw();
                     }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y * 30.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / self.dpi,
+                };
+                if self.kept_app.scroll_by(-dy) {
+                    self.env.window.request_redraw();
                 }
             }
             WindowEvent::Resized(physical_size) => {
