@@ -1,7 +1,10 @@
 use std::time::{Duration, Instant};
 
 use skia_safe::{Canvas, Color, Font, FontMgr, Paint, PaintStyle, Point, Rect, Typeface};
-use winit::event::{KeyEvent, Modifiers};
+use winit::{
+    event::{ElementState, KeyEvent, Modifiers},
+    keyboard::{Key, NamedKey},
+};
 
 use crate::cell::Cell;
 
@@ -162,11 +165,28 @@ impl KeptApp {
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        if event.state == ElementState::Pressed
+            && modifiers.state().control_key()
+            && matches!(event.logical_key, Key::Named(NamedKey::Enter))
+        {
+            self.insert_cell_after_focused();
+            return true;
+        }
         if let Some(cell) = self.cells.get_mut(self.focused) {
             cell.handle_key(event, modifiers)
         } else {
             false
         }
+    }
+
+    fn insert_cell_after_focused(&mut self) {
+        let new_cell = Cell::new(self.typeface.clone(), String::new());
+        let insert_at = (self.focused + 1).min(self.cells.len());
+        self.cells.insert(insert_at, new_cell);
+        self.focused = insert_at;
+        // An in-progress drag's cell index would be invalidated by the insert;
+        // safest to drop it. The user can't realistically be dragging mid-keypress.
+        self.dragging_cell = None;
     }
 
     pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
