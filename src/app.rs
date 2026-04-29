@@ -137,6 +137,19 @@ enum UndoOp {
         snapshot: CellSnapshot,
         pre_focused: Option<Uuid>,
     },
+    RotateContext {
+        /// The context that was active before rotation; this is the one that
+        /// gets `end_time` set on apply, and restored on inverse.
+        prev_active: Uuid,
+        /// `prev_active`'s `end_time` before rotation (usually `None`).
+        prev_end_time: Option<i64>,
+        /// The `end_time` written to `prev_active` when rotation applied.
+        new_end_time: i64,
+        /// The freshly-created context. Re-inserted on redo, removed on undo.
+        new_context: Context,
+        pre_focused: Option<Uuid>,
+        pre_scroll_y: f32,
+    },
 }
 
 const SEED_TEXTS: &[&str] = &[
@@ -152,6 +165,7 @@ only feature this app commits to is keeping.",
 in here while a different cell is focused — the click count is per-cell.",
 ];
 
+#[derive(Clone)]
 pub struct Context {
     pub id: Uuid,
     pub start_time: i64,
@@ -215,6 +229,7 @@ pub struct KeptApp {
     dirty_cells: HashSet<Uuid>,
     pending_deletes: HashSet<Uuid>,
     dirty_contexts: HashSet<Uuid>,
+    pending_context_deletes: HashSet<Uuid>,
     cell_menu_open: Option<Uuid>,
     last_kebab_rects: Vec<(Uuid, Rect)>,
     /// Sidebar item rects in window (logical) coords from last frame, paired
@@ -280,7 +295,14 @@ impl KeptApp {
             }
             contexts.push(ctx);
         }
-        let active_context = contexts[0].id;
+        // Pick the most recent context. Prefer an open one; among ties, the
+        // one with the latest start. `(end_time.is_none(), start_time)` works
+        // because bool sorts false < true.
+        let active_context = contexts
+            .iter()
+            .max_by_key(|c| (c.end_time.is_none(), c.start_time))
+            .map(|c| c.id)
+            .expect("at least one context exists after seeding");
 
         if cells.is_empty() {
             for (i, text) in SEED_TEXTS.iter().enumerate() {
@@ -330,6 +352,7 @@ impl KeptApp {
             dirty_cells: HashSet::new(),
             pending_deletes: HashSet::new(),
             dirty_contexts: HashSet::new(),
+            pending_context_deletes: HashSet::new(),
             cell_menu_open: None,
             last_kebab_rects: Vec::new(),
             last_sidebar_rects: Vec::new(),
@@ -372,36 +395,84 @@ impl KeptApp {
     /// Close the active context (`end_time = now`) and open a new one whose
     /// window starts at `now`. Sets `active_context` to the new id. Drops focus
     /// since the new window is empty until the next cell is created.
+    /// Recorded as an undoable op.
     fn rotate_context_now(&mut self) {
         let now = now_epoch_ms();
-        if let Some(ctx) = self
+        let prev_active = self.active_context;
+        let prev_end_time = self
             .contexts
-            .iter_mut()
-            .find(|c| c.id == self.active_context)
-        {
-            // Don't double-close — if something already closed this context,
-            // keep its prior end_time.
-            if ctx.end_time.is_none() {
-                ctx.end_time = Some(now);
-                let id = ctx.id;
-                self.dirty_contexts.insert(id);
-            }
-        }
-        let new_ctx = Context {
+            .iter()
+            .find(|c| c.id == prev_active)
+            .and_then(|c| c.end_time);
+        let new_context = Context {
             id: Uuid::now_v7(),
             start_time: now,
             end_time: None,
             title: None,
         };
-        let new_id = new_ctx.id;
-        self.contexts.push(new_ctx);
+        let pre_focused = self.focused;
+        let pre_scroll_y = self.scroll_y;
+
+        self.apply_rotation(prev_active, now, &new_context);
+
+        self.undo_stack.push(UndoOp::RotateContext {
+            prev_active,
+            prev_end_time,
+            new_end_time: now,
+            new_context,
+            pre_focused,
+            pre_scroll_y,
+        });
+        self.redo_stack.clear();
+        self.coalesce_break = true;
+    }
+
+    /// Apply rotation forward: close `prev_active` (set its `end_time`), insert
+    /// `new_context`, switch to it. Used by both initial rotation and redo.
+    fn apply_rotation(&mut self, prev_active: Uuid, new_end_time: i64, new_context: &Context) {
+        if let Some(ctx) = self.contexts.iter_mut().find(|c| c.id == prev_active) {
+            ctx.end_time = Some(new_end_time);
+        }
+        self.dirty_contexts.insert(prev_active);
+        let new_id = new_context.id;
+        if !self.contexts.iter().any(|c| c.id == new_id) {
+            self.contexts.push(new_context.clone());
+        }
         self.dirty_contexts.insert(new_id);
+        self.pending_context_deletes.remove(&new_id);
         self.active_context = new_id;
         self.focused = None;
         self.dragging_cell = None;
         self.cell_menu_open = None;
         self.scroll_y = 0.0;
-        self.coalesce_break = true;
+    }
+
+    /// Inverse of `apply_rotation`: restore `prev_active`'s `end_time`, remove
+    /// the new context (queue it for DB deletion), restore focus and scroll.
+    fn inverse_rotation(
+        &mut self,
+        prev_active: Uuid,
+        prev_end_time: Option<i64>,
+        new_context_id: Uuid,
+        pre_focused: Option<Uuid>,
+        pre_scroll_y: f32,
+    ) {
+        if let Some(ctx) = self
+            .contexts
+            .iter_mut()
+            .find(|c| c.id == prev_active)
+        {
+            ctx.end_time = prev_end_time;
+        }
+        self.dirty_contexts.insert(prev_active);
+        self.contexts.retain(|c| c.id != new_context_id);
+        self.dirty_contexts.remove(&new_context_id);
+        self.pending_context_deletes.insert(new_context_id);
+        self.active_context = prev_active;
+        self.focused = pre_focused;
+        self.dragging_cell = None;
+        self.cell_menu_open = None;
+        self.scroll_y = pre_scroll_y;
     }
 
     /// Switch the visible window to an existing context. No data movement.
@@ -480,6 +551,7 @@ impl KeptApp {
             self.dirty_cells.clear();
             self.pending_deletes.clear();
             self.dirty_contexts.clear();
+            self.pending_context_deletes.clear();
             return;
         };
         for id in self.pending_deletes.drain() {
@@ -493,6 +565,11 @@ impl KeptApp {
                 if let Err(e) = db.save_cell(cell) {
                     eprintln!("kept: save_cell failed for {id}: {e}");
                 }
+            }
+        }
+        for id in self.pending_context_deletes.drain() {
+            if let Err(e) = db.delete_context(id) {
+                eprintln!("kept: delete_context failed for {id}: {e}");
             }
         }
         let ctx_dirty: Vec<Uuid> = self.dirty_contexts.drain().collect();
@@ -667,7 +744,8 @@ impl KeptApp {
         // for SAVE_DEBOUNCE, flush.
         let any_dirty = !self.dirty_cells.is_empty()
             || !self.pending_deletes.is_empty()
-            || !self.dirty_contexts.is_empty();
+            || !self.dirty_contexts.is_empty()
+            || !self.pending_context_deletes.is_empty();
         if any_dirty {
             let idle = self
                 .last_edit_time
@@ -1403,6 +1481,7 @@ impl KeptApp {
         let Some(op) = self.undo_stack.pop() else {
             return false;
         };
+        let mut bump_focused_edited = true;
         match &op {
             UndoOp::CellEdit { cell_id, pre, .. } => {
                 self.focused = Some(*cell_id);
@@ -1433,13 +1512,32 @@ impl KeptApp {
                 self.pending_deletes.remove(cell_id);
                 self.focused = *pre_focused;
             }
+            UndoOp::RotateContext {
+                prev_active,
+                prev_end_time,
+                new_context,
+                pre_focused,
+                pre_scroll_y,
+                ..
+            } => {
+                self.inverse_rotation(
+                    *prev_active,
+                    *prev_end_time,
+                    new_context.id,
+                    *pre_focused,
+                    *pre_scroll_y,
+                );
+                bump_focused_edited = false;
+            }
         }
         self.redo_stack.push(op);
         self.dragging_cell = None;
         self.pending_caret_scroll = true;
         self.coalesce_break = true;
-        if let Some(id) = self.focused {
-            self.touch_cell(id);
+        if bump_focused_edited {
+            if let Some(id) = self.focused {
+                self.touch_cell(id);
+            }
         }
         true
     }
@@ -1448,6 +1546,7 @@ impl KeptApp {
         let Some(op) = self.redo_stack.pop() else {
             return false;
         };
+        let mut bump_focused_edited = true;
         match &op {
             UndoOp::CellEdit {
                 cell_id, post, ..
@@ -1476,13 +1575,24 @@ impl KeptApp {
                     self.focused = self.visible_cell_ids().last().copied();
                 }
             }
+            UndoOp::RotateContext {
+                prev_active,
+                new_end_time,
+                new_context,
+                ..
+            } => {
+                self.apply_rotation(*prev_active, *new_end_time, new_context);
+                bump_focused_edited = false;
+            }
         }
         self.undo_stack.push(op);
         self.dragging_cell = None;
         self.pending_caret_scroll = true;
         self.coalesce_break = true;
-        if let Some(id) = self.focused {
-            self.touch_cell(id);
+        if bump_focused_edited {
+            if let Some(id) = self.focused {
+                self.touch_cell(id);
+            }
         }
         true
     }

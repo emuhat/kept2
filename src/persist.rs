@@ -199,6 +199,14 @@ impl Db {
         )?;
         Ok(())
     }
+
+    pub fn delete_context(&mut self, id: Uuid) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM contexts WHERE id = ?1",
+            params![id.as_bytes().to_vec()],
+        )?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
