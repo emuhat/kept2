@@ -419,8 +419,17 @@ impl TextBox {
 
     /// Render the cell at `(x, y)` with `width`. Returns the height consumed,
     /// which the container uses to position the next cell. `focused` controls
-    /// whether selection highlights and carets render.
-    pub fn tick(&mut self, canvas: &Canvas, x: f32, y: f32, width: f32, focused: bool) -> f32 {
+    /// whether selection highlights render; `show_caret` separately gates the
+    /// blinking caret (so view mode shows selection but no caret).
+    pub fn tick(
+        &mut self,
+        canvas: &Canvas,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+        show_caret: bool,
+    ) -> f32 {
         self.x_origin = x;
         self.y_origin = y;
         self.width = width;
@@ -525,7 +534,7 @@ impl TextBox {
             }
         }
 
-        if focused {
+        if show_caret {
             let mut caret_paint = Paint::default();
             caret_paint.set_anti_alias(false);
             caret_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
@@ -1602,7 +1611,15 @@ impl OutlineCell {
         self.bullets.iter().position(|b| b.id == self.focused_bullet)
     }
 
-    pub fn tick(&mut self, canvas: &Canvas, x: f32, y: f32, width: f32, focused: bool) -> f32 {
+    pub fn tick(
+        &mut self,
+        canvas: &Canvas,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+        show_caret: bool,
+    ) -> f32 {
         self.x_origin = x;
         self.y_origin = y;
         self.width = width;
@@ -1649,8 +1666,15 @@ impl OutlineCell {
 
             let text_x = x + depth_offset + indent_per_level;
             let text_w = (width - depth_offset - indent_per_level).max(40.0);
-            let bullet_focused = focused && !suppress_caret && bullet.id == self.focused_bullet;
-            let h = bullet.textbox.tick(canvas, text_x, cur_y, text_w, bullet_focused);
+            let is_focused_bullet = focused && bullet.id == self.focused_bullet;
+            // Selection (highlight) for the active bullet whenever the cell is
+            // focused. Caret only when also editing.
+            let bullet_focused = is_focused_bullet && !suppress_caret;
+            let bullet_show_caret = show_caret && !suppress_caret && bullet.id == self.focused_bullet;
+            let h =
+                bullet
+                    .textbox
+                    .tick(canvas, text_x, cur_y, text_w, bullet_focused, bullet_show_caret);
             bullet_y_bands.push((cur_y, cur_y + h));
             cur_y += h;
         }
@@ -2524,10 +2548,18 @@ impl Cell {
         }
     }
 
-    pub fn tick(&mut self, canvas: &Canvas, x: f32, y: f32, width: f32, focused: bool) -> f32 {
+    pub fn tick(
+        &mut self,
+        canvas: &Canvas,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+        show_caret: bool,
+    ) -> f32 {
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.tick(canvas, x, y, width, focused),
-            CellKind::Outline(oc) => oc.tick(canvas, x, y, width, focused),
+            CellKind::Plain(tb) => tb.tick(canvas, x, y, width, focused, show_caret),
+            CellKind::Outline(oc) => oc.tick(canvas, x, y, width, focused, show_caret),
         }
     }
 

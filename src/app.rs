@@ -995,8 +995,19 @@ impl KeptApp {
             let cell_x = cells_left;
             let cell_y = y;
             let cell_is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
-            let render_focused = cell_is_focused && self.editing;
-            let h = cell.tick(canvas, cell_x, cell_y, content_width, render_focused);
+            // Selection highlights are visible whenever the cell is focused
+            // (so view-mode users can drag-select). Caret only renders in
+            // edit mode.
+            let render_focused = cell_is_focused;
+            let show_caret = cell_is_focused && self.editing;
+            let h = cell.tick(
+                canvas,
+                cell_x,
+                cell_y,
+                content_width,
+                render_focused,
+                show_caret,
+            );
             let kebab_right = cell_x + outer_cell_width - KEBAB_INSET_X;
             let kebab_left = kebab_right - KEBAB_SIZE;
             let kebab_top = cell_y + KEBAB_INSET_Y;
