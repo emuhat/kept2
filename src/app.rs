@@ -163,6 +163,17 @@ pub struct Entry {
 const SEED_ENTRY_ID: Uuid = uuid!("01900000-0000-7000-8000-000000000001");
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+const KEBAB_SIZE: f32 = 22.0;
+const KEBAB_INSET_X: f32 = 4.0;
+const KEBAB_INSET_Y: f32 = 2.0;
+const KEBAB_DOT_RADIUS: f32 = 1.6;
+/// Width reserved on the right of each cell so the kebab sits *outside* the
+/// focused-cell card. Must accommodate `FOCUS_PAD` (card outset) + gap +
+/// `KEBAB_SIZE` + `KEBAB_INSET_X`.
+const KEBAB_RESERVE: f32 = FOCUS_PAD + 4.0 + KEBAB_SIZE + KEBAB_INSET_X;
+const CELL_MENU_WIDTH: f32 = 280.0;
+const CELL_MENU_HEIGHT: f32 = 64.0;
+
 pub struct KeptApp {
     typeface: Typeface,
     entries: Vec<Entry>,
@@ -184,6 +195,10 @@ pub struct KeptApp {
     clipboard: Option<Clipboard>,
     db: Option<Db>,
     dirty_entries: HashSet<Uuid>,
+    cell_menu_open: Option<usize>,
+    last_kebab_rects: Vec<(usize, Rect)>,
+    /// Most recent cursor position in window (logical) coords, used for hover.
+    mouse_pos: (f32, f32),
 }
 
 impl KeptApp {
@@ -240,7 +255,14 @@ impl KeptApp {
             clipboard: Clipboard::new().ok(),
             db,
             dirty_entries: HashSet::new(),
+            cell_menu_open: None,
+            last_kebab_rects: Vec::new(),
+            mouse_pos: (-1.0, -1.0),
         }
+    }
+
+    pub fn cursor_moved(&mut self, x: f32, y: f32) {
+        self.mouse_pos = (x, y);
     }
 
     fn mark_dirty(&mut self) {
@@ -309,6 +331,9 @@ impl KeptApp {
         }
         self.scroll_y = new_y;
         self.last_scroll_time = Some(Instant::now());
+        // Scrolling dismisses the per-cell menu (anchored in doc coords; would
+        // visually decouple from its kebab if left open during a scroll).
+        self.cell_menu_open = None;
         true
     }
 
@@ -366,9 +391,28 @@ impl KeptApp {
         }
 
         let mut y = MARGIN_TOP;
-        let cell_width = (width - MARGIN_X * 2.0).max(80.0);
+        let outer_cell_width = (width - MARGIN_X * 2.0).max(80.0);
+        let content_width = (outer_cell_width - KEBAB_RESERVE).max(60.0);
+        self.last_kebab_rects.clear();
+        let mouse_doc_x = self.mouse_pos.0;
+        let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
         for (i, cell) in self.entries[self.active].cells.iter_mut().enumerate() {
-            let h = cell.tick(canvas, MARGIN_X, y, cell_width, i == self.focused);
+            let cell_x = MARGIN_X;
+            let cell_y = y;
+            let h = cell.tick(canvas, cell_x, cell_y, content_width, i == self.focused);
+            // Kebab in the right-side gutter, top-aligned to the cell. Sits
+            // outside the focused-cell card thanks to KEBAB_RESERVE.
+            let kebab_right = cell_x + outer_cell_width - KEBAB_INSET_X;
+            let kebab_left = kebab_right - KEBAB_SIZE;
+            let kebab_top = cell_y + KEBAB_INSET_Y;
+            let kebab_bot = kebab_top + KEBAB_SIZE;
+            let kebab_rect = Rect::new(kebab_left, kebab_top, kebab_right, kebab_bot);
+            let hovered = mouse_doc_x >= kebab_rect.left
+                && mouse_doc_x <= kebab_rect.right
+                && mouse_doc_y >= kebab_rect.top
+                && mouse_doc_y <= kebab_rect.bottom;
+            draw_kebab(canvas, kebab_rect, hovered);
+            self.last_kebab_rects.push((i, kebab_rect));
             y += h + CELL_GAP;
         }
 
@@ -386,6 +430,10 @@ impl KeptApp {
                 cy + ch + FOCUS_PAD,
             );
             canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &focus_paint);
+        }
+
+        if let Some(idx) = self.cell_menu_open {
+            self.render_cell_menu(canvas, idx);
         }
 
         self.render_mention_popup(canvas);
@@ -446,6 +494,15 @@ impl KeptApp {
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        // Esc closes the cell menu first if it's open.
+        if event.state == ElementState::Pressed
+            && self.cell_menu_open.is_some()
+            && matches!(event.logical_key, Key::Named(NamedKey::Escape))
+        {
+            self.cell_menu_open = None;
+            return true;
+        }
+
         // While the @-mention popup is open, intercept navigation/commit/dismiss
         // keys; everything else falls through to the cell, after which we sync
         // the popup against the new text+caret state.
@@ -731,6 +788,77 @@ impl KeptApp {
         self.coalesce_break = true;
         self.pending_caret_scroll = true;
         true
+    }
+
+    fn render_cell_menu(&self, canvas: &Canvas, cell_idx: usize) {
+        let Some((_, anchor)) = self
+            .last_kebab_rects
+            .iter()
+            .find(|(i, _)| *i == cell_idx)
+            .copied()
+        else {
+            return;
+        };
+        let Some(cell) = self.entries[self.active].cells.get(cell_idx) else {
+            return;
+        };
+        let scale = self.font_scale;
+        let menu_w = CELL_MENU_WIDTH * scale;
+        let menu_h = CELL_MENU_HEIGHT * scale;
+        let menu_x = anchor.right - menu_w;
+        let menu_y = anchor.bottom + 4.0 * scale;
+        let radius = 6.0 * scale;
+        let rect = Rect::new(menu_x, menu_y, menu_x + menu_w, menu_y + menu_h);
+
+        // Drop shadow.
+        let mut shadow_paint = Paint::default();
+        shadow_paint.set_anti_alias(true);
+        shadow_paint.set_color(Color::from_argb(0x30, 0, 0, 0));
+        shadow_paint.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
+        canvas.draw_round_rect(
+            Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
+            radius,
+            radius,
+            &shadow_paint,
+        );
+
+        // Background.
+        let mut bg_paint = Paint::default();
+        bg_paint.set_anti_alias(true);
+        bg_paint.set_color(Color::WHITE);
+        canvas.draw_round_rect(rect, radius, radius, &bg_paint);
+
+        // Border.
+        let mut border_paint = Paint::default();
+        border_paint.set_anti_alias(true);
+        border_paint.set_style(PaintStyle::Stroke);
+        border_paint.set_stroke_width(1.0);
+        border_paint.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        canvas.draw_round_rect(rect, radius, radius, &border_paint);
+
+        // Two non-selectable timestamp lines.
+        let font = Font::from_typeface(&self.typeface, 13.0 * scale);
+        let mut text_paint = Paint::default();
+        text_paint.set_anti_alias(true);
+        text_paint.set_color(Color::from_rgb(0x70, 0x70, 0x70));
+        let (_, m) = font.metrics();
+        let line_step = -m.ascent + m.descent + m.leading;
+        let pad_y = 10.0 * scale;
+        let line1_baseline = rect.top + pad_y + (-m.ascent);
+        let line2_baseline = line1_baseline + line_step;
+        let pad_x = 12.0 * scale;
+        canvas.draw_str(
+            format!("Created {}", format_timestamp(cell.created_at)),
+            Point::new(rect.left + pad_x, line1_baseline),
+            &font,
+            &text_paint,
+        );
+        canvas.draw_str(
+            format!("Last edited {}", format_timestamp(cell.edited_at)),
+            Point::new(rect.left + pad_x, line2_baseline),
+            &font,
+            &text_paint,
+        );
     }
 
     fn render_mention_popup(&self, canvas: &Canvas) {
@@ -1121,6 +1249,26 @@ impl KeptApp {
         self.mention_popup = None;
 
         let doc_y = y + self.scroll_y;
+
+        // Per-cell kebab toggle wins over normal cell click routing.
+        for (idx, kebab) in &self.last_kebab_rects {
+            if x >= kebab.left
+                && x <= kebab.right
+                && doc_y >= kebab.top
+                && doc_y <= kebab.bottom
+            {
+                self.cell_menu_open = if self.cell_menu_open == Some(*idx) {
+                    None
+                } else {
+                    Some(*idx)
+                };
+                return true;
+            }
+        }
+        // Any other click closes the cell menu before falling through to
+        // normal cell routing.
+        self.cell_menu_open = None;
+
         let Some(target) = self.find_cell_at(x, doc_y) else {
             return false;
         };
@@ -1225,6 +1373,37 @@ fn draw_runs_with_matches(
         x += font.measure_str(segment, Some(paint)).0;
         i = j;
     }
+}
+
+fn draw_kebab(canvas: &Canvas, rect: Rect, hovered: bool) {
+    let cx = (rect.left + rect.right) * 0.5;
+    let cy = (rect.top + rect.bottom) * 0.5;
+    if hovered {
+        let mut hover_paint = Paint::default();
+        hover_paint.set_anti_alias(true);
+        hover_paint.set_color(Color::from_argb(0x22, 0, 0, 0));
+        let r = rect.width().min(rect.height()) * 0.5;
+        canvas.draw_circle((cx, cy), r, &hover_paint);
+    }
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+    let h = rect.height();
+    let cy0 = rect.top + h * 0.28;
+    let cy1 = rect.top + h * 0.50;
+    let cy2 = rect.top + h * 0.72;
+    canvas.draw_circle((cx, cy0), KEBAB_DOT_RADIUS, &paint);
+    canvas.draw_circle((cx, cy1), KEBAB_DOT_RADIUS, &paint);
+    canvas.draw_circle((cx, cy2), KEBAB_DOT_RADIUS, &paint);
+}
+
+fn format_timestamp(epoch_ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    let dt = Local
+        .timestamp_millis_opt(epoch_ms)
+        .single()
+        .unwrap_or_else(|| Local.timestamp_millis_opt(0).single().unwrap());
+    dt.format("%-d %B %Y, %-I:%M %p").to_string()
 }
 
 fn entry_from_row(row: EntryRow) -> Entry {

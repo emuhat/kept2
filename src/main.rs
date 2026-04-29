@@ -116,6 +116,7 @@ impl ApplicationHandler for Application {
                 let x = position.x as f32 / self.dpi;
                 let y = position.y as f32 / self.dpi;
                 self.last_mouse_pos = (x, y);
+                self.kept_app.cursor_moved(x, y);
                 if self.kept_app.mouse_drag_to(x, y) {
                     self.env.window.request_redraw();
                 }

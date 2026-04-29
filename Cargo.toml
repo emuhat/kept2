@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 arboard = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "5"
 gl = "0.14"
 glutin = "0.32.0"
