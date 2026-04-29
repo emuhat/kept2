@@ -9,6 +9,7 @@ use winit::{
 };
 
 const BODY_FONT_SIZE: f32 = 18.0;
+const HEADING_FONT_SCALE: f32 = 1.12;
 const CARET_WIDTH: f32 = 1.5;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const MULTI_CLICK_DIST: f32 = 5.0;
@@ -463,11 +464,12 @@ impl TextBox {
         Font::from_typeface(&self.typeface, BODY_FONT_SIZE * self.font_scale)
     }
 
-    /// Bold variant for rendering markdown-style headings. Same size as body
-    /// (only the weight differs) so most layout math stays correct without
-    /// per-line metrics.
+    /// Bold + slightly larger variant for rendering markdown-style headings.
     fn heading_font(&self) -> Font {
-        let mut f = Font::from_typeface(&self.typeface, BODY_FONT_SIZE * self.font_scale);
+        let mut f = Font::from_typeface(
+            &self.typeface,
+            BODY_FONT_SIZE * HEADING_FONT_SCALE * self.font_scale,
+        );
         f.set_embolden(true);
         f
     }
@@ -511,24 +513,36 @@ impl TextBox {
         }
 
         let (_, body_metrics) = body_font.metrics();
-        let line_step = -body_metrics.ascent + body_metrics.descent + body_metrics.leading;
-        let line_extra = line_step * 0.25;
+        let (_, heading_metrics) = heading_font.metrics();
+        let line_metrics_for = |li: usize| {
+            if self.line_is_heading.get(li).copied().unwrap_or(false) {
+                heading_metrics
+            } else {
+                body_metrics
+            }
+        };
 
-        // Cell-local baselines; absolute = local + y.
+        // Cell-local baselines; absolute = local + y. Each line steps by its
+        // own font's metrics so heading lines (taller font) get more space.
         let line_count = self.body_lines.len().max(1);
         let mut baselines_local: Vec<f32> = Vec::with_capacity(line_count);
+        let mut line_advances: Vec<f32> = Vec::with_capacity(line_count);
         let mut cur_local = 0.0_f32;
-        for _ in 0..line_count {
-            cur_local += -body_metrics.ascent;
+        for li in 0..line_count {
+            let m = line_metrics_for(li);
+            let step = -m.ascent + m.descent + m.leading;
+            let extra = step * 0.25;
+            cur_local += -m.ascent;
             baselines_local.push(cur_local);
-            cur_local += body_metrics.descent + body_metrics.leading + line_extra;
+            line_advances.push(step + extra);
+            cur_local += m.descent + m.leading + extra;
         }
 
-        let line_advance = line_step + line_extra;
         self.line_bands.clear();
-        for &b in &baselines_local {
-            let top = b + body_metrics.ascent;
-            self.line_bands.push((top, top + line_advance));
+        for (li, &b) in baselines_local.iter().enumerate() {
+            let m = line_metrics_for(li);
+            let top = b + m.ascent;
+            self.line_bands.push((top, top + line_advances[li]));
         }
 
         if focused {
@@ -559,8 +573,9 @@ impl TextBox {
                     let x0 = x + line_font.measure_str(prefix, Some(&text_paint)).0;
                     let x1 = x0 + line_font.measure_str(span, Some(&text_paint)).0;
                     let baseline = baselines_local[li] + y;
-                    let top = baseline + body_metrics.ascent;
-                    let bot = baseline + body_metrics.descent;
+                    let m = line_metrics_for(li);
+                    let top = baseline + m.ascent;
+                    let bot = baseline + m.descent;
                     canvas.draw_rect(Rect::new(x0, top, x1, bot), &hl_paint);
                 }
             }
@@ -630,8 +645,9 @@ impl TextBox {
                         .measure_str(&self.text[line.start..prefix_end], Some(&text_paint))
                         .0
                 };
-                let top = baseline + body_metrics.ascent;
-                let bot = baseline + body_metrics.descent;
+                let m = line_metrics_for(li);
+                let top = baseline + m.ascent;
+                let bot = baseline + m.descent;
                 canvas.draw_rect(
                     Rect::new(caret_x, top, caret_x + CARET_WIDTH, bot),
                     &caret_paint,
@@ -1779,14 +1795,27 @@ impl OutlineCell {
         let mut bullet_y_bands: Vec<(f32, f32)> = Vec::with_capacity(self.bullets.len());
         let suppress_caret = active_indices.is_some();
         let mut cur_y = y;
-        for bullet in &mut self.bullets {
-            let depth_offset = (bullet.depth as f32) * indent_per_level;
-            let marker_x = x + depth_offset + indent_per_level / 2.0;
-            let marker_y = cur_y + line_height / 2.0;
-            canvas.draw_circle((marker_x, marker_y), radius, &bullet_paint);
+        for (idx, bullet) in self.bullets.iter_mut().enumerate() {
+            // The first bullet, when it's a markdown heading, is rendered as
+            // a title: its bullet marker is suppressed and the `#` shifts left
+            // to occupy the marker's slot.
+            let is_title_bullet = idx == 0 && bullet.textbox.text().starts_with("# ");
 
-            let text_x = x + depth_offset + indent_per_level;
-            let text_w = (width - depth_offset - indent_per_level).max(40.0);
+            let depth_offset = (bullet.depth as f32) * indent_per_level;
+            if !is_title_bullet {
+                let marker_x = x + depth_offset + indent_per_level / 2.0;
+                let marker_y = cur_y + line_height / 2.0;
+                canvas.draw_circle((marker_x, marker_y), radius, &bullet_paint);
+            }
+
+            let (text_x, text_w) = if is_title_bullet {
+                (x + depth_offset, (width - depth_offset).max(40.0))
+            } else {
+                (
+                    x + depth_offset + indent_per_level,
+                    (width - depth_offset - indent_per_level).max(40.0),
+                )
+            };
             let is_focused_bullet = focused && bullet.id == self.focused_bullet;
             // Selection (highlight) for the active bullet whenever the cell is
             // focused. Caret only when also editing.
