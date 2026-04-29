@@ -22,6 +22,22 @@ pub struct Db {
     conn: Connection,
 }
 
+/// View of a context loaded from the DB. Mirrors the in-memory `Context` shape
+/// but lives here so `persist` doesn't depend on app types.
+pub struct ContextRow {
+    pub id: Uuid,
+    pub start_time: i64,
+    pub end_time: Option<i64>,
+    pub title: Option<String>,
+}
+
+pub struct ContextRef<'a> {
+    pub id: Uuid,
+    pub start_time: i64,
+    pub end_time: Option<i64>,
+    pub title: Option<&'a str>,
+}
+
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -38,37 +54,87 @@ impl Db {
         let version: u32 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version < 1 {
-            self.conn.execute_batch(
-                "BEGIN;
-                 CREATE TABLE entries (
-                     id          BLOB PRIMARY KEY,
-                     title       TEXT NOT NULL,
-                     created_at  INTEGER NOT NULL,
-                     edited_at   INTEGER NOT NULL
-                 );
-                 CREATE TABLE cells (
-                     id          BLOB PRIMARY KEY,
-                     entry_id    BLOB NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
-                     order_index INTEGER NOT NULL,
-                     kind        TEXT NOT NULL,
-                     body        TEXT NOT NULL,
-                     created_at  INTEGER NOT NULL,
-                     edited_at   INTEGER NOT NULL
-                 );
-                 CREATE INDEX cells_by_entry ON cells (entry_id, order_index);
-                 PRAGMA user_version = 1;
-                 COMMIT;",
-            )?;
+        if version >= 2 {
+            return Ok(());
         }
+        // v1 → v2: drop the entry-owned schema entirely; v2 is fresh.
+        self.conn.execute_batch(
+            "BEGIN;
+             DROP TABLE IF EXISTS cells;
+             DROP TABLE IF EXISTS entries;
+             CREATE TABLE cells (
+                 id              BLOB PRIMARY KEY,
+                 timestamp       INTEGER NOT NULL,
+                 body            TEXT NOT NULL,
+                 edited_at       INTEGER NOT NULL,
+                 context_hint_id BLOB
+             );
+             CREATE INDEX cells_by_time ON cells (timestamp);
+             CREATE TABLE contexts (
+                 id          BLOB PRIMARY KEY,
+                 start_time  INTEGER NOT NULL,
+                 end_time    INTEGER,
+                 title       TEXT
+             );
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )?;
         Ok(())
     }
 
-    pub fn load_entries(&self, typeface: &Typeface) -> rusqlite::Result<Vec<EntryRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, title, created_at, edited_at FROM entries ORDER BY edited_at DESC")?;
-        let rows: Vec<(Uuid, String, i64, i64)> = stmt
+    pub fn load_cells(&self, typeface: &Typeface) -> rusqlite::Result<Vec<Cell>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, body, edited_at, context_hint_id \
+             FROM cells ORDER BY timestamp ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let timestamp: i64 = row.get(1)?;
+                let body: String = row.get(2)?;
+                let edited_at: i64 = row.get(3)?;
+                let hint_bytes: Option<Vec<u8>> = row.get(4)?;
+                let id = Uuid::from_slice(&id_bytes).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        Box::new(e),
+                    )
+                })?;
+                let hint = match hint_bytes {
+                    Some(b) => Some(Uuid::from_slice(&b).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(e),
+                        )
+                    })?),
+                    None => None,
+                };
+                Ok((id, timestamp, body, edited_at, hint))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut cells = Vec::with_capacity(rows.len());
+        for (id, timestamp, body_json, edited_at, hint) in rows {
+            let body: CellBody = serde_json::from_str(&body_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            let kind = body_to_kind(body, typeface);
+            cells.push(Cell::from_parts(id, kind, timestamp, edited_at, hint));
+        }
+        Ok(cells)
+    }
+
+    pub fn load_contexts(&self) -> rusqlite::Result<Vec<ContextRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, start_time, end_time, title FROM contexts ORDER BY start_time ASC",
+        )?;
+        let rows = stmt
             .query_map([], |row| {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let id = Uuid::from_slice(&id_bytes).map_err(|e| {
@@ -78,126 +144,65 @@ impl Db {
                         Box::new(e),
                     )
                 })?;
-                Ok((id, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok(ContextRow {
+                    id,
+                    start_time: row.get(1)?,
+                    end_time: row.get(2)?,
+                    title: row.get(3)?,
+                })
             })?
-            .collect::<rusqlite::Result<_>>()?;
-
-        let mut entries = Vec::with_capacity(rows.len());
-        for (id, title, created_at, edited_at) in rows {
-            let cells = self.load_cells_for_entry(id, typeface)?;
-            entries.push(EntryRow {
-                id,
-                title,
-                cells,
-                created_at,
-                edited_at,
-            });
-        }
-        Ok(entries)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
-    fn load_cells_for_entry(
-        &self,
-        entry_id: Uuid,
-        typeface: &Typeface,
-    ) -> rusqlite::Result<Vec<Cell>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, body, created_at, edited_at FROM cells \
-             WHERE entry_id = ?1 ORDER BY order_index ASC",
-        )?;
-        let rows: Vec<(Uuid, String, i64, i64)> = stmt
-            .query_map(params![entry_id.as_bytes().to_vec()], |row| {
-                let id_bytes: Vec<u8> = row.get(0)?;
-                let id = Uuid::from_slice(&id_bytes).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Blob,
-                        Box::new(e),
-                    )
-                })?;
-                Ok((id, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-
-        let mut cells = Vec::with_capacity(rows.len());
-        for (id, body_json, created_at, edited_at) in rows {
-            let body: CellBody = serde_json::from_str(&body_json).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?;
-            let kind = body_to_kind(body, typeface);
-            cells.push(Cell::from_parts(id, kind, created_at, edited_at));
-        }
-        Ok(cells)
-    }
-
-    pub fn save_entry(&mut self, entry: &EntryRef<'_>) -> rusqlite::Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT OR REPLACE INTO entries (id, title, created_at, edited_at) \
-             VALUES (?1, ?2, ?3, ?4)",
+    pub fn save_cell(&mut self, cell: &Cell) -> rusqlite::Result<()> {
+        let body = cell_to_body(cell);
+        let body_json = serde_json::to_string(&body)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let hint_bytes = cell.context_hint_id.map(|u| u.as_bytes().to_vec());
+        self.conn.execute(
+            "INSERT INTO cells (id, timestamp, body, edited_at, context_hint_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(id) DO UPDATE SET \
+                 timestamp = excluded.timestamp, \
+                 body = excluded.body, \
+                 edited_at = excluded.edited_at, \
+                 context_hint_id = excluded.context_hint_id",
             params![
-                entry.id.as_bytes().to_vec(),
-                entry.title,
-                entry.created_at,
-                entry.edited_at,
+                cell.id.as_bytes().to_vec(),
+                cell.timestamp,
+                body_json,
+                cell.edited_at,
+                hint_bytes,
             ],
         )?;
-        tx.execute(
-            "DELETE FROM cells WHERE entry_id = ?1",
-            params![entry.id.as_bytes().to_vec()],
-        )?;
-        for (idx, cell) in entry.cells.iter().enumerate() {
-            let body = cell_to_body(cell);
-            let body_json = serde_json::to_string(&body).map_err(|e| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-            })?;
-            let kind_str = match &cell.kind {
-                CellKind::Plain(_) => "plain",
-                CellKind::Outline(_) => "outline",
-            };
-            tx.execute(
-                "INSERT INTO cells (id, entry_id, order_index, kind, body, created_at, edited_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    cell.id.as_bytes().to_vec(),
-                    entry.id.as_bytes().to_vec(),
-                    idx as i64,
-                    kind_str,
-                    body_json,
-                    cell.created_at,
-                    cell.edited_at,
-                ],
-            )?;
-        }
-        tx.commit()
+        Ok(())
     }
-}
 
-/// Loaded entry shape — matches `Entry` in app.rs but lives here so the
-/// persistence module doesn't depend on the app's runtime types.
-pub struct EntryRow {
-    pub id: Uuid,
-    pub title: String,
-    pub cells: Vec<Cell>,
-    pub created_at: i64,
-    pub edited_at: i64,
-}
+    pub fn delete_cell(&mut self, id: Uuid) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM cells WHERE id = ?1",
+            params![id.as_bytes().to_vec()],
+        )?;
+        Ok(())
+    }
 
-/// Borrowed view passed to `save_entry`.
-pub struct EntryRef<'a> {
-    pub id: Uuid,
-    pub title: &'a str,
-    pub cells: &'a [Cell],
-    pub created_at: i64,
-    pub edited_at: i64,
+    pub fn save_context(&mut self, ctx: &ContextRef<'_>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO contexts (id, start_time, end_time, title) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(id) DO UPDATE SET \
+                 start_time = excluded.start_time, \
+                 end_time = excluded.end_time, \
+                 title = excluded.title",
+            params![ctx.id.as_bytes().to_vec(), ctx.start_time, ctx.end_time, ctx.title],
+        )?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Serde shape — kept private to this module. Cell body fields land here.
+// Serde shape for cells.body — kept private to this module.
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]

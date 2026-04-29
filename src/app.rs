@@ -11,8 +11,8 @@ use winit::{
     keyboard::{Key, NamedKey},
 };
 
-use crate::cell::{Cell, CellSnapshot, CellSnapshotKind, now_epoch_ms};
-use crate::persist::{Db, EntryRef, EntryRow, db_path};
+use crate::cell::{Cell, CellSnapshot, now_epoch_ms};
+use crate::persist::{ContextRef, Db, db_path};
 
 const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
 
@@ -109,8 +109,8 @@ fn filter_mentions(query: &str) -> Vec<(&'static str, Vec<usize>)> {
 }
 
 struct MentionPopup {
-    /// Cell index the popup is anchored to.
-    cell_idx: usize,
+    /// Cell the popup is anchored to.
+    cell_id: Uuid,
     /// For outline cells, the specific bullet's id. None for plain cells.
     bullet_id: Option<Uuid>,
     /// Byte position of the '@' in the active textbox.
@@ -123,19 +123,19 @@ struct MentionPopup {
 
 enum UndoOp {
     CellEdit {
-        cell_idx: usize,
+        cell_id: Uuid,
         pre: CellSnapshot,
         post: CellSnapshot,
     },
     InsertCell {
-        at_idx: usize,
-        pre_focused: usize,
-        outline: bool,
+        cell_id: Uuid,
+        snapshot: CellSnapshot,
+        pre_focused: Option<Uuid>,
     },
     DeleteCell {
-        at_idx: usize,
+        cell_id: Uuid,
         snapshot: CellSnapshot,
-        pre_focused: usize,
+        pre_focused: Option<Uuid>,
     },
 }
 
@@ -152,15 +152,14 @@ only feature this app commits to is keeping.",
 in here while a different cell is focused — the click count is per-cell.",
 ];
 
-pub struct Entry {
+pub struct Context {
     pub id: Uuid,
-    pub title: String,
-    pub cells: Vec<Cell>,
-    pub created_at: i64,
-    pub edited_at: i64,
+    pub start_time: i64,
+    pub end_time: Option<i64>,
+    pub title: Option<String>,
 }
 
-const SEED_ENTRY_ID: Uuid = uuid!("01900000-0000-7000-8000-000000000001");
+const SEED_CONTEXT_ID: Uuid = uuid!("01900000-0000-7000-8000-000000000001");
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 const KEBAB_SIZE: f32 = 22.0;
@@ -176,10 +175,15 @@ const CELL_MENU_HEIGHT: f32 = 64.0;
 
 pub struct KeptApp {
     typeface: Typeface,
-    entries: Vec<Entry>,
-    active: usize,
-    focused: usize,
-    dragging_cell: Option<usize>,
+    /// Global, append-only stream of cells. Source of truth.
+    /// Always sorted ascending by `Cell.timestamp`.
+    cells: Vec<Cell>,
+    /// Time-window overlays. Membership is derived (timestamp-based), not stored.
+    contexts: Vec<Context>,
+    /// The context whose window is currently visible.
+    active_context: Uuid,
+    focused: Option<Uuid>,
+    dragging_cell: Option<Uuid>,
     scroll_y: f32,
     max_scroll: f32,
     doc_height: f32,
@@ -194,9 +198,11 @@ pub struct KeptApp {
     mention_popup: Option<MentionPopup>,
     clipboard: Option<Clipboard>,
     db: Option<Db>,
-    dirty_entries: HashSet<Uuid>,
-    cell_menu_open: Option<usize>,
-    last_kebab_rects: Vec<(usize, Rect)>,
+    dirty_cells: HashSet<Uuid>,
+    pending_deletes: HashSet<Uuid>,
+    dirty_contexts: HashSet<Uuid>,
+    cell_menu_open: Option<Uuid>,
+    last_kebab_rects: Vec<(Uuid, Rect)>,
     /// Most recent cursor position in window (logical) coords, used for hover.
     mouse_pos: (f32, f32),
 }
@@ -207,8 +213,6 @@ impl KeptApp {
             .new_from_data(FONT_BYTES, None)
             .expect("failed to load embedded TTF");
 
-        // Open DB and load entries. On any failure, fall back to in-memory seed
-        // so editing still works (we just won't persist).
         let path = db_path();
         let mut db = match Db::open(&path) {
             Ok(d) => Some(d),
@@ -217,28 +221,79 @@ impl KeptApp {
                 None
             }
         };
-        let mut entries: Vec<Entry> = match db.as_ref().map(|d| d.load_entries(&typeface)) {
-            Some(Ok(rows)) => rows.into_iter().map(entry_from_row).collect(),
+
+        let mut cells: Vec<Cell> = match db.as_ref().map(|d| d.load_cells(&typeface)) {
+            Some(Ok(rows)) => rows,
             Some(Err(e)) => {
-                eprintln!("kept: failed to load entries: {e}");
+                eprintln!("kept: failed to load cells: {e}");
                 Vec::new()
             }
             None => Vec::new(),
         };
-        if entries.is_empty() {
-            entries.push(seed_entry(&typeface));
-            // Persist the seed immediately so subsequent runs see it.
+
+        let mut contexts: Vec<Context> = match db.as_ref().map(|d| d.load_contexts()) {
+            Some(Ok(rows)) => rows
+                .into_iter()
+                .map(|r| Context {
+                    id: r.id,
+                    start_time: r.start_time,
+                    end_time: r.end_time,
+                    title: r.title,
+                })
+                .collect(),
+            Some(Err(e)) => {
+                eprintln!("kept: failed to load contexts: {e}");
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+
+        // First-run / empty-DB seed: one default open context, three plain
+        // welcome cells.
+        if contexts.is_empty() {
+            let ctx = Context {
+                id: SEED_CONTEXT_ID,
+                start_time: now_epoch_ms(),
+                end_time: None,
+                title: None,
+            };
             if let Some(d) = db.as_mut() {
-                if let Err(e) = d.save_entry(&entry_ref(&entries[0])) {
-                    eprintln!("kept: failed to save seed entry: {e}");
+                let _ = d.save_context(&context_ref(&ctx));
+            }
+            contexts.push(ctx);
+        }
+        let active_context = contexts[0].id;
+
+        if cells.is_empty() {
+            for (i, text) in SEED_TEXTS.iter().enumerate() {
+                let mut cell = Cell::new(typeface.clone(), (*text).to_string());
+                // Stagger seed timestamps by 1ms so order is stable.
+                cell.timestamp += i as i64;
+                cell.edited_at = cell.timestamp;
+                cell.context_hint_id = Some(active_context);
+                cells.push(cell);
+            }
+            if let Some(c) = cells.get_mut(0) {
+                c.add_link_to_first(19..27, "https://example.com/click".to_string());
+            }
+            if let Some(c) = cells.get_mut(1) {
+                c.add_link_to_first(17..28, "https://example.com/intent".to_string());
+            }
+            if let Some(d) = db.as_mut() {
+                for c in &cells {
+                    let _ = d.save_cell(c);
                 }
             }
         }
+
+        let focused = cells.first().map(|c| c.id);
+
         Self {
             typeface,
-            entries,
-            active: 0,
-            focused: 0,
+            cells,
+            contexts,
+            active_context,
+            focused,
             dragging_cell: None,
             scroll_y: 0.0,
             max_scroll: 0.0,
@@ -254,7 +309,9 @@ impl KeptApp {
             mention_popup: None,
             clipboard: Clipboard::new().ok(),
             db,
-            dirty_entries: HashSet::new(),
+            dirty_cells: HashSet::new(),
+            pending_deletes: HashSet::new(),
+            dirty_contexts: HashSet::new(),
             cell_menu_open: None,
             last_kebab_rects: Vec::new(),
             mouse_pos: (-1.0, -1.0),
@@ -265,42 +322,108 @@ impl KeptApp {
         self.mouse_pos = (x, y);
     }
 
-    fn mark_dirty(&mut self) {
-        self.dirty_entries.insert(self.entries[self.active].id);
+    // ----- cell access helpers -----
+
+    fn cell_idx(&self, id: Uuid) -> Option<usize> {
+        self.cells.iter().position(|c| c.id == id)
     }
 
-    fn touch_active(&mut self) {
-        let now = now_epoch_ms();
-        self.entries[self.active].edited_at = now;
-        self.mark_dirty();
+    fn cell(&self, id: Uuid) -> Option<&Cell> {
+        self.cells.iter().find(|c| c.id == id)
     }
 
-    fn touch_active_cell(&mut self, cell_idx: usize) {
+    fn cell_mut(&mut self, id: Uuid) -> Option<&mut Cell> {
+        self.cells.iter_mut().find(|c| c.id == id)
+    }
+
+    fn active_window(&self) -> (i64, Option<i64>) {
+        self.contexts
+            .iter()
+            .find(|c| c.id == self.active_context)
+            .map(|c| (c.start_time, c.end_time))
+            .unwrap_or((i64::MIN, None))
+    }
+
+    /// IDs of cells visible in the active context, in timestamp order.
+    fn visible_cell_ids(&self) -> Vec<Uuid> {
+        let (start, end) = self.active_window();
+        self.cells
+            .iter()
+            .filter(|c| c.timestamp >= start && end.map(|e| c.timestamp < e).unwrap_or(true))
+            .map(|c| c.id)
+            .collect()
+    }
+
+    /// Insert a cell into the stream maintaining ascending timestamp order.
+    fn insert_cell_sorted(&mut self, cell: Cell) {
+        let pos = self
+            .cells
+            .binary_search_by(|c| c.timestamp.cmp(&cell.timestamp).then(c.id.cmp(&cell.id)));
+        let at = match pos {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        self.cells.insert(at, cell);
+    }
+
+    fn mark_cell_dirty(&mut self, id: Uuid) {
+        self.dirty_cells.insert(id);
+    }
+
+    fn touch_cell(&mut self, id: Uuid) {
         let now = now_epoch_ms();
-        if let Some(cell) = self.entries[self.active].cells.get_mut(cell_idx) {
+        if let Some(cell) = self.cell_mut(id) {
             cell.edited_at = now;
         }
-        self.entries[self.active].edited_at = now;
-        self.mark_dirty();
+        self.mark_cell_dirty(id);
+    }
+
+    /// Previous visible cell relative to `id` in timestamp order. None if
+    /// `id` is unknown or already first.
+    fn prev_visible(&self, id: Uuid) -> Option<Uuid> {
+        let ids = self.visible_cell_ids();
+        let pos = ids.iter().position(|x| *x == id)?;
+        if pos == 0 {
+            None
+        } else {
+            Some(ids[pos - 1])
+        }
+    }
+
+    fn next_visible(&self, id: Uuid) -> Option<Uuid> {
+        let ids = self.visible_cell_ids();
+        let pos = ids.iter().position(|x| *x == id)?;
+        ids.get(pos + 1).copied()
     }
 
     pub fn flush_persistence(&mut self) {
-        if self.dirty_entries.is_empty() {
-            return;
-        }
         let Some(db) = self.db.as_mut() else {
-            self.dirty_entries.clear();
+            self.dirty_cells.clear();
+            self.pending_deletes.clear();
+            self.dirty_contexts.clear();
             return;
         };
-        let ids: Vec<Uuid> = self.dirty_entries.iter().copied().collect();
-        for id in ids {
-            if let Some(entry) = self.entries.iter().find(|e| e.id == id) {
-                if let Err(e) = db.save_entry(&entry_ref(entry)) {
-                    eprintln!("kept: save_entry failed for {id}: {e}");
+        for id in self.pending_deletes.drain() {
+            if let Err(e) = db.delete_cell(id) {
+                eprintln!("kept: delete_cell failed for {id}: {e}");
+            }
+        }
+        let dirty: Vec<Uuid> = self.dirty_cells.drain().collect();
+        for id in dirty {
+            if let Some(cell) = self.cells.iter().find(|c| c.id == id) {
+                if let Err(e) = db.save_cell(cell) {
+                    eprintln!("kept: save_cell failed for {id}: {e}");
                 }
             }
         }
-        self.dirty_entries.clear();
+        let ctx_dirty: Vec<Uuid> = self.dirty_contexts.drain().collect();
+        for id in ctx_dirty {
+            if let Some(ctx) = self.contexts.iter().find(|c| c.id == id) {
+                if let Err(e) = db.save_context(&context_ref(ctx)) {
+                    eprintln!("kept: save_context failed for {id}: {e}");
+                }
+            }
+        }
     }
 
     fn set_font_scale(&mut self, scale: f32) -> bool {
@@ -309,7 +432,7 @@ impl KeptApp {
             return false;
         }
         self.font_scale = s;
-        for cell in &mut self.entries[self.active].cells {
+        for cell in &mut self.cells {
             cell.set_font_scale(s);
         }
         self.pending_caret_scroll = true;
@@ -355,8 +478,9 @@ impl KeptApp {
         // *before* cell content) and the focus ring (drawn after) both use
         // this so they stay in lockstep — at most one frame of lag when the
         // cell grows from typing, but they always match each other.
-        let focused_geom = self.entries[self.active].cells
-            .get(self.focused)
+        let focused_geom = self
+            .focused
+            .and_then(|id| self.cell(id))
             .filter(|c| c.height() > 0.0)
             .map(|c| (c.x_origin(), c.y_origin(), c.width(), c.height()));
 
@@ -396,12 +520,19 @@ impl KeptApp {
         self.last_kebab_rects.clear();
         let mouse_doc_x = self.mouse_pos.0;
         let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
-        for (i, cell) in self.entries[self.active].cells.iter_mut().enumerate() {
+        let focused_id = self.focused;
+        let (window_start, window_end) = self.active_window();
+        for cell in self.cells.iter_mut() {
+            // Filter to active context window without preallocating a Vec.
+            if cell.timestamp < window_start
+                || window_end.map(|e| cell.timestamp >= e).unwrap_or(false)
+            {
+                continue;
+            }
             let cell_x = MARGIN_X;
             let cell_y = y;
-            let h = cell.tick(canvas, cell_x, cell_y, content_width, i == self.focused);
-            // Kebab in the right-side gutter, top-aligned to the cell. Sits
-            // outside the focused-cell card thanks to KEBAB_RESERVE.
+            let is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
+            let h = cell.tick(canvas, cell_x, cell_y, content_width, is_focused);
             let kebab_right = cell_x + outer_cell_width - KEBAB_INSET_X;
             let kebab_left = kebab_right - KEBAB_SIZE;
             let kebab_top = cell_y + KEBAB_INSET_Y;
@@ -412,7 +543,7 @@ impl KeptApp {
                 && mouse_doc_y >= kebab_rect.top
                 && mouse_doc_y <= kebab_rect.bottom;
             draw_kebab(canvas, kebab_rect, hovered);
-            self.last_kebab_rects.push((i, kebab_rect));
+            self.last_kebab_rects.push((cell.id, kebab_rect));
             y += h + CELL_GAP;
         }
 
@@ -432,8 +563,8 @@ impl KeptApp {
             canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &focus_paint);
         }
 
-        if let Some(idx) = self.cell_menu_open {
-            self.render_cell_menu(canvas, idx);
+        if let Some(id) = self.cell_menu_open {
+            self.render_cell_menu(canvas, id);
         }
 
         self.render_mention_popup(canvas);
@@ -452,9 +583,12 @@ impl KeptApp {
             self.scroll_caret_into_view();
         }
 
-        // Debounced persistence: if there are dirty entries and the user has
-        // been idle for SAVE_DEBOUNCE, flush them to the DB.
-        if !self.dirty_entries.is_empty() {
+        // Debounced persistence: if anything dirty and user has been idle
+        // for SAVE_DEBOUNCE, flush.
+        let any_dirty = !self.dirty_cells.is_empty()
+            || !self.pending_deletes.is_empty()
+            || !self.dirty_contexts.is_empty();
+        if any_dirty {
             let idle = self
                 .last_edit_time
                 .map(|t| t.elapsed() >= SAVE_DEBOUNCE)
@@ -539,20 +673,24 @@ impl KeptApp {
                     return self.delete_focused_cell();
                 }
                 Key::Named(NamedKey::ArrowUp) => {
-                    if self.focused > 0 {
-                        self.focused -= 1;
-                        self.coalesce_break = true;
-                        self.scroll_to_focused();
-                        return true;
+                    if let Some(focused) = self.focused {
+                        if let Some(prev) = self.prev_visible(focused) {
+                            self.focused = Some(prev);
+                            self.coalesce_break = true;
+                            self.scroll_to_focused();
+                            return true;
+                        }
                     }
                     return false;
                 }
                 Key::Named(NamedKey::ArrowDown) => {
-                    if self.focused + 1 < self.entries[self.active].cells.len() {
-                        self.focused += 1;
-                        self.coalesce_break = true;
-                        self.scroll_to_focused();
-                        return true;
+                    if let Some(focused) = self.focused {
+                        if let Some(next) = self.next_visible(focused) {
+                            self.focused = Some(next);
+                            self.coalesce_break = true;
+                            self.scroll_to_focused();
+                            return true;
+                        }
                     }
                     return false;
                 }
@@ -592,51 +730,64 @@ impl KeptApp {
         {
             match &event.logical_key {
                 Key::Named(NamedKey::ArrowUp) => {
-                    if self.focused > 0
-                        && self.entries[self.active].cells
-                            .get(self.focused)
-                            .map_or(false, |c| c.at_top_edge())
-                    {
-                        self.focused -= 1;
-                        self.entries[self.active].cells[self.focused].place_caret_at_end();
-                        self.coalesce_break = true;
-                        self.pending_caret_scroll = true;
-                        return true;
+                    if let Some(focused) = self.focused {
+                        let at_top = self.cell(focused).map_or(false, |c| c.at_top_edge());
+                        if at_top {
+                            if let Some(prev) = self.prev_visible(focused) {
+                                self.focused = Some(prev);
+                                if let Some(c) = self.cell_mut(prev) {
+                                    c.place_caret_at_end();
+                                }
+                                self.coalesce_break = true;
+                                self.pending_caret_scroll = true;
+                                return true;
+                            }
+                        }
                     }
                 }
                 Key::Named(NamedKey::ArrowDown) => {
-                    if self.focused + 1 < self.entries[self.active].cells.len()
-                        && self.entries[self.active].cells
-                            .get(self.focused)
-                            .map_or(false, |c| c.at_bottom_edge())
-                    {
-                        self.focused += 1;
-                        self.entries[self.active].cells[self.focused].place_caret_at_start();
-                        self.coalesce_break = true;
-                        self.pending_caret_scroll = true;
-                        return true;
+                    if let Some(focused) = self.focused {
+                        let at_bot = self.cell(focused).map_or(false, |c| c.at_bottom_edge());
+                        if at_bot {
+                            if let Some(next) = self.next_visible(focused) {
+                                self.focused = Some(next);
+                                if let Some(c) = self.cell_mut(next) {
+                                    c.place_caret_at_start();
+                                }
+                                self.coalesce_break = true;
+                                self.pending_caret_scroll = true;
+                                return true;
+                            }
+                        }
                     }
                 }
                 _ => {}
             }
         }
 
-        let pre = self.entries[self.active].cells.get(self.focused).map(|c| c.snapshot());
+        let focused_id = self.focused;
+        let pre = focused_id.and_then(|id| self.cell(id)).map(|c| c.snapshot());
         let popup_was_open = self.mention_popup.is_some();
-        let handled = if let Some(cell) = self.entries[self.active].cells.get_mut(self.focused) {
-            cell.handle_key(event, modifiers)
+        let handled = if let Some(id) = focused_id {
+            if let Some(cell) = self.cell_mut(id) {
+                cell.handle_key(event, modifiers)
+            } else {
+                false
+            }
         } else {
             false
         };
         if handled {
-            if let Some(pre) = pre {
-                let post = self.entries[self.active].cells[self.focused].snapshot();
-                if !pre.doc_eq(&post) {
-                    self.record_edit(pre, post);
-                } else {
-                    // Cursor-only event: break coalescing so the next text edit
-                    // starts a fresh undo entry.
-                    self.coalesce_break = true;
+            if let (Some(pre), Some(id)) = (pre, focused_id) {
+                if let Some(cell) = self.cell(id) {
+                    let post = cell.snapshot();
+                    if !pre.doc_eq(&post) {
+                        self.record_edit(pre, post);
+                    } else {
+                        // Cursor-only event: break coalescing so the next text edit
+                        // starts a fresh undo entry.
+                        self.coalesce_break = true;
+                    }
                 }
             }
             self.pending_caret_scroll = true;
@@ -652,7 +803,10 @@ impl KeptApp {
     }
 
     fn try_open_mention_popup(&mut self) {
-        let Some(cell) = self.entries[self.active].cells.get(self.focused) else {
+        let Some(focused_id) = self.focused else {
+            return;
+        };
+        let Some(cell) = self.cell(focused_id) else {
             return;
         };
         let Some((text, caret)) = cell.focused_text_and_caret() else {
@@ -666,7 +820,7 @@ impl KeptApp {
             return;
         }
         self.mention_popup = Some(MentionPopup {
-            cell_idx: self.focused,
+            cell_id: focused_id,
             bullet_id: cell.focused_bullet_id(),
             anchor_byte: caret - 1,
             query: String::new(),
@@ -679,45 +833,51 @@ impl KeptApp {
             return;
         };
         // Cell focus must still match.
-        if self.focused != popup.cell_idx {
+        if self.focused != Some(popup.cell_id) {
             self.mention_popup = None;
             return;
         }
-        let Some(cell) = self.entries[self.active].cells.get(self.focused) else {
-            self.mention_popup = None;
-            return;
+        let cell_id = popup.cell_id;
+        let bullet_id = popup.bullet_id;
+        let anchor_byte = popup.anchor_byte;
+        let query: String = {
+            let Some(cell) = self.cell(cell_id) else {
+                self.mention_popup = None;
+                return;
+            };
+            // Bullet must still match (outline only).
+            if cell.focused_bullet_id() != bullet_id {
+                self.mention_popup = None;
+                return;
+            }
+            let Some((text, caret)) = cell.focused_text_and_caret() else {
+                self.mention_popup = None;
+                return;
+            };
+            // The '@' must still be at anchor_byte.
+            if text.get(anchor_byte..).map_or(true, |s| !s.starts_with('@')) {
+                self.mention_popup = None;
+                return;
+            }
+            // Caret must be at or past the '@' itself.
+            if caret < anchor_byte + 1 {
+                self.mention_popup = None;
+                return;
+            }
+            // Query is everything between the '@' and the caret. Whitespace breaks it.
+            let Some(q) = text.get(anchor_byte + 1..caret) else {
+                self.mention_popup = None;
+                return;
+            };
+            if q.chars().any(|c| c.is_whitespace()) {
+                self.mention_popup = None;
+                return;
+            }
+            q.to_string()
         };
-        // Bullet must still match (outline only).
-        if cell.focused_bullet_id() != popup.bullet_id {
-            self.mention_popup = None;
-            return;
-        }
-        let Some((text, caret)) = cell.focused_text_and_caret() else {
-            self.mention_popup = None;
-            return;
-        };
-        // The '@' must still be at anchor_byte.
-        if text.get(popup.anchor_byte..).map_or(true, |s| !s.starts_with('@')) {
-            self.mention_popup = None;
-            return;
-        }
-        // Caret must be at or past the '@' itself.
-        if caret < popup.anchor_byte + 1 {
-            self.mention_popup = None;
-            return;
-        }
-        // Query is everything between the '@' and the caret. Whitespace breaks it.
-        let Some(query) = text.get(popup.anchor_byte + 1..caret) else {
-            self.mention_popup = None;
-            return;
-        };
-        if query.chars().any(|c| c.is_whitespace()) {
-            self.mention_popup = None;
-            return;
-        }
         if let Some(p) = self.mention_popup.as_mut() {
-            p.query = query.to_string();
-            let count = filter_mentions(&p.query).len().min(MENTION_POPUP_MAX_VISIBLE);
+            let count = filter_mentions(&query).len().min(MENTION_POPUP_MAX_VISIBLE);
+            p.query = query;
             if count == 0 {
                 p.selected = 0;
             } else if p.selected >= count {
@@ -727,10 +887,8 @@ impl KeptApp {
     }
 
     fn copy_to_clipboard(&mut self) -> bool {
-        let text = self.entries[self.active].cells
-            .get(self.focused)
-            .map(|c| c.copy_text())
-            .unwrap_or_default();
+        let Some(id) = self.focused else { return false };
+        let text = self.cell(id).map(|c| c.copy_text()).unwrap_or_default();
         if text.is_empty() {
             return false;
         }
@@ -741,8 +899,9 @@ impl KeptApp {
     }
 
     fn cut_to_clipboard(&mut self) -> bool {
-        let pre = self.entries[self.active].cells.get(self.focused).map(|c| c.snapshot());
-        let cut = match self.entries[self.active].cells.get_mut(self.focused) {
+        let Some(id) = self.focused else { return false };
+        let pre = self.cell(id).map(|c| c.snapshot());
+        let cut = match self.cell_mut(id) {
             Some(c) => c.cut_text(),
             None => return false,
         };
@@ -752,8 +911,8 @@ impl KeptApp {
         if let Some(cb) = self.clipboard.as_mut() {
             let _ = cb.set_text(cut);
         }
-        // Record the deletion in the undo stack.
-        if let (Some(pre), Some(post)) = (pre, self.entries[self.active].cells.get(self.focused).map(|c| c.snapshot())) {
+        if let (Some(pre), Some(cell)) = (pre, self.cell(id)) {
+            let post = cell.snapshot();
             if !pre.doc_eq(&post) {
                 self.record_edit(pre, post);
             }
@@ -764,6 +923,7 @@ impl KeptApp {
     }
 
     fn paste_from_clipboard(&mut self) -> bool {
+        let Some(id) = self.focused else { return false };
         let Some(cb) = self.clipboard.as_mut() else {
             return false;
         };
@@ -774,13 +934,14 @@ impl KeptApp {
         if text.is_empty() {
             return false;
         }
-        let pre = self.entries[self.active].cells.get(self.focused).map(|c| c.snapshot());
-        if let Some(c) = self.entries[self.active].cells.get_mut(self.focused) {
+        let pre = self.cell(id).map(|c| c.snapshot());
+        if let Some(c) = self.cell_mut(id) {
             c.paste_text(&text);
         } else {
             return false;
         }
-        if let (Some(pre), Some(post)) = (pre, self.entries[self.active].cells.get(self.focused).map(|c| c.snapshot())) {
+        if let (Some(pre), Some(cell)) = (pre, self.cell(id)) {
+            let post = cell.snapshot();
             if !pre.doc_eq(&post) {
                 self.record_edit(pre, post);
             }
@@ -790,16 +951,16 @@ impl KeptApp {
         true
     }
 
-    fn render_cell_menu(&self, canvas: &Canvas, cell_idx: usize) {
+    fn render_cell_menu(&self, canvas: &Canvas, cell_id: Uuid) {
         let Some((_, anchor)) = self
             .last_kebab_rects
             .iter()
-            .find(|(i, _)| *i == cell_idx)
+            .find(|(i, _)| *i == cell_id)
             .copied()
         else {
             return;
         };
-        let Some(cell) = self.entries[self.active].cells.get(cell_idx) else {
+        let Some(cell) = self.cell(cell_id) else {
             return;
         };
         let scale = self.font_scale;
@@ -848,7 +1009,7 @@ impl KeptApp {
         let line2_baseline = line1_baseline + line_step;
         let pad_x = 12.0 * scale;
         canvas.draw_str(
-            format!("Created {}", format_timestamp(cell.created_at)),
+            format!("Created {}", format_timestamp(cell.timestamp)),
             Point::new(rect.left + pad_x, line1_baseline),
             &font,
             &text_paint,
@@ -865,7 +1026,7 @@ impl KeptApp {
         let Some(popup) = self.mention_popup.as_ref() else {
             return;
         };
-        let Some(cell) = self.entries[self.active].cells.get(popup.cell_idx) else {
+        let Some(cell) = self.cell(popup.cell_id) else {
             return;
         };
         let Some((anchor_x, anchor_y_below)) =
@@ -1006,8 +1167,8 @@ impl KeptApp {
     }
 
     fn record_edit(&mut self, pre: CellSnapshot, post: CellSnapshot) {
+        let Some(cell_id) = self.focused else { return };
         let now = Instant::now();
-        let cell_idx = self.focused;
 
         let can_coalesce = !self.coalesce_break
             && self
@@ -1016,7 +1177,7 @@ impl KeptApp {
                 .unwrap_or(false)
             && matches!(
                 self.undo_stack.last(),
-                Some(UndoOp::CellEdit { cell_idx: prev, .. }) if *prev == cell_idx
+                Some(UndoOp::CellEdit { cell_id: prev, .. }) if *prev == cell_id
             );
 
         if can_coalesce {
@@ -1025,7 +1186,7 @@ impl KeptApp {
             }
         } else {
             self.undo_stack.push(UndoOp::CellEdit {
-                cell_idx,
+                cell_id,
                 pre,
                 post,
             });
@@ -1035,8 +1196,7 @@ impl KeptApp {
         self.redo_stack.clear();
         self.coalesce_break = false;
 
-        // Bump timestamps and mark the entry dirty for the debounced save.
-        self.touch_active_cell(cell_idx);
+        self.touch_cell(cell_id);
     }
 
     fn undo(&mut self) -> bool {
@@ -1044,31 +1204,33 @@ impl KeptApp {
             return false;
         };
         match &op {
-            UndoOp::CellEdit { cell_idx, pre, .. } => {
-                self.focused = *cell_idx;
-                self.entries[self.active].cells[*cell_idx].restore(pre.clone());
+            UndoOp::CellEdit { cell_id, pre, .. } => {
+                self.focused = Some(*cell_id);
+                if let Some(c) = self.cell_mut(*cell_id) {
+                    c.restore(pre.clone());
+                }
             }
             UndoOp::InsertCell {
-                at_idx,
+                cell_id,
                 pre_focused,
                 ..
             } => {
-                if *at_idx < self.entries[self.active].cells.len() {
-                    self.entries[self.active].cells.remove(*at_idx);
+                if let Some(idx) = self.cell_idx(*cell_id) {
+                    self.cells.remove(idx);
                 }
-                self.focused = (*pre_focused).min(self.entries[self.active].cells.len().saturating_sub(1));
+                self.pending_deletes.insert(*cell_id);
+                self.dirty_cells.remove(cell_id);
+                self.focused = *pre_focused;
             }
             UndoOp::DeleteCell {
-                at_idx,
+                cell_id,
                 snapshot,
                 pre_focused,
             } => {
-                let mut cell = match &snapshot.kind {
-                    CellSnapshotKind::Plain(_) => Cell::new(self.typeface.clone(), String::new()),
-                    CellSnapshotKind::Outline(_) => Cell::new_outline(self.typeface.clone()),
-                };
-                cell.restore(snapshot.clone());
-                self.entries[self.active].cells.insert(*at_idx, cell);
+                let cell = Cell::from_snapshot(*cell_id, snapshot.clone(), &self.typeface);
+                self.insert_cell_sorted(cell);
+                self.dirty_cells.insert(*cell_id);
+                self.pending_deletes.remove(cell_id);
                 self.focused = *pre_focused;
             }
         }
@@ -1076,13 +1238,8 @@ impl KeptApp {
         self.dragging_cell = None;
         self.pending_caret_scroll = true;
         self.coalesce_break = true;
-        // Undo is a user interaction; bump the entry's edited_at and the
-        // affected cell's edited_at (if a cell is currently focused).
-        let cell_idx = self.focused;
-        if cell_idx < self.entries[self.active].cells.len() {
-            self.touch_active_cell(cell_idx);
-        } else {
-            self.touch_active();
+        if let Some(id) = self.focused {
+            self.touch_cell(id);
         }
         true
     }
@@ -1093,29 +1250,30 @@ impl KeptApp {
         };
         match &op {
             UndoOp::CellEdit {
-                cell_idx, post, ..
+                cell_id, post, ..
             } => {
-                self.focused = *cell_idx;
-                self.entries[self.active].cells[*cell_idx].restore(post.clone());
+                self.focused = Some(*cell_id);
+                if let Some(c) = self.cell_mut(*cell_id) {
+                    c.restore(post.clone());
+                }
             }
             UndoOp::InsertCell {
-                at_idx, outline, ..
+                cell_id, snapshot, ..
             } => {
-                let mut cell = if *outline {
-                    Cell::new_outline(self.typeface.clone())
-                } else {
-                    Cell::new(self.typeface.clone(), String::new())
-                };
-                cell.set_font_scale(self.font_scale);
-                self.entries[self.active].cells.insert(*at_idx, cell);
-                self.focused = *at_idx;
+                let cell = Cell::from_snapshot(*cell_id, snapshot.clone(), &self.typeface);
+                self.insert_cell_sorted(cell);
+                self.dirty_cells.insert(*cell_id);
+                self.pending_deletes.remove(cell_id);
+                self.focused = Some(*cell_id);
             }
-            UndoOp::DeleteCell { at_idx, .. } => {
-                if *at_idx < self.entries[self.active].cells.len() {
-                    self.entries[self.active].cells.remove(*at_idx);
+            UndoOp::DeleteCell { cell_id, .. } => {
+                if let Some(idx) = self.cell_idx(*cell_id) {
+                    self.cells.remove(idx);
                 }
-                if self.focused >= self.entries[self.active].cells.len() {
-                    self.focused = self.entries[self.active].cells.len().saturating_sub(1);
+                self.pending_deletes.insert(*cell_id);
+                self.dirty_cells.remove(cell_id);
+                if self.focused == Some(*cell_id) {
+                    self.focused = self.visible_cell_ids().last().copied();
                 }
             }
         }
@@ -1123,47 +1281,59 @@ impl KeptApp {
         self.dragging_cell = None;
         self.pending_caret_scroll = true;
         self.coalesce_break = true;
-        // Symmetric to undo — redo is also a user interaction.
-        let cell_idx = self.focused;
-        if cell_idx < self.entries[self.active].cells.len() {
-            self.touch_active_cell(cell_idx);
-        } else {
-            self.touch_active();
+        if let Some(id) = self.focused {
+            self.touch_cell(id);
         }
         true
     }
 
     fn delete_focused_cell(&mut self) -> bool {
-        // Refuse to delete the last cell — leaves the app with nothing to focus.
-        if self.entries[self.active].cells.len() <= 1 {
+        let Some(id) = self.focused else { return false };
+        // Refuse to delete the last visible cell — keep the UX invariant that
+        // there's always at least one cell to type into.
+        let visible = self.visible_cell_ids();
+        if visible.len() <= 1 {
             return false;
         }
-        let at_idx = self.focused;
-        let pre_focused = self.focused;
-        let snapshot = self.entries[self.active].cells[at_idx].snapshot();
-        self.entries[self.active].cells.remove(at_idx);
-        if self.focused >= self.entries[self.active].cells.len() {
-            self.focused = self.entries[self.active].cells.len() - 1;
+        let snapshot = match self.cell(id) {
+            Some(c) => c.snapshot(),
+            None => return false,
+        };
+        // Pick a new focus before removing.
+        let pos_in_visible = visible.iter().position(|x| *x == id);
+        let new_focus = match pos_in_visible {
+            Some(i) if i + 1 < visible.len() => Some(visible[i + 1]),
+            Some(i) if i > 0 => Some(visible[i - 1]),
+            _ => None,
+        };
+        if let Some(idx) = self.cell_idx(id) {
+            self.cells.remove(idx);
         }
+        self.pending_deletes.insert(id);
+        self.dirty_cells.remove(&id);
+        self.focused = new_focus;
         self.dragging_cell = None;
         self.pending_caret_scroll = true;
 
         self.undo_stack.push(UndoOp::DeleteCell {
-            at_idx,
+            cell_id: id,
             snapshot,
-            pre_focused,
+            pre_focused: Some(id),
         });
         self.redo_stack.clear();
         self.coalesce_break = true;
-        self.touch_active();
+        // Bump active context so its window stays "fresh."
+        self.dirty_contexts.insert(self.active_context);
         true
     }
 
     fn insert_cell_after_focused(&mut self, outline: bool) -> bool {
         // No-op if the focused cell is empty — Ctrl+Enter shouldn't pile up empties.
-        if let Some(cell) = self.entries[self.active].cells.get(self.focused) {
-            if cell.is_empty() {
-                return false;
+        if let Some(id) = self.focused {
+            if let Some(cell) = self.cell(id) {
+                if cell.is_empty() {
+                    return false;
+                }
             }
         }
         let pre_focused = self.focused;
@@ -1173,33 +1343,30 @@ impl KeptApp {
             Cell::new(self.typeface.clone(), String::new())
         };
         new_cell.set_font_scale(self.font_scale);
-        let insert_at = (self.focused + 1).min(self.entries[self.active].cells.len());
-        self.entries[self.active].cells.insert(insert_at, new_cell);
-        self.focused = insert_at;
-        // An in-progress drag's cell index would be invalidated by the insert;
-        // safest to drop it. The user can't realistically be dragging mid-keypress.
+        new_cell.context_hint_id = Some(self.active_context);
+        let new_id = new_cell.id;
+        let snapshot = new_cell.snapshot();
+        self.insert_cell_sorted(new_cell);
+        self.focused = Some(new_id);
         self.dragging_cell = None;
-        // The new cell will be laid out by this tick; the end-of-tick scroll
-        // hook then brings its caret into view.
         self.pending_caret_scroll = true;
 
         self.undo_stack.push(UndoOp::InsertCell {
-            at_idx: insert_at,
+            cell_id: new_id,
+            snapshot,
             pre_focused,
-            outline,
         });
         self.redo_stack.clear();
         self.coalesce_break = true;
-        self.touch_active_cell(insert_at);
+        self.touch_cell(new_id);
         true
     }
 
     /// Bring the primary caret of the focused cell into view if it's outside
     /// the viewport. Used after edits, caret movement, and zoom changes.
     fn scroll_caret_into_view(&mut self) {
-        let Some(cell) = self.entries[self.active].cells.get(self.focused) else {
-            return;
-        };
+        let Some(id) = self.focused else { return };
+        let Some(cell) = self.cell(id) else { return };
         let Some((top, bot)) = cell.caret_doc_y_band() else {
             return;
         };
@@ -1223,9 +1390,8 @@ impl KeptApp {
     /// Uses last frame's cell geometry; on the first frame everything is at 0
     /// which results in scroll_y = 0, which is correct.
     fn scroll_to_focused(&mut self) {
-        let Some(cell) = self.entries[self.active].cells.get(self.focused) else {
-            return;
-        };
+        let Some(id) = self.focused else { return };
+        let Some(cell) = self.cell(id) else { return };
         let pad = 8.0_f32;
         let cell_top = cell.y_origin();
         let cell_bot = cell.y_origin() + cell.height();
@@ -1251,16 +1417,16 @@ impl KeptApp {
         let doc_y = y + self.scroll_y;
 
         // Per-cell kebab toggle wins over normal cell click routing.
-        for (idx, kebab) in &self.last_kebab_rects {
+        for (id, kebab) in &self.last_kebab_rects {
             if x >= kebab.left
                 && x <= kebab.right
                 && doc_y >= kebab.top
                 && doc_y <= kebab.bottom
             {
-                self.cell_menu_open = if self.cell_menu_open == Some(*idx) {
+                self.cell_menu_open = if self.cell_menu_open == Some(*id) {
                     None
                 } else {
-                    Some(*idx)
+                    Some(*id)
                 };
                 return true;
             }
@@ -1272,45 +1438,59 @@ impl KeptApp {
         let Some(target) = self.find_cell_at(x, doc_y) else {
             return false;
         };
-        if target != self.focused {
-            self.focused = target;
+        if Some(target) != self.focused {
+            self.focused = Some(target);
         }
         // Any click moves/replaces the caret — break coalescing so the next
         // text edit starts a fresh undo entry.
         self.coalesce_break = true;
         self.dragging_cell = Some(target);
-        self.entries[self.active].cells[target].mouse_down(x, doc_y, modifiers)
+        match self.cell_mut(target) {
+            Some(cell) => cell.mouse_down(x, doc_y, modifiers),
+            None => false,
+        }
     }
 
     pub fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool {
         let doc_y = y + self.scroll_y;
-        if let Some(idx) = self.dragging_cell {
-            self.entries[self.active].cells[idx].mouse_drag_to(x, doc_y)
+        if let Some(id) = self.dragging_cell {
+            match self.cell_mut(id) {
+                Some(cell) => cell.mouse_drag_to(x, doc_y),
+                None => false,
+            }
         } else {
             false
         }
     }
 
     pub fn mouse_up(&mut self) -> bool {
-        if let Some(idx) = self.dragging_cell.take() {
-            self.entries[self.active].cells[idx].mouse_up()
+        if let Some(id) = self.dragging_cell.take() {
+            match self.cell_mut(id) {
+                Some(cell) => cell.mouse_up(),
+                None => false,
+            }
         } else {
             false
         }
     }
 
-    /// Pick the cell that contains `(x, doc_y)` — `doc_y` must already include
-    /// any scroll offset. Each cell's clickable region is its
+    /// Pick the visible cell that contains `(x, doc_y)` — `doc_y` must already
+    /// include any scroll offset. Each cell's clickable region is its
     /// rendered rect plus half of `CELL_GAP` on each interior side (so clicks in
     /// the gap snap to whichever cell owns that half). Returns `None` for clicks
     /// above the first cell, below the last cell, or outside the cell width.
-    fn find_cell_at(&self, x: f32, y: f32) -> Option<usize> {
-        if self.entries[self.active].cells.is_empty() {
+    fn find_cell_at(&self, x: f32, y: f32) -> Option<Uuid> {
+        let visible: Vec<Uuid> = self.visible_cell_ids();
+        if visible.is_empty() {
             return None;
         }
         let half_gap = CELL_GAP * 0.5;
-        let last = self.entries[self.active].cells.len() - 1;
-        for (i, cell) in self.entries[self.active].cells.iter().enumerate() {
+        let last = visible.len() - 1;
+        for (i, id) in visible.iter().enumerate() {
+            let cell = match self.cell(*id) {
+                Some(c) => c,
+                None => continue,
+            };
             let in_x = x >= cell.x_origin() && x < cell.x_origin() + cell.width();
             let top = if i == 0 {
                 cell.y_origin()
@@ -1323,7 +1503,7 @@ impl KeptApp {
                 cell.y_origin() + cell.height() + half_gap
             };
             if in_x && y >= top && y < bot {
-                return Some(i);
+                return Some(*id);
             }
         }
         None
@@ -1406,48 +1586,11 @@ fn format_timestamp(epoch_ms: i64) -> String {
     dt.format("%-d %B %Y, %-I:%M %p").to_string()
 }
 
-fn entry_from_row(row: EntryRow) -> Entry {
-    Entry {
-        id: row.id,
-        title: row.title,
-        cells: row.cells,
-        created_at: row.created_at,
-        edited_at: row.edited_at,
-    }
-}
-
-fn entry_ref<'a>(e: &'a Entry) -> EntryRef<'a> {
-    EntryRef {
-        id: e.id,
-        title: &e.title,
-        cells: &e.cells,
-        created_at: e.created_at,
-        edited_at: e.edited_at,
-    }
-}
-
-fn seed_entry(typeface: &Typeface) -> Entry {
-    let now = now_epoch_ms();
-    let mut cells: Vec<Cell> = SEED_TEXTS
-        .iter()
-        .map(|s| Cell::new(typeface.clone(), (*s).to_string()))
-        .collect();
-    if let Some(c) = cells.get_mut(0) {
-        c.add_link_to_first(19..27, "https://example.com/click".to_string());
-    }
-    if let Some(c) = cells.get_mut(1) {
-        c.add_link_to_first(17..28, "https://example.com/intent".to_string());
-    }
-    // Override timestamps so seeded cells share the entry's created_at.
-    for cell in &mut cells {
-        cell.created_at = now;
-        cell.edited_at = now;
-    }
-    Entry {
-        id: SEED_ENTRY_ID,
-        title: "Untitled".to_string(),
-        cells,
-        created_at: now,
-        edited_at: now,
+fn context_ref<'a>(c: &'a Context) -> ContextRef<'a> {
+    ContextRef {
+        id: c.id,
+        start_time: c.start_time,
+        end_time: c.end_time,
+        title: c.title.as_deref(),
     }
 }

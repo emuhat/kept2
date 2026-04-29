@@ -2393,7 +2393,9 @@ impl OutlineCell {
 
 #[derive(Clone)]
 pub struct CellSnapshot {
-    pub created_at: i64,
+    pub timestamp: i64,
+    pub edited_at: i64,
+    pub context_hint_id: Option<Uuid>,
     pub kind: CellSnapshotKind,
 }
 
@@ -2424,8 +2426,13 @@ impl CellSnapshot {
 pub struct Cell {
     pub id: Uuid,
     pub kind: CellKind,
-    pub created_at: i64,
+    /// Stream position. Set once at creation; never moves.
+    pub timestamp: i64,
+    /// Bumped on any content change. Display-only metadata.
     pub edited_at: i64,
+    /// Optional hint about which context the cell was created in.
+    /// Does NOT determine visibility — that's purely timestamp-based.
+    pub context_hint_id: Option<Uuid>,
 }
 
 pub enum CellKind {
@@ -2439,8 +2446,9 @@ impl Cell {
         Self {
             id: Uuid::now_v7(),
             kind: CellKind::Plain(TextBox::new(typeface, initial_text)),
-            created_at: now,
+            timestamp: now,
             edited_at: now,
+            context_hint_id: None,
         }
     }
 
@@ -2449,14 +2457,40 @@ impl Cell {
         Self {
             id: Uuid::now_v7(),
             kind: CellKind::Outline(OutlineCell::new(typeface)),
-            created_at: now,
+            timestamp: now,
             edited_at: now,
+            context_hint_id: None,
         }
     }
 
     /// Reconstruct from raw parts (used by the persistence layer).
-    pub fn from_parts(id: Uuid, kind: CellKind, created_at: i64, edited_at: i64) -> Self {
-        Self { id, kind, created_at, edited_at }
+    pub fn from_parts(
+        id: Uuid,
+        kind: CellKind,
+        timestamp: i64,
+        edited_at: i64,
+        context_hint_id: Option<Uuid>,
+    ) -> Self {
+        Self { id, kind, timestamp, edited_at, context_hint_id }
+    }
+
+    /// Reconstruct a cell from a snapshot + id, using `typeface` for fresh
+    /// TextBox / OutlineCell instances. Used by undo of delete and redo of
+    /// insert to recreate cells with their original identity intact.
+    pub fn from_snapshot(id: Uuid, snap: CellSnapshot, typeface: &Typeface) -> Self {
+        let kind = match snap.kind {
+            CellSnapshotKind::Plain(tbs) => {
+                let mut tb = TextBox::new(typeface.clone(), String::new());
+                tb.restore(tbs);
+                CellKind::Plain(tb)
+            }
+            CellSnapshotKind::Outline(os) => {
+                let mut oc = OutlineCell::new(typeface.clone());
+                oc.restore(os);
+                CellKind::Outline(oc)
+            }
+        };
+        Self::from_parts(id, kind, snap.timestamp, snap.edited_at, snap.context_hint_id)
     }
 
     /// Add a link span to the cell's first textbox (plain) or first bullet
@@ -2642,7 +2676,9 @@ impl Cell {
 
     pub fn snapshot(&self) -> CellSnapshot {
         CellSnapshot {
-            created_at: self.created_at,
+            timestamp: self.timestamp,
+            edited_at: self.edited_at,
+            context_hint_id: self.context_hint_id,
             kind: match &self.kind {
                 CellKind::Plain(tb) => CellSnapshotKind::Plain(tb.snapshot()),
                 CellKind::Outline(oc) => CellSnapshotKind::Outline(oc.snapshot()),
@@ -2652,10 +2688,12 @@ impl Cell {
 
     /// Restore from a snapshot of the same variant. Variant mismatches are a
     /// bug (undo stack and live state disagree); fall through silently rather
-    /// than panic. `created_at` is preserved from the snapshot; `edited_at` is
-    /// the caller's responsibility to update.
+    /// than panic. All metadata (timestamp, edited_at, context_hint_id) is
+    /// preserved from the snapshot.
     pub fn restore(&mut self, snap: CellSnapshot) {
-        self.created_at = snap.created_at;
+        self.timestamp = snap.timestamp;
+        self.edited_at = snap.edited_at;
+        self.context_hint_id = snap.context_hint_id;
         match (&mut self.kind, snap.kind) {
             (CellKind::Plain(tb), CellSnapshotKind::Plain(tbs)) => tb.restore(tbs),
             (CellKind::Outline(oc), CellSnapshotKind::Outline(os)) => oc.restore(os),
