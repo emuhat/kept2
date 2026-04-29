@@ -559,14 +559,24 @@ impl TextBox {
         if event.state != ElementState::Pressed {
             return false;
         }
-        let shift = modifiers.state().shift_key();
+        let mods = modifiers.state();
+        let shift = mods.shift_key();
+        let ctrl = mods.control_key();
         match &event.logical_key {
             Key::Named(NamedKey::ArrowLeft) => {
-                self.move_horizontal(-1, shift);
+                if ctrl {
+                    self.move_horizontal_word(-1, shift);
+                } else {
+                    self.move_horizontal(-1, shift);
+                }
                 true
             }
             Key::Named(NamedKey::ArrowRight) => {
-                self.move_horizontal(1, shift);
+                if ctrl {
+                    self.move_horizontal_word(1, shift);
+                } else {
+                    self.move_horizontal(1, shift);
+                }
                 true
             }
             Key::Named(NamedKey::ArrowUp) => {
@@ -833,6 +843,30 @@ impl TextBox {
                 if !shift {
                     sel.anchor = sel.head;
                 }
+            }
+        }
+        self.sels.normalize();
+    }
+
+    /// Word-wise horizontal movement (Ctrl+Arrow). Moves each cursor's head to
+    /// the next class boundary in the direction of motion: Right lands at the
+    /// end of the run starting at the caret; Left lands at the start of the
+    /// run ending just before the caret. Without `shift`, anchor follows head
+    /// (collapses any existing selection).
+    fn move_horizontal_word(&mut self, delta: i32, shift: bool) {
+        let text = &self.text;
+        for sel in &mut self.sels.items {
+            let new_head = if delta > 0 {
+                find_word_right_of(text, sel.head).end
+            } else {
+                find_word_left_of(text, sel.head).start
+            };
+            if new_head != sel.head {
+                sel.head = new_head;
+                sel.affinity = Affinity::Downstream;
+            }
+            if !shift {
+                sel.anchor = sel.head;
             }
         }
         self.sels.normalize();
