@@ -22,7 +22,9 @@ const CELL_GAP: f32 = 20.0;
 const FOCUS_PAD: f32 = 10.0;
 const FOCUS_RADIUS: f32 = 10.0;
 const FOCUS_STROKE: f32 = 1.0;
+const FOCUS_STROKE_EDIT: f32 = 2.0;
 const FOCUS_RING_ALPHA: u8 = 0x60;
+const FOCUS_RING_ALPHA_EDIT: u8 = 0xff;
 const FOCUS_SHADOW_ALPHA: u8 = 0x30;
 const FOCUS_SHADOW_BLUR: f32 = 12.0;
 const FOCUS_SHADOW_DY: f32 = 3.0;
@@ -121,6 +123,25 @@ struct MentionPopup {
     selected: usize,
 }
 
+/// Context-level consequence of a cell deletion that emptied a context's
+/// window. Stored on `UndoOp::DeleteCell` so undo/redo restore atomically.
+#[derive(Clone)]
+enum ContextSideEffect {
+    /// A closed context became empty and was removed. Undo restores it.
+    ContextRemoved {
+        context: Context,
+        prev_active: Uuid,
+        new_active: Uuid,
+    },
+    /// The open context became empty; its `start_time` was reset to "now"
+    /// so the sidebar label and visible window track the resumption.
+    StartReset {
+        context_id: Uuid,
+        prev_start: i64,
+        new_start: i64,
+    },
+}
+
 enum UndoOp {
     CellEdit {
         cell_id: Uuid,
@@ -136,6 +157,9 @@ enum UndoOp {
         cell_id: Uuid,
         snapshot: CellSnapshot,
         pre_focused: Option<Uuid>,
+        post_focused: Option<Uuid>,
+        /// If this delete emptied the cell's context, what to do with it.
+        side_effect: Option<ContextSideEffect>,
     },
     RotateContext {
         /// The context that was active before rotation; this is the one that
@@ -149,6 +173,13 @@ enum UndoOp {
         new_context: Context,
         pre_focused: Option<Uuid>,
         pre_scroll_y: f32,
+    },
+    /// Rotation on an already-empty active context: bumps the context's
+    /// `start_time` to "now" instead of creating another empty context.
+    ResetContextStart {
+        context_id: Uuid,
+        prev_start: i64,
+        new_start: i64,
     },
 }
 
@@ -211,6 +242,11 @@ pub struct KeptApp {
     /// The context whose window is currently visible.
     active_context: Uuid,
     focused: Option<Uuid>,
+    /// Modal state. `false` = view (cell is selected but not accepting text);
+    /// `true` = edit (caret visible, text input forwarded). Toggled by Enter
+    /// (view → edit) and Esc (edit → view). Any focus change drops to view
+    /// mode except creation (Ctrl+Enter) and clicks, which enter edit mode.
+    editing: bool,
     dragging_cell: Option<Uuid>,
     scroll_y: f32,
     max_scroll: f32,
@@ -281,6 +317,29 @@ impl KeptApp {
             None => Vec::new(),
         };
 
+        // Sweep: drop any closed context whose window contains no cells.
+        // These are leftovers from earlier rotations on already-empty
+        // contexts; the current code path no longer creates them.
+        let stale: Vec<Uuid> = contexts
+            .iter()
+            .filter(|c| c.end_time.is_some())
+            .filter(|c| {
+                !cells.iter().any(|cell| {
+                    cell.timestamp >= c.start_time
+                        && c.end_time.map_or(true, |e| cell.timestamp < e)
+                })
+            })
+            .map(|c| c.id)
+            .collect();
+        if !stale.is_empty() {
+            contexts.retain(|c| !stale.contains(&c.id));
+            if let Some(d) = db.as_mut() {
+                for id in &stale {
+                    let _ = d.delete_context(*id);
+                }
+            }
+        }
+
         // First-run / empty-DB seed: one default open context, three plain
         // welcome cells.
         if contexts.is_empty() {
@@ -334,6 +393,7 @@ impl KeptApp {
             contexts,
             active_context,
             focused,
+            editing: false,
             dragging_cell: None,
             scroll_y: 0.0,
             max_scroll: 0.0,
@@ -399,6 +459,35 @@ impl KeptApp {
     fn rotate_context_now(&mut self) {
         let now = now_epoch_ms();
         let prev_active = self.active_context;
+
+        // If the active context has no cells, don't create another empty
+        // context — just bump its start_time so the sidebar label reflects
+        // "now" and the user gets the "fresh" feel they asked for.
+        if !self.active_has_cells() {
+            let prev_start = self
+                .contexts
+                .iter()
+                .find(|c| c.id == prev_active)
+                .map(|c| c.start_time)
+                .unwrap_or(now);
+            if prev_start == now {
+                // Already stamped at this instant; nothing to do.
+                return;
+            }
+            if let Some(ctx) = self.contexts.iter_mut().find(|c| c.id == prev_active) {
+                ctx.start_time = now;
+            }
+            self.dirty_contexts.insert(prev_active);
+            self.undo_stack.push(UndoOp::ResetContextStart {
+                context_id: prev_active,
+                prev_start,
+                new_start: now,
+            });
+            self.redo_stack.clear();
+            self.coalesce_break = true;
+            return;
+        }
+
         let prev_end_time = self
             .contexts
             .iter()
@@ -427,6 +516,13 @@ impl KeptApp {
         self.coalesce_break = true;
     }
 
+    fn active_has_cells(&self) -> bool {
+        let (start, end) = self.active_window();
+        self.cells
+            .iter()
+            .any(|c| c.timestamp >= start && end.map(|e| c.timestamp < e).unwrap_or(true))
+    }
+
     /// Apply rotation forward: close `prev_active` (set its `end_time`), insert
     /// `new_context`, switch to it. Used by both initial rotation and redo.
     fn apply_rotation(&mut self, prev_active: Uuid, new_end_time: i64, new_context: &Context) {
@@ -442,6 +538,7 @@ impl KeptApp {
         self.pending_context_deletes.remove(&new_id);
         self.active_context = new_id;
         self.focused = None;
+        self.editing = false;
         self.dragging_cell = None;
         self.cell_menu_open = None;
         self.scroll_y = 0.0;
@@ -470,9 +567,57 @@ impl KeptApp {
         self.pending_context_deletes.insert(new_context_id);
         self.active_context = prev_active;
         self.focused = pre_focused;
+        self.editing = false;
         self.dragging_cell = None;
         self.cell_menu_open = None;
         self.scroll_y = pre_scroll_y;
+    }
+
+    /// Previous context (older `start_time`) relative to the currently active
+    /// one. None if active is already the oldest.
+    fn prev_context(&self) -> Option<Uuid> {
+        let mut sorted: Vec<&Context> = self.contexts.iter().collect();
+        sorted.sort_by_key(|c| c.start_time);
+        let pos = sorted.iter().position(|c| c.id == self.active_context)?;
+        if pos == 0 {
+            None
+        } else {
+            Some(sorted[pos - 1].id)
+        }
+    }
+
+    /// Next context (newer `start_time`). None if active is already the newest.
+    fn next_context(&self) -> Option<Uuid> {
+        let mut sorted: Vec<&Context> = self.contexts.iter().collect();
+        sorted.sort_by_key(|c| c.start_time);
+        let pos = sorted.iter().position(|c| c.id == self.active_context)?;
+        sorted.get(pos + 1).map(|c| c.id)
+    }
+
+    /// If the active context is closed, switch to the most recent open
+    /// context. Used so a write action while viewing history lands in
+    /// "today" instead of in a closed window. Returns true if the active
+    /// context changed. If no open context exists, leaves active alone — the
+    /// idle-rotation path in `insert_cell_after_focused` will handle it.
+    fn ensure_writable_context(&mut self) -> bool {
+        let active_is_open = self
+            .contexts
+            .iter()
+            .find(|c| c.id == self.active_context)
+            .map_or(false, |c| c.end_time.is_none());
+        if active_is_open {
+            return false;
+        }
+        let target = self
+            .contexts
+            .iter()
+            .filter(|c| c.end_time.is_none())
+            .max_by_key(|c| c.start_time)
+            .map(|c| c.id);
+        match target {
+            Some(id) => self.set_active_context(id),
+            None => false,
+        }
     }
 
     /// Switch the visible window to an existing context. No data movement.
@@ -486,6 +631,7 @@ impl KeptApp {
         self.active_context = id;
         // Focus the first visible cell in the new window (if any).
         self.focused = self.visible_cell_ids().first().copied();
+        self.editing = false;
         self.dragging_cell = None;
         self.cell_menu_open = None;
         self.scroll_y = 0.0;
@@ -688,8 +834,11 @@ impl KeptApp {
             }
             let cell_x = cells_left;
             let cell_y = y;
-            let is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
-            let h = cell.tick(canvas, cell_x, cell_y, content_width, is_focused);
+            let cell_is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
+            // In view mode, the cell renders without caret/selection. The
+            // outer card + ring (drawn by KeptApp) still indicate focus.
+            let render_focused = cell_is_focused && self.editing;
+            let h = cell.tick(canvas, cell_x, cell_y, content_width, render_focused);
             let kebab_right = cell_x + outer_cell_width - KEBAB_INSET_X;
             let kebab_left = kebab_right - KEBAB_SIZE;
             let kebab_top = cell_y + KEBAB_INSET_Y;
@@ -704,13 +853,18 @@ impl KeptApp {
             y += h + CELL_GAP;
         }
 
-        // Subtle focus ring using the same captured geometry as the card.
+        // Focus ring — subtle when viewing, brighter and thicker when editing.
         if let Some((cx, cy, cw, ch)) = focused_geom {
+            let (stroke, alpha) = if self.editing {
+                (FOCUS_STROKE_EDIT, FOCUS_RING_ALPHA_EDIT)
+            } else {
+                (FOCUS_STROKE, FOCUS_RING_ALPHA)
+            };
             let mut focus_paint = Paint::default();
             focus_paint.set_anti_alias(true);
             focus_paint.set_style(PaintStyle::Stroke);
-            focus_paint.set_stroke_width(FOCUS_STROKE);
-            focus_paint.set_color(Color::from_argb(FOCUS_RING_ALPHA, 0x4a, 0x90, 0xe2));
+            focus_paint.set_stroke_width(stroke);
+            focus_paint.set_color(Color::from_argb(alpha, 0x4a, 0x90, 0xe2));
             let rect = Rect::new(
                 cx - FOCUS_PAD,
                 cy - FOCUS_PAD,
@@ -834,9 +988,16 @@ impl KeptApp {
                     return self.delete_focused_cell();
                 }
                 Key::Named(NamedKey::ArrowUp) => {
+                    if modifiers.state().shift_key() {
+                        if let Some(id) = self.prev_context() {
+                            return self.set_active_context(id);
+                        }
+                        return false;
+                    }
                     if let Some(focused) = self.focused {
                         if let Some(prev) = self.prev_visible(focused) {
                             self.focused = Some(prev);
+                            self.editing = false;
                             self.coalesce_break = true;
                             self.scroll_to_focused();
                             return true;
@@ -845,9 +1006,16 @@ impl KeptApp {
                     return false;
                 }
                 Key::Named(NamedKey::ArrowDown) => {
+                    if modifiers.state().shift_key() {
+                        if let Some(id) = self.next_context() {
+                            return self.set_active_context(id);
+                        }
+                        return false;
+                    }
                     if let Some(focused) = self.focused {
                         if let Some(next) = self.next_visible(focused) {
                             self.focused = Some(next);
+                            self.editing = false;
                             self.coalesce_break = true;
                             self.scroll_to_focused();
                             return true;
@@ -887,9 +1055,73 @@ impl KeptApp {
             }
         }
 
+        // Modal mode switches: Esc exits edit, Enter enters edit.
+        if event.state == ElementState::Pressed
+            && !modifiers.state().control_key()
+            && !modifiers.state().alt_key()
+        {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) if self.editing => {
+                    self.editing = false;
+                    self.mention_popup = None;
+                    self.coalesce_break = true;
+                    return true;
+                }
+                Key::Named(NamedKey::Enter)
+                    if !self.editing
+                        && !modifiers.state().shift_key()
+                        && self.focused.is_some() =>
+                {
+                    self.editing = true;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        // View mode: cell-level operations only. Text input is dropped —
+        // Enter is the way back to edit; Backspace/Delete delete the cell.
+        if !self.editing {
+            if event.state == ElementState::Pressed
+                && !modifiers.state().shift_key()
+                && !modifiers.state().control_key()
+                && !modifiers.state().alt_key()
+            {
+                match &event.logical_key {
+                    Key::Named(NamedKey::ArrowUp) => {
+                        if let Some(focused) = self.focused {
+                            if let Some(prev) = self.prev_visible(focused) {
+                                self.focused = Some(prev);
+                                self.coalesce_break = true;
+                                self.scroll_to_focused();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        if let Some(focused) = self.focused {
+                            if let Some(next) = self.next_visible(focused) {
+                                self.focused = Some(next);
+                                self.coalesce_break = true;
+                                self.scroll_to_focused();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => {
+                        return self.delete_focused_cell();
+                    }
+                    _ => {}
+                }
+            }
+            return false;
+        }
+
         // Cross-cell arrow nav: a plain ArrowUp/Down at the focused cell's
-        // top/bottom edge moves focus to the adjacent cell, with the caret
-        // landing at the end (Up) or start (Down) of the destination.
+        // top/bottom edge moves focus to the adjacent cell, dropping to view
+        // mode (the new cell starts unedited; press Enter to continue).
         if event.state == ElementState::Pressed
             && !modifiers.state().shift_key()
             && !modifiers.state().control_key()
@@ -905,6 +1137,7 @@ impl KeptApp {
                                 if let Some(c) = self.cell_mut(prev) {
                                     c.place_caret_at_end();
                                 }
+                                self.editing = false;
                                 self.coalesce_break = true;
                                 self.pending_caret_scroll = true;
                                 return true;
@@ -921,6 +1154,7 @@ impl KeptApp {
                                 if let Some(c) = self.cell_mut(next) {
                                     c.place_caret_at_start();
                                 }
+                                self.editing = false;
                                 self.coalesce_break = true;
                                 self.pending_caret_scroll = true;
                                 return true;
@@ -1505,11 +1739,16 @@ impl KeptApp {
                 cell_id,
                 snapshot,
                 pre_focused,
+                side_effect,
+                ..
             } => {
                 let cell = Cell::from_snapshot(*cell_id, snapshot.clone(), &self.typeface);
                 self.insert_cell_sorted(cell);
                 self.dirty_cells.insert(*cell_id);
                 self.pending_deletes.remove(cell_id);
+                if let Some(se) = side_effect {
+                    self.reverse_context_side_effect(se);
+                }
                 self.focused = *pre_focused;
             }
             UndoOp::RotateContext {
@@ -1527,6 +1766,17 @@ impl KeptApp {
                     *pre_focused,
                     *pre_scroll_y,
                 );
+                bump_focused_edited = false;
+            }
+            UndoOp::ResetContextStart {
+                context_id,
+                prev_start,
+                ..
+            } => {
+                if let Some(c) = self.contexts.iter_mut().find(|c| c.id == *context_id) {
+                    c.start_time = *prev_start;
+                }
+                self.dirty_contexts.insert(*context_id);
                 bump_focused_edited = false;
             }
         }
@@ -1565,15 +1815,21 @@ impl KeptApp {
                 self.pending_deletes.remove(cell_id);
                 self.focused = Some(*cell_id);
             }
-            UndoOp::DeleteCell { cell_id, .. } => {
+            UndoOp::DeleteCell {
+                cell_id,
+                post_focused,
+                side_effect,
+                ..
+            } => {
                 if let Some(idx) = self.cell_idx(*cell_id) {
                     self.cells.remove(idx);
                 }
                 self.pending_deletes.insert(*cell_id);
                 self.dirty_cells.remove(cell_id);
-                if self.focused == Some(*cell_id) {
-                    self.focused = self.visible_cell_ids().last().copied();
+                if let Some(se) = side_effect {
+                    self.apply_context_side_effect(se);
                 }
+                self.focused = *post_focused;
             }
             UndoOp::RotateContext {
                 prev_active,
@@ -1582,6 +1838,17 @@ impl KeptApp {
                 ..
             } => {
                 self.apply_rotation(*prev_active, *new_end_time, new_context);
+                bump_focused_edited = false;
+            }
+            UndoOp::ResetContextStart {
+                context_id,
+                new_start,
+                ..
+            } => {
+                if let Some(c) = self.contexts.iter_mut().find(|c| c.id == *context_id) {
+                    c.start_time = *new_start;
+                }
+                self.dirty_contexts.insert(*context_id);
                 bump_focused_edited = false;
             }
         }
@@ -1599,29 +1866,94 @@ impl KeptApp {
 
     fn delete_focused_cell(&mut self) -> bool {
         let Some(id) = self.focused else { return false };
-        // Refuse to delete the last visible cell — keep the UX invariant that
-        // there's always at least one cell to type into.
-        let visible = self.visible_cell_ids();
-        if visible.len() <= 1 {
-            return false;
-        }
-        let snapshot = match self.cell(id) {
-            Some(c) => c.snapshot(),
+        let cell_ref = match self.cell(id) {
+            Some(c) => c,
             None => return false,
         };
-        // Pick a new focus before removing.
+        let snapshot = cell_ref.snapshot();
+        let cell_ts = cell_ref.timestamp;
+
+        // Find the context whose window contains this cell (by timestamp).
+        let containing_ctx: Option<Context> = self
+            .contexts
+            .iter()
+            .find(|c| {
+                cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
+            })
+            .cloned();
+
+        // Will deleting this cell leave its containing context empty?
+        let side_effect = if let Some(ctx) = containing_ctx {
+            let others_in_ctx = self
+                .cells
+                .iter()
+                .filter(|c| c.id != id)
+                .filter(|c| {
+                    c.timestamp >= ctx.start_time
+                        && ctx.end_time.map_or(true, |e| c.timestamp < e)
+                })
+                .count();
+            if others_in_ctx == 0 {
+                if ctx.end_time.is_some() {
+                    // Closed context — remove it. Need an open context to
+                    // become active; if none exists, skip the side effect to
+                    // preserve the "always one open context" invariant.
+                    let new_active = self
+                        .contexts
+                        .iter()
+                        .filter(|c| c.id != ctx.id && c.end_time.is_none())
+                        .max_by_key(|c| c.start_time)
+                        .map(|c| c.id);
+                    new_active.map(|new_active| ContextSideEffect::ContextRemoved {
+                        context: ctx.clone(),
+                        prev_active: self.active_context,
+                        new_active,
+                    })
+                } else {
+                    Some(ContextSideEffect::StartReset {
+                        context_id: ctx.id,
+                        prev_start: ctx.start_time,
+                        new_start: now_epoch_ms(),
+                    })
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Pick neighbor focus from the visible list (under the *current*
+        // active context — may be overridden below if active changes).
+        let visible = self.visible_cell_ids();
         let pos_in_visible = visible.iter().position(|x| *x == id);
-        let new_focus = match pos_in_visible {
+        let mut new_focus = match pos_in_visible {
             Some(i) if i + 1 < visible.len() => Some(visible[i + 1]),
             Some(i) if i > 0 => Some(visible[i - 1]),
             _ => None,
         };
+
+        // Remove the cell.
         if let Some(idx) = self.cell_idx(id) {
             self.cells.remove(idx);
         }
         self.pending_deletes.insert(id);
         self.dirty_cells.remove(&id);
+
+        // Apply the context-level side effect.
+        if let Some(se) = &side_effect {
+            self.apply_context_side_effect(se);
+            // Re-pick focus after the active context may have changed.
+            new_focus = match se {
+                ContextSideEffect::ContextRemoved { .. } => {
+                    self.visible_cell_ids().first().copied()
+                }
+                ContextSideEffect::StartReset { .. } => None,
+            };
+        }
+
         self.focused = new_focus;
+        self.editing = false;
         self.dragging_cell = None;
         self.pending_caret_scroll = true;
 
@@ -1629,18 +1961,77 @@ impl KeptApp {
             cell_id: id,
             snapshot,
             pre_focused: Some(id),
+            post_focused: new_focus,
+            side_effect,
         });
         self.redo_stack.clear();
         self.coalesce_break = true;
         true
     }
 
+    fn apply_context_side_effect(&mut self, se: &ContextSideEffect) {
+        match se {
+            ContextSideEffect::ContextRemoved {
+                context, new_active, ..
+            } => {
+                self.contexts.retain(|c| c.id != context.id);
+                self.dirty_contexts.remove(&context.id);
+                self.pending_context_deletes.insert(context.id);
+                self.active_context = *new_active;
+            }
+            ContextSideEffect::StartReset {
+                context_id,
+                new_start,
+                ..
+            } => {
+                if let Some(c) = self.contexts.iter_mut().find(|c| c.id == *context_id) {
+                    c.start_time = *new_start;
+                }
+                self.dirty_contexts.insert(*context_id);
+            }
+        }
+    }
+
+    fn reverse_context_side_effect(&mut self, se: &ContextSideEffect) {
+        match se {
+            ContextSideEffect::ContextRemoved {
+                context,
+                prev_active,
+                ..
+            } => {
+                if !self.contexts.iter().any(|c| c.id == context.id) {
+                    self.contexts.push(context.clone());
+                }
+                self.dirty_contexts.insert(context.id);
+                self.pending_context_deletes.remove(&context.id);
+                self.active_context = *prev_active;
+            }
+            ContextSideEffect::StartReset {
+                context_id,
+                prev_start,
+                ..
+            } => {
+                if let Some(c) = self.contexts.iter_mut().find(|c| c.id == *context_id) {
+                    c.start_time = *prev_start;
+                }
+                self.dirty_contexts.insert(*context_id);
+            }
+        }
+    }
+
     fn insert_cell_after_focused(&mut self, outline: bool) -> bool {
-        // No-op if the focused cell is empty — Ctrl+Enter shouldn't pile up empties.
-        if let Some(id) = self.focused {
-            if let Some(cell) = self.cell(id) {
-                if cell.is_empty() {
-                    return false;
+        // If the user is viewing a closed context, jump to the current open
+        // one before inserting. The note belongs in "today," not in history.
+        let auto_switched = self.ensure_writable_context();
+        // No-op if the focused cell is empty — Ctrl+Enter shouldn't pile up
+        // empties. Skip when we just auto-switched: the destination's focused
+        // cell is incidental, the user's intent was clearly to write.
+        if !auto_switched {
+            if let Some(id) = self.focused {
+                if let Some(cell) = self.cell(id) {
+                    if cell.is_empty() {
+                        return false;
+                    }
                 }
             }
         }
@@ -1677,6 +2068,8 @@ impl KeptApp {
         let snapshot = new_cell.snapshot();
         self.insert_cell_sorted(new_cell);
         self.focused = Some(new_id);
+        // Creating a cell is an explicit "I want to type" action.
+        self.editing = true;
         self.dragging_cell = None;
         self.pending_caret_scroll = true;
 
@@ -1782,8 +2175,13 @@ impl KeptApp {
         let Some(target) = self.find_cell_at(x, doc_y) else {
             return false;
         };
+        // Cross-cell click drops to view mode (matches keyboard nav). Same-cell
+        // click preserves whatever mode the user was in. To start editing a new
+        // cell, click it (selects), then hit Enter — or just keep typing once
+        // already editing the same cell.
         if Some(target) != self.focused {
             self.focused = Some(target);
+            self.editing = false;
         }
         // Any click moves/replaces the caret — break coalescing so the next
         // text edit starts a fresh undo entry.
