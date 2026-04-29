@@ -162,6 +162,20 @@ pub struct Context {
 const SEED_CONTEXT_ID: Uuid = uuid!("01900000-0000-7000-8000-000000000001");
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// Idle threshold after which the next cell creation rotates to a fresh
+/// context. Edits to existing cells don't reset this — only new cells do.
+const IDLE_CONTEXT_THRESHOLD: Duration = Duration::from_secs(15 * 60);
+
+const SIDEBAR_WIDTH: f32 = 180.0;
+const SIDEBAR_PAD_X: f32 = 12.0;
+const SIDEBAR_PAD_TOP: f32 = 18.0;
+const SIDEBAR_HEADER_H: f32 = 28.0;
+const SIDEBAR_ITEM_H: f32 = 30.0;
+const SIDEBAR_ITEM_GAP: f32 = 2.0;
+const SIDEBAR_ITEM_RADIUS: f32 = 6.0;
+const SIDEBAR_HEADER_FONT_SIZE: f32 = 11.0;
+const SIDEBAR_ITEM_FONT_SIZE: f32 = 13.0;
+
 const KEBAB_SIZE: f32 = 22.0;
 const KEBAB_INSET_X: f32 = 4.0;
 const KEBAB_INSET_Y: f32 = 2.0;
@@ -203,6 +217,10 @@ pub struct KeptApp {
     dirty_contexts: HashSet<Uuid>,
     cell_menu_open: Option<Uuid>,
     last_kebab_rects: Vec<(Uuid, Rect)>,
+    /// Sidebar item rects in window (logical) coords from last frame, paired
+    /// with their context id, for click hit-testing. Sidebar is fixed (doesn't
+    /// scroll), so these stay in window space.
+    last_sidebar_rects: Vec<(Uuid, Rect)>,
     /// Most recent cursor position in window (logical) coords, used for hover.
     mouse_pos: (f32, f32),
 }
@@ -314,6 +332,7 @@ impl KeptApp {
             dirty_contexts: HashSet::new(),
             cell_menu_open: None,
             last_kebab_rects: Vec::new(),
+            last_sidebar_rects: Vec::new(),
             mouse_pos: (-1.0, -1.0),
         }
     }
@@ -342,6 +361,66 @@ impl KeptApp {
             .find(|c| c.id == self.active_context)
             .map(|c| (c.start_time, c.end_time))
             .unwrap_or((i64::MIN, None))
+    }
+
+    /// Timestamp (epoch ms) of the most recently created cell anywhere in the
+    /// stream, used for idle detection. None if no cells exist.
+    fn last_cell_create_ms(&self) -> Option<i64> {
+        self.cells.iter().map(|c| c.timestamp).max()
+    }
+
+    /// Close the active context (`end_time = now`) and open a new one whose
+    /// window starts at `now`. Sets `active_context` to the new id. Drops focus
+    /// since the new window is empty until the next cell is created.
+    fn rotate_context_now(&mut self) {
+        let now = now_epoch_ms();
+        if let Some(ctx) = self
+            .contexts
+            .iter_mut()
+            .find(|c| c.id == self.active_context)
+        {
+            // Don't double-close — if something already closed this context,
+            // keep its prior end_time.
+            if ctx.end_time.is_none() {
+                ctx.end_time = Some(now);
+                let id = ctx.id;
+                self.dirty_contexts.insert(id);
+            }
+        }
+        let new_ctx = Context {
+            id: Uuid::now_v7(),
+            start_time: now,
+            end_time: None,
+            title: None,
+        };
+        let new_id = new_ctx.id;
+        self.contexts.push(new_ctx);
+        self.dirty_contexts.insert(new_id);
+        self.active_context = new_id;
+        self.focused = None;
+        self.dragging_cell = None;
+        self.cell_menu_open = None;
+        self.scroll_y = 0.0;
+        self.coalesce_break = true;
+    }
+
+    /// Switch the visible window to an existing context. No data movement.
+    fn set_active_context(&mut self, id: Uuid) -> bool {
+        if id == self.active_context {
+            return false;
+        }
+        if !self.contexts.iter().any(|c| c.id == id) {
+            return false;
+        }
+        self.active_context = id;
+        // Focus the first visible cell in the new window (if any).
+        self.focused = self.visible_cell_ids().first().copied();
+        self.dragging_cell = None;
+        self.cell_menu_open = None;
+        self.scroll_y = 0.0;
+        self.coalesce_break = true;
+        self.pending_caret_scroll = true;
+        true
     }
 
     /// IDs of cells visible in the active context, in timestamp order.
@@ -515,7 +594,8 @@ impl KeptApp {
         }
 
         let mut y = MARGIN_TOP;
-        let outer_cell_width = (width - MARGIN_X * 2.0).max(80.0);
+        let cells_left = SIDEBAR_WIDTH + MARGIN_X;
+        let outer_cell_width = (width - cells_left - MARGIN_X).max(80.0);
         let content_width = (outer_cell_width - KEBAB_RESERVE).max(60.0);
         self.last_kebab_rects.clear();
         let mouse_doc_x = self.mouse_pos.0;
@@ -529,7 +609,7 @@ impl KeptApp {
             {
                 continue;
             }
-            let cell_x = MARGIN_X;
+            let cell_x = cells_left;
             let cell_y = y;
             let is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
             let h = cell.tick(canvas, cell_x, cell_y, content_width, is_focused);
@@ -625,6 +705,9 @@ impl KeptApp {
                 );
             }
         }
+
+        // Sidebar (window space — does not scroll with content).
+        self.render_sidebar(canvas, height);
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
@@ -715,6 +798,12 @@ impl KeptApp {
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("v") => {
                     return self.paste_from_clipboard();
+                }
+                Key::Character(s)
+                    if modifiers.state().shift_key() && s.as_str().eq_ignore_ascii_case("n") =>
+                {
+                    self.rotate_context_now();
+                    return true;
                 }
                 _ => {}
             }
@@ -1022,6 +1111,117 @@ impl KeptApp {
         );
     }
 
+    fn render_sidebar(&mut self, canvas: &Canvas, height: f32) {
+        // Background panel.
+        let mut bg_paint = Paint::default();
+        bg_paint.set_anti_alias(true);
+        bg_paint.set_color(Color::from_rgb(0xf2, 0xee, 0xe6));
+        canvas.draw_rect(
+            Rect::new(0.0, 0.0, SIDEBAR_WIDTH, height.max(0.0)),
+            &bg_paint,
+        );
+        // Right-edge separator.
+        let mut sep = Paint::default();
+        sep.set_anti_alias(false);
+        sep.set_color(Color::from_rgb(0xdc, 0xd4, 0xc6));
+        canvas.draw_rect(
+            Rect::new(SIDEBAR_WIDTH - 1.0, 0.0, SIDEBAR_WIDTH, height.max(0.0)),
+            &sep,
+        );
+
+        // Header.
+        let header_font = Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE);
+        let mut header_paint = Paint::default();
+        header_paint.set_anti_alias(true);
+        header_paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+        let (_, hm) = header_font.metrics();
+        let header_baseline = SIDEBAR_PAD_TOP + (-hm.ascent);
+        canvas.draw_str(
+            "CONTEXTS",
+            Point::new(SIDEBAR_PAD_X, header_baseline),
+            &header_font,
+            &header_paint,
+        );
+
+        // Items, ordered by start_time ascending. Cache the click rects.
+        self.last_sidebar_rects.clear();
+        let mut order: Vec<(usize, i64)> = self
+            .contexts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.start_time))
+            .collect();
+        order.sort_by_key(|(_, t)| *t);
+
+        let item_font = Font::from_typeface(&self.typeface, SIDEBAR_ITEM_FONT_SIZE);
+        let (_, im) = item_font.metrics();
+        let mouse_x = self.mouse_pos.0;
+        let mouse_y = self.mouse_pos.1;
+
+        let items_top = SIDEBAR_PAD_TOP + SIDEBAR_HEADER_H;
+        for (slot, (orig_idx, _)) in order.iter().enumerate() {
+            let ctx = &self.contexts[*orig_idx];
+            let item_top =
+                items_top + slot as f32 * (SIDEBAR_ITEM_H + SIDEBAR_ITEM_GAP);
+            let item_bot = item_top + SIDEBAR_ITEM_H;
+            if item_top > height {
+                break;
+            }
+            let item_rect = Rect::new(
+                SIDEBAR_PAD_X * 0.5,
+                item_top,
+                SIDEBAR_WIDTH - SIDEBAR_PAD_X * 0.5,
+                item_bot,
+            );
+            let is_active = ctx.id == self.active_context;
+            let is_hovered = mouse_x >= item_rect.left
+                && mouse_x <= item_rect.right
+                && mouse_y >= item_rect.top
+                && mouse_y <= item_rect.bottom;
+
+            if is_active {
+                let mut p = Paint::default();
+                p.set_anti_alias(true);
+                p.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+                canvas.draw_round_rect(
+                    item_rect,
+                    SIDEBAR_ITEM_RADIUS,
+                    SIDEBAR_ITEM_RADIUS,
+                    &p,
+                );
+            } else if is_hovered {
+                let mut p = Paint::default();
+                p.set_anti_alias(true);
+                p.set_color(Color::from_argb(0x20, 0x1c, 0x1c, 0x1c));
+                canvas.draw_round_rect(
+                    item_rect,
+                    SIDEBAR_ITEM_RADIUS,
+                    SIDEBAR_ITEM_RADIUS,
+                    &p,
+                );
+            }
+
+            let mut text_paint = Paint::default();
+            text_paint.set_anti_alias(true);
+            let text_color = if is_active {
+                Color::from_rgb(0x1c, 0x1c, 0x1c)
+            } else {
+                Color::from_rgb(0x55, 0x55, 0x55)
+            };
+            text_paint.set_color(text_color);
+            let baseline = item_top + (SIDEBAR_ITEM_H + (-im.ascent) - im.descent) * 0.5;
+            let label = format_context_label(ctx.start_time);
+            canvas.draw_str(
+                label,
+                Point::new(SIDEBAR_PAD_X, baseline),
+                &item_font,
+                &text_paint,
+            );
+
+            self.last_sidebar_rects.push((ctx.id, item_rect));
+        }
+    }
+
     fn render_mention_popup(&self, canvas: &Canvas) {
         let Some(popup) = self.mention_popup.as_ref() else {
             return;
@@ -1322,8 +1522,6 @@ impl KeptApp {
         });
         self.redo_stack.clear();
         self.coalesce_break = true;
-        // Bump active context so its window stays "fresh."
-        self.dirty_contexts.insert(self.active_context);
         true
     }
 
@@ -1335,6 +1533,27 @@ impl KeptApp {
                     return false;
                 }
             }
+        }
+        // Idle rotation: if the user has been quiet (no new cells) for the
+        // threshold, this write opens a fresh context instead of extending the
+        // current one. Pre-existing cells stay where they were — context
+        // membership is purely time-derived. The baseline is the later of the
+        // last cell creation and the active context's start, so an empty fresh
+        // context can't rotate again on its very first write.
+        let now = now_epoch_ms();
+        let idle_ms = IDLE_CONTEXT_THRESHOLD.as_millis() as i64;
+        let active_start = self
+            .contexts
+            .iter()
+            .find(|c| c.id == self.active_context)
+            .map(|c| c.start_time)
+            .unwrap_or(i64::MIN);
+        let baseline = self
+            .last_cell_create_ms()
+            .map(|t| t.max(active_start))
+            .unwrap_or(active_start);
+        if baseline > i64::MIN && now - baseline >= idle_ms {
+            self.rotate_context_now();
         }
         let pre_focused = self.focused;
         let mut new_cell = if outline {
@@ -1413,6 +1632,21 @@ impl KeptApp {
     pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
         // Any click dismisses an active @-mention popup.
         self.mention_popup = None;
+
+        // Sidebar clicks switch the active context. Sidebar lives in window
+        // (logical) space, so use raw (x, y) — not doc_y.
+        if x < SIDEBAR_WIDTH {
+            for (id, rect) in self.last_sidebar_rects.clone() {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    self.cell_menu_open = None;
+                    return self.set_active_context(id);
+                }
+            }
+            // Click in the sidebar background but not on an item: close menus,
+            // but don't fall through to cell hit-testing.
+            self.cell_menu_open = None;
+            return false;
+        }
 
         let doc_y = y + self.scroll_y;
 
@@ -1584,6 +1818,22 @@ fn format_timestamp(epoch_ms: i64) -> String {
         .single()
         .unwrap_or_else(|| Local.timestamp_millis_opt(0).single().unwrap());
     dt.format("%-d %B %Y, %-I:%M %p").to_string()
+}
+
+/// Compact label for sidebar context entries. Same day → just the time
+/// (`10:42 AM`); other days include a short date prefix (`Apr 28, 10:42 AM`).
+fn format_context_label(epoch_ms: i64) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+    let dt = Local
+        .timestamp_millis_opt(epoch_ms)
+        .single()
+        .unwrap_or_else(|| Local.timestamp_millis_opt(0).single().unwrap());
+    let now = Local::now();
+    if dt.year() == now.year() && dt.ordinal() == now.ordinal() {
+        dt.format("%-I:%M %p").to_string()
+    } else {
+        dt.format("%b %-d, %-I:%M %p").to_string()
+    }
 }
 
 fn context_ref<'a>(c: &'a Context) -> ContextRef<'a> {
