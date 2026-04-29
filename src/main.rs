@@ -1,5 +1,6 @@
 mod app;
 mod cell;
+mod persist;
 
 use std::{
     ffi::CString,
@@ -96,8 +97,12 @@ impl ApplicationHandler for Application {
 
         match event {
             WindowEvent::CloseRequested => {
+                self.kept_app.flush_persistence();
                 event_loop.exit();
                 return;
+            }
+            WindowEvent::Focused(false) => {
+                self.kept_app.flush_persistence();
             }
             WindowEvent::ModifiersChanged(new_modifiers) => {
                 self.modifiers = new_modifiers;

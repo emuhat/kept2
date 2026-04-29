@@ -2,6 +2,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use skia_safe::{Canvas, Color, Font, Paint, Point, Rect, Typeface};
+use uuid::Uuid;
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
     keyboard::{Key, NamedKey},
@@ -327,6 +328,10 @@ impl TextBox {
 
     pub fn link_at(&self, byte: usize) -> Option<&LinkSpan> {
         self.links.iter().find(|l| byte >= l.range.start && byte < l.range.end)
+    }
+
+    pub fn links(&self) -> &[LinkSpan] {
+        &self.links
     }
 
     /// Text covered by the primary selection. Empty if collapsed.
@@ -1414,7 +1419,7 @@ const BULLET_RADIUS: f32 = 3.0;
 
 #[derive(Clone)]
 pub struct BulletSnapshot {
-    pub id: u64,
+    pub id: Uuid,
     pub textbox: TextBoxSnapshot,
     pub depth: u32,
 }
@@ -1422,18 +1427,35 @@ pub struct BulletSnapshot {
 #[derive(Clone)]
 pub struct OutlineSnapshot {
     pub bullets: Vec<BulletSnapshot>,
-    pub focused_bullet: u64,
-    pub next_id: u64,
+    pub focused_bullet: Uuid,
 }
 
 pub struct Bullet {
-    id: u64,
+    id: Uuid,
     textbox: TextBox,
     depth: u32,
 }
 
+impl Bullet {
+    pub fn new(id: Uuid, textbox: TextBox, depth: u32) -> Self {
+        Self { id, textbox, depth }
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    pub fn textbox(&self) -> &TextBox {
+        &self.textbox
+    }
+}
+
 struct OutlineDrag {
-    origin_id: u64,
+    origin_id: Uuid,
     mode: DragMode,
 }
 
@@ -1442,22 +1464,21 @@ enum DragMode {
     TextBox,
     /// Drag has crossed bullet boundaries; we own the selection. `head_id`
     /// is the bullet currently under the cursor.
-    BulletRange { head_id: u64 },
+    BulletRange { head_id: Uuid },
 }
 
 #[derive(Clone, Copy)]
 struct BulletSelection {
-    anchor_id: u64,
-    head_id: u64,
+    anchor_id: Uuid,
+    head_id: Uuid,
 }
 
 pub struct OutlineCell {
     typeface: Typeface,
     bullets: Vec<Bullet>,
-    focused_bullet: u64,
+    focused_bullet: Uuid,
     drag: Option<OutlineDrag>,
     bullet_selection: Option<BulletSelection>,
-    next_id: u64,
     x_origin: f32,
     y_origin: f32,
     width: f32,
@@ -1467,24 +1488,59 @@ pub struct OutlineCell {
 
 impl OutlineCell {
     pub fn new(typeface: Typeface) -> Self {
+        let id = Uuid::now_v7();
         let initial = Bullet {
-            id: 0,
+            id,
             textbox: TextBox::new(typeface.clone(), String::new()),
             depth: 0,
         };
         Self {
             typeface,
             bullets: vec![initial],
-            focused_bullet: 0,
+            focused_bullet: id,
             drag: None,
             bullet_selection: None,
-            next_id: 1,
             x_origin: 0.0,
             y_origin: 0.0,
             width: 0.0,
             height: 0.0,
             font_scale: 1.0,
         }
+    }
+
+    /// Reconstruct an `OutlineCell` from persisted bullets. Bullets must be
+    /// non-empty (the OutlineCell invariant). Used by the persistence layer.
+    pub fn from_bullets(typeface: Typeface, bullets: Vec<Bullet>) -> Self {
+        let focused_bullet = bullets
+            .first()
+            .map(|b| b.id)
+            .unwrap_or_else(Uuid::now_v7);
+        let bullets = if bullets.is_empty() {
+            let id = Uuid::now_v7();
+            vec![Bullet {
+                id,
+                textbox: TextBox::new(typeface.clone(), String::new()),
+                depth: 0,
+            }]
+        } else {
+            bullets
+        };
+        Self {
+            typeface,
+            bullets,
+            focused_bullet,
+            drag: None,
+            bullet_selection: None,
+            x_origin: 0.0,
+            y_origin: 0.0,
+            width: 0.0,
+            height: 0.0,
+            font_scale: 1.0,
+        }
+    }
+
+    pub fn bullets(&self) -> &[Bullet] {
+        &self.bullets
     }
 
     /// Resolve the bullet index containing the given absolute y. Clamps to
@@ -1504,14 +1560,8 @@ impl OutlineCell {
         }
     }
 
-    fn bullet_idx_by_id(&self, id: u64) -> Option<usize> {
+    fn bullet_idx_by_id(&self, id: Uuid) -> Option<usize> {
         self.bullets.iter().position(|b| b.id == id)
-    }
-
-    fn alloc_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
     }
 
     fn focused_index(&self) -> Option<usize> {
@@ -1865,7 +1915,7 @@ impl OutlineCell {
         self.focused_bullet = self.bullets[0].id;
     }
 
-    pub fn focused_bullet_id(&self) -> u64 {
+    pub fn focused_bullet_id(&self) -> Uuid {
         self.focused_bullet
     }
 
@@ -1879,7 +1929,7 @@ impl OutlineCell {
     /// Returns `(abs_x, abs_y_below_line)` so the popup can render below the
     /// line containing the byte. Returns None if the bullet is gone or the
     /// byte is out of range.
-    pub fn anchor_doc_pos(&self, bullet_id: u64, byte: usize) -> Option<(f32, f32)> {
+    pub fn anchor_doc_pos(&self, bullet_id: Uuid, byte: usize) -> Option<(f32, f32)> {
         let idx = self.bullet_idx_by_id(bullet_id)?;
         let tb = &self.bullets[idx].textbox;
         let (x, _) = tb.doc_position_of_byte(byte)?;
@@ -1911,7 +1961,6 @@ impl OutlineCell {
                 })
                 .collect(),
             focused_bullet: self.focused_bullet,
-            next_id: self.next_id,
         }
     }
 
@@ -1930,7 +1979,6 @@ impl OutlineCell {
             })
             .collect();
         self.focused_bullet = snap.focused_bullet;
-        self.next_id = snap.next_id;
         self.drag = None;
         self.bullet_selection = None;
     }
@@ -1977,7 +2025,7 @@ impl OutlineCell {
         let prefix_len = self.bullets[idx].textbox.text().len();
         self.bullets[idx].textbox.set_caret_at(prefix_len);
 
-        let new_id = self.alloc_id();
+        let new_id = Uuid::now_v7();
         let mut new_tb = TextBox::new(self.typeface.clone(), suffix);
         new_tb.set_font_scale(scale);
         new_tb.set_caret_at(0);
@@ -2060,7 +2108,7 @@ impl OutlineCell {
 
         if self.bullets.is_empty() {
             // Maintain the OutlineCell invariant: at least one bullet always.
-            let new_id = self.alloc_id();
+            let new_id = Uuid::now_v7();
             let mut tb = TextBox::new(self.typeface.clone(), String::new());
             tb.set_font_scale(self.font_scale);
             self.bullets.push(Bullet {
@@ -2310,20 +2358,25 @@ impl OutlineCell {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub enum CellSnapshot {
+pub struct CellSnapshot {
+    pub created_at: i64,
+    pub kind: CellSnapshotKind,
+}
+
+#[derive(Clone)]
+pub enum CellSnapshotKind {
     Plain(TextBoxSnapshot),
     Outline(OutlineSnapshot),
 }
 
 impl CellSnapshot {
-    /// Document content equality (ignores selection state). Used by undo to
-    /// detect "cursor moved but text didn't change" events that shouldn't
-    /// record a new undo entry. Variant-mismatched snapshots compare unequal,
-    /// which only happens if undo state and live state get out of sync — a bug.
+    /// Document content equality (ignores selection + timestamp state). Used
+    /// by undo to detect "cursor moved but text didn't change" events that
+    /// shouldn't record a new undo entry.
     pub fn doc_eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (CellSnapshot::Plain(a), CellSnapshot::Plain(b)) => a.text == b.text,
-            (CellSnapshot::Outline(a), CellSnapshot::Outline(b)) => {
+        match (&self.kind, &other.kind) {
+            (CellSnapshotKind::Plain(a), CellSnapshotKind::Plain(b)) => a.text == b.text,
+            (CellSnapshotKind::Outline(a), CellSnapshotKind::Outline(b)) => {
                 a.bullets.len() == b.bullets.len()
                     && a.bullets.iter().zip(b.bullets.iter()).all(|(x, y)| {
                         x.depth == y.depth && x.textbox.text == y.textbox.text
@@ -2334,180 +2387,204 @@ impl CellSnapshot {
     }
 }
 
-pub enum Cell {
+pub struct Cell {
+    pub id: Uuid,
+    pub kind: CellKind,
+    pub created_at: i64,
+    pub edited_at: i64,
+}
+
+pub enum CellKind {
     Plain(TextBox),
     Outline(OutlineCell),
 }
 
 impl Cell {
     pub fn new(typeface: Typeface, initial_text: String) -> Self {
-        Cell::Plain(TextBox::new(typeface, initial_text))
+        let now = now_epoch_ms();
+        Self {
+            id: Uuid::now_v7(),
+            kind: CellKind::Plain(TextBox::new(typeface, initial_text)),
+            created_at: now,
+            edited_at: now,
+        }
     }
 
     pub fn new_outline(typeface: Typeface) -> Self {
-        Cell::Outline(OutlineCell::new(typeface))
+        let now = now_epoch_ms();
+        Self {
+            id: Uuid::now_v7(),
+            kind: CellKind::Outline(OutlineCell::new(typeface)),
+            created_at: now,
+            edited_at: now,
+        }
+    }
+
+    /// Reconstruct from raw parts (used by the persistence layer).
+    pub fn from_parts(id: Uuid, kind: CellKind, created_at: i64, edited_at: i64) -> Self {
+        Self { id, kind, created_at, edited_at }
     }
 
     /// Add a link span to the cell's first textbox (plain) or first bullet
     /// (outline). Used by seed setup; future link-creation UI will go through
     /// a richer path scoped to the focused textbox.
     pub fn add_link_to_first(&mut self, range: Range<usize>, url: String) {
-        match self {
-            Cell::Plain(tb) => tb.add_link(range, url),
-            Cell::Outline(oc) => oc.add_link_to_first(range, url),
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.add_link(range, url),
+            CellKind::Outline(oc) => oc.add_link_to_first(range, url),
         }
     }
 
     pub fn copy_text(&self) -> String {
-        match self {
-            Cell::Plain(tb) => tb.copy_primary_selection(),
-            Cell::Outline(oc) => oc.copy_text(),
+        match &self.kind {
+            CellKind::Plain(tb) => tb.copy_primary_selection(),
+            CellKind::Outline(oc) => oc.copy_text(),
         }
     }
 
     pub fn cut_text(&mut self) -> String {
-        match self {
-            Cell::Plain(tb) => tb.cut_primary_selection(),
-            Cell::Outline(oc) => oc.cut_text(),
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.cut_primary_selection(),
+            CellKind::Outline(oc) => oc.cut_text(),
         }
     }
 
     pub fn paste_text(&mut self, s: &str) {
-        match self {
-            Cell::Plain(tb) => tb.paste(s),
-            Cell::Outline(oc) => oc.paste_text(s),
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.paste(s),
+            CellKind::Outline(oc) => oc.paste_text(s),
         }
     }
 
     pub fn tick(&mut self, canvas: &Canvas, x: f32, y: f32, width: f32, focused: bool) -> f32 {
-        match self {
-            Cell::Plain(tb) => tb.tick(canvas, x, y, width, focused),
-            Cell::Outline(oc) => oc.tick(canvas, x, y, width, focused),
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.tick(canvas, x, y, width, focused),
+            CellKind::Outline(oc) => oc.tick(canvas, x, y, width, focused),
         }
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
-        match self {
-            Cell::Plain(tb) => tb.handle_key(event, modifiers),
-            Cell::Outline(oc) => oc.handle_key(event, modifiers),
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.handle_key(event, modifiers),
+            CellKind::Outline(oc) => oc.handle_key(event, modifiers),
         }
     }
 
     pub fn mouse_down(&mut self, abs_x: f32, abs_y: f32, modifiers: &Modifiers) -> bool {
-        match self {
-            Cell::Plain(tb) => tb.mouse_down(abs_x, abs_y, modifiers),
-            Cell::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers),
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.mouse_down(abs_x, abs_y, modifiers),
+            CellKind::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers),
         }
     }
 
     pub fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
-        match self {
-            Cell::Plain(tb) => tb.mouse_drag_to(abs_x, abs_y),
-            Cell::Outline(oc) => oc.mouse_drag_to(abs_x, abs_y),
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.mouse_drag_to(abs_x, abs_y),
+            CellKind::Outline(oc) => oc.mouse_drag_to(abs_x, abs_y),
         }
     }
 
     pub fn mouse_up(&mut self) -> bool {
-        match self {
-            Cell::Plain(tb) => tb.mouse_up(),
-            Cell::Outline(oc) => oc.mouse_up(),
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.mouse_up(),
+            CellKind::Outline(oc) => oc.mouse_up(),
         }
     }
 
     pub fn x_origin(&self) -> f32 {
-        match self {
-            Cell::Plain(tb) => tb.x_origin(),
-            Cell::Outline(oc) => oc.x_origin,
+        match &self.kind {
+            CellKind::Plain(tb) => tb.x_origin(),
+            CellKind::Outline(oc) => oc.x_origin,
         }
     }
 
     pub fn y_origin(&self) -> f32 {
-        match self {
-            Cell::Plain(tb) => tb.y_origin(),
-            Cell::Outline(oc) => oc.y_origin,
+        match &self.kind {
+            CellKind::Plain(tb) => tb.y_origin(),
+            CellKind::Outline(oc) => oc.y_origin,
         }
     }
 
     pub fn width(&self) -> f32 {
-        match self {
-            Cell::Plain(tb) => tb.width(),
-            Cell::Outline(oc) => oc.width,
+        match &self.kind {
+            CellKind::Plain(tb) => tb.width(),
+            CellKind::Outline(oc) => oc.width,
         }
     }
 
     pub fn height(&self) -> f32 {
-        match self {
-            Cell::Plain(tb) => tb.height(),
-            Cell::Outline(oc) => oc.height,
+        match &self.kind {
+            CellKind::Plain(tb) => tb.height(),
+            CellKind::Outline(oc) => oc.height,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        match self {
-            Cell::Plain(tb) => tb.is_empty(),
-            Cell::Outline(oc) => oc.is_empty(),
+        match &self.kind {
+            CellKind::Plain(tb) => tb.is_empty(),
+            CellKind::Outline(oc) => oc.is_empty(),
         }
     }
 
     pub fn set_font_scale(&mut self, scale: f32) {
-        match self {
-            Cell::Plain(tb) => tb.set_font_scale(scale),
-            Cell::Outline(oc) => oc.set_font_scale(scale),
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.set_font_scale(scale),
+            CellKind::Outline(oc) => oc.set_font_scale(scale),
         }
     }
 
     pub fn caret_doc_y_band(&self) -> Option<(f32, f32)> {
-        match self {
-            Cell::Plain(tb) => tb.caret_doc_y_band(),
-            Cell::Outline(oc) => oc.caret_doc_y_band(),
+        match &self.kind {
+            CellKind::Plain(tb) => tb.caret_doc_y_band(),
+            CellKind::Outline(oc) => oc.caret_doc_y_band(),
         }
     }
 
     pub fn at_top_edge(&self) -> bool {
-        match self {
-            Cell::Plain(tb) => tb.at_top_visual_line(),
-            Cell::Outline(oc) => oc.at_top_edge(),
+        match &self.kind {
+            CellKind::Plain(tb) => tb.at_top_visual_line(),
+            CellKind::Outline(oc) => oc.at_top_edge(),
         }
     }
 
     pub fn at_bottom_edge(&self) -> bool {
-        match self {
-            Cell::Plain(tb) => tb.at_bottom_visual_line(),
-            Cell::Outline(oc) => oc.at_bottom_edge(),
+        match &self.kind {
+            CellKind::Plain(tb) => tb.at_bottom_visual_line(),
+            CellKind::Outline(oc) => oc.at_bottom_edge(),
         }
     }
 
     pub fn place_caret_at_start(&mut self) {
-        match self {
-            Cell::Plain(tb) => tb.set_caret_at(0),
-            Cell::Outline(oc) => oc.place_caret_at_start(),
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.set_caret_at(0),
+            CellKind::Outline(oc) => oc.place_caret_at_start(),
         }
     }
 
     pub fn place_caret_at_end(&mut self) {
-        match self {
-            Cell::Plain(tb) => {
+        match &mut self.kind {
+            CellKind::Plain(tb) => {
                 let end = tb.text().len();
                 tb.set_caret_at(end);
             }
-            Cell::Outline(oc) => oc.place_caret_at_end(),
+            CellKind::Outline(oc) => oc.place_caret_at_end(),
         }
     }
 
     /// `(text, caret_byte)` for the active text input — the cell's textbox
     /// for plain cells, or the focused bullet's textbox for outline cells.
     pub fn focused_text_and_caret(&self) -> Option<(&str, usize)> {
-        match self {
-            Cell::Plain(tb) => tb.primary_caret().map(|(_, h)| (tb.text(), h)),
-            Cell::Outline(oc) => oc.focused_text_and_caret(),
+        match &self.kind {
+            CellKind::Plain(tb) => tb.primary_caret().map(|(_, h)| (tb.text(), h)),
+            CellKind::Outline(oc) => oc.focused_text_and_caret(),
         }
     }
 
     /// Outline cells: ID of the focused bullet. Plain cells: None.
-    pub fn focused_bullet_id(&self) -> Option<u64> {
-        match self {
-            Cell::Plain(_) => None,
-            Cell::Outline(oc) => Some(oc.focused_bullet_id()),
+    pub fn focused_bullet_id(&self) -> Option<Uuid> {
+        match &self.kind {
+            CellKind::Plain(_) => None,
+            CellKind::Outline(oc) => Some(oc.focused_bullet_id()),
         }
     }
 
@@ -2515,35 +2592,47 @@ impl Cell {
     /// active textbox (focused bullet for outline). Used by the @-mention popup.
     pub fn anchor_doc_pos(
         &self,
-        bullet_id: Option<u64>,
+        bullet_id: Option<Uuid>,
         byte: usize,
     ) -> Option<(f32, f32)> {
-        match (self, bullet_id) {
-            (Cell::Plain(tb), None) => {
+        match (&self.kind, bullet_id) {
+            (CellKind::Plain(tb), None) => {
                 let (x, _) = tb.doc_position_of_byte(byte)?;
                 let (_, bot) = tb.line_y_band_of_byte(byte)?;
                 Some((x, bot))
             }
-            (Cell::Outline(oc), Some(id)) => oc.anchor_doc_pos(id, byte),
+            (CellKind::Outline(oc), Some(id)) => oc.anchor_doc_pos(id, byte),
             _ => None,
         }
     }
 
     pub fn snapshot(&self) -> CellSnapshot {
-        match self {
-            Cell::Plain(tb) => CellSnapshot::Plain(tb.snapshot()),
-            Cell::Outline(oc) => CellSnapshot::Outline(oc.snapshot()),
+        CellSnapshot {
+            created_at: self.created_at,
+            kind: match &self.kind {
+                CellKind::Plain(tb) => CellSnapshotKind::Plain(tb.snapshot()),
+                CellKind::Outline(oc) => CellSnapshotKind::Outline(oc.snapshot()),
+            },
         }
     }
 
     /// Restore from a snapshot of the same variant. Variant mismatches are a
     /// bug (undo stack and live state disagree); fall through silently rather
-    /// than panic.
+    /// than panic. `created_at` is preserved from the snapshot; `edited_at` is
+    /// the caller's responsibility to update.
     pub fn restore(&mut self, snap: CellSnapshot) {
-        match (self, snap) {
-            (Cell::Plain(tb), CellSnapshot::Plain(tbs)) => tb.restore(tbs),
-            (Cell::Outline(oc), CellSnapshot::Outline(os)) => oc.restore(os),
+        self.created_at = snap.created_at;
+        match (&mut self.kind, snap.kind) {
+            (CellKind::Plain(tb), CellSnapshotKind::Plain(tbs)) => tb.restore(tbs),
+            (CellKind::Outline(oc), CellSnapshotKind::Outline(os)) => oc.restore(os),
             _ => {}
         }
     }
+}
+
+pub fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

@@ -5,9 +5,14 @@ edition = "2024"
 
 [dependencies]
 arboard = "3"
+dirs = "5"
 gl = "0.14"
 glutin = "0.32.0"
 glutin-winit = "0.5.0"
 raw-window-handle = "0.6.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 skia-safe = { version = "0.87.0", features = ["gl"] }
+uuid = { version = "1", features = ["v4", "v7", "serde", "macro-diagnostics"] }
 winit = "0.30.2"
