@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use skia_safe::{Canvas, Color, FontMgr, Paint, PaintStyle, Rect, Typeface};
+use skia_safe::{Canvas, Color, Font, FontMgr, Paint, PaintStyle, Point, Rect, Typeface};
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
     keyboard::{Key, NamedKey},
@@ -26,6 +26,90 @@ const ZOOM_STEP: f32 = 1.1;
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 3.0;
 const COALESCE_INTERVAL: Duration = Duration::from_millis(600);
+
+const MENTION_POPUP_WIDTH: f32 = 220.0;
+const MENTION_POPUP_ROW_H: f32 = 28.0;
+const MENTION_POPUP_PAD: f32 = 6.0;
+const MENTION_POPUP_RADIUS: f32 = 6.0;
+const MENTION_POPUP_MAX_VISIBLE: usize = 6;
+const MENTION_BODY_FONT_SIZE: f32 = 16.0;
+
+const FAKE_MENTIONS: &[&str] = &[
+    "alice", "alex", "alfred", "anna", "bob", "carol", "dave", "eve",
+    "frank", "grace", "heidi", "ivan", "judy", "karl", "linda",
+];
+
+/// Subsequence fuzzy match. Returns `(score, matched_byte_positions)` if every
+/// query char appears in `candidate` (case-insensitive) in order; None otherwise.
+/// Bonuses: start-of-string, post-separator, contiguous-with-previous-match.
+/// Length penalty so shorter candidates win ties.
+fn fuzzy_score(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
+    if query.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    let q_lower = query.to_lowercase();
+    let c_lower = candidate.to_lowercase();
+    let q = q_lower.as_bytes();
+    let c = c_lower.as_bytes();
+
+    let mut matches: Vec<usize> = Vec::with_capacity(q.len());
+    let mut qi = 0;
+    let mut score: i32 = 0;
+    let mut prev_match: Option<usize> = None;
+
+    for i in 0..c.len() {
+        if qi >= q.len() {
+            break;
+        }
+        if c[i] == q[qi] {
+            matches.push(i);
+            if i == 0 {
+                score += 8;
+            } else if !c[i - 1].is_ascii_alphanumeric() {
+                score += 4;
+            }
+            if let Some(prev) = prev_match {
+                if i == prev + 1 {
+                    score += 5;
+                }
+            }
+            score += 1;
+            prev_match = Some(i);
+            qi += 1;
+        }
+    }
+
+    if qi < q.len() {
+        return None;
+    }
+    score -= (c.len() as i32) / 4;
+    Some((score, matches))
+}
+
+fn filter_mentions(query: &str) -> Vec<(&'static str, Vec<usize>)> {
+    if query.is_empty() {
+        return FAKE_MENTIONS.iter().map(|&n| (n, Vec::new())).collect();
+    }
+    let mut scored: Vec<(i32, &'static str, Vec<usize>)> = FAKE_MENTIONS
+        .iter()
+        .filter_map(|&name| fuzzy_score(query, name).map(|(s, m)| (s, name, m)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.into_iter().map(|(_, n, m)| (n, m)).collect()
+}
+
+struct MentionPopup {
+    /// Cell index the popup is anchored to.
+    cell_idx: usize,
+    /// For outline cells, the specific bullet's id. None for plain cells.
+    bullet_id: Option<u64>,
+    /// Byte position of the '@' in the active textbox.
+    anchor_byte: usize,
+    /// Currently typed query (text after the '@', no whitespace).
+    query: String,
+    /// Index of the highlighted item in the filtered list.
+    selected: usize,
+}
 
 enum UndoOp {
     CellEdit {
@@ -74,6 +158,7 @@ pub struct KeptApp {
     redo_stack: Vec<UndoOp>,
     last_edit_time: Option<Instant>,
     coalesce_break: bool,
+    mention_popup: Option<MentionPopup>,
 }
 
 impl KeptApp {
@@ -101,6 +186,7 @@ impl KeptApp {
             redo_stack: Vec::new(),
             last_edit_time: None,
             coalesce_break: false,
+            mention_popup: None,
         }
     }
 
@@ -174,6 +260,8 @@ impl KeptApp {
             canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &focus_paint);
         }
 
+        self.render_mention_popup(canvas);
+
         canvas.restore();
 
         // Update bookkeeping for scroll math + clamp again in case content shrank.
@@ -218,6 +306,32 @@ impl KeptApp {
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        // While the @-mention popup is open, intercept navigation/commit/dismiss
+        // keys; everything else falls through to the cell, after which we sync
+        // the popup against the new text+caret state.
+        if event.state == ElementState::Pressed && self.mention_popup.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.mention_popup = None;
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.mention_popup_move(-1);
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.mention_popup_move(1);
+                    return true;
+                }
+                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
+                    // Selection commit is non-functional for now — just dismiss.
+                    self.mention_popup = None;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
         if event.state == ElementState::Pressed && modifiers.state().control_key() {
             match &event.logical_key {
                 Key::Named(NamedKey::Enter) => {
@@ -304,6 +418,7 @@ impl KeptApp {
         }
 
         let pre = self.cells.get(self.focused).map(|c| c.snapshot());
+        let popup_was_open = self.mention_popup.is_some();
         let handled = if let Some(cell) = self.cells.get_mut(self.focused) {
             cell.handle_key(event, modifiers)
         } else {
@@ -321,8 +436,234 @@ impl KeptApp {
                 }
             }
             self.pending_caret_scroll = true;
+
+            // Maybe open the @-mention popup (if user just typed '@'), then
+            // sync against the current text+caret state.
+            if !popup_was_open && event.text.as_deref() == Some("@") {
+                self.try_open_mention_popup();
+            }
+            self.sync_mention_popup();
         }
         handled
+    }
+
+    fn try_open_mention_popup(&mut self) {
+        let Some(cell) = self.cells.get(self.focused) else {
+            return;
+        };
+        let Some((text, caret)) = cell.focused_text_and_caret() else {
+            return;
+        };
+        if caret == 0 {
+            return;
+        }
+        // Caret should be just past the '@'.
+        if text.get(caret - 1..caret) != Some("@") {
+            return;
+        }
+        self.mention_popup = Some(MentionPopup {
+            cell_idx: self.focused,
+            bullet_id: cell.focused_bullet_id(),
+            anchor_byte: caret - 1,
+            query: String::new(),
+            selected: 0,
+        });
+    }
+
+    fn sync_mention_popup(&mut self) {
+        let Some(popup) = self.mention_popup.as_ref() else {
+            return;
+        };
+        // Cell focus must still match.
+        if self.focused != popup.cell_idx {
+            self.mention_popup = None;
+            return;
+        }
+        let Some(cell) = self.cells.get(self.focused) else {
+            self.mention_popup = None;
+            return;
+        };
+        // Bullet must still match (outline only).
+        if cell.focused_bullet_id() != popup.bullet_id {
+            self.mention_popup = None;
+            return;
+        }
+        let Some((text, caret)) = cell.focused_text_and_caret() else {
+            self.mention_popup = None;
+            return;
+        };
+        // The '@' must still be at anchor_byte.
+        if text.get(popup.anchor_byte..).map_or(true, |s| !s.starts_with('@')) {
+            self.mention_popup = None;
+            return;
+        }
+        // Caret must be at or past the '@' itself.
+        if caret < popup.anchor_byte + 1 {
+            self.mention_popup = None;
+            return;
+        }
+        // Query is everything between the '@' and the caret. Whitespace breaks it.
+        let Some(query) = text.get(popup.anchor_byte + 1..caret) else {
+            self.mention_popup = None;
+            return;
+        };
+        if query.chars().any(|c| c.is_whitespace()) {
+            self.mention_popup = None;
+            return;
+        }
+        if let Some(p) = self.mention_popup.as_mut() {
+            p.query = query.to_string();
+            let count = filter_mentions(&p.query).len().min(MENTION_POPUP_MAX_VISIBLE);
+            if count == 0 {
+                p.selected = 0;
+            } else if p.selected >= count {
+                p.selected = count - 1;
+            }
+        }
+    }
+
+    fn render_mention_popup(&self, canvas: &Canvas) {
+        let Some(popup) = self.mention_popup.as_ref() else {
+            return;
+        };
+        let Some(cell) = self.cells.get(popup.cell_idx) else {
+            return;
+        };
+        let Some((anchor_x, anchor_y_below)) =
+            cell.anchor_doc_pos(popup.bullet_id, popup.anchor_byte)
+        else {
+            return;
+        };
+
+        let scale = self.font_scale;
+        let popup_w = MENTION_POPUP_WIDTH * scale;
+        let row_h = MENTION_POPUP_ROW_H * scale;
+        let pad = MENTION_POPUP_PAD * scale;
+        let radius = MENTION_POPUP_RADIUS * scale;
+
+        let items = filter_mentions(&popup.query);
+        let visible = items.len().min(MENTION_POPUP_MAX_VISIBLE);
+        let popup_h = if visible == 0 {
+            row_h + pad * 2.0
+        } else {
+            (visible as f32) * row_h + pad * 2.0
+        };
+
+        let popup_x = anchor_x;
+        let popup_y = anchor_y_below + 4.0 * scale;
+
+        // Drop shadow (drawn first, slightly offset).
+        let mut shadow_paint = Paint::default();
+        shadow_paint.set_anti_alias(true);
+        shadow_paint.set_color(Color::from_argb(0x30, 0, 0, 0));
+        canvas.draw_round_rect(
+            Rect::new(
+                popup_x + 1.0,
+                popup_y + 2.0,
+                popup_x + popup_w + 1.0,
+                popup_y + popup_h + 2.0,
+            ),
+            radius,
+            radius,
+            &shadow_paint,
+        );
+
+        // Background.
+        let mut bg_paint = Paint::default();
+        bg_paint.set_anti_alias(true);
+        bg_paint.set_color(Color::WHITE);
+        let popup_rect = Rect::new(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h);
+        canvas.draw_round_rect(popup_rect, radius, radius, &bg_paint);
+
+        // Border.
+        let mut border_paint = Paint::default();
+        border_paint.set_anti_alias(true);
+        border_paint.set_style(PaintStyle::Stroke);
+        border_paint.set_stroke_width(1.0);
+        border_paint.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        canvas.draw_round_rect(popup_rect, radius, radius, &border_paint);
+
+        let body_font = Font::from_typeface(&self.typeface, MENTION_BODY_FONT_SIZE * scale);
+        let (_, m) = body_font.metrics();
+        let row_text_height = -m.ascent + m.descent;
+        let text_offset_in_row = (row_h - row_text_height) * 0.5 + (-m.ascent);
+
+        if items.is_empty() {
+            let mut hint_paint = Paint::default();
+            hint_paint.set_anti_alias(true);
+            hint_paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+            let baseline = popup_y + pad + text_offset_in_row;
+            let label = if popup.query.is_empty() {
+                "Type to search…".to_string()
+            } else {
+                format!("No matches for \"{}\"", popup.query)
+            };
+            canvas.draw_str(
+                label,
+                Point::new(popup_x + 12.0 * scale, baseline),
+                &body_font,
+                &hint_paint,
+            );
+            return;
+        }
+
+        let mut dim_paint = Paint::default();
+        dim_paint.set_anti_alias(true);
+        dim_paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+
+        let mut match_paint = Paint::default();
+        match_paint.set_anti_alias(true);
+        match_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+
+        let mut hl_paint = Paint::default();
+        hl_paint.set_anti_alias(true);
+        hl_paint.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+
+        let selected = popup.selected.min(visible - 1);
+        let mut row_y = popup_y + pad;
+        for (i, (item, matches)) in items.iter().take(visible).enumerate() {
+            if i == selected {
+                canvas.draw_round_rect(
+                    Rect::new(
+                        popup_x + 4.0 * scale,
+                        row_y,
+                        popup_x + popup_w - 4.0 * scale,
+                        row_y + row_h,
+                    ),
+                    4.0 * scale,
+                    4.0 * scale,
+                    &hl_paint,
+                );
+            }
+            let baseline = row_y + text_offset_in_row;
+            let text_x = popup_x + 12.0 * scale;
+            // Render '@' in dim, then alternate dim / match-paint runs.
+            let at_w = body_font.measure_str("@", Some(&dim_paint)).0;
+            canvas.draw_str("@", Point::new(text_x, baseline), &body_font, &dim_paint);
+            draw_runs_with_matches(
+                canvas,
+                item,
+                matches,
+                Point::new(text_x + at_w, baseline),
+                &body_font,
+                &match_paint,
+                &dim_paint,
+            );
+            row_y += row_h;
+        }
+    }
+
+    fn mention_popup_move(&mut self, delta: i32) {
+        let Some(p) = self.mention_popup.as_mut() else {
+            return;
+        };
+        let count = filter_mentions(&p.query).len().min(MENTION_POPUP_MAX_VISIBLE);
+        if count == 0 {
+            return;
+        }
+        let cur = p.selected.min(count - 1) as i32;
+        let new = ((cur + delta).rem_euclid(count as i32)) as usize;
+        p.selected = new;
     }
 
     fn record_edit(&mut self, pre: CellSnapshot, post: CellSnapshot) {
@@ -545,6 +886,9 @@ impl KeptApp {
     }
 
     pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
+        // Any click dismisses an active @-mention popup.
+        self.mention_popup = None;
+
         let doc_y = y + self.scroll_y;
         let Some(target) = self.find_cell_at(x, doc_y) else {
             return false;
@@ -620,5 +964,34 @@ fn scrollbar_alpha(last: Option<Instant>) -> f32 {
     } else {
         let into_fade = elapsed - SCROLLBAR_HOLD;
         1.0 - (into_fade.as_secs_f32() / SCROLLBAR_FADE.as_secs_f32())
+    }
+}
+
+/// Draw `name` starting at `origin`, painting bytes in `match_indices` with
+/// `match_paint` and the rest with `dim_paint`. ASCII-safe (matches use byte
+/// indices); the FAKE_MENTIONS list is all ASCII so this is fine.
+fn draw_runs_with_matches(
+    canvas: &Canvas,
+    name: &str,
+    match_indices: &[usize],
+    origin: Point,
+    font: &Font,
+    match_paint: &Paint,
+    dim_paint: &Paint,
+) {
+    let bytes = name.as_bytes();
+    let mut x = origin.x;
+    let mut i = 0;
+    while i < bytes.len() {
+        let in_match = match_indices.contains(&i);
+        let mut j = i + 1;
+        while j < bytes.len() && match_indices.contains(&j) == in_match {
+            j += 1;
+        }
+        let segment = &name[i..j];
+        let paint = if in_match { match_paint } else { dim_paint };
+        canvas.draw_str(segment, Point::new(x, origin.y), font, paint);
+        x += font.measure_str(segment, Some(paint)).0;
+        i = j;
     }
 }

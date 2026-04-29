@@ -261,6 +261,45 @@ impl TextBox {
         self.primary_visual_line() + 1 >= self.visual_line_count()
     }
 
+    /// Absolute (x, baseline_y) of the byte at `byte` on its visual line.
+    pub fn doc_position_of_byte(&self, byte: usize) -> Option<(f32, f32)> {
+        if self.body_lines.is_empty() {
+            return None;
+        }
+        let (li, _) = locate_caret(&self.body_lines, byte, Affinity::Downstream);
+        let line = self.body_lines.get(li)?;
+        let prefix_end = byte.min(line.end);
+        let body_font = self.body_font();
+        let paint = Paint::default();
+        let local_x = body_font
+            .measure_str(&self.text[line.start..prefix_end], Some(&paint))
+            .0;
+        let (_, m) = body_font.metrics();
+        let line_step = -m.ascent + m.descent + m.leading;
+        let line_extra = line_step * 0.25;
+        let line_advance = line_step + line_extra;
+        let baseline_local = (li as f32) * line_advance + (-m.ascent);
+        Some((self.x_origin + local_x, self.y_origin + baseline_local))
+    }
+
+    /// Absolute (top, bottom) y of the visual line containing `byte`.
+    pub fn line_y_band_of_byte(&self, byte: usize) -> Option<(f32, f32)> {
+        if self.body_lines.is_empty() {
+            return None;
+        }
+        let (li, _) = locate_caret(&self.body_lines, byte, Affinity::Downstream);
+        let body_font = self.body_font();
+        let (_, m) = body_font.metrics();
+        let line_step = -m.ascent + m.descent + m.leading;
+        let line_extra = line_step * 0.25;
+        let line_advance = line_step + line_extra;
+        let top_local = (li as f32) * line_advance;
+        Some((
+            self.y_origin + top_local,
+            self.y_origin + top_local + line_advance,
+        ))
+    }
+
     pub fn snapshot(&self) -> TextBoxSnapshot {
         TextBoxSnapshot {
             text: self.text.clone(),
@@ -1550,6 +1589,28 @@ impl OutlineCell {
         self.focused_bullet = self.bullets[0].id;
     }
 
+    pub fn focused_bullet_id(&self) -> u64 {
+        self.focused_bullet
+    }
+
+    pub fn focused_text_and_caret(&self) -> Option<(&str, usize)> {
+        let idx = self.focused_index()?;
+        let tb = &self.bullets[idx].textbox;
+        tb.primary_caret().map(|(_, h)| (tb.text(), h))
+    }
+
+    /// Anchor a popup at byte `byte` in the bullet identified by `bullet_id`.
+    /// Returns `(abs_x, abs_y_below_line)` so the popup can render below the
+    /// line containing the byte. Returns None if the bullet is gone or the
+    /// byte is out of range.
+    pub fn anchor_doc_pos(&self, bullet_id: u64, byte: usize) -> Option<(f32, f32)> {
+        let idx = self.bullet_idx_by_id(bullet_id)?;
+        let tb = &self.bullets[idx].textbox;
+        let (x, _) = tb.doc_position_of_byte(byte)?;
+        let (_, bot) = tb.line_y_band_of_byte(byte)?;
+        Some((x, bot))
+    }
+
     /// Place the caret at the very end of the cell (last bullet, end of text).
     pub fn place_caret_at_end(&mut self) {
         self.bullet_selection = None;
@@ -2123,6 +2184,41 @@ impl Cell {
                 tb.set_caret_at(end);
             }
             Cell::Outline(oc) => oc.place_caret_at_end(),
+        }
+    }
+
+    /// `(text, caret_byte)` for the active text input — the cell's textbox
+    /// for plain cells, or the focused bullet's textbox for outline cells.
+    pub fn focused_text_and_caret(&self) -> Option<(&str, usize)> {
+        match self {
+            Cell::Plain(tb) => tb.primary_caret().map(|(_, h)| (tb.text(), h)),
+            Cell::Outline(oc) => oc.focused_text_and_caret(),
+        }
+    }
+
+    /// Outline cells: ID of the focused bullet. Plain cells: None.
+    pub fn focused_bullet_id(&self) -> Option<u64> {
+        match self {
+            Cell::Plain(_) => None,
+            Cell::Outline(oc) => Some(oc.focused_bullet_id()),
+        }
+    }
+
+    /// Anchor position for an overlay tied to byte `byte` in this cell's
+    /// active textbox (focused bullet for outline). Used by the @-mention popup.
+    pub fn anchor_doc_pos(
+        &self,
+        bullet_id: Option<u64>,
+        byte: usize,
+    ) -> Option<(f32, f32)> {
+        match (self, bullet_id) {
+            (Cell::Plain(tb), None) => {
+                let (x, _) = tb.doc_position_of_byte(byte)?;
+                let (_, bot) = tb.line_y_band_of_byte(byte)?;
+                Some((x, bot))
+            }
+            (Cell::Outline(oc), Some(id)) => oc.anchor_doc_pos(id, byte),
+            _ => None,
         }
     }
 
