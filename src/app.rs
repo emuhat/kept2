@@ -681,6 +681,49 @@ impl KeptApp {
         sorted.get(pos + 1).map(|c| c.id)
     }
 
+    fn context_has_cells(&self, ctx: &Context) -> bool {
+        let start = ctx.start_time;
+        let end = ctx.end_time;
+        self.cells
+            .iter()
+            .any(|c| c.timestamp >= start && end.map(|e| c.timestamp < e).unwrap_or(true))
+    }
+
+    /// Walk contexts forward in time from the current view, skipping empties.
+    /// Used for arrow-nav cross-context jumps so an empty newer context
+    /// doesn't trap the cursor.
+    fn next_context_with_cells(&self) -> Option<Uuid> {
+        let current = match self.view {
+            ViewSelection::Context(id) => id,
+            ViewSelection::Date(_) => return None,
+        };
+        let mut sorted: Vec<&Context> = self.contexts.iter().collect();
+        sorted.sort_by_key(|c| c.start_time);
+        let pos = sorted.iter().position(|c| c.id == current)?;
+        sorted
+            .iter()
+            .skip(pos + 1)
+            .find(|c| self.context_has_cells(c))
+            .map(|c| c.id)
+    }
+
+    /// Walk contexts backward in time, skipping empties.
+    fn prev_context_with_cells(&self) -> Option<Uuid> {
+        let current = match self.view {
+            ViewSelection::Context(id) => id,
+            ViewSelection::Date(_) => return None,
+        };
+        let mut sorted: Vec<&Context> = self.contexts.iter().collect();
+        sorted.sort_by_key(|c| c.start_time);
+        let pos = sorted.iter().position(|c| c.id == current)?;
+        sorted
+            .iter()
+            .take(pos)
+            .rev()
+            .find(|c| self.context_has_cells(c))
+            .map(|c| c.id)
+    }
+
     /// In Context view: if the viewed context is closed, switch to the most
     /// recent open one so writes land in "today." In Date view: no-op (writes
     /// still go to the writable context, which is found at insertion time).
@@ -741,13 +784,18 @@ impl KeptApp {
         true
     }
 
-    /// IDs of cells visible under the active view, in timestamp order.
+    /// IDs of cells visible under the active view, in DISPLAY order — newest
+    /// first. Index 0 is the topmost (most recent) cell. `prev_visible` /
+    /// `next_visible` operate on this same order, so "prev" = visually above.
     fn visible_cell_ids(&self) -> Vec<Uuid> {
-        self.cells
+        let mut ids: Vec<Uuid> = self
+            .cells
             .iter()
             .filter(|c| self.is_visible_for_view(c.timestamp))
             .map(|c| c.id)
-            .collect()
+            .collect();
+        ids.reverse();
+        ids
     }
 
     /// Insert a cell into the stream maintaining ascending timestamp order.
@@ -933,23 +981,23 @@ impl KeptApp {
             .map(|c| self.is_visible_for_view(c.timestamp))
             .collect();
         let in_date_view = matches!(self.view, ViewSelection::Date(_));
+        // Headers are aligned to self.cells indices but computed in DISPLAY
+        // order (descending) so a header lands above the first cell of each
+        // context group as the user scrolls top-down.
         let headers: Vec<Option<String>> = if in_date_view {
-            let mut hs: Vec<Option<String>> = Vec::with_capacity(self.cells.len());
+            let mut hs: Vec<Option<String>> = vec![None; self.cells.len()];
             let mut last_id: Option<Uuid> = None;
-            for (i, cell) in self.cells.iter().enumerate() {
+            for i in (0..self.cells.len()).rev() {
                 if !visible[i] {
-                    hs.push(None);
                     continue;
                 }
+                let cell = &self.cells[i];
                 let ctx = self.context_for_timestamp(cell.timestamp);
                 let ctx_id = ctx.map(|c| c.id);
-                let label = if ctx_id != last_id {
+                if ctx_id != last_id {
                     last_id = ctx_id;
-                    ctx.map(|c| format_context_time(c.start_time))
-                } else {
-                    None
-                };
-                hs.push(label);
+                    hs[i] = ctx.map(|c| format_context_time(c.start_time));
+                }
             }
             hs
         } else {
@@ -963,7 +1011,11 @@ impl KeptApp {
         let header_h = CONTEXT_HEADER_H * scale;
         let header_pad_top = CONTEXT_HEADER_PAD_TOP * scale;
 
-        for (i, cell) in self.cells.iter_mut().enumerate() {
+        // Render cells newest-first (descending) — index walked in reverse so
+        // self.cells (asc) iterates from end to start.
+        let total_cells = self.cells.len();
+        for i in (0..total_cells).rev() {
+            let cell = &mut self.cells[i];
             if !visible[i] {
                 continue;
             }
@@ -1276,6 +1328,12 @@ impl KeptApp {
                                 self.scroll_to_focused();
                                 return true;
                             }
+                            if let Some(next_ctx) = self.next_context_with_cells() {
+                                if self.set_active_context(next_ctx) {
+                                    self.focused = self.visible_cell_ids().last().copied();
+                                    return true;
+                                }
+                            }
                         }
                         return false;
                     }
@@ -1286,6 +1344,12 @@ impl KeptApp {
                                 self.coalesce_break = true;
                                 self.scroll_to_focused();
                                 return true;
+                            }
+                            if let Some(prev_ctx) = self.prev_context_with_cells() {
+                                if self.set_active_context(prev_ctx) {
+                                    self.focused = self.visible_cell_ids().first().copied();
+                                    return true;
+                                }
                             }
                         }
                         return false;
@@ -1322,6 +1386,26 @@ impl KeptApp {
                                 self.pending_caret_scroll = true;
                                 return true;
                             }
+                            // No more cells in this view going up — cross to
+                            // the newer context and land at its bottom (oldest)
+                            // cell, caret at end so the chronological flow is
+                            // continuous when arrowing further up. Skip empty
+                            // contexts so the cursor doesn't get trapped.
+                            if let Some(next_ctx) = self.next_context_with_cells() {
+                                if self.set_active_context(next_ctx) {
+                                    let landing = self.visible_cell_ids().last().copied();
+                                    self.focused = landing;
+                                    if let Some(id) = landing {
+                                        if let Some(c) = self.cell_mut(id) {
+                                            c.place_caret_at_end();
+                                        }
+                                    }
+                                    self.editing = false;
+                                    self.coalesce_break = true;
+                                    self.pending_caret_scroll = true;
+                                    return true;
+                                }
+                            }
                         }
                     }
                 }
@@ -1338,6 +1422,24 @@ impl KeptApp {
                                 self.coalesce_break = true;
                                 self.pending_caret_scroll = true;
                                 return true;
+                            }
+                            // Bottom of the view — cross to the older context
+                            // and land at its top (newest) cell, caret at start.
+                            // Skip empties.
+                            if let Some(prev_ctx) = self.prev_context_with_cells() {
+                                if self.set_active_context(prev_ctx) {
+                                    let landing = self.visible_cell_ids().first().copied();
+                                    self.focused = landing;
+                                    if let Some(id) = landing {
+                                        if let Some(c) = self.cell_mut(id) {
+                                            c.place_caret_at_start();
+                                        }
+                                    }
+                                    self.editing = false;
+                                    self.coalesce_break = true;
+                                    self.pending_caret_scroll = true;
+                                    return true;
+                                }
                             }
                         }
                     }
