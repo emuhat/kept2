@@ -196,6 +196,9 @@ impl KeptApp {
                 Key::Named(NamedKey::Enter) => {
                     return self.insert_cell_after_focused();
                 }
+                Key::Named(NamedKey::Delete) => {
+                    return self.delete_focused_cell();
+                }
                 Key::Named(NamedKey::ArrowUp) => {
                     if self.focused > 0 {
                         self.focused -= 1;
@@ -230,6 +233,20 @@ impl KeptApp {
             self.pending_caret_scroll = true;
         }
         handled
+    }
+
+    fn delete_focused_cell(&mut self) -> bool {
+        // Refuse to delete the last cell — leaves the app with nothing to focus.
+        if self.cells.len() <= 1 {
+            return false;
+        }
+        self.cells.remove(self.focused);
+        if self.focused >= self.cells.len() {
+            self.focused = self.cells.len() - 1;
+        }
+        self.dragging_cell = None;
+        self.pending_caret_scroll = true;
+        true
     }
 
     fn insert_cell_after_focused(&mut self) -> bool {
