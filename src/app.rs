@@ -241,9 +241,10 @@ const SIDEBAR_DATE_FONT_SIZE: f32 = 13.0;
 const SIDEBAR_ITEM_FONT_SIZE: f32 = 12.0;
 
 /// Context-section header drawn in Date view between cell groups from
-/// different contexts.
-const CONTEXT_HEADER_H: f32 = 32.0;
-const CONTEXT_HEADER_PAD_TOP: f32 = 12.0;
+/// different contexts. `H` covers `PAD_TOP + text + PAD_BOTTOM`. The bottom
+/// pad must clear `FOCUS_PAD` on the cell that follows, plus breathing room.
+const CONTEXT_HEADER_H: f32 = 50.0;
+const CONTEXT_HEADER_PAD_TOP: f32 = 14.0;
 const CONTEXT_HEADER_FONT_SIZE: f32 = 11.0;
 
 const KEBAB_SIZE: f32 = 22.0;
@@ -916,7 +917,7 @@ impl KeptApp {
         }
 
         let mut y = MARGIN_TOP;
-        let cells_left = SIDEBAR_WIDTH + MARGIN_X;
+        let cells_left = SIDEBAR_WIDTH * self.font_scale + MARGIN_X;
         let outer_cell_width = (width - cells_left - MARGIN_X).max(80.0);
         let content_width = (outer_cell_width - KEBAB_RESERVE).max(60.0);
         self.last_kebab_rects.clear();
@@ -955,15 +956,19 @@ impl KeptApp {
             vec![None; self.cells.len()]
         };
 
-        let header_font = Font::from_typeface(&self.typeface, CONTEXT_HEADER_FONT_SIZE);
+        let scale = self.font_scale;
+        let header_font =
+            Font::from_typeface(&self.typeface, CONTEXT_HEADER_FONT_SIZE * scale);
         let (_, hm) = header_font.metrics();
+        let header_h = CONTEXT_HEADER_H * scale;
+        let header_pad_top = CONTEXT_HEADER_PAD_TOP * scale;
 
         for (i, cell) in self.cells.iter_mut().enumerate() {
             if !visible[i] {
                 continue;
             }
             if let Some(label) = &headers[i] {
-                let header_y = y + CONTEXT_HEADER_PAD_TOP;
+                let header_y = y + header_pad_top;
                 let baseline = header_y + (-hm.ascent);
                 let mut hp = Paint::default();
                 hp.set_anti_alias(true);
@@ -981,11 +986,11 @@ impl KeptApp {
                 lp.set_color(Color::from_argb(0x40, 0x90, 0x88, 0x7a));
                 lp.set_stroke_width(1.0);
                 canvas.draw_line(
-                    Point::new(cells_left + label_w + 8.0, line_y),
+                    Point::new(cells_left + label_w + 8.0 * scale, line_y),
                     Point::new(cells_left + outer_cell_width, line_y),
                     &lp,
                 );
-                y += CONTEXT_HEADER_H;
+                y += header_h;
             }
             let cell_x = cells_left;
             let cell_y = y;
@@ -1588,33 +1593,43 @@ impl KeptApp {
     }
 
     fn render_sidebar(&mut self, canvas: &Canvas, height: f32) {
+        let scale = self.font_scale;
+        let sb_w = SIDEBAR_WIDTH * scale;
+        let pad_x = SIDEBAR_PAD_X * scale;
+        let pad_top = SIDEBAR_PAD_TOP * scale;
+        let header_h = SIDEBAR_HEADER_H * scale;
+        let date_h = SIDEBAR_DATE_H * scale;
+        let item_h = SIDEBAR_ITEM_H * scale;
+        let item_gap = SIDEBAR_ITEM_GAP * scale;
+        let date_gap = SIDEBAR_DATE_GAP * scale;
+        let indent = SIDEBAR_INDENT * scale;
+        let radius = SIDEBAR_ITEM_RADIUS * scale;
+
         // Background panel.
         let mut bg_paint = Paint::default();
         bg_paint.set_anti_alias(true);
         bg_paint.set_color(Color::from_rgb(0xf2, 0xee, 0xe6));
-        canvas.draw_rect(
-            Rect::new(0.0, 0.0, SIDEBAR_WIDTH, height.max(0.0)),
-            &bg_paint,
-        );
+        canvas.draw_rect(Rect::new(0.0, 0.0, sb_w, height.max(0.0)), &bg_paint);
         // Right-edge separator.
         let mut sep = Paint::default();
         sep.set_anti_alias(false);
         sep.set_color(Color::from_rgb(0xdc, 0xd4, 0xc6));
         canvas.draw_rect(
-            Rect::new(SIDEBAR_WIDTH - 1.0, 0.0, SIDEBAR_WIDTH, height.max(0.0)),
+            Rect::new(sb_w - 1.0, 0.0, sb_w, height.max(0.0)),
             &sep,
         );
 
         // Header.
-        let header_font = Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE);
+        let header_font =
+            Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
         let mut header_paint = Paint::default();
         header_paint.set_anti_alias(true);
         header_paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
         let (_, hm) = header_font.metrics();
-        let header_baseline = SIDEBAR_PAD_TOP + (-hm.ascent);
+        let header_baseline = pad_top + (-hm.ascent);
         canvas.draw_str(
             "CONTEXTS",
-            Point::new(SIDEBAR_PAD_X, header_baseline),
+            Point::new(pad_x, header_baseline),
             &header_font,
             &header_paint,
         );
@@ -1635,25 +1650,19 @@ impl KeptApp {
         }
         let dates: Vec<chrono::NaiveDate> = groups.keys().rev().copied().collect();
 
-        let date_font = Font::from_typeface(&self.typeface, SIDEBAR_DATE_FONT_SIZE);
-        let item_font = Font::from_typeface(&self.typeface, SIDEBAR_ITEM_FONT_SIZE);
+        let date_font = Font::from_typeface(&self.typeface, SIDEBAR_DATE_FONT_SIZE * scale);
+        let item_font = Font::from_typeface(&self.typeface, SIDEBAR_ITEM_FONT_SIZE * scale);
         let (_, dm) = date_font.metrics();
         let (_, im) = item_font.metrics();
         let mouse_x = self.mouse_pos.0;
         let mouse_y = self.mouse_pos.1;
 
-        let mut y = SIDEBAR_PAD_TOP + SIDEBAR_HEADER_H;
+        let mut y = pad_top + header_h;
         for d in dates {
             let mut day_contexts: Vec<&Context> = groups.get(&d).cloned().unwrap_or_default();
             day_contexts.sort_by_key(|c| std::cmp::Reverse(c.start_time));
 
-            // Date row.
-            let date_rect = Rect::new(
-                SIDEBAR_PAD_X * 0.5,
-                y,
-                SIDEBAR_WIDTH - SIDEBAR_PAD_X * 0.5,
-                y + SIDEBAR_DATE_H,
-            );
+            let date_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
             if date_rect.top > height {
                 break;
             }
@@ -1667,33 +1676,32 @@ impl KeptApp {
                 let mut p = Paint::default();
                 p.set_anti_alias(true);
                 p.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
-                canvas.draw_round_rect(date_rect, SIDEBAR_ITEM_RADIUS, SIDEBAR_ITEM_RADIUS, &p);
+                canvas.draw_round_rect(date_rect, radius, radius, &p);
             } else if date_hovered {
                 let mut p = Paint::default();
                 p.set_anti_alias(true);
                 p.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
-                canvas.draw_round_rect(date_rect, SIDEBAR_ITEM_RADIUS, SIDEBAR_ITEM_RADIUS, &p);
+                canvas.draw_round_rect(date_rect, radius, radius, &p);
             }
             let mut date_paint = Paint::default();
             date_paint.set_anti_alias(true);
             date_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
-            let date_baseline = y + (SIDEBAR_DATE_H + (-dm.ascent) - dm.descent) * 0.5;
+            let date_baseline = y + (date_h + (-dm.ascent) - dm.descent) * 0.5;
             canvas.draw_str(
                 format_date_label(d),
-                Point::new(SIDEBAR_PAD_X, date_baseline),
+                Point::new(pad_x, date_baseline),
                 &date_font,
                 &date_paint,
             );
             self.last_sidebar_date_rects.push((d, date_rect));
-            y += SIDEBAR_DATE_H + SIDEBAR_ITEM_GAP;
+            y += date_h + item_gap;
 
-            // Context rows under this date — indented.
             for ctx in day_contexts {
                 let item_rect = Rect::new(
-                    SIDEBAR_PAD_X * 0.5 + SIDEBAR_INDENT,
+                    pad_x * 0.5 + indent,
                     y,
-                    SIDEBAR_WIDTH - SIDEBAR_PAD_X * 0.5,
-                    y + SIDEBAR_ITEM_H,
+                    sb_w - pad_x * 0.5,
+                    y + item_h,
                 );
                 if item_rect.top > height {
                     break;
@@ -1708,22 +1716,12 @@ impl KeptApp {
                     let mut p = Paint::default();
                     p.set_anti_alias(true);
                     p.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
-                    canvas.draw_round_rect(
-                        item_rect,
-                        SIDEBAR_ITEM_RADIUS,
-                        SIDEBAR_ITEM_RADIUS,
-                        &p,
-                    );
+                    canvas.draw_round_rect(item_rect, radius, radius, &p);
                 } else if is_hovered {
                     let mut p = Paint::default();
                     p.set_anti_alias(true);
                     p.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
-                    canvas.draw_round_rect(
-                        item_rect,
-                        SIDEBAR_ITEM_RADIUS,
-                        SIDEBAR_ITEM_RADIUS,
-                        &p,
-                    );
+                    canvas.draw_round_rect(item_rect, radius, radius, &p);
                 }
 
                 let mut text_paint = Paint::default();
@@ -1734,20 +1732,19 @@ impl KeptApp {
                     Color::from_rgb(0x55, 0x55, 0x55)
                 };
                 text_paint.set_color(text_color);
-                let baseline =
-                    y + (SIDEBAR_ITEM_H + (-im.ascent) - im.descent) * 0.5;
+                let baseline = y + (item_h + (-im.ascent) - im.descent) * 0.5;
                 let label = format_context_time(ctx.start_time);
                 canvas.draw_str(
                     label,
-                    Point::new(SIDEBAR_PAD_X + SIDEBAR_INDENT, baseline),
+                    Point::new(pad_x + indent, baseline),
                     &item_font,
                     &text_paint,
                 );
 
                 self.last_sidebar_rects.push((ctx.id, item_rect));
-                y += SIDEBAR_ITEM_H + SIDEBAR_ITEM_GAP;
+                y += item_h + item_gap;
             }
-            y += SIDEBAR_DATE_GAP;
+            y += date_gap;
         }
     }
 
@@ -2375,7 +2372,7 @@ impl KeptApp {
 
         // Sidebar clicks switch the view. Sidebar lives in window (logical)
         // space, so use raw (x, y) — not doc_y.
-        if x < SIDEBAR_WIDTH {
+        if x < SIDEBAR_WIDTH * self.font_scale {
             // Context rows first (they're indented inside dates so their bbox
             // overlaps date row gaps in some edge cases — context wins).
             for (id, rect) in self.last_sidebar_rects.clone() {
