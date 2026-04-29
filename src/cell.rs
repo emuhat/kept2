@@ -277,7 +277,8 @@ impl TextBox {
         }
         let (li, _) = locate_caret(&self.body_lines, byte, Affinity::Downstream);
         let line = self.body_lines.get(li)?;
-        let prefix_end = byte.min(line.end);
+        let visible_end = trim_nl_end(&self.text, line);
+        let prefix_end = byte.min(visible_end);
         let body_font = self.body_font();
         let paint = Paint::default();
         let local_x = body_font
@@ -462,8 +463,11 @@ impl TextBox {
                 }
                 let r = sel.range();
                 for (li, line) in self.body_lines.iter().enumerate() {
-                    let s = r.start.max(line.start);
-                    let e = r.end.min(line.end);
+                    // Don't extend the highlight past the visible end (the '\n'
+                    // is part of the line range but isn't rendered).
+                    let visible_end = trim_nl_end(&self.text, line);
+                    let s = r.start.max(line.start).min(visible_end);
+                    let e = r.end.min(visible_end);
                     if s >= e {
                         continue;
                     }
@@ -490,9 +494,12 @@ impl TextBox {
         underline_paint.set_stroke_width(1.0);
         for (li, line) in self.body_lines.iter().enumerate() {
             let baseline = baselines_local[li] + y;
+            // Trailing '\n' is part of the line range but not drawn.
+            let visible_end = trim_nl_end(&self.text, line);
+            let visible_line = line.start..visible_end;
             if self.links.is_empty() {
                 canvas.draw_str(
-                    &self.text[line.clone()],
+                    &self.text[visible_line.clone()],
                     Point::new(x, baseline),
                     &body_font,
                     &text_paint,
@@ -501,7 +508,7 @@ impl TextBox {
                 draw_line_with_links(
                     canvas,
                     &self.text,
-                    line,
+                    &visible_line,
                     &self.links,
                     x,
                     baseline,
@@ -524,7 +531,8 @@ impl TextBox {
                     x
                 } else {
                     let line = &self.body_lines[li];
-                    let prefix_end = (line.start + offset).min(line.end);
+                    let visible_end = trim_nl_end(&self.text, line);
+                    let prefix_end = (line.start + offset).min(visible_end);
                     x + body_font
                         .measure_str(&self.text[line.start..prefix_end], Some(&text_paint))
                         .0
@@ -588,7 +596,11 @@ impl TextBox {
                 }
                 true
             }
-            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => false,
+            Key::Named(NamedKey::Enter) => {
+                self.insert_text("\n");
+                true
+            }
+            Key::Named(NamedKey::Tab) => false,
             _ => {
                 if let Some(s) = &event.text {
                     if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
@@ -742,7 +754,8 @@ impl TextBox {
         }
         let line_idx = self.find_line_at_y(ly);
         let line = &self.body_lines[line_idx];
-        let line_text = &self.text[line.clone()];
+        let visible_end = trim_nl_end(&self.text, line);
+        let line_text = &self.text[line.start..visible_end];
         let local_x = lx.max(0.0);
 
         let body_font = self.body_font();
@@ -1069,6 +1082,16 @@ fn draw_line_with_links(
     }
 }
 
+/// End byte of the visible portion of a line: drops a single trailing `'\n'`
+/// (which lives at the end of the line range but isn't drawn).
+fn trim_nl_end(text: &str, line: &Range<usize>) -> usize {
+    if line.end > line.start && text.as_bytes().get(line.end - 1) == Some(&b'\n') {
+        line.end - 1
+    } else {
+        line.end
+    }
+}
+
 pub(crate) fn open_url(url: &str) {
     eprintln!("Opening link: {url}");
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
@@ -1302,19 +1325,69 @@ fn prev_char_boundary(text: &str, idx: usize) -> usize {
     i
 }
 
+/// Wrap into a contiguous partition of the text, treating `'\n'` as a hard
+/// paragraph break. Each visual line's range includes its trailing `'\n'`
+/// (if any). Empty paragraphs produce empty visual lines.
 fn wrap_text(text: &str, font: &Font, paint: &Paint, max_width: f32) -> Vec<Range<usize>> {
     if text.is_empty() {
         return Vec::new();
     }
-    let words = word_ranges(text);
-    if words.is_empty() {
-        return vec![0..text.len()];
-    }
-
     let mut lines = Vec::new();
-    let mut line_start: usize = 0;
-    let mut have_word = false;
+    let mut start = 0;
+    loop {
+        let nl = text[start..].find('\n').map(|p| start + p);
+        let para_end = nl.unwrap_or(text.len());
+        wrap_paragraph_into(text, start, para_end, font, paint, max_width, &mut lines);
+        // Extend the paragraph's last line to absorb the '\n' (or to text end).
+        let consumed_to = nl.map(|i| i + 1).unwrap_or(text.len());
+        if let Some(last) = lines.last_mut() {
+            last.end = consumed_to;
+        }
+        match nl {
+            Some(i) => start = i + 1,
+            None => break,
+        }
+    }
+    lines
+}
 
+/// Word-wrap a single paragraph (no '\n' inside) and append its lines to `out`.
+/// Empty paragraphs emit one empty range so each paragraph contributes ≥ 1 line.
+fn wrap_paragraph_into(
+    text: &str,
+    start: usize,
+    end: usize,
+    font: &Font,
+    paint: &Paint,
+    max_width: f32,
+    out: &mut Vec<Range<usize>>,
+) {
+    if start >= end {
+        out.push(start..end);
+        return;
+    }
+    // Collect word ranges within [start, end) (whitespace-delimited).
+    let mut words: Vec<Range<usize>> = Vec::new();
+    let mut word_start: Option<usize> = None;
+    for (i, c) in text[start..end].char_indices() {
+        let abs = start + i;
+        if c.is_whitespace() {
+            if let Some(s) = word_start.take() {
+                words.push(s..abs);
+            }
+        } else if word_start.is_none() {
+            word_start = Some(abs);
+        }
+    }
+    if let Some(s) = word_start {
+        words.push(s..end);
+    }
+    if words.is_empty() {
+        out.push(start..end);
+        return;
+    }
+    let mut line_start = start;
+    let mut have_word = false;
     for word in &words {
         if !have_word {
             have_word = true;
@@ -1322,31 +1395,13 @@ fn wrap_text(text: &str, font: &Font, paint: &Paint, max_width: f32) -> Vec<Rang
         }
         let candidate = &text[line_start..word.end];
         if font.measure_str(candidate, Some(paint)).0 > max_width {
-            lines.push(line_start..word.start);
+            out.push(line_start..word.start);
             line_start = word.start;
         }
     }
-    lines.push(line_start..text.len());
-    lines
+    out.push(line_start..end);
 }
 
-fn word_ranges(text: &str) -> Vec<Range<usize>> {
-    let mut words = Vec::new();
-    let mut start: Option<usize> = None;
-    for (idx, c) in text.char_indices() {
-        if c.is_whitespace() {
-            if let Some(s) = start.take() {
-                words.push(s..idx);
-            }
-        } else if start.is_none() {
-            start = Some(idx);
-        }
-    }
-    if let Some(s) = start {
-        words.push(s..text.len());
-    }
-    words
-}
 
 // ---------------------------------------------------------------------------
 // OutlineCell — a flat list of bullets with explicit depth. Display order is
@@ -1572,7 +1627,9 @@ impl OutlineCell {
         if event.state == ElementState::Pressed {
             let mods = modifiers.state();
             match &event.logical_key {
-                Key::Named(NamedKey::Enter) if !mods.control_key() && !mods.alt_key() => {
+                Key::Named(NamedKey::Enter)
+                    if !mods.control_key() && !mods.alt_key() && !mods.shift_key() =>
+                {
                     return self.split_focused();
                 }
                 Key::Named(NamedKey::Tab) => {
