@@ -108,6 +108,12 @@ pub struct Edit {
     pub replacement: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct LinkSpan {
+    pub range: Range<usize>,
+    pub url: String,
+}
+
 /// A point-in-time clone of a cell's document state. Used by undo/redo to
 /// roll a cell back to a previous text + selection + zoom configuration.
 /// View-only state (drag, click count, line cache, geometry) is excluded.
@@ -116,6 +122,7 @@ pub struct TextBoxSnapshot {
     pub text: String,
     pub sels: Selections,
     pub font_scale: f32,
+    pub links: Vec<LinkSpan>,
 }
 
 fn transform_index(i: usize, start: usize, del: usize, ins: usize) -> usize {
@@ -164,6 +171,7 @@ pub struct TextBox {
     last_click_pos: (f32, f32),
     click_count: u8,
     font_scale: f32,
+    links: Vec<LinkSpan>,
 }
 
 impl TextBox {
@@ -184,6 +192,7 @@ impl TextBox {
             last_click_pos: (0.0, 0.0),
             click_count: 0,
             font_scale: 1.0,
+            links: Vec::new(),
         }
     }
 
@@ -305,7 +314,18 @@ impl TextBox {
             text: self.text.clone(),
             sels: self.sels.clone(),
             font_scale: self.font_scale,
+            links: self.links.clone(),
         }
+    }
+
+    pub fn add_link(&mut self, range: Range<usize>, url: String) {
+        if range.start < range.end && range.end <= self.text.len() {
+            self.links.push(LinkSpan { range, url });
+        }
+    }
+
+    pub fn link_at(&self, byte: usize) -> Option<&LinkSpan> {
+        self.links.iter().find(|l| byte >= l.range.start && byte < l.range.end)
     }
 
     /// Restore document state from a snapshot. Resets transient input state
@@ -315,6 +335,7 @@ impl TextBox {
         self.text = snap.text;
         self.sels = snap.sels;
         self.font_scale = snap.font_scale;
+        self.links = snap.links;
         self.body_lines_width = f32::NAN;
         self.mouse_drag = None;
         self.click_count = 0;
@@ -419,13 +440,38 @@ impl TextBox {
             }
         }
 
+        // Body text. If any links exist, walk each line as runs alternating
+        // between plain and linked styling.
+        let mut link_paint = Paint::default();
+        link_paint.set_anti_alias(true);
+        link_paint.set_color(Color::from_rgb(0x1a, 0x66, 0xc4));
+        let mut underline_paint = Paint::default();
+        underline_paint.set_anti_alias(true);
+        underline_paint.set_color(Color::from_rgb(0x1a, 0x66, 0xc4));
+        underline_paint.set_stroke_width(1.0);
         for (li, line) in self.body_lines.iter().enumerate() {
-            canvas.draw_str(
-                &self.text[line.clone()],
-                Point::new(x, baselines_local[li] + y),
-                &body_font,
-                &text_paint,
-            );
+            let baseline = baselines_local[li] + y;
+            if self.links.is_empty() {
+                canvas.draw_str(
+                    &self.text[line.clone()],
+                    Point::new(x, baseline),
+                    &body_font,
+                    &text_paint,
+                );
+            } else {
+                draw_line_with_links(
+                    canvas,
+                    &self.text,
+                    line,
+                    &self.links,
+                    x,
+                    baseline,
+                    &body_font,
+                    &text_paint,
+                    &link_paint,
+                    &underline_paint,
+                );
+            }
         }
 
         if focused {
@@ -522,6 +568,15 @@ impl TextBox {
 
         let (idx, affinity) = self.hit_test(lx, ly);
         let mods = modifiers.state();
+
+        // Ctrl+Click on a link opens it instead of moving the caret.
+        if mods.control_key() && !mods.shift_key() && !mods.alt_key() {
+            if let Some(link) = self.link_at(idx) {
+                open_url(&link.url);
+                return true;
+            }
+        }
+
         let now = Instant::now();
 
         let allow_multi = !mods.shift_key();
@@ -894,6 +949,7 @@ impl TextBox {
         let start = edit.range.start;
         let del = edit.range.end - edit.range.start;
         let ins = edit.replacement.len();
+        let edit_end = edit.range.end;
         self.text.replace_range(edit.range.clone(), &edit.replacement);
         for sel in &mut self.sels.items {
             sel.anchor = transform_index(sel.anchor, start, del, ins);
@@ -901,6 +957,21 @@ impl TextBox {
             sel.affinity = Affinity::Downstream;
         }
         self.sels.normalize();
+        // Update link spans: deletions that overlap a link drop it; pure
+        // insertions and edits outside the link just shift indices via the
+        // standard right-gravity transform (so typing at link.end extends it,
+        // typing at link.start pushes the link forward).
+        self.links.retain_mut(|link| {
+            if del > 0 {
+                let overlap = start < link.range.end && edit_end > link.range.start;
+                if overlap {
+                    return false;
+                }
+            }
+            link.range.start = transform_index(link.range.start, start, del, ins);
+            link.range.end = transform_index(link.range.end, start, del, ins);
+            link.range.start < link.range.end
+        });
         self.rewrap();
     }
 
@@ -913,6 +984,55 @@ impl TextBox {
         let paint = Paint::default();
         self.body_lines = wrap_text(&self.text, &body_font, &paint, self.body_lines_width);
     }
+}
+
+/// Draw the visible portion of `line` from `text` at `(text_x, baseline)`,
+/// switching to `link_paint` (and drawing an underline below the baseline)
+/// for byte ranges that fall inside any of `links`.
+fn draw_line_with_links(
+    canvas: &Canvas,
+    text: &str,
+    line: &Range<usize>,
+    links: &[LinkSpan],
+    text_x: f32,
+    baseline: f32,
+    font: &Font,
+    text_paint: &Paint,
+    link_paint: &Paint,
+    underline_paint: &Paint,
+) {
+    let mut pos = line.start;
+    let mut x = text_x;
+    while pos < line.end {
+        let in_link = links.iter().find(|l| pos >= l.range.start && pos < l.range.end);
+        let run_end = match in_link {
+            Some(l) => l.range.end.min(line.end),
+            None => links
+                .iter()
+                .filter(|l| l.range.start > pos && l.range.start < line.end)
+                .map(|l| l.range.start)
+                .min()
+                .unwrap_or(line.end),
+        };
+        let segment = &text[pos..run_end];
+        let paint = if in_link.is_some() { link_paint } else { text_paint };
+        canvas.draw_str(segment, Point::new(x, baseline), font, paint);
+        let w = font.measure_str(segment, Some(paint)).0;
+        if in_link.is_some() {
+            canvas.draw_line(
+                (x, baseline + 2.0),
+                (x + w, baseline + 2.0),
+                underline_paint,
+            );
+        }
+        x += w;
+        pos = run_end;
+    }
+}
+
+pub(crate) fn open_url(url: &str) {
+    eprintln!("Opening link: {url}");
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
 fn locate_caret(lines: &[Range<usize>], idx: usize, affinity: Affinity) -> (usize, usize) {
@@ -1578,6 +1698,12 @@ impl OutlineCell {
         }
     }
 
+    pub fn add_link_to_first(&mut self, range: Range<usize>, url: String) {
+        if let Some(b) = self.bullets.first_mut() {
+            b.textbox.add_link(range, url);
+        }
+    }
+
     /// Place the caret at the very start of the cell (first bullet, offset 0).
     /// Used by the container when arrow-nav arrives from the previous cell.
     pub fn place_caret_at_start(&mut self) {
@@ -2070,6 +2196,16 @@ impl Cell {
 
     pub fn new_outline(typeface: Typeface) -> Self {
         Cell::Outline(OutlineCell::new(typeface))
+    }
+
+    /// Add a link span to the cell's first textbox (plain) or first bullet
+    /// (outline). Used by seed setup; future link-creation UI will go through
+    /// a richer path scoped to the focused textbox.
+    pub fn add_link_to_first(&mut self, range: Range<usize>, url: String) {
+        match self {
+            Cell::Plain(tb) => tb.add_link(range, url),
+            Cell::Outline(oc) => oc.add_link_to_first(range, url),
+        }
     }
 
     pub fn tick(&mut self, canvas: &Canvas, x: f32, y: f32, width: f32, focused: bool) -> f32 {

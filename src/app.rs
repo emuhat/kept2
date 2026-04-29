@@ -166,10 +166,20 @@ impl KeptApp {
         let typeface = FontMgr::new()
             .new_from_data(FONT_BYTES, None)
             .expect("failed to load embedded TTF");
-        let cells = SEED_TEXTS
+        let mut cells: Vec<Cell> = SEED_TEXTS
             .iter()
             .map(|s| Cell::new(typeface.clone(), (*s).to_string()))
             .collect();
+        // Seed a couple of test links so the rendering is visible without
+        // needing a creation UI yet. Ctrl+Click follows the URL.
+        if let Some(c) = cells.get_mut(0) {
+            // "clicking" in "First cell — try clicking between cells…"
+            c.add_link_to_first(19..27, "https://example.com/click".to_string());
+        }
+        if let Some(c) = cells.get_mut(1) {
+            // "intentional" in "Kept is a small, intentional space …"
+            c.add_link_to_first(17..28, "https://example.com/intent".to_string());
+        }
         Self {
             typeface,
             cells,
