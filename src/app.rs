@@ -1,7 +1,9 @@
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
-use skia_safe::{Canvas, Color, Font, FontMgr, Paint, PaintStyle, Point, Rect, Typeface};
+use skia_safe::{
+    BlurStyle, Canvas, Color, Font, FontMgr, MaskFilter, Paint, PaintStyle, Point, Rect, Typeface,
+};
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
     keyboard::{Key, NamedKey},
@@ -14,9 +16,13 @@ const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
 const MARGIN_X: f32 = 40.0;
 const MARGIN_TOP: f32 = 60.0;
 const CELL_GAP: f32 = 20.0;
-const FOCUS_PAD: f32 = 6.0;
-const FOCUS_RADIUS: f32 = 8.0;
-const FOCUS_STROKE: f32 = 1.5;
+const FOCUS_PAD: f32 = 10.0;
+const FOCUS_RADIUS: f32 = 10.0;
+const FOCUS_STROKE: f32 = 1.0;
+const FOCUS_RING_ALPHA: u8 = 0x60;
+const FOCUS_SHADOW_ALPHA: u8 = 0x30;
+const FOCUS_SHADOW_BLUR: f32 = 12.0;
+const FOCUS_SHADOW_DY: f32 = 3.0;
 const DOC_BOTTOM_PAD: f32 = 24.0;
 const SCROLLBAR_INSET: f32 = 4.0;
 const SCROLLBAR_WIDTH: f32 = 4.0;
@@ -248,27 +254,65 @@ impl KeptApp {
         canvas.save();
         canvas.translate((0.0, -self.scroll_y));
 
+        // Capture focused-cell geometry up front. The card backdrop (drawn
+        // *before* cell content) and the focus ring (drawn after) both use
+        // this so they stay in lockstep — at most one frame of lag when the
+        // cell grows from typing, but they always match each other.
+        let focused_geom = self
+            .cells
+            .get(self.focused)
+            .filter(|c| c.height() > 0.0)
+            .map(|c| (c.x_origin(), c.y_origin(), c.width(), c.height()));
+
+        if let Some((cx, cy, cw, ch)) = focused_geom {
+            let card_rect = Rect::new(
+                cx - FOCUS_PAD,
+                cy - FOCUS_PAD,
+                cx + cw + FOCUS_PAD,
+                cy + ch + FOCUS_PAD,
+            );
+            // Drop shadow: blurred dark rect, offset down a few px.
+            let mut shadow_paint = Paint::default();
+            shadow_paint.set_anti_alias(true);
+            shadow_paint.set_color(Color::from_argb(FOCUS_SHADOW_ALPHA, 0, 0, 0));
+            shadow_paint.set_mask_filter(MaskFilter::blur(
+                BlurStyle::Normal,
+                FOCUS_SHADOW_BLUR,
+                false,
+            ));
+            let shadow_rect = Rect::new(
+                card_rect.left,
+                card_rect.top + FOCUS_SHADOW_DY,
+                card_rect.right,
+                card_rect.bottom + FOCUS_SHADOW_DY,
+            );
+            canvas.draw_round_rect(shadow_rect, FOCUS_RADIUS, FOCUS_RADIUS, &shadow_paint);
+            // White card fill.
+            let mut fill_paint = Paint::default();
+            fill_paint.set_anti_alias(true);
+            fill_paint.set_color(Color::WHITE);
+            canvas.draw_round_rect(card_rect, FOCUS_RADIUS, FOCUS_RADIUS, &fill_paint);
+        }
+
         let mut y = MARGIN_TOP;
-
-
         let cell_width = (width - MARGIN_X * 2.0).max(80.0);
         for (i, cell) in self.cells.iter_mut().enumerate() {
             let h = cell.tick(canvas, MARGIN_X, y, cell_width, i == self.focused);
             y += h + CELL_GAP;
         }
 
-        // Focus rect for the active cell (still in document coords).
-        if let Some(cell) = self.cells.get(self.focused) {
+        // Subtle focus ring using the same captured geometry as the card.
+        if let Some((cx, cy, cw, ch)) = focused_geom {
             let mut focus_paint = Paint::default();
             focus_paint.set_anti_alias(true);
             focus_paint.set_style(PaintStyle::Stroke);
             focus_paint.set_stroke_width(FOCUS_STROKE);
-            focus_paint.set_color(Color::from_argb(0xb0, 0x4a, 0x90, 0xe2));
+            focus_paint.set_color(Color::from_argb(FOCUS_RING_ALPHA, 0x4a, 0x90, 0xe2));
             let rect = Rect::new(
-                cell.x_origin() - FOCUS_PAD,
-                cell.y_origin() - FOCUS_PAD,
-                cell.x_origin() + cell.width() + FOCUS_PAD,
-                cell.y_origin() + cell.height() + FOCUS_PAD,
+                cx - FOCUS_PAD,
+                cy - FOCUS_PAD,
+                cx + cw + FOCUS_PAD,
+                cy + ch + FOCUS_PAD,
             );
             canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &focus_paint);
         }
