@@ -6,7 +6,7 @@ use winit::{
     keyboard::{Key, NamedKey},
 };
 
-use crate::cell::Cell;
+use crate::cell::{Cell, CellSnapshot};
 
 const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
 
@@ -25,6 +25,24 @@ const SCROLLBAR_FADE: Duration = Duration::from_millis(700);
 const ZOOM_STEP: f32 = 1.1;
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 3.0;
+const COALESCE_INTERVAL: Duration = Duration::from_millis(600);
+
+enum UndoOp {
+    CellEdit {
+        cell_idx: usize,
+        pre: CellSnapshot,
+        post: CellSnapshot,
+    },
+    InsertCell {
+        at_idx: usize,
+        pre_focused: usize,
+    },
+    DeleteCell {
+        at_idx: usize,
+        snapshot: CellSnapshot,
+        pre_focused: usize,
+    },
+}
 
 const SEED_TEXTS: &[&str] = &[
     "First cell — try clicking between cells. Each one is its own little editor.",
@@ -51,6 +69,10 @@ pub struct KeptApp {
     last_scroll_time: Option<Instant>,
     font_scale: f32,
     pending_caret_scroll: bool,
+    undo_stack: Vec<UndoOp>,
+    redo_stack: Vec<UndoOp>,
+    last_edit_time: Option<Instant>,
+    coalesce_break: bool,
 }
 
 impl KeptApp {
@@ -74,6 +96,10 @@ impl KeptApp {
             last_scroll_time: None,
             font_scale: 1.0,
             pending_caret_scroll: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit_time: None,
+            coalesce_break: false,
         }
     }
 
@@ -202,6 +228,7 @@ impl KeptApp {
                 Key::Named(NamedKey::ArrowUp) => {
                     if self.focused > 0 {
                         self.focused -= 1;
+                        self.coalesce_break = true;
                         self.scroll_to_focused();
                         return true;
                     }
@@ -210,6 +237,7 @@ impl KeptApp {
                 Key::Named(NamedKey::ArrowDown) => {
                     if self.focused + 1 < self.cells.len() {
                         self.focused += 1;
+                        self.coalesce_break = true;
                         self.scroll_to_focused();
                         return true;
                     }
@@ -221,18 +249,137 @@ impl KeptApp {
                 Key::Character(s) if s.as_str() == "-" => {
                     return self.zoom_out();
                 }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("z") => {
+                    return if modifiers.state().shift_key() {
+                        self.redo()
+                    } else {
+                        self.undo()
+                    };
+                }
                 _ => {}
             }
         }
+
+        let pre = self.cells.get(self.focused).map(|c| c.snapshot());
         let handled = if let Some(cell) = self.cells.get_mut(self.focused) {
             cell.handle_key(event, modifiers)
         } else {
             false
         };
         if handled {
+            if let Some(pre) = pre {
+                let post = self.cells[self.focused].snapshot();
+                if pre.text != post.text {
+                    self.record_edit(pre, post);
+                } else {
+                    // Cursor-only event: break coalescing so the next text edit
+                    // starts a fresh undo entry.
+                    self.coalesce_break = true;
+                }
+            }
             self.pending_caret_scroll = true;
         }
         handled
+    }
+
+    fn record_edit(&mut self, pre: CellSnapshot, post: CellSnapshot) {
+        let now = Instant::now();
+        let cell_idx = self.focused;
+
+        let can_coalesce = !self.coalesce_break
+            && self
+                .last_edit_time
+                .map(|t| now.duration_since(t) < COALESCE_INTERVAL)
+                .unwrap_or(false)
+            && matches!(
+                self.undo_stack.last(),
+                Some(UndoOp::CellEdit { cell_idx: prev, .. }) if *prev == cell_idx
+            );
+
+        if can_coalesce {
+            if let Some(UndoOp::CellEdit { post: prev_post, .. }) = self.undo_stack.last_mut() {
+                *prev_post = post;
+            }
+        } else {
+            self.undo_stack.push(UndoOp::CellEdit {
+                cell_idx,
+                pre,
+                post,
+            });
+        }
+
+        self.last_edit_time = Some(now);
+        self.redo_stack.clear();
+        self.coalesce_break = false;
+    }
+
+    fn undo(&mut self) -> bool {
+        let Some(op) = self.undo_stack.pop() else {
+            return false;
+        };
+        match &op {
+            UndoOp::CellEdit { cell_idx, pre, .. } => {
+                self.focused = *cell_idx;
+                self.cells[*cell_idx].restore(pre.clone());
+            }
+            UndoOp::InsertCell {
+                at_idx,
+                pre_focused,
+            } => {
+                if *at_idx < self.cells.len() {
+                    self.cells.remove(*at_idx);
+                }
+                self.focused = (*pre_focused).min(self.cells.len().saturating_sub(1));
+            }
+            UndoOp::DeleteCell {
+                at_idx,
+                snapshot,
+                pre_focused,
+            } => {
+                let mut cell = Cell::new(self.typeface.clone(), String::new());
+                cell.restore(snapshot.clone());
+                self.cells.insert(*at_idx, cell);
+                self.focused = *pre_focused;
+            }
+        }
+        self.redo_stack.push(op);
+        self.dragging_cell = None;
+        self.pending_caret_scroll = true;
+        self.coalesce_break = true;
+        true
+    }
+
+    fn redo(&mut self) -> bool {
+        let Some(op) = self.redo_stack.pop() else {
+            return false;
+        };
+        match &op {
+            UndoOp::CellEdit {
+                cell_idx, post, ..
+            } => {
+                self.focused = *cell_idx;
+                self.cells[*cell_idx].restore(post.clone());
+            }
+            UndoOp::InsertCell { at_idx, .. } => {
+                let mut cell = Cell::new(self.typeface.clone(), String::new());
+                cell.set_font_scale(self.font_scale);
+                self.cells.insert(*at_idx, cell);
+                self.focused = *at_idx;
+            }
+            UndoOp::DeleteCell { at_idx, .. } => {
+                if *at_idx < self.cells.len() {
+                    self.cells.remove(*at_idx);
+                }
+                if self.focused >= self.cells.len() {
+                    self.focused = self.cells.len().saturating_sub(1);
+                }
+            }
+        }
+        self.undo_stack.push(op);
+        self.dragging_cell = None;
+        self.pending_caret_scroll = true;
+        self.coalesce_break = true;
+        true
     }
 
     fn delete_focused_cell(&mut self) -> bool {
@@ -240,12 +387,23 @@ impl KeptApp {
         if self.cells.len() <= 1 {
             return false;
         }
-        self.cells.remove(self.focused);
+        let at_idx = self.focused;
+        let pre_focused = self.focused;
+        let snapshot = self.cells[at_idx].snapshot();
+        self.cells.remove(at_idx);
         if self.focused >= self.cells.len() {
             self.focused = self.cells.len() - 1;
         }
         self.dragging_cell = None;
         self.pending_caret_scroll = true;
+
+        self.undo_stack.push(UndoOp::DeleteCell {
+            at_idx,
+            snapshot,
+            pre_focused,
+        });
+        self.redo_stack.clear();
+        self.coalesce_break = true;
         true
     }
 
@@ -256,6 +414,7 @@ impl KeptApp {
                 return false;
             }
         }
+        let pre_focused = self.focused;
         let mut new_cell = Cell::new(self.typeface.clone(), String::new());
         new_cell.set_font_scale(self.font_scale);
         let insert_at = (self.focused + 1).min(self.cells.len());
@@ -267,6 +426,13 @@ impl KeptApp {
         // The new cell will be laid out by this tick; the end-of-tick scroll
         // hook then brings its caret into view.
         self.pending_caret_scroll = true;
+
+        self.undo_stack.push(UndoOp::InsertCell {
+            at_idx: insert_at,
+            pre_focused,
+        });
+        self.redo_stack.clear();
+        self.coalesce_break = true;
         true
     }
 
@@ -328,6 +494,9 @@ impl KeptApp {
         if target != self.focused {
             self.focused = target;
         }
+        // Any click moves/replaces the caret — break coalescing so the next
+        // text edit starts a fresh undo entry.
+        self.coalesce_break = true;
         self.dragging_cell = Some(target);
         self.cells[target].mouse_down(x, doc_y, modifiers)
     }

@@ -49,6 +49,7 @@ impl Selection {
     }
 }
 
+#[derive(Clone)]
 pub struct Selections {
     pub items: Vec<Selection>,
     pub primary: usize,
@@ -105,6 +106,16 @@ impl Selections {
 pub struct Edit {
     pub range: Range<usize>,
     pub replacement: String,
+}
+
+/// A point-in-time clone of a cell's document state. Used by undo/redo to
+/// roll a cell back to a previous text + selection + zoom configuration.
+/// View-only state (drag, click count, line cache, geometry) is excluded.
+#[derive(Clone)]
+pub struct CellSnapshot {
+    pub text: String,
+    pub sels: Selections,
+    pub font_scale: f32,
 }
 
 fn transform_index(i: usize, start: usize, del: usize, ins: usize) -> usize {
@@ -194,6 +205,27 @@ impl Cell {
 
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty()
+    }
+
+    pub fn snapshot(&self) -> CellSnapshot {
+        CellSnapshot {
+            text: self.text.clone(),
+            sels: self.sels.clone(),
+            font_scale: self.font_scale,
+        }
+    }
+
+    /// Restore document state from a snapshot. Resets transient input state
+    /// (mouse drag, click count) and invalidates the wrap cache so the next
+    /// tick re-wraps at the (possibly different) font scale.
+    pub fn restore(&mut self, snap: CellSnapshot) {
+        self.text = snap.text;
+        self.sels = snap.sels;
+        self.font_scale = snap.font_scale;
+        self.body_lines_width = f32::NAN;
+        self.mouse_drag = None;
+        self.click_count = 0;
+        self.last_click_time = None;
     }
 
     /// (top, bottom) of the primary caret's visual line, in document coordinates.
