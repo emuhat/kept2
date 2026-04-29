@@ -123,6 +123,18 @@ struct MentionPopup {
     selected: usize,
 }
 
+/// What the user is viewing in the doc area / highlighting in the sidebar.
+/// Decoupled from the writable-target context (which is always the most
+/// recent open one).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewSelection {
+    /// A specific context's window (open or closed).
+    Context(Uuid),
+    /// All cells whose local date matches `d`, with context-section headers
+    /// rendered between groups.
+    Date(chrono::NaiveDate),
+}
+
 /// Context-level consequence of a cell deletion that emptied a context's
 /// window. Stored on `UndoOp::DeleteCell` so undo/redo restore atomically.
 #[derive(Clone)]
@@ -130,8 +142,8 @@ enum ContextSideEffect {
     /// A closed context became empty and was removed. Undo restores it.
     ContextRemoved {
         context: Context,
-        prev_active: Uuid,
-        new_active: Uuid,
+        prev_view: ViewSelection,
+        new_view: ViewSelection,
     },
     /// The open context became empty; its `start_time` was reset to "now"
     /// so the sidebar label and visible window track the resumption.
@@ -162,15 +174,16 @@ enum UndoOp {
         side_effect: Option<ContextSideEffect>,
     },
     RotateContext {
-        /// The context that was active before rotation; this is the one that
-        /// gets `end_time` set on apply, and restored on inverse.
-        prev_active: Uuid,
-        /// `prev_active`'s `end_time` before rotation (usually `None`).
+        /// The context that got closed (formerly the most recent open).
+        closed_id: Uuid,
+        /// Its `end_time` before rotation (usually `None`).
         prev_end_time: Option<i64>,
-        /// The `end_time` written to `prev_active` when rotation applied.
+        /// The `end_time` written when rotation applied.
         new_end_time: i64,
-        /// The freshly-created context. Re-inserted on redo, removed on undo.
+        /// The freshly-created open context. Re-inserted on redo, removed on undo.
         new_context: Context,
+        prev_view: ViewSelection,
+        new_view: ViewSelection,
         pre_focused: Option<Uuid>,
         pre_scroll_y: f32,
     },
@@ -180,6 +193,8 @@ enum UndoOp {
         context_id: Uuid,
         prev_start: i64,
         new_start: i64,
+        prev_view: ViewSelection,
+        new_view: ViewSelection,
     },
 }
 
@@ -215,11 +230,21 @@ const SIDEBAR_WIDTH: f32 = 180.0;
 const SIDEBAR_PAD_X: f32 = 12.0;
 const SIDEBAR_PAD_TOP: f32 = 18.0;
 const SIDEBAR_HEADER_H: f32 = 28.0;
-const SIDEBAR_ITEM_H: f32 = 30.0;
+const SIDEBAR_DATE_H: f32 = 28.0;
+const SIDEBAR_ITEM_H: f32 = 26.0;
 const SIDEBAR_ITEM_GAP: f32 = 2.0;
+const SIDEBAR_DATE_GAP: f32 = 6.0;
+const SIDEBAR_INDENT: f32 = 14.0;
 const SIDEBAR_ITEM_RADIUS: f32 = 6.0;
 const SIDEBAR_HEADER_FONT_SIZE: f32 = 11.0;
-const SIDEBAR_ITEM_FONT_SIZE: f32 = 13.0;
+const SIDEBAR_DATE_FONT_SIZE: f32 = 13.0;
+const SIDEBAR_ITEM_FONT_SIZE: f32 = 12.0;
+
+/// Context-section header drawn in Date view between cell groups from
+/// different contexts.
+const CONTEXT_HEADER_H: f32 = 32.0;
+const CONTEXT_HEADER_PAD_TOP: f32 = 12.0;
+const CONTEXT_HEADER_FONT_SIZE: f32 = 11.0;
 
 const KEBAB_SIZE: f32 = 22.0;
 const KEBAB_INSET_X: f32 = 4.0;
@@ -239,8 +264,10 @@ pub struct KeptApp {
     cells: Vec<Cell>,
     /// Time-window overlays. Membership is derived (timestamp-based), not stored.
     contexts: Vec<Context>,
-    /// The context whose window is currently visible.
-    active_context: Uuid,
+    /// What the user is currently viewing (single context or a whole date).
+    /// The "writable target" is always the most recent open context, derived
+    /// on demand via `writable_context_id` — independent of this field.
+    view: ViewSelection,
     focused: Option<Uuid>,
     /// Modal state. `false` = view (cell is selected but not accepting text);
     /// `true` = edit (caret visible, text input forwarded). Toggled by Enter
@@ -268,10 +295,10 @@ pub struct KeptApp {
     pending_context_deletes: HashSet<Uuid>,
     cell_menu_open: Option<Uuid>,
     last_kebab_rects: Vec<(Uuid, Rect)>,
-    /// Sidebar item rects in window (logical) coords from last frame, paired
-    /// with their context id, for click hit-testing. Sidebar is fixed (doesn't
-    /// scroll), so these stay in window space.
+    /// Sidebar context-row rects (window coords) from last frame, for hit-testing.
     last_sidebar_rects: Vec<(Uuid, Rect)>,
+    /// Sidebar date-header rects from last frame, for hit-testing.
+    last_sidebar_date_rects: Vec<(chrono::NaiveDate, Rect)>,
     /// Most recent cursor position in window (logical) coords, used for hover.
     mouse_pos: (f32, f32),
 }
@@ -357,11 +384,12 @@ impl KeptApp {
         // Pick the most recent context. Prefer an open one; among ties, the
         // one with the latest start. `(end_time.is_none(), start_time)` works
         // because bool sorts false < true.
-        let active_context = contexts
+        let initial_context = contexts
             .iter()
             .max_by_key(|c| (c.end_time.is_none(), c.start_time))
             .map(|c| c.id)
             .expect("at least one context exists after seeding");
+        let view = ViewSelection::Context(initial_context);
 
         if cells.is_empty() {
             for (i, text) in SEED_TEXTS.iter().enumerate() {
@@ -369,7 +397,7 @@ impl KeptApp {
                 // Stagger seed timestamps by 1ms so order is stable.
                 cell.timestamp += i as i64;
                 cell.edited_at = cell.timestamp;
-                cell.context_hint_id = Some(active_context);
+                cell.context_hint_id = Some(initial_context);
                 cells.push(cell);
             }
             if let Some(c) = cells.get_mut(0) {
@@ -391,7 +419,7 @@ impl KeptApp {
             typeface,
             cells,
             contexts,
-            active_context,
+            view,
             focused,
             editing: false,
             dragging_cell: None,
@@ -416,6 +444,7 @@ impl KeptApp {
             cell_menu_open: None,
             last_kebab_rects: Vec::new(),
             last_sidebar_rects: Vec::new(),
+            last_sidebar_date_rects: Vec::new(),
             mouse_pos: (-1.0, -1.0),
         }
     }
@@ -438,12 +467,34 @@ impl KeptApp {
         self.cells.iter_mut().find(|c| c.id == id)
     }
 
-    fn active_window(&self) -> (i64, Option<i64>) {
+    /// Most recent open context's id — the writable target. Always Some in
+    /// normal operation (the rotation/seed logic preserves the invariant).
+    fn writable_context_id(&self) -> Option<Uuid> {
         self.contexts
             .iter()
-            .find(|c| c.id == self.active_context)
-            .map(|c| (c.start_time, c.end_time))
-            .unwrap_or((i64::MIN, None))
+            .filter(|c| c.end_time.is_none())
+            .max_by_key(|c| c.start_time)
+            .map(|c| c.id)
+    }
+
+    /// Test whether a cell with `cell_ts` is visible under the current view.
+    fn is_visible_for_view(&self, cell_ts: i64) -> bool {
+        match self.view {
+            ViewSelection::Context(id) => {
+                self.contexts.iter().find(|c| c.id == id).map_or(false, |c| {
+                    cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
+                })
+            }
+            ViewSelection::Date(d) => local_date_for_ms(cell_ts) == d,
+        }
+    }
+
+    /// Find the context whose window contains `cell_ts`. Used for rendering
+    /// per-context section headers in Date view.
+    fn context_for_timestamp(&self, cell_ts: i64) -> Option<&Context> {
+        self.contexts.iter().find(|c| {
+            cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
+        })
     }
 
     /// Timestamp (epoch ms) of the most recently created cell anywhere in the
@@ -452,36 +503,46 @@ impl KeptApp {
         self.cells.iter().map(|c| c.timestamp).max()
     }
 
-    /// Close the active context (`end_time = now`) and open a new one whose
-    /// window starts at `now`. Sets `active_context` to the new id. Drops focus
-    /// since the new window is empty until the next cell is created.
-    /// Recorded as an undoable op.
+    /// Close the writable (open) context and open a new one whose window
+    /// starts at `now`. View follows: in Date view, stays in Date view; in
+    /// Context view, switches to Context(new_id). Empty-writable case bumps
+    /// `start_time` instead of creating a new context. Recorded as an
+    /// undoable op.
     fn rotate_context_now(&mut self) {
         let now = now_epoch_ms();
-        let prev_active = self.active_context;
+        let writable = match self.writable_context_id() {
+            Some(id) => id,
+            None => return, // Invariant violated; bail safely.
+        };
+        let prev_view = self.view;
 
-        // If the active context has no cells, don't create another empty
-        // context — just bump its start_time so the sidebar label reflects
-        // "now" and the user gets the "fresh" feel they asked for.
-        if !self.active_has_cells() {
+        // Empty writable: bump its start_time instead of creating a new context.
+        if !self.writable_has_cells() {
             let prev_start = self
                 .contexts
                 .iter()
-                .find(|c| c.id == prev_active)
+                .find(|c| c.id == writable)
                 .map(|c| c.start_time)
                 .unwrap_or(now);
             if prev_start == now {
-                // Already stamped at this instant; nothing to do.
                 return;
             }
-            if let Some(ctx) = self.contexts.iter_mut().find(|c| c.id == prev_active) {
+            if let Some(ctx) = self.contexts.iter_mut().find(|c| c.id == writable) {
                 ctx.start_time = now;
             }
-            self.dirty_contexts.insert(prev_active);
+            self.dirty_contexts.insert(writable);
+            // View update: Date view stays. Context view focuses the bumped one.
+            let new_view = match prev_view {
+                ViewSelection::Date(d) => ViewSelection::Date(d),
+                ViewSelection::Context(_) => ViewSelection::Context(writable),
+            };
+            self.view = new_view;
             self.undo_stack.push(UndoOp::ResetContextStart {
-                context_id: prev_active,
+                context_id: writable,
                 prev_start,
                 new_start: now,
+                prev_view,
+                new_view,
             });
             self.redo_stack.clear();
             self.coalesce_break = true;
@@ -491,7 +552,7 @@ impl KeptApp {
         let prev_end_time = self
             .contexts
             .iter()
-            .find(|c| c.id == prev_active)
+            .find(|c| c.id == writable)
             .and_then(|c| c.end_time);
         let new_context = Context {
             id: Uuid::now_v7(),
@@ -501,14 +562,20 @@ impl KeptApp {
         };
         let pre_focused = self.focused;
         let pre_scroll_y = self.scroll_y;
+        let new_view = match prev_view {
+            ViewSelection::Date(d) => ViewSelection::Date(d),
+            ViewSelection::Context(_) => ViewSelection::Context(new_context.id),
+        };
 
-        self.apply_rotation(prev_active, now, &new_context);
+        self.apply_rotation(writable, now, &new_context, new_view);
 
         self.undo_stack.push(UndoOp::RotateContext {
-            prev_active,
+            closed_id: writable,
             prev_end_time,
             new_end_time: now,
             new_context,
+            prev_view,
+            new_view,
             pre_focused,
             pre_scroll_y,
         });
@@ -516,27 +583,41 @@ impl KeptApp {
         self.coalesce_break = true;
     }
 
-    fn active_has_cells(&self) -> bool {
-        let (start, end) = self.active_window();
+    /// Does the writable (most-recent-open) context have any cells in its window?
+    fn writable_has_cells(&self) -> bool {
+        let Some(id) = self.writable_context_id() else {
+            return false;
+        };
+        let Some(ctx) = self.contexts.iter().find(|c| c.id == id) else {
+            return false;
+        };
+        let start = ctx.start_time;
+        let end = ctx.end_time;
         self.cells
             .iter()
             .any(|c| c.timestamp >= start && end.map(|e| c.timestamp < e).unwrap_or(true))
     }
 
-    /// Apply rotation forward: close `prev_active` (set its `end_time`), insert
-    /// `new_context`, switch to it. Used by both initial rotation and redo.
-    fn apply_rotation(&mut self, prev_active: Uuid, new_end_time: i64, new_context: &Context) {
-        if let Some(ctx) = self.contexts.iter_mut().find(|c| c.id == prev_active) {
+    /// Apply rotation forward: close `closed_id`, insert `new_context`,
+    /// switch view as specified. Used by initial rotation and redo.
+    fn apply_rotation(
+        &mut self,
+        closed_id: Uuid,
+        new_end_time: i64,
+        new_context: &Context,
+        new_view: ViewSelection,
+    ) {
+        if let Some(ctx) = self.contexts.iter_mut().find(|c| c.id == closed_id) {
             ctx.end_time = Some(new_end_time);
         }
-        self.dirty_contexts.insert(prev_active);
+        self.dirty_contexts.insert(closed_id);
         let new_id = new_context.id;
         if !self.contexts.iter().any(|c| c.id == new_id) {
             self.contexts.push(new_context.clone());
         }
         self.dirty_contexts.insert(new_id);
         self.pending_context_deletes.remove(&new_id);
-        self.active_context = new_id;
+        self.view = new_view;
         self.focused = None;
         self.editing = false;
         self.dragging_cell = None;
@@ -544,28 +625,25 @@ impl KeptApp {
         self.scroll_y = 0.0;
     }
 
-    /// Inverse of `apply_rotation`: restore `prev_active`'s `end_time`, remove
-    /// the new context (queue it for DB deletion), restore focus and scroll.
+    /// Inverse of `apply_rotation`: restore the closed context's `end_time`,
+    /// remove the new context (queue for DB deletion), restore prior view.
     fn inverse_rotation(
         &mut self,
-        prev_active: Uuid,
+        closed_id: Uuid,
         prev_end_time: Option<i64>,
         new_context_id: Uuid,
+        prev_view: ViewSelection,
         pre_focused: Option<Uuid>,
         pre_scroll_y: f32,
     ) {
-        if let Some(ctx) = self
-            .contexts
-            .iter_mut()
-            .find(|c| c.id == prev_active)
-        {
+        if let Some(ctx) = self.contexts.iter_mut().find(|c| c.id == closed_id) {
             ctx.end_time = prev_end_time;
         }
-        self.dirty_contexts.insert(prev_active);
+        self.dirty_contexts.insert(closed_id);
         self.contexts.retain(|c| c.id != new_context_id);
         self.dirty_contexts.remove(&new_context_id);
         self.pending_context_deletes.insert(new_context_id);
-        self.active_context = prev_active;
+        self.view = prev_view;
         self.focused = pre_focused;
         self.editing = false;
         self.dragging_cell = None;
@@ -573,12 +651,16 @@ impl KeptApp {
         self.scroll_y = pre_scroll_y;
     }
 
-    /// Previous context (older `start_time`) relative to the currently active
-    /// one. None if active is already the oldest.
+    /// Previous context (older `start_time`) relative to the currently
+    /// viewed one. None when in Date view (use date-arrow nav for that).
     fn prev_context(&self) -> Option<Uuid> {
+        let current = match self.view {
+            ViewSelection::Context(id) => id,
+            ViewSelection::Date(_) => return None,
+        };
         let mut sorted: Vec<&Context> = self.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
-        let pos = sorted.iter().position(|c| c.id == self.active_context)?;
+        let pos = sorted.iter().position(|c| c.id == current)?;
         if pos == 0 {
             None
         } else {
@@ -586,49 +668,51 @@ impl KeptApp {
         }
     }
 
-    /// Next context (newer `start_time`). None if active is already the newest.
+    /// Next context (newer `start_time`). None when in Date view.
     fn next_context(&self) -> Option<Uuid> {
+        let current = match self.view {
+            ViewSelection::Context(id) => id,
+            ViewSelection::Date(_) => return None,
+        };
         let mut sorted: Vec<&Context> = self.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
-        let pos = sorted.iter().position(|c| c.id == self.active_context)?;
+        let pos = sorted.iter().position(|c| c.id == current)?;
         sorted.get(pos + 1).map(|c| c.id)
     }
 
-    /// If the active context is closed, switch to the most recent open
-    /// context. Used so a write action while viewing history lands in
-    /// "today" instead of in a closed window. Returns true if the active
-    /// context changed. If no open context exists, leaves active alone — the
-    /// idle-rotation path in `insert_cell_after_focused` will handle it.
+    /// In Context view: if the viewed context is closed, switch to the most
+    /// recent open one so writes land in "today." In Date view: no-op (writes
+    /// still go to the writable context, which is found at insertion time).
+    /// Returns true if the view changed.
     fn ensure_writable_context(&mut self) -> bool {
+        let id = match self.view {
+            ViewSelection::Context(id) => id,
+            ViewSelection::Date(_) => return false,
+        };
         let active_is_open = self
             .contexts
             .iter()
-            .find(|c| c.id == self.active_context)
+            .find(|c| c.id == id)
             .map_or(false, |c| c.end_time.is_none());
         if active_is_open {
             return false;
         }
-        let target = self
-            .contexts
-            .iter()
-            .filter(|c| c.end_time.is_none())
-            .max_by_key(|c| c.start_time)
-            .map(|c| c.id);
+        let target = self.writable_context_id();
         match target {
-            Some(id) => self.set_active_context(id),
+            Some(target_id) => self.set_active_context(target_id),
             None => false,
         }
     }
 
-    /// Switch the visible window to an existing context. No data movement.
+    /// Switch the view to a single existing context.
     fn set_active_context(&mut self, id: Uuid) -> bool {
-        if id == self.active_context {
+        if self.view == ViewSelection::Context(id) {
             return false;
         }
         if !self.contexts.iter().any(|c| c.id == id) {
             return false;
         }
-        self.active_context = id;
+        self.view = ViewSelection::Context(id);
         // Focus the first visible cell in the new window (if any).
         self.focused = self.visible_cell_ids().first().copied();
         self.editing = false;
@@ -640,12 +724,27 @@ impl KeptApp {
         true
     }
 
-    /// IDs of cells visible in the active context, in timestamp order.
+    /// Switch the view to "everything from this local date" mode.
+    fn set_active_date(&mut self, d: chrono::NaiveDate) -> bool {
+        if self.view == ViewSelection::Date(d) {
+            return false;
+        }
+        self.view = ViewSelection::Date(d);
+        self.focused = self.visible_cell_ids().first().copied();
+        self.editing = false;
+        self.dragging_cell = None;
+        self.cell_menu_open = None;
+        self.scroll_y = 0.0;
+        self.coalesce_break = true;
+        self.pending_caret_scroll = true;
+        true
+    }
+
+    /// IDs of cells visible under the active view, in timestamp order.
     fn visible_cell_ids(&self) -> Vec<Uuid> {
-        let (start, end) = self.active_window();
         self.cells
             .iter()
-            .filter(|c| c.timestamp >= start && end.map(|e| c.timestamp < e).unwrap_or(true))
+            .filter(|c| self.is_visible_for_view(c.timestamp))
             .map(|c| c.id)
             .collect()
     }
@@ -824,19 +923,73 @@ impl KeptApp {
         let mouse_doc_x = self.mouse_pos.0;
         let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
         let focused_id = self.focused;
-        let (window_start, window_end) = self.active_window();
-        for cell in self.cells.iter_mut() {
-            // Filter to active context window without preallocating a Vec.
-            if cell.timestamp < window_start
-                || window_end.map(|e| cell.timestamp >= e).unwrap_or(false)
-            {
+
+        // Precompute per-cell visibility and section headers (Date view only)
+        // so the mutable cell loop below doesn't have to re-borrow self.
+        let visible: Vec<bool> = self
+            .cells
+            .iter()
+            .map(|c| self.is_visible_for_view(c.timestamp))
+            .collect();
+        let in_date_view = matches!(self.view, ViewSelection::Date(_));
+        let headers: Vec<Option<String>> = if in_date_view {
+            let mut hs: Vec<Option<String>> = Vec::with_capacity(self.cells.len());
+            let mut last_id: Option<Uuid> = None;
+            for (i, cell) in self.cells.iter().enumerate() {
+                if !visible[i] {
+                    hs.push(None);
+                    continue;
+                }
+                let ctx = self.context_for_timestamp(cell.timestamp);
+                let ctx_id = ctx.map(|c| c.id);
+                let label = if ctx_id != last_id {
+                    last_id = ctx_id;
+                    ctx.map(|c| format_context_time(c.start_time))
+                } else {
+                    None
+                };
+                hs.push(label);
+            }
+            hs
+        } else {
+            vec![None; self.cells.len()]
+        };
+
+        let header_font = Font::from_typeface(&self.typeface, CONTEXT_HEADER_FONT_SIZE);
+        let (_, hm) = header_font.metrics();
+
+        for (i, cell) in self.cells.iter_mut().enumerate() {
+            if !visible[i] {
                 continue;
+            }
+            if let Some(label) = &headers[i] {
+                let header_y = y + CONTEXT_HEADER_PAD_TOP;
+                let baseline = header_y + (-hm.ascent);
+                let mut hp = Paint::default();
+                hp.set_anti_alias(true);
+                hp.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+                canvas.draw_str(
+                    label,
+                    Point::new(cells_left, baseline),
+                    &header_font,
+                    &hp,
+                );
+                let label_w = header_font.measure_str(label, Some(&hp)).0;
+                let line_y = baseline - hm.ascent / 3.0;
+                let mut lp = Paint::default();
+                lp.set_anti_alias(true);
+                lp.set_color(Color::from_argb(0x40, 0x90, 0x88, 0x7a));
+                lp.set_stroke_width(1.0);
+                canvas.draw_line(
+                    Point::new(cells_left + label_w + 8.0, line_y),
+                    Point::new(cells_left + outer_cell_width, line_y),
+                    &lp,
+                );
+                y += CONTEXT_HEADER_H;
             }
             let cell_x = cells_left;
             let cell_y = y;
             let cell_is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
-            // In view mode, the cell renders without caret/selection. The
-            // outer card + ring (drawn by KeptApp) still indicate focus.
             let render_focused = cell_is_focused && self.editing;
             let h = cell.tick(canvas, cell_x, cell_y, content_width, render_focused);
             let kebab_right = cell_x + outer_cell_width - KEBAB_INSET_X;
@@ -989,7 +1142,9 @@ impl KeptApp {
                 }
                 Key::Named(NamedKey::ArrowUp) => {
                     if modifiers.state().shift_key() {
-                        if let Some(id) = self.prev_context() {
+                        // Sidebar is rendered newest-first; "Up" should move
+                        // visually upward — toward the newer context.
+                        if let Some(id) = self.next_context() {
                             return self.set_active_context(id);
                         }
                         return false;
@@ -1007,7 +1162,9 @@ impl KeptApp {
                 }
                 Key::Named(NamedKey::ArrowDown) => {
                     if modifiers.state().shift_key() {
-                        if let Some(id) = self.next_context() {
+                        // "Down" moves visually downward in the newest-first
+                        // sidebar — toward the older context.
+                        if let Some(id) = self.prev_context() {
                             return self.set_active_context(id);
                         }
                         return false;
@@ -1073,6 +1230,13 @@ impl KeptApp {
                         && self.focused.is_some() =>
                 {
                     self.editing = true;
+                    // Position caret at the end so typing appends to the cell.
+                    if let Some(id) = self.focused {
+                        if let Some(c) = self.cell_mut(id) {
+                            c.place_caret_at_end();
+                        }
+                    }
+                    self.pending_caret_scroll = true;
                     return true;
                 }
                 _ => {}
@@ -1455,82 +1619,135 @@ impl KeptApp {
             &header_paint,
         );
 
-        // Items, ordered by start_time ascending. Cache the click rects.
+        // Group contexts by their local start-date. Render dates descending
+        // (newest at top); within each date, contexts also descending so the
+        // most recent context sits right under the date header.
         self.last_sidebar_rects.clear();
-        let mut order: Vec<(usize, i64)> = self
-            .contexts
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (i, c.start_time))
-            .collect();
-        order.sort_by_key(|(_, t)| *t);
+        self.last_sidebar_date_rects.clear();
 
+        let mut groups: std::collections::BTreeMap<chrono::NaiveDate, Vec<&Context>> =
+            std::collections::BTreeMap::new();
+        for c in &self.contexts {
+            groups
+                .entry(local_date_for_ms(c.start_time))
+                .or_default()
+                .push(c);
+        }
+        let dates: Vec<chrono::NaiveDate> = groups.keys().rev().copied().collect();
+
+        let date_font = Font::from_typeface(&self.typeface, SIDEBAR_DATE_FONT_SIZE);
         let item_font = Font::from_typeface(&self.typeface, SIDEBAR_ITEM_FONT_SIZE);
+        let (_, dm) = date_font.metrics();
         let (_, im) = item_font.metrics();
         let mouse_x = self.mouse_pos.0;
         let mouse_y = self.mouse_pos.1;
 
-        let items_top = SIDEBAR_PAD_TOP + SIDEBAR_HEADER_H;
-        for (slot, (orig_idx, _)) in order.iter().enumerate() {
-            let ctx = &self.contexts[*orig_idx];
-            let item_top =
-                items_top + slot as f32 * (SIDEBAR_ITEM_H + SIDEBAR_ITEM_GAP);
-            let item_bot = item_top + SIDEBAR_ITEM_H;
-            if item_top > height {
+        let mut y = SIDEBAR_PAD_TOP + SIDEBAR_HEADER_H;
+        for d in dates {
+            let mut day_contexts: Vec<&Context> = groups.get(&d).cloned().unwrap_or_default();
+            day_contexts.sort_by_key(|c| std::cmp::Reverse(c.start_time));
+
+            // Date row.
+            let date_rect = Rect::new(
+                SIDEBAR_PAD_X * 0.5,
+                y,
+                SIDEBAR_WIDTH - SIDEBAR_PAD_X * 0.5,
+                y + SIDEBAR_DATE_H,
+            );
+            if date_rect.top > height {
                 break;
             }
-            let item_rect = Rect::new(
-                SIDEBAR_PAD_X * 0.5,
-                item_top,
-                SIDEBAR_WIDTH - SIDEBAR_PAD_X * 0.5,
-                item_bot,
-            );
-            let is_active = ctx.id == self.active_context;
-            let is_hovered = mouse_x >= item_rect.left
-                && mouse_x <= item_rect.right
-                && mouse_y >= item_rect.top
-                && mouse_y <= item_rect.bottom;
+            let date_active = self.view == ViewSelection::Date(d);
+            let date_hovered = mouse_x >= date_rect.left
+                && mouse_x <= date_rect.right
+                && mouse_y >= date_rect.top
+                && mouse_y <= date_rect.bottom;
 
-            if is_active {
+            if date_active {
                 let mut p = Paint::default();
                 p.set_anti_alias(true);
                 p.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
-                canvas.draw_round_rect(
-                    item_rect,
-                    SIDEBAR_ITEM_RADIUS,
-                    SIDEBAR_ITEM_RADIUS,
-                    &p,
-                );
-            } else if is_hovered {
+                canvas.draw_round_rect(date_rect, SIDEBAR_ITEM_RADIUS, SIDEBAR_ITEM_RADIUS, &p);
+            } else if date_hovered {
                 let mut p = Paint::default();
                 p.set_anti_alias(true);
-                p.set_color(Color::from_argb(0x20, 0x1c, 0x1c, 0x1c));
-                canvas.draw_round_rect(
-                    item_rect,
-                    SIDEBAR_ITEM_RADIUS,
-                    SIDEBAR_ITEM_RADIUS,
-                    &p,
-                );
+                p.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+                canvas.draw_round_rect(date_rect, SIDEBAR_ITEM_RADIUS, SIDEBAR_ITEM_RADIUS, &p);
             }
-
-            let mut text_paint = Paint::default();
-            text_paint.set_anti_alias(true);
-            let text_color = if is_active {
-                Color::from_rgb(0x1c, 0x1c, 0x1c)
-            } else {
-                Color::from_rgb(0x55, 0x55, 0x55)
-            };
-            text_paint.set_color(text_color);
-            let baseline = item_top + (SIDEBAR_ITEM_H + (-im.ascent) - im.descent) * 0.5;
-            let label = format_context_label(ctx.start_time);
+            let mut date_paint = Paint::default();
+            date_paint.set_anti_alias(true);
+            date_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+            let date_baseline = y + (SIDEBAR_DATE_H + (-dm.ascent) - dm.descent) * 0.5;
             canvas.draw_str(
-                label,
-                Point::new(SIDEBAR_PAD_X, baseline),
-                &item_font,
-                &text_paint,
+                format_date_label(d),
+                Point::new(SIDEBAR_PAD_X, date_baseline),
+                &date_font,
+                &date_paint,
             );
+            self.last_sidebar_date_rects.push((d, date_rect));
+            y += SIDEBAR_DATE_H + SIDEBAR_ITEM_GAP;
 
-            self.last_sidebar_rects.push((ctx.id, item_rect));
+            // Context rows under this date — indented.
+            for ctx in day_contexts {
+                let item_rect = Rect::new(
+                    SIDEBAR_PAD_X * 0.5 + SIDEBAR_INDENT,
+                    y,
+                    SIDEBAR_WIDTH - SIDEBAR_PAD_X * 0.5,
+                    y + SIDEBAR_ITEM_H,
+                );
+                if item_rect.top > height {
+                    break;
+                }
+                let is_active = self.view == ViewSelection::Context(ctx.id);
+                let is_hovered = mouse_x >= item_rect.left
+                    && mouse_x <= item_rect.right
+                    && mouse_y >= item_rect.top
+                    && mouse_y <= item_rect.bottom;
+
+                if is_active {
+                    let mut p = Paint::default();
+                    p.set_anti_alias(true);
+                    p.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+                    canvas.draw_round_rect(
+                        item_rect,
+                        SIDEBAR_ITEM_RADIUS,
+                        SIDEBAR_ITEM_RADIUS,
+                        &p,
+                    );
+                } else if is_hovered {
+                    let mut p = Paint::default();
+                    p.set_anti_alias(true);
+                    p.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+                    canvas.draw_round_rect(
+                        item_rect,
+                        SIDEBAR_ITEM_RADIUS,
+                        SIDEBAR_ITEM_RADIUS,
+                        &p,
+                    );
+                }
+
+                let mut text_paint = Paint::default();
+                text_paint.set_anti_alias(true);
+                let text_color = if is_active {
+                    Color::from_rgb(0x1c, 0x1c, 0x1c)
+                } else {
+                    Color::from_rgb(0x55, 0x55, 0x55)
+                };
+                text_paint.set_color(text_color);
+                let baseline =
+                    y + (SIDEBAR_ITEM_H + (-im.ascent) - im.descent) * 0.5;
+                let label = format_context_time(ctx.start_time);
+                canvas.draw_str(
+                    label,
+                    Point::new(SIDEBAR_PAD_X + SIDEBAR_INDENT, baseline),
+                    &item_font,
+                    &text_paint,
+                );
+
+                self.last_sidebar_rects.push((ctx.id, item_rect));
+                y += SIDEBAR_ITEM_H + SIDEBAR_ITEM_GAP;
+            }
+            y += SIDEBAR_DATE_GAP;
         }
     }
 
@@ -1752,17 +1969,19 @@ impl KeptApp {
                 self.focused = *pre_focused;
             }
             UndoOp::RotateContext {
-                prev_active,
+                closed_id,
                 prev_end_time,
                 new_context,
+                prev_view,
                 pre_focused,
                 pre_scroll_y,
                 ..
             } => {
                 self.inverse_rotation(
-                    *prev_active,
+                    *closed_id,
                     *prev_end_time,
                     new_context.id,
+                    *prev_view,
                     *pre_focused,
                     *pre_scroll_y,
                 );
@@ -1771,12 +1990,14 @@ impl KeptApp {
             UndoOp::ResetContextStart {
                 context_id,
                 prev_start,
+                prev_view,
                 ..
             } => {
                 if let Some(c) = self.contexts.iter_mut().find(|c| c.id == *context_id) {
                     c.start_time = *prev_start;
                 }
                 self.dirty_contexts.insert(*context_id);
+                self.view = *prev_view;
                 bump_focused_edited = false;
             }
         }
@@ -1832,23 +2053,26 @@ impl KeptApp {
                 self.focused = *post_focused;
             }
             UndoOp::RotateContext {
-                prev_active,
+                closed_id,
                 new_end_time,
                 new_context,
+                new_view,
                 ..
             } => {
-                self.apply_rotation(*prev_active, *new_end_time, new_context);
+                self.apply_rotation(*closed_id, *new_end_time, new_context, *new_view);
                 bump_focused_edited = false;
             }
             UndoOp::ResetContextStart {
                 context_id,
                 new_start,
+                new_view,
                 ..
             } => {
                 if let Some(c) = self.contexts.iter_mut().find(|c| c.id == *context_id) {
                     c.start_time = *new_start;
                 }
                 self.dirty_contexts.insert(*context_id);
+                self.view = *new_view;
                 bump_focused_edited = false;
             }
         }
@@ -1904,10 +2128,22 @@ impl KeptApp {
                         .filter(|c| c.id != ctx.id && c.end_time.is_none())
                         .max_by_key(|c| c.start_time)
                         .map(|c| c.id);
-                    new_active.map(|new_active| ContextSideEffect::ContextRemoved {
-                        context: ctx.clone(),
-                        prev_active: self.active_context,
-                        new_active,
+                    new_active.map(|nid| {
+                        // If user was viewing this closed context, follow to
+                        // the new open one; otherwise leave the view alone
+                        // (e.g., Date view stays).
+                        let prev_view = self.view;
+                        let new_view = match prev_view {
+                            ViewSelection::Context(viewed) if viewed == ctx.id => {
+                                ViewSelection::Context(nid)
+                            }
+                            other => other,
+                        };
+                        ContextSideEffect::ContextRemoved {
+                            context: ctx.clone(),
+                            prev_view,
+                            new_view,
+                        }
                     })
                 } else {
                     Some(ContextSideEffect::StartReset {
@@ -1972,12 +2208,12 @@ impl KeptApp {
     fn apply_context_side_effect(&mut self, se: &ContextSideEffect) {
         match se {
             ContextSideEffect::ContextRemoved {
-                context, new_active, ..
+                context, new_view, ..
             } => {
                 self.contexts.retain(|c| c.id != context.id);
                 self.dirty_contexts.remove(&context.id);
                 self.pending_context_deletes.insert(context.id);
-                self.active_context = *new_active;
+                self.view = *new_view;
             }
             ContextSideEffect::StartReset {
                 context_id,
@@ -1996,7 +2232,7 @@ impl KeptApp {
         match se {
             ContextSideEffect::ContextRemoved {
                 context,
-                prev_active,
+                prev_view,
                 ..
             } => {
                 if !self.contexts.iter().any(|c| c.id == context.id) {
@@ -2004,7 +2240,7 @@ impl KeptApp {
                 }
                 self.dirty_contexts.insert(context.id);
                 self.pending_context_deletes.remove(&context.id);
-                self.active_context = *prev_active;
+                self.view = *prev_view;
             }
             ContextSideEffect::StartReset {
                 context_id,
@@ -2043,16 +2279,17 @@ impl KeptApp {
         // context can't rotate again on its very first write.
         let now = now_epoch_ms();
         let idle_ms = IDLE_CONTEXT_THRESHOLD.as_millis() as i64;
-        let active_start = self
-            .contexts
-            .iter()
-            .find(|c| c.id == self.active_context)
+        // Idle baseline tracks the writable (most recent open) context, not
+        // the user's view selection — date-view doesn't affect rotation.
+        let writable_start = self
+            .writable_context_id()
+            .and_then(|id| self.contexts.iter().find(|c| c.id == id))
             .map(|c| c.start_time)
             .unwrap_or(i64::MIN);
         let baseline = self
             .last_cell_create_ms()
-            .map(|t| t.max(active_start))
-            .unwrap_or(active_start);
+            .map(|t| t.max(writable_start))
+            .unwrap_or(writable_start);
         if baseline > i64::MIN && now - baseline >= idle_ms {
             self.rotate_context_now();
         }
@@ -2063,7 +2300,7 @@ impl KeptApp {
             Cell::new(self.typeface.clone(), String::new())
         };
         new_cell.set_font_scale(self.font_scale);
-        new_cell.context_hint_id = Some(self.active_context);
+        new_cell.context_hint_id = self.writable_context_id();
         let new_id = new_cell.id;
         let snapshot = new_cell.snapshot();
         self.insert_cell_sorted(new_cell);
@@ -2136,17 +2373,23 @@ impl KeptApp {
         // Any click dismisses an active @-mention popup.
         self.mention_popup = None;
 
-        // Sidebar clicks switch the active context. Sidebar lives in window
-        // (logical) space, so use raw (x, y) — not doc_y.
+        // Sidebar clicks switch the view. Sidebar lives in window (logical)
+        // space, so use raw (x, y) — not doc_y.
         if x < SIDEBAR_WIDTH {
+            // Context rows first (they're indented inside dates so their bbox
+            // overlaps date row gaps in some edge cases — context wins).
             for (id, rect) in self.last_sidebar_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_menu_open = None;
                     return self.set_active_context(id);
                 }
             }
-            // Click in the sidebar background but not on an item: close menus,
-            // but don't fall through to cell hit-testing.
+            for (date, rect) in self.last_sidebar_date_rects.clone() {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    self.cell_menu_open = None;
+                    return self.set_active_date(date);
+                }
+            }
             self.cell_menu_open = None;
             return false;
         }
@@ -2328,20 +2571,40 @@ fn format_timestamp(epoch_ms: i64) -> String {
     dt.format("%-d %B %Y, %-I:%M %p").to_string()
 }
 
-/// Compact label for sidebar context entries. Same day → just the time
-/// (`10:42 AM`); other days include a short date prefix (`Apr 28, 10:42 AM`).
-fn format_context_label(epoch_ms: i64) -> String {
-    use chrono::{Datelike, Local, TimeZone};
+fn local_date_for_ms(epoch_ms: i64) -> chrono::NaiveDate {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_millis_opt(epoch_ms)
+        .single()
+        .map(|dt| dt.date_naive())
+        .unwrap_or_else(|| {
+            Local
+                .timestamp_millis_opt(0)
+                .single()
+                .unwrap()
+                .date_naive()
+        })
+}
+
+fn format_date_label(d: chrono::NaiveDate) -> String {
+    let now = chrono::Local::now().date_naive();
+    if d == now {
+        format!("Today — {}", d.format("%b %-d"))
+    } else if d.succ_opt() == Some(now) {
+        format!("Yesterday — {}", d.format("%b %-d"))
+    } else {
+        d.format("%B %-d, %Y").to_string()
+    }
+}
+
+/// Time-only label for sidebar context rows nested under a date header.
+fn format_context_time(epoch_ms: i64) -> String {
+    use chrono::{Local, TimeZone};
     let dt = Local
         .timestamp_millis_opt(epoch_ms)
         .single()
         .unwrap_or_else(|| Local.timestamp_millis_opt(0).single().unwrap());
-    let now = Local::now();
-    if dt.year() == now.year() && dt.ordinal() == now.ordinal() {
-        dt.format("%-I:%M %p").to_string()
-    } else {
-        dt.format("%b %-d, %-I:%M %p").to_string()
-    }
+    dt.format("%-I:%M %p").to_string()
 }
 
 fn context_ref<'a>(c: &'a Context) -> ContextRef<'a> {
