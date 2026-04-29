@@ -328,6 +328,45 @@ impl TextBox {
         self.links.iter().find(|l| byte >= l.range.start && byte < l.range.end)
     }
 
+    /// Text covered by the primary selection. Empty if collapsed.
+    pub fn copy_primary_selection(&self) -> String {
+        let Some((anchor, head)) = self.primary_caret() else {
+            return String::new();
+        };
+        if anchor == head {
+            return String::new();
+        }
+        let lo = anchor.min(head);
+        let hi = anchor.max(head);
+        self.text[lo..hi].to_string()
+    }
+
+    /// Returns the cut text and removes it from the textbox via `apply_edit`
+    /// (so undo records the change).
+    pub fn cut_primary_selection(&mut self) -> String {
+        let Some((anchor, head)) = self.primary_caret() else {
+            return String::new();
+        };
+        if anchor == head {
+            return String::new();
+        }
+        let lo = anchor.min(head);
+        let hi = anchor.max(head);
+        let cut_text = self.text[lo..hi].to_string();
+        self.apply_edit(&Edit {
+            range: lo..hi,
+            replacement: String::new(),
+        });
+        cut_text
+    }
+
+    /// Insert `s` at every cursor (replacing each cursor's selection).
+    pub fn paste(&mut self, s: &str) {
+        if !s.is_empty() {
+            self.insert_text(s);
+        }
+    }
+
     /// Restore document state from a snapshot. Resets transient input state
     /// (mouse drag, click count) and invalidates the wrap cache so the next
     /// tick re-wraps at the (possibly different) font scale.
@@ -1704,6 +1743,60 @@ impl OutlineCell {
         }
     }
 
+    /// Plain-text representation of the current selection — joined bullet text
+    /// (one bullet per line, indented with 4 spaces per depth) when a multi-
+    /// bullet selection is active, otherwise the focused bullet's textbox
+    /// selection.
+    pub fn copy_text(&self) -> String {
+        if let Some(sel) = self.bullet_selection {
+            self.copy_bullet_range(sel)
+        } else if let Some(idx) = self.focused_index() {
+            self.bullets[idx].textbox.copy_primary_selection()
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn cut_text(&mut self) -> String {
+        if let Some(sel) = self.bullet_selection {
+            let text = self.copy_bullet_range(sel);
+            self.delete_bullet_selection();
+            text
+        } else if let Some(idx) = self.focused_index() {
+            self.bullets[idx].textbox.cut_primary_selection()
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn paste_text(&mut self, s: &str) {
+        if self.bullet_selection.is_some() {
+            self.delete_bullet_selection();
+        }
+        if let Some(idx) = self.focused_index() {
+            self.bullets[idx].textbox.paste(s);
+        }
+    }
+
+    fn copy_bullet_range(&self, sel: BulletSelection) -> String {
+        let (Some(ai), Some(hi)) = (
+            self.bullet_idx_by_id(sel.anchor_id),
+            self.bullet_idx_by_id(sel.head_id),
+        ) else {
+            return String::new();
+        };
+        let lo = ai.min(hi);
+        let high = ai.max(hi);
+        self.bullets[lo..=high]
+            .iter()
+            .map(|b| {
+                let indent = "    ".repeat(b.depth as usize);
+                format!("{}{}", indent, b.textbox.text())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Place the caret at the very start of the cell (first bullet, offset 0).
     /// Used by the container when arrow-nav arrives from the previous cell.
     pub fn place_caret_at_start(&mut self) {
@@ -2205,6 +2298,27 @@ impl Cell {
         match self {
             Cell::Plain(tb) => tb.add_link(range, url),
             Cell::Outline(oc) => oc.add_link_to_first(range, url),
+        }
+    }
+
+    pub fn copy_text(&self) -> String {
+        match self {
+            Cell::Plain(tb) => tb.copy_primary_selection(),
+            Cell::Outline(oc) => oc.copy_text(),
+        }
+    }
+
+    pub fn cut_text(&mut self) -> String {
+        match self {
+            Cell::Plain(tb) => tb.cut_primary_selection(),
+            Cell::Outline(oc) => oc.cut_text(),
+        }
+    }
+
+    pub fn paste_text(&mut self, s: &str) {
+        match self {
+            Cell::Plain(tb) => tb.paste(s),
+            Cell::Outline(oc) => oc.paste_text(s),
         }
     }
 

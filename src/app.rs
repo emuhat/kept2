@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use arboard::Clipboard;
 use skia_safe::{Canvas, Color, Font, FontMgr, Paint, PaintStyle, Point, Rect, Typeface};
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
@@ -159,6 +160,7 @@ pub struct KeptApp {
     last_edit_time: Option<Instant>,
     coalesce_break: bool,
     mention_popup: Option<MentionPopup>,
+    clipboard: Option<Clipboard>,
 }
 
 impl KeptApp {
@@ -197,6 +199,7 @@ impl KeptApp {
             last_edit_time: None,
             coalesce_break: false,
             mention_popup: None,
+            clipboard: Clipboard::new().ok(),
         }
     }
 
@@ -382,6 +385,15 @@ impl KeptApp {
                         self.undo()
                     };
                 }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("c") => {
+                    return self.copy_to_clipboard();
+                }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("x") => {
+                    return self.cut_to_clipboard();
+                }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("v") => {
+                    return self.paste_from_clipboard();
+                }
                 _ => {}
             }
         }
@@ -530,6 +542,71 @@ impl KeptApp {
                 p.selected = count - 1;
             }
         }
+    }
+
+    fn copy_to_clipboard(&mut self) -> bool {
+        let text = self
+            .cells
+            .get(self.focused)
+            .map(|c| c.copy_text())
+            .unwrap_or_default();
+        if text.is_empty() {
+            return false;
+        }
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set_text(text);
+        }
+        true
+    }
+
+    fn cut_to_clipboard(&mut self) -> bool {
+        let pre = self.cells.get(self.focused).map(|c| c.snapshot());
+        let cut = match self.cells.get_mut(self.focused) {
+            Some(c) => c.cut_text(),
+            None => return false,
+        };
+        if cut.is_empty() {
+            return false;
+        }
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set_text(cut);
+        }
+        // Record the deletion in the undo stack.
+        if let (Some(pre), Some(post)) = (pre, self.cells.get(self.focused).map(|c| c.snapshot())) {
+            if !pre.doc_eq(&post) {
+                self.record_edit(pre, post);
+            }
+        }
+        self.coalesce_break = true;
+        self.pending_caret_scroll = true;
+        true
+    }
+
+    fn paste_from_clipboard(&mut self) -> bool {
+        let Some(cb) = self.clipboard.as_mut() else {
+            return false;
+        };
+        let text = match cb.get_text() {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        if text.is_empty() {
+            return false;
+        }
+        let pre = self.cells.get(self.focused).map(|c| c.snapshot());
+        if let Some(c) = self.cells.get_mut(self.focused) {
+            c.paste_text(&text);
+        } else {
+            return false;
+        }
+        if let (Some(pre), Some(post)) = (pre, self.cells.get(self.focused).map(|c| c.snapshot())) {
+            if !pre.doc_eq(&post) {
+                self.record_edit(pre, post);
+            }
+        }
+        self.coalesce_break = true;
+        self.pending_caret_scroll = true;
+        true
     }
 
     fn render_mention_popup(&self, canvas: &Canvas) {
