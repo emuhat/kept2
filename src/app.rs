@@ -1469,7 +1469,13 @@ impl KeptApp {
 
     fn copy_to_clipboard(&mut self) -> bool {
         let Some(id) = self.focused else { return false };
-        let text = self.cell(id).map(|c| c.copy_text()).unwrap_or_default();
+        let mut text = self.cell(id).map(|c| c.copy_text()).unwrap_or_default();
+        // View mode + no selection → copy the whole cell. Edit mode keeps
+        // the selection-or-nothing behavior so an accidental Ctrl+C with no
+        // selection doesn't dump the whole cell.
+        if text.is_empty() && !self.editing {
+            text = self.cell(id).map(|c| c.full_text()).unwrap_or_default();
+        }
         if text.is_empty() {
             return false;
         }
@@ -2438,8 +2444,9 @@ impl KeptApp {
         // text edit starts a fresh undo entry.
         self.coalesce_break = true;
         self.dragging_cell = Some(target);
+        let editing = self.editing;
         match self.cell_mut(target) {
-            Some(cell) => cell.mouse_down(x, doc_y, modifiers),
+            Some(cell) => cell.mouse_down(x, doc_y, modifiers, editing),
             None => false,
         }
     }

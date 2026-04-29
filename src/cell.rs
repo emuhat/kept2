@@ -232,10 +232,51 @@ impl TextBox {
 
     /// Replace the entire text and reset the selection. Caller is responsible
     /// for setting a sensible caret position via `set_caret_at` afterward.
+    /// Drops any links that no longer fit within the new text.
     pub fn replace_text(&mut self, new_text: String) {
+        let new_len = new_text.len();
         self.text = new_text;
         self.body_lines_width = f32::NAN;
         self.sels = Selections::single_caret(0);
+        self.links.retain(|l| l.range.end <= new_len);
+    }
+
+    /// Split this textbox's links at byte offset `at`, returning links that
+    /// belonged to the suffix half (with their ranges rebased to start from 0
+    /// in the suffix). Self keeps links that lie wholly in the prefix half.
+    /// Links that straddle `at` are dropped from both halves.
+    pub fn split_links_at(&mut self, at: usize) -> Vec<LinkSpan> {
+        let mut suffix = Vec::new();
+        self.links.retain(|l| {
+            if l.range.end <= at {
+                true // wholly in prefix — keep
+            } else if l.range.start >= at {
+                // wholly in suffix — move
+                suffix.push(LinkSpan {
+                    range: (l.range.start - at)..(l.range.end - at),
+                    url: l.url.clone(),
+                });
+                false
+            } else {
+                // straddles `at` — drop
+                false
+            }
+        });
+        suffix
+    }
+
+    /// Append `new_text` and shift any links from `extra_links` by the current
+    /// text length before adding (used after merging two bullets).
+    pub fn append_with_links(&mut self, new_text: &str, extra_links: Vec<LinkSpan>) {
+        let offset = self.text.len();
+        self.text.push_str(new_text);
+        self.body_lines_width = f32::NAN;
+        for l in extra_links {
+            self.links.push(LinkSpan {
+                range: (l.range.start + offset)..(l.range.end + offset),
+                url: l.url,
+            });
+        }
     }
 
     pub fn set_caret_at(&mut self, idx: usize) {
@@ -675,15 +716,25 @@ impl TextBox {
         }
     }
 
-    pub fn mouse_down(&mut self, abs_x: f32, abs_y: f32, modifiers: &Modifiers) -> bool {
+    pub fn mouse_down(
+        &mut self,
+        abs_x: f32,
+        abs_y: f32,
+        modifiers: &Modifiers,
+        editing: bool,
+    ) -> bool {
         let lx = abs_x - self.x_origin;
         let ly = abs_y - self.y_origin;
 
         let (idx, affinity) = self.hit_test(lx, ly);
         let mods = modifiers.state();
 
-        // Ctrl+Click on a link opens it instead of moving the caret.
-        if mods.control_key() && !mods.shift_key() && !mods.alt_key() {
+        // Plain click on a link opens it in view mode; Ctrl+click opens it
+        // while editing (so plain clicks in edit mode still move the caret).
+        let plain_in_view = !editing && !mods.shift_key() && !mods.alt_key();
+        let ctrl_in_edit =
+            editing && mods.control_key() && !mods.shift_key() && !mods.alt_key();
+        if plain_in_view || ctrl_in_edit {
             if let Some(link) = self.link_at(idx) {
                 open_url(&link.url);
                 return true;
@@ -983,6 +1034,11 @@ impl TextBox {
         self.sels.normalize();
     }
 
+    #[cfg(test)]
+    pub fn backspace_for_test(&mut self) {
+        self.backspace();
+    }
+
     fn backspace(&mut self) {
         let mut edits: Vec<Edit> = Vec::new();
         for sel in &self.sels.items {
@@ -1091,7 +1147,6 @@ impl TextBox {
         let start = edit.range.start;
         let del = edit.range.end - edit.range.start;
         let ins = edit.replacement.len();
-        let edit_end = edit.range.end;
         self.text.replace_range(edit.range.clone(), &edit.replacement);
         for sel in &mut self.sels.items {
             sel.anchor = transform_index(sel.anchor, start, del, ins);
@@ -1099,17 +1154,13 @@ impl TextBox {
             sel.affinity = Affinity::Downstream;
         }
         self.sels.normalize();
-        // Update link spans: deletions that overlap a link drop it; pure
-        // insertions and edits outside the link just shift indices via the
-        // standard right-gravity transform (so typing at link.end extends it,
-        // typing at link.start pushes the link forward).
+        // Update link spans: shift both endpoints through the same transform
+        // used for selections (right-gravity insert, clamp-to-start delete).
+        // Deletions inside a link shrink it; deletions covering it leave a
+        // degenerate range that the final `start < end` check drops. This
+        // keeps link state recoverable across Enter+Backspace, partial deletes,
+        // and replacements.
         self.links.retain_mut(|link| {
-            if del > 0 {
-                let overlap = start < link.range.end && edit_end > link.range.start;
-                if overlap {
-                    return false;
-                }
-            }
             link.range.start = transform_index(link.range.start, start, del, ins);
             link.range.end = transform_index(link.range.end, start, del, ins);
             link.range.start < link.range.end
@@ -1852,7 +1903,13 @@ impl OutlineCell {
         }
     }
 
-    pub fn mouse_down(&mut self, abs_x: f32, abs_y: f32, modifiers: &Modifiers) -> bool {
+    pub fn mouse_down(
+        &mut self,
+        abs_x: f32,
+        abs_y: f32,
+        modifiers: &Modifiers,
+        editing: bool,
+    ) -> bool {
         // Any new click clears any persisted multi-bullet selection.
         self.bullet_selection = None;
 
@@ -1866,7 +1923,9 @@ impl OutlineCell {
             origin_id: id,
             mode: DragMode::TextBox,
         });
-        self.bullets[idx].textbox.mouse_down(abs_x, abs_y, modifiers)
+        self.bullets[idx]
+            .textbox
+            .mouse_down(abs_x, abs_y, modifiers, editing)
     }
 
     pub fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
@@ -2134,6 +2193,11 @@ impl OutlineCell {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
+    pub fn split_focused_for_test(&mut self) -> bool {
+        self.split_focused()
+    }
+
     fn split_focused(&mut self) -> bool {
         let Some(idx) = self.focused_index() else {
             return false;
@@ -2148,13 +2212,18 @@ impl OutlineCell {
         let depth = self.bullets[idx].depth;
         let scale = self.bullets[idx].textbox.font_scale();
 
+        // Partition links between the two halves before truncating text
+        // (replace_text would otherwise drop the suffix-side links wholesale).
+        let suffix_links = self.bullets[idx].textbox.split_links_at(head);
+
         // Trim original to prefix; caret position there doesn't matter (focus moves).
         self.bullets[idx].textbox.replace_text(prefix);
         let prefix_len = self.bullets[idx].textbox.text().len();
         self.bullets[idx].textbox.set_caret_at(prefix_len);
 
         let new_id = Uuid::now_v7();
-        let mut new_tb = TextBox::new(self.typeface.clone(), suffix);
+        let mut new_tb = TextBox::new(self.typeface.clone(), String::new());
+        new_tb.append_with_links(&suffix, suffix_links);
         new_tb.set_font_scale(scale);
         new_tb.set_caret_at(0);
         self.bullets.insert(
@@ -2437,14 +2506,12 @@ impl OutlineCell {
         let prev_idx = idx - 1;
         let prev_id = self.bullets[prev_idx].id;
         let prev_len = self.bullets[prev_idx].textbox.text().len();
-        let combined = format!(
-            "{}{}",
-            self.bullets[prev_idx].textbox.text(),
-            self.bullets[idx].textbox.text()
-        );
+        let merged_text = self.bullets[idx].textbox.text().to_string();
+        let merged_links = self.bullets[idx].textbox.links().to_vec();
         self.bullets.remove(idx);
         let prev = &mut self.bullets[prev_idx];
-        prev.textbox.replace_text(combined);
+        prev.textbox
+            .append_with_links(&merged_text, merged_links);
         prev.textbox.set_caret_at(prev_len);
         self.focused_bullet = prev_id;
         true
@@ -2604,6 +2671,28 @@ impl Cell {
         }
     }
 
+    /// Full text of the cell, ignoring selection state. Used as the fallback
+    /// for view-mode copy when no selection is active. Outline cells join
+    /// bullets with newlines, indenting nested bullets two spaces per depth.
+    pub fn full_text(&self) -> String {
+        match &self.kind {
+            CellKind::Plain(tb) => tb.text().to_string(),
+            CellKind::Outline(oc) => {
+                let mut out = String::new();
+                for (i, b) in oc.bullets().iter().enumerate() {
+                    if i > 0 {
+                        out.push('\n');
+                    }
+                    for _ in 0..b.depth() {
+                        out.push_str("  ");
+                    }
+                    out.push_str(b.textbox().text());
+                }
+                out
+            }
+        }
+    }
+
     pub fn cut_text(&mut self) -> String {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.cut_primary_selection(),
@@ -2640,10 +2729,16 @@ impl Cell {
         }
     }
 
-    pub fn mouse_down(&mut self, abs_x: f32, abs_y: f32, modifiers: &Modifiers) -> bool {
+    pub fn mouse_down(
+        &mut self,
+        abs_x: f32,
+        abs_y: f32,
+        modifiers: &Modifiers,
+        editing: bool,
+    ) -> bool {
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.mouse_down(abs_x, abs_y, modifiers),
-            CellKind::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers),
+            CellKind::Plain(tb) => tb.mouse_down(abs_x, abs_y, modifiers, editing),
+            CellKind::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers, editing),
         }
     }
 
@@ -2809,4 +2904,139 @@ pub fn now_epoch_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skia_safe::FontMgr;
+
+    fn typeface() -> Typeface {
+        FontMgr::new()
+            .new_from_data(include_bytes!("../resources/fonts/Figtree.ttf"), None)
+            .expect("font loads")
+    }
+
+    #[test]
+    fn outline_split_preserves_suffix_link() {
+        // After split, a link that was wholly in the suffix half should
+        // appear on the new bullet (not be silently dropped).
+        let mut tb = TextBox::new(typeface(), "head | LINK".to_string());
+        tb.add_link(7..11, "https://example.com/".to_string());
+        tb.set_caret_at(5); // split at the '|'
+        let mut oc = OutlineCell::from_bullets(
+            typeface(),
+            vec![Bullet::new(Uuid::now_v7(), tb, 0)],
+        );
+        oc.split_focused_for_test();
+        let bullets = oc.bullets();
+        assert_eq!(bullets.len(), 2);
+        assert_eq!(bullets[0].textbox().text(), "head ");
+        assert!(bullets[0].textbox().links().is_empty());
+        assert_eq!(bullets[1].textbox().text(), "| LINK");
+        let new_links = bullets[1].textbox().links();
+        assert_eq!(new_links.len(), 1, "suffix link rebased onto new bullet");
+        assert_eq!(new_links[0].range, 2..6);
+    }
+
+    #[test]
+    fn outline_bullet_link_survives_split_then_undo() {
+        let mut tb = TextBox::new(typeface(), "before LINK after".to_string());
+        tb.add_link(7..11, "https://example.com/".to_string());
+        tb.set_caret_at(9);
+        let bullet_id = Uuid::now_v7();
+        let mut oc = OutlineCell::from_bullets(
+            typeface(),
+            vec![Bullet::new(bullet_id, tb, 0)],
+        );
+        let pre = oc.snapshot();
+        // Simulate what split_focused does: shorten this bullet's text and
+        // append a new bullet with the suffix. The original's `links` Vec
+        // is left pointing past the new (shorter) text — the buggy state
+        // before our fix.
+        oc.split_focused_for_test();
+        // Restore from pre.
+        oc.restore(pre);
+        let bullets = oc.bullets();
+        assert_eq!(bullets.len(), 1, "single bullet restored");
+        assert_eq!(bullets[0].textbox().text(), "before LINK after");
+        let links = bullets[0].textbox().links();
+        assert_eq!(links.len(), 1, "link restored on undo");
+        assert_eq!(links[0].range, 7..11);
+    }
+
+    #[test]
+    fn link_survives_enter_then_backspace() {
+        // User reproduction: caret in mid-link, Enter, Backspace. The link
+        // should return to its pre-Enter state, not vanish on the deletion.
+        let mut tb = TextBox::new(typeface(), "before LINK after".to_string());
+        tb.add_link(7..11, "https://example.com/".to_string());
+        tb.set_caret_at(9);
+        // Enter: extend link across the \n.
+        tb.insert_text("\n");
+        assert_eq!(tb.text(), "before LI\nNK after");
+        assert_eq!(tb.links()[0].range, 7..12, "link spans the \\n");
+        // Backspace: delete the \n. Caret is at byte 10 (after \n). Delete
+        // [9, 10) — exercise the same edit shape as a real Backspace.
+        tb.set_caret_at(10);
+        tb.backspace_for_test();
+        assert_eq!(tb.text(), "before LINK after");
+        assert_eq!(
+            tb.links().len(),
+            1,
+            "link survives delete-of-newline-inside-link"
+        );
+        assert_eq!(tb.links()[0].range, 7..11);
+    }
+
+    #[test]
+    fn plain_link_survives_multi_edit_undo_sequence() {
+        let mut tb = TextBox::new(typeface(), "before LINK after".to_string());
+        tb.add_link(7..11, "https://example.com/".to_string());
+        // Stack of pre-snapshots, one per edit, mirroring what the app records.
+        let snap0 = tb.snapshot();
+        tb.set_caret_at(9);
+        tb.insert_text("X"); // -> "before LIXNK after", link 7..12
+        let snap1 = tb.snapshot();
+        tb.insert_text("Y"); // -> "before LIXYNK after", link 7..13
+        let snap2 = tb.snapshot();
+        tb.insert_text("\n"); // -> "before LIXY\nNK after", link 7..14
+        // Expect link still there spanning both visual lines.
+        assert_eq!(tb.links().len(), 1);
+        assert_eq!(tb.links()[0].range, 7..14);
+        // Undo last → should restore to snap2.
+        tb.restore(snap2);
+        assert_eq!(tb.text(), "before LIXYNK after");
+        assert_eq!(tb.links()[0].range, 7..13);
+        // Undo again → snap1.
+        tb.restore(snap1);
+        assert_eq!(tb.text(), "before LIXNK after");
+        assert_eq!(tb.links()[0].range, 7..12);
+        // Undo to original.
+        tb.restore(snap0);
+        assert_eq!(tb.text(), "before LINK after");
+        assert_eq!(tb.links()[0].range, 7..11);
+    }
+
+    #[test]
+    fn plain_link_survives_edit_then_undo() {
+        let mut tb = TextBox::new(typeface(), "before LINK after".to_string());
+        tb.add_link(7..11, "https://example.com/".to_string());
+        let pre = tb.snapshot();
+        // Caret in middle of link, type chars; then insert a newline.
+        tb.set_caret_at(9);
+        tb.insert_text("X");
+        tb.insert_text("Y");
+        tb.insert_text("\n");
+        // The link should still exist and span across the newline.
+        assert_eq!(tb.links().len(), 1, "link survived edit");
+        let after = tb.links()[0].range.clone();
+        assert!(after.end > after.start);
+        // Restore from snapshot.
+        tb.restore(pre.clone());
+        assert_eq!(tb.text(), "before LINK after");
+        assert_eq!(tb.links().len(), 1, "link restored on undo");
+        assert_eq!(tb.links()[0].range, 7..11);
+        assert_eq!(tb.links()[0].url, "https://example.com/");
+    }
 }
