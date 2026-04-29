@@ -36,6 +36,7 @@ enum UndoOp {
     InsertCell {
         at_idx: usize,
         pre_focused: usize,
+        outline: bool,
     },
     DeleteCell {
         at_idx: usize,
@@ -220,7 +221,8 @@ impl KeptApp {
         if event.state == ElementState::Pressed && modifiers.state().control_key() {
             match &event.logical_key {
                 Key::Named(NamedKey::Enter) => {
-                    return self.insert_cell_after_focused();
+                    let outline = modifiers.state().shift_key();
+                    return self.insert_cell_after_focused(outline);
                 }
                 Key::Named(NamedKey::Delete) => {
                     return self.delete_focused_cell();
@@ -260,6 +262,47 @@ impl KeptApp {
             }
         }
 
+        // Cross-cell arrow nav: a plain ArrowUp/Down at the focused cell's
+        // top/bottom edge moves focus to the adjacent cell, with the caret
+        // landing at the end (Up) or start (Down) of the destination.
+        if event.state == ElementState::Pressed
+            && !modifiers.state().shift_key()
+            && !modifiers.state().control_key()
+            && !modifiers.state().alt_key()
+        {
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowUp) => {
+                    if self.focused > 0
+                        && self
+                            .cells
+                            .get(self.focused)
+                            .map_or(false, |c| c.at_top_edge())
+                    {
+                        self.focused -= 1;
+                        self.cells[self.focused].place_caret_at_end();
+                        self.coalesce_break = true;
+                        self.pending_caret_scroll = true;
+                        return true;
+                    }
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    if self.focused + 1 < self.cells.len()
+                        && self
+                            .cells
+                            .get(self.focused)
+                            .map_or(false, |c| c.at_bottom_edge())
+                    {
+                        self.focused += 1;
+                        self.cells[self.focused].place_caret_at_start();
+                        self.coalesce_break = true;
+                        self.pending_caret_scroll = true;
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let pre = self.cells.get(self.focused).map(|c| c.snapshot());
         let handled = if let Some(cell) = self.cells.get_mut(self.focused) {
             cell.handle_key(event, modifiers)
@@ -269,7 +312,7 @@ impl KeptApp {
         if handled {
             if let Some(pre) = pre {
                 let post = self.cells[self.focused].snapshot();
-                if pre.text != post.text {
+                if !pre.doc_eq(&post) {
                     self.record_edit(pre, post);
                 } else {
                     // Cursor-only event: break coalescing so the next text edit
@@ -325,6 +368,7 @@ impl KeptApp {
             UndoOp::InsertCell {
                 at_idx,
                 pre_focused,
+                ..
             } => {
                 if *at_idx < self.cells.len() {
                     self.cells.remove(*at_idx);
@@ -336,7 +380,10 @@ impl KeptApp {
                 snapshot,
                 pre_focused,
             } => {
-                let mut cell = Cell::new(self.typeface.clone(), String::new());
+                let mut cell = match snapshot {
+                    CellSnapshot::Plain(_) => Cell::new(self.typeface.clone(), String::new()),
+                    CellSnapshot::Outline(_) => Cell::new_outline(self.typeface.clone()),
+                };
                 cell.restore(snapshot.clone());
                 self.cells.insert(*at_idx, cell);
                 self.focused = *pre_focused;
@@ -360,8 +407,14 @@ impl KeptApp {
                 self.focused = *cell_idx;
                 self.cells[*cell_idx].restore(post.clone());
             }
-            UndoOp::InsertCell { at_idx, .. } => {
-                let mut cell = Cell::new(self.typeface.clone(), String::new());
+            UndoOp::InsertCell {
+                at_idx, outline, ..
+            } => {
+                let mut cell = if *outline {
+                    Cell::new_outline(self.typeface.clone())
+                } else {
+                    Cell::new(self.typeface.clone(), String::new())
+                };
                 cell.set_font_scale(self.font_scale);
                 self.cells.insert(*at_idx, cell);
                 self.focused = *at_idx;
@@ -407,7 +460,7 @@ impl KeptApp {
         true
     }
 
-    fn insert_cell_after_focused(&mut self) -> bool {
+    fn insert_cell_after_focused(&mut self, outline: bool) -> bool {
         // No-op if the focused cell is empty — Ctrl+Enter shouldn't pile up empties.
         if let Some(cell) = self.cells.get(self.focused) {
             if cell.is_empty() {
@@ -415,7 +468,11 @@ impl KeptApp {
             }
         }
         let pre_focused = self.focused;
-        let mut new_cell = Cell::new(self.typeface.clone(), String::new());
+        let mut new_cell = if outline {
+            Cell::new_outline(self.typeface.clone())
+        } else {
+            Cell::new(self.typeface.clone(), String::new())
+        };
         new_cell.set_font_scale(self.font_scale);
         let insert_at = (self.focused + 1).min(self.cells.len());
         self.cells.insert(insert_at, new_cell);
@@ -430,6 +487,7 @@ impl KeptApp {
         self.undo_stack.push(UndoOp::InsertCell {
             at_idx: insert_at,
             pre_focused,
+            outline,
         });
         self.redo_stack.clear();
         self.coalesce_break = true;
