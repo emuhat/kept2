@@ -10,6 +10,10 @@ use winit::{
 
 const BODY_FONT_SIZE: f32 = 18.0;
 const HEADING_FONT_SCALE: f32 = 1.12;
+/// Trailing `#tag` tokens on a heading line render at this fraction of body
+/// font size, in muted gray, with extra space separating them from the title.
+const HEADING_TAG_FONT_SCALE: f32 = 0.85;
+const HEADING_TAG_GAP: f32 = 12.0;
 const CARET_WIDTH: f32 = 1.5;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const MULTI_CLICK_DIST: f32 = 5.0;
@@ -163,6 +167,12 @@ pub struct TextBox {
     /// markdown heading (text starts with `"# "` — heading is the first
     /// paragraph). Used to render that paragraph in bold.
     line_is_heading: Vec<bool>,
+    /// Aligned with `body_lines`: for heading lines that contain trailing
+    /// `#tag` tokens, holds `(title_end_offset, first_tag_offset)` line-
+    /// relative byte offsets. The title spans `[0, title_end_offset)`,
+    /// `[title_end_offset, first_tag_offset)` is whitespace rendered as a
+    /// gap, and the tag area runs from `first_tag_offset` to the line end.
+    line_tag_layout: Vec<Option<(usize, usize)>>,
     body_lines_width: f32,
     /// Cell-local y-bands per visual line: top-of-cell = 0.
     line_bands: Vec<(f32, f32)>,
@@ -188,6 +198,7 @@ impl TextBox {
             sels: Selections::single_caret(0),
             body_lines: Vec::new(),
             line_is_heading: Vec::new(),
+            line_tag_layout: Vec::new(),
             body_lines_width: f32::NAN,
             line_bands: Vec::new(),
             x_origin: 0.0,
@@ -474,6 +485,51 @@ impl TextBox {
         f
     }
 
+    /// Smaller (non-bold) variant used for `#tag` tokens trailing a heading.
+    fn tag_font(&self) -> Font {
+        Font::from_typeface(
+            &self.typeface,
+            BODY_FONT_SIZE * HEADING_TAG_FONT_SCALE * self.font_scale,
+        )
+    }
+
+    /// Recompute `line_tag_layout` from the current text + body_lines +
+    /// line_is_heading state. Each entry is `(title_end_offset,
+    /// first_tag_offset)` relative to the line's start byte; line is
+    /// otherwise represented as `None` (no tag styling).
+    fn recompute_line_tag_layout(&mut self) {
+        self.line_tag_layout.clear();
+        self.line_tag_layout.resize(self.body_lines.len(), None);
+        // Tags only exist on heading lines. Find heading paragraph end.
+        if !self.text.starts_with("# ") {
+            return;
+        }
+        let heading_end = self.text.find('\n').unwrap_or(self.text.len());
+        let tags = parse_heading_tags(&self.text, heading_end);
+        if tags.is_empty() {
+            return;
+        }
+        let first_tag_start = tags[0].start;
+        // Walk back from first_tag_start over whitespace to find title_end.
+        let bytes = self.text.as_bytes();
+        let mut title_end = first_tag_start;
+        while title_end > 0 && (bytes[title_end - 1] as char).is_whitespace() {
+            title_end -= 1;
+        }
+        // Find the line that contains first_tag_start; record layout for it.
+        for (li, line) in self.body_lines.iter().enumerate() {
+            if !self.line_is_heading.get(li).copied().unwrap_or(false) {
+                continue;
+            }
+            if first_tag_start >= line.start && first_tag_start < line.end {
+                let line_title_end = title_end.saturating_sub(line.start);
+                let line_first_tag = first_tag_start - line.start;
+                self.line_tag_layout[li] = Some((line_title_end, line_first_tag));
+                break;
+            }
+        }
+    }
+
     /// Render the cell at `(x, y)` with `width`. Returns the height consumed,
     /// which the container uses to position the next cell. `focused` controls
     /// whether selection highlights render; `show_caret` separately gates the
@@ -493,9 +549,14 @@ impl TextBox {
 
         let body_font = self.body_font();
         let heading_font = self.heading_font();
+        let tag_font = self.tag_font();
+        let tag_gap = HEADING_TAG_GAP * self.font_scale;
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
         text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        let mut tag_paint = Paint::default();
+        tag_paint.set_anti_alias(true);
+        tag_paint.set_color(Color::from_rgb(0x90, 0x90, 0x90));
 
         let max_text_width = width.max(80.0);
 
@@ -510,6 +571,7 @@ impl TextBox {
             self.body_lines = lines;
             self.line_is_heading = headings;
             self.body_lines_width = max_text_width;
+            self.recompute_line_tag_layout();
         }
 
         let (_, body_metrics) = body_font.metrics();
@@ -563,15 +625,31 @@ impl TextBox {
                     if s >= e {
                         continue;
                     }
-                    let prefix = &self.text[line.start..s];
-                    let span = &self.text[s..e];
-                    let line_font = if self.line_is_heading.get(li).copied().unwrap_or(false) {
+                    let line_text = &self.text[line.start..line.end];
+                    let main_font = if self.line_is_heading.get(li).copied().unwrap_or(false) {
                         &heading_font
                     } else {
                         &body_font
                     };
-                    let x0 = x + line_font.measure_str(prefix, Some(&text_paint)).0;
-                    let x1 = x0 + line_font.measure_str(span, Some(&text_paint)).0;
+                    let layout = self.line_tag_layout.get(li).copied().flatten();
+                    let x0 = x + line_x_at_offset(
+                        line_text,
+                        s - line.start,
+                        layout,
+                        main_font,
+                        &tag_font,
+                        &text_paint,
+                        tag_gap,
+                    );
+                    let x1 = x + line_x_at_offset(
+                        line_text,
+                        e - line.start,
+                        layout,
+                        main_font,
+                        &tag_font,
+                        &text_paint,
+                        tag_gap,
+                    );
                     let baseline = baselines_local[li] + y;
                     let m = line_metrics_for(li);
                     let top = baseline + m.ascent;
@@ -600,7 +678,32 @@ impl TextBox {
             } else {
                 &body_font
             };
-            if self.links.is_empty() {
+            let layout = self.line_tag_layout.get(li).copied().flatten();
+            if let Some((title_end, first_tag)) = layout {
+                let line_text = &self.text[line.start..line.end];
+                let visible_offset = visible_end - line.start;
+                let title_end = title_end.min(visible_offset);
+                let first_tag = first_tag.min(visible_offset);
+                if title_end > 0 {
+                    canvas.draw_str(
+                        &line_text[..title_end],
+                        Point::new(x, baseline),
+                        line_font,
+                        &text_paint,
+                    );
+                }
+                if first_tag < visible_offset {
+                    let title_w = line_font
+                        .measure_str(&line_text[..title_end], Some(&text_paint))
+                        .0;
+                    canvas.draw_str(
+                        &line_text[first_tag..visible_offset],
+                        Point::new(x + title_w + tag_gap, baseline),
+                        &tag_font,
+                        &tag_paint,
+                    );
+                }
+            } else if self.links.is_empty() {
                 canvas.draw_str(
                     &self.text[visible_line.clone()],
                     Point::new(x, baseline),
@@ -636,14 +739,22 @@ impl TextBox {
                     let line = &self.body_lines[li];
                     let visible_end = trim_nl_end(&self.text, line);
                     let prefix_end = (line.start + offset).min(visible_end);
-                    let line_font = if self.line_is_heading.get(li).copied().unwrap_or(false) {
+                    let line_text = &self.text[line.start..line.end];
+                    let main_font = if self.line_is_heading.get(li).copied().unwrap_or(false) {
                         &heading_font
                     } else {
                         &body_font
                     };
-                    x + line_font
-                        .measure_str(&self.text[line.start..prefix_end], Some(&text_paint))
-                        .0
+                    let layout = self.line_tag_layout.get(li).copied().flatten();
+                    x + line_x_at_offset(
+                        line_text,
+                        prefix_end - line.start,
+                        layout,
+                        main_font,
+                        &tag_font,
+                        &text_paint,
+                        tag_gap,
+                    )
                 };
                 let m = line_metrics_for(li);
                 let top = baseline + m.ascent;
@@ -887,20 +998,29 @@ impl TextBox {
         let line_text = &self.text[line.start..visible_end];
         let local_x = lx.max(0.0);
 
-        let line_font = if self.line_is_heading.get(line_idx).copied().unwrap_or(false) {
+        let main_font = if self.line_is_heading.get(line_idx).copied().unwrap_or(false) {
             self.heading_font()
         } else {
             self.body_font()
         };
+        let tag_font = self.tag_font();
+        let tag_gap = HEADING_TAG_GAP * self.font_scale;
+        let layout = self.line_tag_layout.get(line_idx).copied().flatten();
         let paint = Paint::default();
 
         let mut prev_offset = 0usize;
         let mut prev_w = 0.0f32;
 
         for (offset, _) in line_text.char_indices().skip(1) {
-            let w = line_font
-                .measure_str(&line_text[..offset], Some(&paint))
-                .0;
+            let w = line_x_at_offset(
+                line_text,
+                offset,
+                layout,
+                &main_font,
+                &tag_font,
+                &paint,
+                tag_gap,
+            );
             if w >= local_x {
                 let chosen = if (local_x - prev_w) < (w - local_x) {
                     prev_offset
@@ -914,7 +1034,15 @@ impl TextBox {
             prev_offset = offset;
         }
 
-        let total_w = line_font.measure_str(line_text, Some(&paint)).0;
+        let total_w = line_x_at_offset(
+            line_text,
+            line_text.len(),
+            layout,
+            &main_font,
+            &tag_font,
+            &paint,
+            tag_gap,
+        );
         let chosen = if (local_x - prev_w) < (total_w - local_x) {
             prev_offset
         } else {
@@ -1188,6 +1316,7 @@ impl TextBox {
         if self.body_lines_width.is_nan() {
             self.body_lines.clear();
             self.line_is_heading.clear();
+            self.line_tag_layout.clear();
             return;
         }
         let body_font = self.body_font();
@@ -1202,6 +1331,7 @@ impl TextBox {
         );
         self.body_lines = lines;
         self.line_is_heading = headings;
+        self.recompute_line_tag_layout();
     }
 }
 
@@ -1251,6 +1381,73 @@ fn draw_line_with_links(
 
 /// End byte of the visible portion of a line: drops a single trailing `'\n'`
 /// (which lives at the end of the line range but isn't drawn).
+/// X-pixel offset within a line up to byte `target_offset`, accounting for
+/// heading-tag layout: title bytes use `main_font`, the gap between title and
+/// first tag is `tag_gap`, and tag-area bytes use `tag_font`.
+fn line_x_at_offset(
+    line_text: &str,
+    target_offset: usize,
+    tag_layout: Option<(usize, usize)>,
+    main_font: &Font,
+    tag_font: &Font,
+    paint: &Paint,
+    tag_gap: f32,
+) -> f32 {
+    let target = target_offset.min(line_text.len());
+    let (title_end, first_tag) = match tag_layout {
+        Some((te, ft)) => (te, ft),
+        None => return main_font.measure_str(&line_text[..target], Some(paint)).0,
+    };
+    if target <= title_end {
+        main_font.measure_str(&line_text[..target], Some(paint)).0
+    } else if target <= first_tag {
+        main_font.measure_str(&line_text[..title_end], Some(paint)).0 + tag_gap
+    } else {
+        main_font.measure_str(&line_text[..title_end], Some(paint)).0
+            + tag_gap
+            + tag_font
+                .measure_str(&line_text[first_tag..target], Some(paint))
+                .0
+    }
+}
+
+/// Parse trailing `#tag` tokens from a heading paragraph. `text` is the
+/// full source text; `heading_end` is the byte offset where the heading
+/// paragraph ends (exclusive). Returns absolute-in-`text` byte ranges for
+/// each tag, in source order. Tags are whitespace-separated tokens starting
+/// with `#`. A bare `#` (length 1) counts as a tag-in-progress so the user
+/// gets stable rendering as they type out the next tag's name. Tokens at
+/// positions 0..2 are the leading `# ` heading marker and are never tags.
+fn parse_heading_tags(text: &str, heading_end: usize) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut tags: Vec<Range<usize>> = Vec::new();
+    let mut end = heading_end;
+    loop {
+        // Skip trailing whitespace.
+        while end > 0 && (bytes[end - 1] as char).is_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            break;
+        }
+        // Find start of last word.
+        let mut start = end;
+        while start > 0 && !(bytes[start - 1] as char).is_whitespace() {
+            start -= 1;
+        }
+        // Past the leading `# ` marker, any `#`-prefixed word is a tag —
+        // even a bare `#` (the user is mid-typing a new tag).
+        if start >= 2 && start < end && bytes[start] == b'#' {
+            tags.push(start..end);
+            end = start;
+        } else {
+            break;
+        }
+    }
+    tags.reverse();
+    tags
+}
+
 fn trim_nl_end(text: &str, line: &Range<usize>) -> usize {
     if line.end > line.start && text.as_bytes().get(line.end - 1) == Some(&b'\n') {
         line.end - 1
