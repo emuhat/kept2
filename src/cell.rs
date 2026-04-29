@@ -158,6 +158,10 @@ pub struct TextBox {
     text: String,
     sels: Selections,
     body_lines: Vec<Range<usize>>,
+    /// Aligned with `body_lines`: true for lines belonging to a leading
+    /// markdown heading (text starts with `"# "` — heading is the first
+    /// paragraph). Used to render that paragraph in bold.
+    line_is_heading: Vec<bool>,
     body_lines_width: f32,
     /// Cell-local y-bands per visual line: top-of-cell = 0.
     line_bands: Vec<(f32, f32)>,
@@ -182,6 +186,7 @@ impl TextBox {
             text: initial_text,
             sels: Selections::single_caret(0),
             body_lines: Vec::new(),
+            line_is_heading: Vec::new(),
             body_lines_width: f32::NAN,
             line_bands: Vec::new(),
             x_origin: 0.0,
@@ -417,6 +422,15 @@ impl TextBox {
         Font::from_typeface(&self.typeface, BODY_FONT_SIZE * self.font_scale)
     }
 
+    /// Bold variant for rendering markdown-style headings. Same size as body
+    /// (only the weight differs) so most layout math stays correct without
+    /// per-line metrics.
+    fn heading_font(&self) -> Font {
+        let mut f = Font::from_typeface(&self.typeface, BODY_FONT_SIZE * self.font_scale);
+        f.set_embolden(true);
+        f
+    }
+
     /// Render the cell at `(x, y)` with `width`. Returns the height consumed,
     /// which the container uses to position the next cell. `focused` controls
     /// whether selection highlights render; `show_caret` separately gates the
@@ -435,6 +449,7 @@ impl TextBox {
         self.width = width;
 
         let body_font = self.body_font();
+        let heading_font = self.heading_font();
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
         text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
@@ -442,7 +457,15 @@ impl TextBox {
         let max_text_width = width.max(80.0);
 
         if self.body_lines_width != max_text_width {
-            self.body_lines = wrap_text(&self.text, &body_font, &text_paint, max_text_width);
+            let (lines, headings) = wrap_text_styled(
+                &self.text,
+                &body_font,
+                &heading_font,
+                &text_paint,
+                max_text_width,
+            );
+            self.body_lines = lines;
+            self.line_is_heading = headings;
             self.body_lines_width = max_text_width;
         }
 
@@ -487,8 +510,13 @@ impl TextBox {
                     }
                     let prefix = &self.text[line.start..s];
                     let span = &self.text[s..e];
-                    let x0 = x + body_font.measure_str(prefix, Some(&text_paint)).0;
-                    let x1 = x0 + body_font.measure_str(span, Some(&text_paint)).0;
+                    let line_font = if self.line_is_heading.get(li).copied().unwrap_or(false) {
+                        &heading_font
+                    } else {
+                        &body_font
+                    };
+                    let x0 = x + line_font.measure_str(prefix, Some(&text_paint)).0;
+                    let x1 = x0 + line_font.measure_str(span, Some(&text_paint)).0;
                     let baseline = baselines_local[li] + y;
                     let top = baseline + body_metrics.ascent;
                     let bot = baseline + body_metrics.descent;
@@ -511,11 +539,16 @@ impl TextBox {
             // Trailing '\n' is part of the line range but not drawn.
             let visible_end = trim_nl_end(&self.text, line);
             let visible_line = line.start..visible_end;
+            let line_font = if self.line_is_heading.get(li).copied().unwrap_or(false) {
+                &heading_font
+            } else {
+                &body_font
+            };
             if self.links.is_empty() {
                 canvas.draw_str(
                     &self.text[visible_line.clone()],
                     Point::new(x, baseline),
-                    &body_font,
+                    line_font,
                     &text_paint,
                 );
             } else {
@@ -526,7 +559,7 @@ impl TextBox {
                     &self.links,
                     x,
                     baseline,
-                    &body_font,
+                    line_font,
                     &text_paint,
                     &link_paint,
                     &underline_paint,
@@ -547,7 +580,12 @@ impl TextBox {
                     let line = &self.body_lines[li];
                     let visible_end = trim_nl_end(&self.text, line);
                     let prefix_end = (line.start + offset).min(visible_end);
-                    x + body_font
+                    let line_font = if self.line_is_heading.get(li).copied().unwrap_or(false) {
+                        &heading_font
+                    } else {
+                        &body_font
+                    };
+                    x + line_font
                         .measure_str(&self.text[line.start..prefix_end], Some(&text_paint))
                         .0
                 };
@@ -782,14 +820,18 @@ impl TextBox {
         let line_text = &self.text[line.start..visible_end];
         let local_x = lx.max(0.0);
 
-        let body_font = self.body_font();
+        let line_font = if self.line_is_heading.get(line_idx).copied().unwrap_or(false) {
+            self.heading_font()
+        } else {
+            self.body_font()
+        };
         let paint = Paint::default();
 
         let mut prev_offset = 0usize;
         let mut prev_w = 0.0f32;
 
         for (offset, _) in line_text.char_indices().skip(1) {
-            let w = body_font
+            let w = line_font
                 .measure_str(&line_text[..offset], Some(&paint))
                 .0;
             if w >= local_x {
@@ -805,7 +847,7 @@ impl TextBox {
             prev_offset = offset;
         }
 
-        let total_w = body_font.measure_str(line_text, Some(&paint)).0;
+        let total_w = line_font.measure_str(line_text, Some(&paint)).0;
         let chosen = if (local_x - prev_w) < (total_w - local_x) {
             prev_offset
         } else {
@@ -1078,11 +1120,21 @@ impl TextBox {
     fn rewrap(&mut self) {
         if self.body_lines_width.is_nan() {
             self.body_lines.clear();
+            self.line_is_heading.clear();
             return;
         }
         let body_font = self.body_font();
+        let heading_font = self.heading_font();
         let paint = Paint::default();
-        self.body_lines = wrap_text(&self.text, &body_font, &paint, self.body_lines_width);
+        let (lines, headings) = wrap_text_styled(
+            &self.text,
+            &body_font,
+            &heading_font,
+            &paint,
+            self.body_lines_width,
+        );
+        self.body_lines = lines;
+        self.line_is_heading = headings;
     }
 }
 
@@ -1376,27 +1428,45 @@ fn prev_char_boundary(text: &str, idx: usize) -> usize {
 /// Wrap into a contiguous partition of the text, treating `'\n'` as a hard
 /// paragraph break. Each visual line's range includes its trailing `'\n'`
 /// (if any). Empty paragraphs produce empty visual lines.
-fn wrap_text(text: &str, font: &Font, paint: &Paint, max_width: f32) -> Vec<Range<usize>> {
+/// Wrap `text` paragraph-by-paragraph, using `heading_font` for the first
+/// paragraph if it starts with `"# "`, and `body_font` otherwise. Returns
+/// `(lines, is_heading)` aligned by index.
+fn wrap_text_styled(
+    text: &str,
+    body_font: &Font,
+    heading_font: &Font,
+    paint: &Paint,
+    max_width: f32,
+) -> (Vec<Range<usize>>, Vec<bool>) {
     if text.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let mut lines = Vec::new();
-    let mut start = 0;
+    let has_heading = text.starts_with("# ");
+    let mut lines: Vec<Range<usize>> = Vec::new();
+    let mut is_heading: Vec<bool> = Vec::new();
+    let mut start = 0usize;
+    let mut first_paragraph = true;
     loop {
         let nl = text[start..].find('\n').map(|p| start + p);
         let para_end = nl.unwrap_or(text.len());
+        let use_heading = first_paragraph && has_heading;
+        let font = if use_heading { heading_font } else { body_font };
+        let prev = lines.len();
         wrap_paragraph_into(text, start, para_end, font, paint, max_width, &mut lines);
-        // Extend the paragraph's last line to absorb the '\n' (or to text end).
         let consumed_to = nl.map(|i| i + 1).unwrap_or(text.len());
         if let Some(last) = lines.last_mut() {
             last.end = consumed_to;
         }
+        for _ in prev..lines.len() {
+            is_heading.push(use_heading);
+        }
+        first_paragraph = false;
         match nl {
             Some(i) => start = i + 1,
             None => break,
         }
     }
-    lines
+    (lines, is_heading)
 }
 
 /// Word-wrap a single paragraph (no '\n' inside) and append its lines to `out`.
