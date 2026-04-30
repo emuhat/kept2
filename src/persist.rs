@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use skia_safe::Typeface;
 use uuid::Uuid;
 
-use crate::cell::{Bullet, Cell, CellKind, OutlineCell, TextBox};
+use crate::cell::{Bullet, Cell, CellKind, OutlineCell, PopPopCell, TextBox};
 
 /// Resolved database path: env override → OS data dir → CWD fallback.
 pub fn db_path() -> PathBuf {
@@ -344,6 +344,12 @@ enum CellBody {
     Outline {
         blocks: Vec<BlockRecord>,
     },
+    #[serde(alias = "pop")]
+    PopPop {
+        text: String,
+        #[serde(default)]
+        links: Vec<LinkRecord>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -397,6 +403,19 @@ fn cell_to_body(cell: &Cell) -> CellBody {
                 })
                 .collect(),
         },
+        CellKind::PopPop(pc) => CellBody::PopPop {
+            text: pc.textbox().text().to_string(),
+            links: pc
+                .textbox()
+                .links()
+                .iter()
+                .map(|l| LinkRecord {
+                    start: l.range.start,
+                    end: l.range.end,
+                    url: l.url.clone(),
+                })
+                .collect(),
+        },
     }
 }
 
@@ -428,6 +447,7 @@ fn tag_names_from_body(body: &CellBody) -> Vec<String> {
                 push_from(&b.text);
             }
         }
+        CellBody::PopPop { text, .. } => push_from(text),
     }
     out
 }
@@ -481,6 +501,14 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
                 })
                 .collect();
             CellKind::Outline(OutlineCell::from_bullets(typeface.clone(), bullets))
+        }
+        CellBody::PopPop { text, links } => {
+            let mut pc = PopPopCell::new(typeface.clone());
+            pc.textbox_mut().replace_text(text);
+            for l in links {
+                pc.textbox_mut().add_link(l.start..l.end, l.url);
+            }
+            CellKind::PopPop(pc)
         }
     }
 }

@@ -127,6 +127,14 @@ struct MentionPopup {
 /// What the user is viewing in the doc area / highlighting in the sidebar.
 /// Decoupled from the writable-target context (which is always the most
 /// recent open one).
+/// Which kind of cell to spawn from a "new cell" hotkey.
+#[derive(Clone, Copy)]
+enum NewCellKind {
+    Plain,
+    Outline,
+    PopPop,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ViewSelection {
     /// A specific context's window (open or closed).
@@ -1238,10 +1246,6 @@ impl KeptApp {
 
         if event.state == ElementState::Pressed && primary_mod(modifiers.state()) {
             match &event.logical_key {
-                Key::Named(NamedKey::Enter) => {
-                    let outline = modifiers.state().shift_key();
-                    return self.insert_cell_after_focused(outline);
-                }
                 Key::Named(NamedKey::Delete) => {
                     return self.delete_focused_cell();
                 }
@@ -1307,11 +1311,18 @@ impl KeptApp {
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("v") => {
                     return self.paste_from_clipboard();
                 }
-                Key::Character(s)
-                    if modifiers.state().shift_key() && s.as_str().eq_ignore_ascii_case("n") =>
-                {
-                    self.rotate_context_now();
-                    return true;
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("n") => {
+                    if modifiers.state().shift_key() {
+                        self.rotate_context_now();
+                        return true;
+                    }
+                    return self.insert_cell_after_focused(NewCellKind::Plain);
+                }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("o") => {
+                    return self.insert_cell_after_focused(NewCellKind::Outline);
+                }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("p") => {
+                    return self.insert_cell_after_focused(NewCellKind::PopPop);
                 }
                 _ => {}
             }
@@ -2411,7 +2422,7 @@ impl KeptApp {
         }
     }
 
-    fn insert_cell_after_focused(&mut self, outline: bool) -> bool {
+    fn insert_cell_after_focused(&mut self, kind: NewCellKind) -> bool {
         // If the user is viewing a closed context, jump to the current open
         // one before inserting. The note belongs in "today," not in history.
         let auto_switched = self.ensure_writable_context();
@@ -2450,10 +2461,10 @@ impl KeptApp {
             self.rotate_context_now();
         }
         let pre_focused = self.focused;
-        let mut new_cell = if outline {
-            Cell::new_outline(self.typeface.clone())
-        } else {
-            Cell::new(self.typeface.clone(), String::new())
+        let mut new_cell = match kind {
+            NewCellKind::Plain => Cell::new(self.typeface.clone(), String::new()),
+            NewCellKind::Outline => Cell::new_outline(self.typeface.clone()),
+            NewCellKind::PopPop => Cell::new_poppop(self.typeface.clone()),
         };
         new_cell.set_font_scale(self.font_scale);
         new_cell.context_hint_id = self.writable_context_id();

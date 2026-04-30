@@ -422,6 +422,49 @@ impl TextBox {
         }
     }
 
+    /// Absolute-y `(top, bottom, is_heading)` for each source line (i.e., each
+    /// `\n`-separated paragraph), in source order. The bottom of source line N
+    /// is the top of source line N+1, or the bottom of the last visual line
+    /// for the final paragraph. Used by `PopPopCell` to size row stripes and
+    /// align outputs with input rows. Empty after a fresh rewrap if
+    /// `body_lines` hasn't been populated yet.
+    pub fn source_line_y_bands(&self) -> Vec<(f32, f32, bool)> {
+        let bytes = self.text.as_bytes();
+        // Collect (li, top_local, is_heading) per paragraph-starting body line.
+        let mut entries: Vec<(usize, f32, bool)> = Vec::new();
+        for (li, line) in self.body_lines.iter().enumerate() {
+            let starts_paragraph = line.start == 0
+                || matches!(bytes.get(line.start.saturating_sub(1)), Some(&b'\n'));
+            if !starts_paragraph {
+                continue;
+            }
+            if let Some(&(top_local, _)) = self.line_bands.get(li) {
+                let is_heading = self.line_is_heading.get(li).copied().unwrap_or(false);
+                entries.push((li, top_local, is_heading));
+            }
+        }
+        // Bottom = next entry's top; for the last entry, the bottom of the
+        // final visual line in body_lines (line_bands.last().bottom).
+        let mut out = Vec::with_capacity(entries.len());
+        let total_bottom_local = self
+            .line_bands
+            .last()
+            .map(|&(_, b)| b)
+            .unwrap_or(0.0);
+        for (i, &(_li, top_local, is_heading)) in entries.iter().enumerate() {
+            let bot_local = entries
+                .get(i + 1)
+                .map(|&(_, t, _)| t)
+                .unwrap_or(total_bottom_local);
+            out.push((
+                self.y_origin + top_local,
+                self.y_origin + bot_local,
+                is_heading,
+            ));
+        }
+        out
+    }
+
     pub fn add_link(&mut self, range: Range<usize>, url: String) {
         if range.start < range.end && range.end <= self.text.len() {
             self.links.push(LinkSpan { range, url });
@@ -613,6 +656,55 @@ impl TextBox {
         }
     }
 
+    /// Pure-state layout step: set origins, wrap if width changed, recompute
+    /// tag layout, populate `line_bands`. Does NOT draw. `tick` calls this
+    /// first; PopPopCell calls it directly so it can compute row stripes
+    /// before the text gets drawn over them.
+    pub fn layout(&mut self, x: f32, y: f32, width: f32) {
+        self.x_origin = x;
+        self.y_origin = y;
+        self.width = width;
+
+        let body_font = self.body_font();
+        let heading_font = self.heading_font();
+        let paint = Paint::default();
+
+        let max_text_width = width.max(80.0);
+        if self.body_lines_width != max_text_width {
+            let (lines, headings) = wrap_text_styled(
+                &self.text,
+                &body_font,
+                &heading_font,
+                &paint,
+                max_text_width,
+            );
+            self.body_lines = lines;
+            self.line_is_heading = headings;
+            self.body_lines_width = max_text_width;
+            self.recompute_line_tag_layout();
+        }
+
+        let (_, body_metrics) = body_font.metrics();
+        let (_, heading_metrics) = heading_font.metrics();
+        let line_count = self.body_lines.len().max(1);
+        self.line_bands.clear();
+        let mut cur_local = 0.0_f32;
+        for li in 0..line_count {
+            let m = if self.line_is_heading.get(li).copied().unwrap_or(false) {
+                heading_metrics
+            } else {
+                body_metrics
+            };
+            let step = -m.ascent + m.descent + m.leading;
+            let extra = step * 0.25;
+            let line_advance = step + extra;
+            // top = cur_local; bottom = top + line_advance.
+            self.line_bands.push((cur_local, cur_local + line_advance));
+            cur_local += line_advance;
+        }
+        self.height = cur_local;
+    }
+
     /// Render the cell at `(x, y)` with `width`. Returns the height consumed,
     /// which the container uses to position the next cell. `focused` controls
     /// whether selection highlights render; `show_caret` separately gates the
@@ -626,9 +718,7 @@ impl TextBox {
         focused: bool,
         show_caret: bool,
     ) -> f32 {
-        self.x_origin = x;
-        self.y_origin = y;
-        self.width = width;
+        self.layout(x, y, width);
 
         let body_font = self.body_font();
         let heading_font = self.heading_font();
@@ -641,22 +731,6 @@ impl TextBox {
         tag_paint.set_anti_alias(true);
         tag_paint.set_color(Color::from_rgb(0x90, 0x90, 0x90));
 
-        let max_text_width = width.max(80.0);
-
-        if self.body_lines_width != max_text_width {
-            let (lines, headings) = wrap_text_styled(
-                &self.text,
-                &body_font,
-                &heading_font,
-                &text_paint,
-                max_text_width,
-            );
-            self.body_lines = lines;
-            self.line_is_heading = headings;
-            self.body_lines_width = max_text_width;
-            self.recompute_line_tag_layout();
-        }
-
         let (_, body_metrics) = body_font.metrics();
         let (_, heading_metrics) = heading_font.metrics();
         let line_metrics_for = |li: usize| {
@@ -667,28 +741,14 @@ impl TextBox {
             }
         };
 
-        // Cell-local baselines; absolute = local + y. Each line steps by its
-        // own font's metrics so heading lines (taller font) get more space.
-        let line_count = self.body_lines.len().max(1);
-        let mut baselines_local: Vec<f32> = Vec::with_capacity(line_count);
-        let mut line_advances: Vec<f32> = Vec::with_capacity(line_count);
-        let mut cur_local = 0.0_f32;
-        for li in 0..line_count {
-            let m = line_metrics_for(li);
-            let step = -m.ascent + m.descent + m.leading;
-            let extra = step * 0.25;
-            cur_local += -m.ascent;
-            baselines_local.push(cur_local);
-            line_advances.push(step + extra);
-            cur_local += m.descent + m.leading + extra;
-        }
-
-        self.line_bands.clear();
-        for (li, &b) in baselines_local.iter().enumerate() {
-            let m = line_metrics_for(li);
-            let top = b + m.ascent;
-            self.line_bands.push((top, top + line_advances[li]));
-        }
+        // Derive cell-local baselines from the (already populated) line_bands:
+        // top + (-ascent) is the baseline.
+        let baselines_local: Vec<f32> = self
+            .line_bands
+            .iter()
+            .enumerate()
+            .map(|(li, &(top, _))| top + (-line_metrics_for(li).ascent))
+            .collect();
 
         if focused {
             let mut hl_paint = Paint::default();
@@ -849,8 +909,7 @@ impl TextBox {
             }
         }
 
-        self.height = cur_local;
-        cur_local
+        self.height
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
@@ -2911,6 +2970,10 @@ pub struct CellSnapshot {
 pub enum CellSnapshotKind {
     Plain(TextBoxSnapshot),
     Outline(OutlineSnapshot),
+    /// PopPop cells share input shape with Plain — a single TextBox — so the
+    /// snapshot is identical. The PopPop variant exists so restore can
+    /// re-attach to a PopPop cell rather than collapsing it back to Plain.
+    PopPop(TextBoxSnapshot),
 }
 
 impl CellSnapshot {
@@ -2926,8 +2989,188 @@ impl CellSnapshot {
                         x.depth == y.depth && x.textbox.text == y.textbox.text
                     })
             }
+            (CellSnapshotKind::PopPop(a), CellSnapshotKind::PopPop(b)) => a.text == b.text,
             _ => false,
         }
+    }
+}
+
+/// Width split between input (left) and output (right) in a PopPop cell.
+const POPPOP_INPUT_RATIO: f32 = 0.7;
+/// Padding on each side of the vertical divider line.
+const POPPOP_DIVIDER_PAD: f32 = 8.0;
+
+/// Calculator-style "REPL" cell. Single TextBox for input on the left;
+/// each `\n`-separated source line gets a sentinel `42` rendered on the right
+/// in dark blue. If the first line starts with `# ` it's treated as a title
+/// (heading + tags + mentions, same as Outline / Plain) and gets no output —
+/// calc lines start from the second source line.
+pub struct PopPopCell {
+    typeface: Typeface,
+    textbox: TextBox,
+    x_origin: f32,
+    y_origin: f32,
+    width: f32,
+    height: f32,
+}
+
+impl PopPopCell {
+    pub fn new(typeface: Typeface) -> Self {
+        Self {
+            typeface: typeface.clone(),
+            textbox: TextBox::new(typeface, String::new()),
+            x_origin: 0.0,
+            y_origin: 0.0,
+            width: 0.0,
+            height: 0.0,
+        }
+    }
+
+    pub fn textbox(&self) -> &TextBox {
+        &self.textbox
+    }
+
+    pub fn textbox_mut(&mut self) -> &mut TextBox {
+        &mut self.textbox
+    }
+
+    pub fn x_origin(&self) -> f32 {
+        self.x_origin
+    }
+    pub fn y_origin(&self) -> f32 {
+        self.y_origin
+    }
+    pub fn width(&self) -> f32 {
+        self.width
+    }
+    pub fn height(&self) -> f32 {
+        self.height
+    }
+
+    fn input_width(&self, total: f32) -> f32 {
+        ((total - POPPOP_DIVIDER_PAD * 2.0) * POPPOP_INPUT_RATIO).max(40.0)
+    }
+
+    pub fn tick(
+        &mut self,
+        canvas: &Canvas,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+        show_caret: bool,
+    ) -> f32 {
+        self.x_origin = x;
+        self.y_origin = y;
+        self.width = width;
+
+        let scale = self.textbox.font_scale();
+        let pad = POPPOP_DIVIDER_PAD * scale;
+        let input_w = ((width - pad * 2.0) * POPPOP_INPUT_RATIO).max(40.0);
+        let divider_x = x + input_w + pad;
+        let output_x = divider_x + pad;
+
+        // 1) Compute layout without drawing so we know per-source-line bands.
+        self.textbox.layout(x, y, input_w);
+
+        // 2) Draw alternating stripes BEHIND the text. Counting only
+        //    non-heading source lines, stripe odd indices (calc-row 0 plain,
+        //    1 light blue, 2 plain, …). Stripes span the full cell width.
+        let bands = self.textbox.source_line_y_bands();
+        let mut stripe = Paint::default();
+        stripe.set_anti_alias(true);
+        stripe.set_color(Color::from_rgb(0xed, 0xf3, 0xfa));
+        let mut calc_row_idx: usize = 0;
+        for &(top, bot, is_heading) in &bands {
+            if is_heading {
+                continue;
+            }
+            if calc_row_idx % 2 == 1 {
+                canvas.draw_rect(Rect::new(x, top, x + width, bot), &stripe);
+            }
+            calc_row_idx += 1;
+        }
+
+        // 3) Render input text on top of stripes. tick re-runs layout but
+        //    the cached width matches, so the wrap step is skipped.
+        let input_h = self
+            .textbox
+            .tick(canvas, x, y, input_w, focused, show_caret);
+
+        // 4) Vertical divider (muted), full input height.
+        let mut divider = Paint::default();
+        divider.set_anti_alias(true);
+        divider.set_color(Color::from_argb(0x40, 0x60, 0x60, 0x60));
+        divider.set_stroke_width(1.0);
+        canvas.draw_line(
+            (divider_x, y + 2.0),
+            (divider_x, y + input_h - 2.0),
+            &divider,
+        );
+
+        // 5) Output column: render "42" only for COMMITTED non-heading source
+        //    lines. A source line is committed iff there's a `\n` after it,
+        //    i.e., it's not the last paragraph in the text.
+        let body_font = Font::from_typeface(&self.typeface, BODY_FONT_SIZE * scale);
+        let (_, m) = body_font.metrics();
+        let mut output_paint = Paint::default();
+        output_paint.set_anti_alias(true);
+        output_paint.set_color(Color::from_rgb(0x18, 0x3a, 0x9c));
+        let last_idx = bands.len().saturating_sub(1);
+        for (i, &(top, _, is_heading)) in bands.iter().enumerate() {
+            if is_heading || i == last_idx {
+                continue;
+            }
+            let baseline = top + (-m.ascent);
+            canvas.draw_str("42", Point::new(output_x, baseline), &body_font, &output_paint);
+        }
+
+        self.height = input_h;
+        input_h
+    }
+
+    pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        self.textbox.handle_key(event, modifiers)
+    }
+
+    pub fn mouse_down(
+        &mut self,
+        abs_x: f32,
+        abs_y: f32,
+        modifiers: &Modifiers,
+        editing: bool,
+    ) -> bool {
+        // Click in the output column (right of divider) is a no-op for now;
+        // forward only clicks within the input column.
+        let input_w = self.input_width(self.width);
+        if abs_x > self.x_origin + input_w {
+            return false;
+        }
+        self.textbox.mouse_down(abs_x, abs_y, modifiers, editing)
+    }
+
+    pub fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
+        // Clamp drag x to within the input column so selection doesn't run
+        // off into the output area.
+        let input_w = self.input_width(self.width);
+        let clamped_x = abs_x.min(self.x_origin + input_w);
+        self.textbox.mouse_drag_to(clamped_x, abs_y)
+    }
+
+    pub fn mouse_up(&mut self) -> bool {
+        self.textbox.mouse_up()
+    }
+
+    pub fn snapshot(&self) -> TextBoxSnapshot {
+        self.textbox.snapshot()
+    }
+
+    pub fn restore(&mut self, snap: TextBoxSnapshot) {
+        self.textbox.restore(snap);
+    }
+
+    pub fn set_font_scale(&mut self, scale: f32) {
+        self.textbox.set_font_scale(scale);
     }
 }
 
@@ -2946,6 +3189,7 @@ pub struct Cell {
 pub enum CellKind {
     Plain(TextBox),
     Outline(OutlineCell),
+    PopPop(PopPopCell),
 }
 
 impl Cell {
@@ -2965,6 +3209,17 @@ impl Cell {
         Self {
             id: Uuid::now_v7(),
             kind: CellKind::Outline(OutlineCell::new(typeface)),
+            timestamp: now,
+            edited_at: now,
+            context_hint_id: None,
+        }
+    }
+
+    pub fn new_poppop(typeface: Typeface) -> Self {
+        let now = now_epoch_ms();
+        Self {
+            id: Uuid::now_v7(),
+            kind: CellKind::PopPop(PopPopCell::new(typeface)),
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
@@ -2997,6 +3252,11 @@ impl Cell {
                 oc.restore(os);
                 CellKind::Outline(oc)
             }
+            CellSnapshotKind::PopPop(tbs) => {
+                let mut pc = PopPopCell::new(typeface.clone());
+                pc.restore(tbs);
+                CellKind::PopPop(pc)
+            }
         };
         Self::from_parts(id, kind, snap.timestamp, snap.edited_at, snap.context_hint_id)
     }
@@ -3008,6 +3268,7 @@ impl Cell {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.add_link(range, url),
             CellKind::Outline(oc) => oc.add_link_to_first(range, url),
+            CellKind::PopPop(pc) => pc.textbox_mut().add_link(range, url),
         }
     }
 
@@ -3028,6 +3289,7 @@ impl Cell {
                     oc.replace_in_bullet_with_link(bid, range, text, url);
                 }
             }
+            CellKind::PopPop(pc) => pc.textbox_mut().replace_with_link(range, text, url),
         }
     }
 
@@ -3035,6 +3297,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.copy_primary_selection(),
             CellKind::Outline(oc) => oc.copy_text(),
+            CellKind::PopPop(pc) => pc.textbox().copy_primary_selection(),
         }
     }
 
@@ -3044,6 +3307,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.heading_title(),
             CellKind::Outline(oc) => oc.bullets().first().and_then(|b| b.textbox().heading_title()),
+            CellKind::PopPop(pc) => pc.textbox().heading_title(),
         }
     }
 
@@ -3063,6 +3327,7 @@ impl Cell {
                 }
                 out
             }
+            CellKind::PopPop(pc) => pc.textbox().heading_tag_names(),
         }
     }
 
@@ -3085,6 +3350,7 @@ impl Cell {
                 }
                 out
             }
+            CellKind::PopPop(pc) => pc.textbox().text().to_string(),
         }
     }
 
@@ -3092,6 +3358,7 @@ impl Cell {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.cut_primary_selection(),
             CellKind::Outline(oc) => oc.cut_text(),
+            CellKind::PopPop(pc) => pc.textbox_mut().cut_primary_selection(),
         }
     }
 
@@ -3099,6 +3366,7 @@ impl Cell {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.paste(s),
             CellKind::Outline(oc) => oc.paste_text(s),
+            CellKind::PopPop(pc) => pc.textbox_mut().paste(s),
         }
     }
 
@@ -3114,6 +3382,7 @@ impl Cell {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.tick(canvas, x, y, width, focused, show_caret),
             CellKind::Outline(oc) => oc.tick(canvas, x, y, width, focused, show_caret),
+            CellKind::PopPop(pc) => pc.tick(canvas, x, y, width, focused, show_caret),
         }
     }
 
@@ -3121,6 +3390,7 @@ impl Cell {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.handle_key(event, modifiers),
             CellKind::Outline(oc) => oc.handle_key(event, modifiers),
+            CellKind::PopPop(pc) => pc.handle_key(event, modifiers),
         }
     }
 
@@ -3134,6 +3404,7 @@ impl Cell {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.mouse_down(abs_x, abs_y, modifiers, editing),
             CellKind::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers, editing),
+            CellKind::PopPop(pc) => pc.mouse_down(abs_x, abs_y, modifiers, editing),
         }
     }
 
@@ -3141,6 +3412,7 @@ impl Cell {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.mouse_drag_to(abs_x, abs_y),
             CellKind::Outline(oc) => oc.mouse_drag_to(abs_x, abs_y),
+            CellKind::PopPop(pc) => pc.mouse_drag_to(abs_x, abs_y),
         }
     }
 
@@ -3148,6 +3420,7 @@ impl Cell {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.mouse_up(),
             CellKind::Outline(oc) => oc.mouse_up(),
+            CellKind::PopPop(pc) => pc.mouse_up(),
         }
     }
 
@@ -3155,6 +3428,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.x_origin(),
             CellKind::Outline(oc) => oc.x_origin,
+            CellKind::PopPop(pc) => pc.x_origin(),
         }
     }
 
@@ -3162,6 +3436,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.y_origin(),
             CellKind::Outline(oc) => oc.y_origin,
+            CellKind::PopPop(pc) => pc.y_origin(),
         }
     }
 
@@ -3169,6 +3444,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.width(),
             CellKind::Outline(oc) => oc.width,
+            CellKind::PopPop(pc) => pc.width(),
         }
     }
 
@@ -3176,6 +3452,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.height(),
             CellKind::Outline(oc) => oc.height,
+            CellKind::PopPop(pc) => pc.height(),
         }
     }
 
@@ -3183,6 +3460,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.is_empty(),
             CellKind::Outline(oc) => oc.is_empty(),
+            CellKind::PopPop(pc) => pc.textbox().is_empty(),
         }
     }
 
@@ -3190,6 +3468,7 @@ impl Cell {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.set_font_scale(scale),
             CellKind::Outline(oc) => oc.set_font_scale(scale),
+            CellKind::PopPop(pc) => pc.set_font_scale(scale),
         }
     }
 
@@ -3197,6 +3476,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.caret_doc_y_band(),
             CellKind::Outline(oc) => oc.caret_doc_y_band(),
+            CellKind::PopPop(pc) => pc.textbox().caret_doc_y_band(),
         }
     }
 
@@ -3204,6 +3484,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.at_top_visual_line(),
             CellKind::Outline(oc) => oc.at_top_edge(),
+            CellKind::PopPop(pc) => pc.textbox().at_top_visual_line(),
         }
     }
 
@@ -3211,6 +3492,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.at_bottom_visual_line(),
             CellKind::Outline(oc) => oc.at_bottom_edge(),
+            CellKind::PopPop(pc) => pc.textbox().at_bottom_visual_line(),
         }
     }
 
@@ -3218,6 +3500,7 @@ impl Cell {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.set_caret_at(0),
             CellKind::Outline(oc) => oc.place_caret_at_start(),
+            CellKind::PopPop(pc) => pc.textbox_mut().set_caret_at(0),
         }
     }
 
@@ -3228,6 +3511,10 @@ impl Cell {
                 tb.set_caret_at(end);
             }
             CellKind::Outline(oc) => oc.place_caret_at_end(),
+            CellKind::PopPop(pc) => {
+                let end = pc.textbox().text().len();
+                pc.textbox_mut().set_caret_at(end);
+            }
         }
     }
 
@@ -3237,14 +3524,19 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.primary_caret().map(|(_, h)| (tb.text(), h)),
             CellKind::Outline(oc) => oc.focused_text_and_caret(),
+            CellKind::PopPop(pc) => pc
+                .textbox()
+                .primary_caret()
+                .map(|(_, h)| (pc.textbox().text(), h)),
         }
     }
 
-    /// Outline cells: ID of the focused bullet. Plain cells: None.
+    /// Outline cells: ID of the focused bullet. Plain/PopPop cells: None.
     pub fn focused_bullet_id(&self) -> Option<Uuid> {
         match &self.kind {
             CellKind::Plain(_) => None,
             CellKind::Outline(oc) => Some(oc.focused_bullet_id()),
+            CellKind::PopPop(_) => None,
         }
     }
 
@@ -3262,6 +3554,11 @@ impl Cell {
                 Some((x, bot))
             }
             (CellKind::Outline(oc), Some(id)) => oc.anchor_doc_pos(id, byte),
+            (CellKind::PopPop(pc), None) => {
+                let (x, _) = pc.textbox().doc_position_of_byte(byte)?;
+                let (_, bot) = pc.textbox().line_y_band_of_byte(byte)?;
+                Some((x, bot))
+            }
             _ => None,
         }
     }
@@ -3274,6 +3571,7 @@ impl Cell {
             kind: match &self.kind {
                 CellKind::Plain(tb) => CellSnapshotKind::Plain(tb.snapshot()),
                 CellKind::Outline(oc) => CellSnapshotKind::Outline(oc.snapshot()),
+                CellKind::PopPop(pc) => CellSnapshotKind::PopPop(pc.snapshot()),
             },
         }
     }
@@ -3289,6 +3587,7 @@ impl Cell {
         match (&mut self.kind, snap.kind) {
             (CellKind::Plain(tb), CellSnapshotKind::Plain(tbs)) => tb.restore(tbs),
             (CellKind::Outline(oc), CellSnapshotKind::Outline(os)) => oc.restore(os),
+            (CellKind::PopPop(pc), CellSnapshotKind::PopPop(tbs)) => pc.restore(tbs),
             _ => {}
         }
     }
@@ -3382,6 +3681,32 @@ mod tests {
         // Link extends to cover the inserted byte: now [4, 10) over "AliXce".
         assert_eq!(tb.text(), "see AliXce here");
         assert_eq!(tb.links()[0].range, 4..10);
+    }
+
+    #[test]
+    fn poppop_cell_title_line_is_heading_subsequent_are_calc() {
+        // A poppop cell with `# Notes #urgent\n42 + 1\nfoo` should mark the
+        // heading paragraph as heading (no output) and the two calc lines
+        // as non-heading (each gets a "42").
+        let mut tb = TextBox::new(typeface(), "# Notes #urgent\n2 + 2\nfoo".to_string());
+        tb.tick(
+            &skia_safe::surfaces::raster_n32_premul((400, 200))
+                .unwrap()
+                .canvas(),
+            0.0,
+            0.0,
+            400.0,
+            false,
+            false,
+        );
+        let bands = tb.source_line_y_bands();
+        assert_eq!(bands.len(), 3, "three source lines");
+        assert!(bands[0].2, "first line is heading");
+        assert!(!bands[1].2, "second line is calc");
+        assert!(!bands[2].2, "third line is calc");
+        // Heading title and tags propagate to the cell-level accessors.
+        assert_eq!(tb.heading_title().as_deref(), Some("Notes"));
+        assert_eq!(tb.heading_tag_names(), vec!["urgent".to_string()]);
     }
 
     #[test]
