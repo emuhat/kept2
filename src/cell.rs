@@ -131,6 +131,35 @@ pub struct TextBoxSnapshot {
     pub links: Vec<LinkSpan>,
 }
 
+/// Whether the platform "primary" modifier is held — Cmd on macOS, Ctrl
+/// everywhere else. Use this for app shortcuts (Ctrl+Enter / Cmd+Enter, etc.)
+/// instead of reading `control_key()` directly so Mac builds feel native.
+pub(crate) fn primary_mod(state: winit::keyboard::ModifiersState) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        state.super_key()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        state.control_key()
+    }
+}
+
+/// Whether the "word-navigation" modifier is held — Option on macOS (Mac
+/// convention is Option+Arrow for word jumps; Cmd+Arrow is line/doc edges)
+/// and Ctrl elsewhere. Use this for word-nav and word-delete only; app
+/// shortcuts should use `primary_mod`.
+pub(crate) fn word_mod(state: winit::keyboard::ModifiersState) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        state.alt_key()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        state.control_key()
+    }
+}
+
 fn transform_index(i: usize, start: usize, del: usize, ins: usize) -> usize {
     if i < start {
         i
@@ -830,10 +859,12 @@ impl TextBox {
         }
         let mods = modifiers.state();
         let shift = mods.shift_key();
-        let ctrl = mods.control_key();
+        // Word nav (Ctrl on Linux/Win, Option on Mac). `word` here gates the
+        // word-versus-char branches in the arrow / Home / End handlers below.
+        let word = word_mod(mods);
         match &event.logical_key {
             Key::Named(NamedKey::ArrowLeft) => {
-                if ctrl {
+                if word {
                     self.move_horizontal_word(-1, shift);
                 } else {
                     self.move_horizontal(-1, shift);
@@ -841,7 +872,7 @@ impl TextBox {
                 true
             }
             Key::Named(NamedKey::ArrowRight) => {
-                if ctrl {
+                if word {
                     self.move_horizontal_word(1, shift);
                 } else {
                     self.move_horizontal(1, shift);
@@ -865,7 +896,7 @@ impl TextBox {
                 true
             }
             Key::Named(NamedKey::Backspace) => {
-                if modifiers.state().control_key() {
+                if word_mod(modifiers.state()) {
                     self.word_backspace();
                 } else {
                     self.backspace();
@@ -873,7 +904,7 @@ impl TextBox {
                 true
             }
             Key::Named(NamedKey::Delete) => {
-                if modifiers.state().control_key() {
+                if word_mod(modifiers.state()) {
                     self.word_forward_delete();
                 } else {
                     self.forward_delete();
@@ -910,12 +941,13 @@ impl TextBox {
         let (idx, affinity) = self.hit_test(lx, ly);
         let mods = modifiers.state();
 
-        // Plain click on a link opens it in view mode; Ctrl+click opens it
-        // while editing (so plain clicks in edit mode still move the caret).
+        // Plain click on a link opens it in view mode; primary-modifier+click
+        // opens it while editing (so plain clicks in edit mode still move the
+        // caret). The primary modifier is Cmd on Mac, Ctrl elsewhere.
         let plain_in_view = !editing && !mods.shift_key() && !mods.alt_key();
-        let ctrl_in_edit =
-            editing && mods.control_key() && !mods.shift_key() && !mods.alt_key();
-        if plain_in_view || ctrl_in_edit {
+        let modified_in_edit =
+            editing && primary_mod(mods) && !mods.shift_key() && !mods.alt_key();
+        if plain_in_view || modified_in_edit {
             if let Some(link) = self.link_at(idx) {
                 open_url(&link.url);
                 return true;
@@ -2158,7 +2190,7 @@ impl OutlineCell {
             let mods = modifiers.state();
             match &event.logical_key {
                 Key::Named(NamedKey::Enter)
-                    if !mods.control_key() && !mods.alt_key() && !mods.shift_key() =>
+                    if !primary_mod(mods) && !mods.alt_key() && !mods.shift_key() =>
                 {
                     return self.split_focused();
                 }
@@ -2170,7 +2202,9 @@ impl OutlineCell {
                     };
                 }
                 Key::Named(NamedKey::Backspace)
-                    if !mods.control_key() && self.focused_at_text_start() =>
+                    if !primary_mod(mods)
+                        && !word_mod(mods)
+                        && self.focused_at_text_start() =>
                 {
                     return self.merge_focused_into_prev();
                 }

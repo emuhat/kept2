@@ -11,7 +11,7 @@ use winit::{
     keyboard::{Key, NamedKey},
 };
 
-use crate::cell::{Cell, CellSnapshot, now_epoch_ms};
+use crate::cell::{Cell, CellSnapshot, now_epoch_ms, primary_mod};
 use crate::persist::{ContextRef, Db, db_path};
 
 const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
@@ -1236,7 +1236,7 @@ impl KeptApp {
             }
         }
 
-        if event.state == ElementState::Pressed && modifiers.state().control_key() {
+        if event.state == ElementState::Pressed && primary_mod(modifiers.state()) {
             match &event.logical_key {
                 Key::Named(NamedKey::Enter) => {
                     let outline = modifiers.state().shift_key();
@@ -1319,7 +1319,7 @@ impl KeptApp {
 
         // Modal mode switches: Esc exits edit, Enter enters edit.
         if event.state == ElementState::Pressed
-            && !modifiers.state().control_key()
+            && !primary_mod(modifiers.state())
             && !modifiers.state().alt_key()
         {
             match &event.logical_key {
@@ -1353,7 +1353,7 @@ impl KeptApp {
         if !self.editing {
             if event.state == ElementState::Pressed
                 && !modifiers.state().shift_key()
-                && !modifiers.state().control_key()
+                && !primary_mod(modifiers.state())
                 && !modifiers.state().alt_key()
             {
                 match &event.logical_key {
@@ -1405,7 +1405,7 @@ impl KeptApp {
         // mode (the new cell starts unedited; press Enter to continue).
         if event.state == ElementState::Pressed
             && !modifiers.state().shift_key()
-            && !modifiers.state().control_key()
+            && !primary_mod(modifiers.state())
             && !modifiers.state().alt_key()
         {
             match &event.logical_key {
