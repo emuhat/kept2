@@ -471,10 +471,11 @@ impl KeptApp {
 
     /// Most recent open context's id — the writable target. Always Some in
     /// normal operation (the rotation/seed logic preserves the invariant).
-    /// Heading titles of every cell tagged `#person`, deduplicated and
-    /// sorted alphabetically. Drives the `@`-mention popup.
-    fn person_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = Vec::new();
+    /// `(title, source cell id)` for every cell tagged `#person`, deduped
+    /// case-insensitively by title and sorted alphabetically. Drives the
+    /// `@`-mention popup and supplies the link target for committed picks.
+    fn person_entries(&self) -> Vec<(String, Uuid)> {
+        let mut out: Vec<(String, Uuid)> = Vec::new();
         for cell in &self.cells {
             if !cell
                 .heading_tag_names()
@@ -484,13 +485,17 @@ impl KeptApp {
                 continue;
             }
             if let Some(title) = cell.heading_title() {
-                if !names.iter().any(|n| n.eq_ignore_ascii_case(&title)) {
-                    names.push(title);
+                if !out.iter().any(|(n, _)| n.eq_ignore_ascii_case(&title)) {
+                    out.push((title, cell.id));
                 }
             }
         }
-        names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-        names
+        out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        out
+    }
+
+    fn person_names(&self) -> Vec<String> {
+        self.person_entries().into_iter().map(|(n, _)| n).collect()
     }
 
     fn writable_context_id(&self) -> Option<Uuid> {
@@ -1214,8 +1219,7 @@ impl KeptApp {
                     return true;
                 }
                 Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
-                    // Selection commit is non-functional for now — just dismiss.
-                    self.mention_popup = None;
+                    self.commit_mention();
                     return true;
                 }
                 _ => {}
@@ -2037,6 +2041,51 @@ impl KeptApp {
         let cur = p.selected.min(count - 1) as i32;
         let new = ((cur + delta).rem_euclid(count as i32)) as usize;
         p.selected = new;
+    }
+
+    /// Commit the highlighted person from the `@`-mention popup: replace
+    /// the `@query` typeahead text with the person's title and attach a
+    /// `kept://<source-cell-id>` link spanning it. Recorded as one undo.
+    fn commit_mention(&mut self) -> bool {
+        let Some(popup) = self.mention_popup.take() else {
+            return false;
+        };
+        let entries = self.person_entries();
+        let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+        let filtered = filter_mentions(&names, &popup.query);
+        let Some(selected) = filtered.get(popup.selected) else {
+            return true;
+        };
+        let chosen_name = selected.0.clone();
+        let Some((_, source_id)) = entries.iter().find(|(n, _)| n == &chosen_name) else {
+            return true;
+        };
+        let source_id = *source_id;
+
+        let cell_id = popup.cell_id;
+        let bullet_id = popup.bullet_id;
+        let start = popup.anchor_byte;
+        let end = start + 1 + popup.query.len();
+
+        let pre = match self.cell(cell_id) {
+            Some(c) => c.snapshot(),
+            None => return true,
+        };
+        let url = format!("kept://{}", source_id);
+        if let Some(c) = self.cell_mut(cell_id) {
+            c.replace_focused_with_link(bullet_id, start..end, chosen_name, url);
+        }
+        if let Some(c) = self.cell(cell_id) {
+            let post = c.snapshot();
+            if !pre.doc_eq(&post) {
+                let saved_focused = self.focused;
+                self.focused = Some(cell_id);
+                self.record_edit(pre, post);
+                self.focused = saved_focused.or(Some(cell_id));
+            }
+        }
+        self.coalesce_break = true;
+        true
     }
 
     fn record_edit(&mut self, pre: CellSnapshot, post: CellSnapshot) {

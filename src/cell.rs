@@ -143,6 +143,21 @@ fn transform_index(i: usize, start: usize, del: usize, ins: usize) -> usize {
     }
 }
 
+/// Like `transform_index`, but with left-gravity at the boundary: an
+/// insertion exactly at `i` does not push `i` forward. Used for link end
+/// positions so typing right after a link doesn't extend it.
+fn transform_index_closed_end(i: usize, start: usize, del: usize, ins: usize) -> usize {
+    if i < start {
+        i
+    } else if i == start && del == 0 {
+        i
+    } else if i >= start + del {
+        i - del + ins
+    } else {
+        start + ins
+    }
+}
+
 #[derive(Clone)]
 enum DragKind {
     Char,
@@ -1319,6 +1334,26 @@ impl TextBox {
         self.apply_edits_right_to_left(edits);
     }
 
+    /// Replace `range` with `text` and add a link covering the inserted text.
+    /// Used to insert mentions like a person's title with a `kept://…` URL.
+    /// Caret lands at the end of the inserted text.
+    pub fn replace_with_link(&mut self, range: Range<usize>, text: String, url: String) {
+        let start = range.start;
+        let inserted_len = text.len();
+        self.apply_edit(&Edit {
+            range,
+            replacement: text,
+        });
+        let end = start + inserted_len;
+        if inserted_len > 0 && end <= self.text.len() {
+            self.links.push(LinkSpan {
+                range: start..end,
+                url,
+            });
+        }
+        self.set_caret_at(end);
+    }
+
     fn apply_edits_right_to_left(&mut self, mut edits: Vec<Edit>) {
         edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
         for edit in &edits {
@@ -1337,15 +1372,16 @@ impl TextBox {
             sel.affinity = Affinity::Downstream;
         }
         self.sels.normalize();
-        // Update link spans: shift both endpoints through the same transform
-        // used for selections (right-gravity insert, clamp-to-start delete).
-        // Deletions inside a link shrink it; deletions covering it leave a
-        // degenerate range that the final `start < end` check drops. This
-        // keeps link state recoverable across Enter+Backspace, partial deletes,
-        // and replacements.
+        // Update link spans. `start` uses right-gravity (insertion at the
+        // link's leading edge keeps the new chars OUTSIDE the link); `end`
+        // uses left-gravity (insertion at the link's trailing edge keeps the
+        // new chars OUTSIDE too). Net effect: a link's bounds are "closed" —
+        // typing right before or right after it produces plain text. Edits
+        // inside the link still grow/shrink it; edits that fully cover it
+        // leave a degenerate range and the `start < end` check drops it.
         self.links.retain_mut(|link| {
             link.range.start = transform_index(link.range.start, start, del, ins);
-            link.range.end = transform_index(link.range.end, start, del, ins);
+            link.range.end = transform_index_closed_end(link.range.end, start, del, ins);
             link.range.start < link.range.end
         });
         self.rewrap();
@@ -2302,6 +2338,18 @@ impl OutlineCell {
         }
     }
 
+    pub fn replace_in_bullet_with_link(
+        &mut self,
+        bullet_id: Uuid,
+        range: Range<usize>,
+        text: String,
+        url: String,
+    ) {
+        if let Some(b) = self.bullets.iter_mut().find(|b| b.id == bullet_id) {
+            b.textbox.replace_with_link(range, text, url);
+        }
+    }
+
     /// Plain-text representation of the current selection — joined bullet text
     /// (one bullet per line, indented with 4 spaces per depth) when a multi-
     /// bullet selection is active, otherwise the focused bullet's textbox
@@ -2929,6 +2977,26 @@ impl Cell {
         }
     }
 
+    /// Replace `range` with `text` in the focused textbox (the cell itself
+    /// for Plain, or the bullet matching `bullet_id` for Outline) and link
+    /// the inserted text to `url`.
+    pub fn replace_focused_with_link(
+        &mut self,
+        bullet_id: Option<Uuid>,
+        range: Range<usize>,
+        text: String,
+        url: String,
+    ) {
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.replace_with_link(range, text, url),
+            CellKind::Outline(oc) => {
+                if let Some(bid) = bullet_id {
+                    oc.replace_in_bullet_with_link(bid, range, text, url);
+                }
+            }
+        }
+    }
+
     pub fn copy_text(&self) -> String {
         match &self.kind {
             CellKind::Plain(tb) => tb.copy_primary_selection(),
@@ -3256,6 +3324,42 @@ mod tests {
         let links = bullets[0].textbox().links();
         assert_eq!(links.len(), 1, "link restored on undo");
         assert_eq!(links[0].range, 7..11);
+    }
+
+    #[test]
+    fn typing_after_link_does_not_extend_it() {
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.replace_with_link(0..0, "Alice".to_string(), "kept://a".to_string());
+        assert_eq!(tb.text(), "Alice");
+        assert_eq!(tb.links()[0].range, 0..5);
+        // Caret is at end of inserted text. Type a space + word.
+        tb.insert_text(" hi");
+        assert_eq!(tb.text(), "Alice hi");
+        // Link must still cover only "Alice", not the trailing chars.
+        assert_eq!(tb.links()[0].range, 0..5);
+    }
+
+    #[test]
+    fn typing_inside_link_still_extends_it() {
+        let mut tb = TextBox::new(typeface(), "see Alice here".to_string());
+        tb.add_link(4..9, "kept://a".to_string()); // covers "Alice"
+        tb.set_caret_at(7); // inside, between "li" and "ce"
+        tb.insert_text("X");
+        // Link extends to cover the inserted byte: now [4, 10) over "AliXce".
+        assert_eq!(tb.text(), "see AliXce here");
+        assert_eq!(tb.links()[0].range, 4..10);
+    }
+
+    #[test]
+    fn replace_with_link_inserts_link_over_text() {
+        let mut tb = TextBox::new(typeface(), "see @al here".to_string());
+        // Replace "@al" (bytes 4..7) with "Alice Smith", linking it.
+        tb.replace_with_link(4..7, "Alice Smith".to_string(), "kept://abc".to_string());
+        assert_eq!(tb.text(), "see Alice Smith here");
+        let links = tb.links();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].range, 4..15); // "Alice Smith" = 11 bytes
+        assert_eq!(links[0].url, "kept://abc");
     }
 
     #[test]
