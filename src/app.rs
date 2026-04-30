@@ -46,10 +46,9 @@ const MENTION_POPUP_RADIUS: f32 = 6.0;
 const MENTION_POPUP_MAX_VISIBLE: usize = 6;
 const MENTION_BODY_FONT_SIZE: f32 = 16.0;
 
-const FAKE_MENTIONS: &[&str] = &[
-    "alice", "alex", "alfred", "anna", "bob", "carol", "dave", "eve",
-    "frank", "grace", "heidi", "ivan", "judy", "karl", "linda",
-];
+/// Tag name used to mark a cell as a "person" — its heading title shows up
+/// in the `@`-mention popup. Convention: `# Alice Smith #person`.
+const PERSON_TAG: &str = "person";
 
 /// Subsequence fuzzy match. Returns `(score, matched_byte_positions)` if every
 /// query char appears in `candidate` (case-insensitive) in order; None otherwise.
@@ -98,15 +97,17 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
     Some((score, matches))
 }
 
-fn filter_mentions(query: &str) -> Vec<(&'static str, Vec<usize>)> {
+/// Rank `names` by fuzzy match against `query`. Empty query returns the
+/// names in their input order.
+fn filter_mentions(names: &[String], query: &str) -> Vec<(String, Vec<usize>)> {
     if query.is_empty() {
-        return FAKE_MENTIONS.iter().map(|&n| (n, Vec::new())).collect();
+        return names.iter().map(|n| (n.clone(), Vec::new())).collect();
     }
-    let mut scored: Vec<(i32, &'static str, Vec<usize>)> = FAKE_MENTIONS
+    let mut scored: Vec<(i32, String, Vec<usize>)> = names
         .iter()
-        .filter_map(|&name| fuzzy_score(query, name).map(|(s, m)| (s, name, m)))
+        .filter_map(|name| fuzzy_score(query, name).map(|(s, m)| (s, name.clone(), m)))
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     scored.into_iter().map(|(_, n, m)| (n, m)).collect()
 }
 
@@ -470,6 +471,28 @@ impl KeptApp {
 
     /// Most recent open context's id — the writable target. Always Some in
     /// normal operation (the rotation/seed logic preserves the invariant).
+    /// Heading titles of every cell tagged `#person`, deduplicated and
+    /// sorted alphabetically. Drives the `@`-mention popup.
+    fn person_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for cell in &self.cells {
+            if !cell
+                .heading_tag_names()
+                .iter()
+                .any(|n| n == PERSON_TAG)
+            {
+                continue;
+            }
+            if let Some(title) = cell.heading_title() {
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(&title)) {
+                    names.push(title);
+                }
+            }
+        }
+        names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        names
+    }
+
     fn writable_context_id(&self) -> Option<Uuid> {
         self.contexts
             .iter()
@@ -1558,8 +1581,9 @@ impl KeptApp {
             }
             q.to_string()
         };
+        let names = self.person_names();
         if let Some(p) = self.mention_popup.as_mut() {
-            let count = filter_mentions(&query).len().min(MENTION_POPUP_MAX_VISIBLE);
+            let count = filter_mentions(&names, &query).len().min(MENTION_POPUP_MAX_VISIBLE);
             p.query = query;
             if count == 0 {
                 p.selected = 0;
@@ -1886,7 +1910,8 @@ impl KeptApp {
         let pad = MENTION_POPUP_PAD * scale;
         let radius = MENTION_POPUP_RADIUS * scale;
 
-        let items = filter_mentions(&popup.query);
+        let names = self.person_names();
+        let items = filter_mentions(&names, &popup.query);
         let visible = items.len().min(MENTION_POPUP_MAX_VISIBLE);
         let popup_h = if visible == 0 {
             row_h + pad * 2.0
@@ -1999,10 +2024,13 @@ impl KeptApp {
     }
 
     fn mention_popup_move(&mut self, delta: i32) {
+        let names = self.person_names();
         let Some(p) = self.mention_popup.as_mut() else {
             return;
         };
-        let count = filter_mentions(&p.query).len().min(MENTION_POPUP_MAX_VISIBLE);
+        let count = filter_mentions(&names, &p.query)
+            .len()
+            .min(MENTION_POPUP_MAX_VISIBLE);
         if count == 0 {
             return;
         }
@@ -2629,8 +2657,9 @@ fn scrollbar_alpha(last: Option<Instant>) -> f32 {
 }
 
 /// Draw `name` starting at `origin`, painting bytes in `match_indices` with
-/// `match_paint` and the rest with `dim_paint`. ASCII-safe (matches use byte
-/// indices); the FAKE_MENTIONS list is all ASCII so this is fine.
+/// `match_paint` and the rest with `dim_paint`. Matches are byte indices; the
+/// fuzzy matcher emits matches at lowercase-byte boundaries so this is safe
+/// for ASCII names.
 fn draw_runs_with_matches(
     canvas: &Canvas,
     name: &str,

@@ -384,6 +384,45 @@ impl TextBox {
         }
     }
 
+    /// If this textbox starts with a markdown heading (`# …`), return the
+    /// title portion: text after `# ` up to (but not including) the first
+    /// trailing `#tag` token, with whitespace trimmed.
+    pub fn heading_title(&self) -> Option<String> {
+        if !self.text.starts_with("# ") {
+            return None;
+        }
+        let heading_end = self.text.find('\n').unwrap_or(self.text.len());
+        let tags = parse_heading_tags(&self.text, heading_end);
+        let bytes = self.text.as_bytes();
+        let mut end = tags.first().map(|r| r.start).unwrap_or(heading_end);
+        while end > 2 && (bytes[end - 1] as char).is_whitespace() {
+            end -= 1;
+        }
+        if end <= 2 {
+            return None;
+        }
+        Some(self.text[2..end].to_string())
+    }
+
+    /// Distinct tag names (without the leading `#`) on this textbox's
+    /// heading, in source order. Bare `#` is skipped.
+    pub fn heading_tag_names(&self) -> Vec<String> {
+        if !self.text.starts_with("# ") {
+            return Vec::new();
+        }
+        let heading_end = self.text.find('\n').unwrap_or(self.text.len());
+        let mut out: Vec<String> = Vec::new();
+        for r in parse_heading_tags(&self.text, heading_end) {
+            if r.end > r.start + 1 {
+                let name = self.text[r.start + 1..r.end].to_string();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
     pub fn link_at(&self, byte: usize) -> Option<&LinkSpan> {
         self.links.iter().find(|l| byte >= l.range.start && byte < l.range.end)
     }
@@ -2894,6 +2933,34 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.copy_primary_selection(),
             CellKind::Outline(oc) => oc.copy_text(),
+        }
+    }
+
+    /// Heading title for this cell, if any. Plain cells use the first
+    /// paragraph; outline cells use the first bullet's heading.
+    pub fn heading_title(&self) -> Option<String> {
+        match &self.kind {
+            CellKind::Plain(tb) => tb.heading_title(),
+            CellKind::Outline(oc) => oc.bullets().first().and_then(|b| b.textbox().heading_title()),
+        }
+    }
+
+    /// All distinct heading-tag names attached to this cell (any heading
+    /// bullet for outlines).
+    pub fn heading_tag_names(&self) -> Vec<String> {
+        match &self.kind {
+            CellKind::Plain(tb) => tb.heading_tag_names(),
+            CellKind::Outline(oc) => {
+                let mut out: Vec<String> = Vec::new();
+                for b in oc.bullets() {
+                    for n in b.textbox().heading_tag_names() {
+                        if !out.contains(&n) {
+                            out.push(n);
+                        }
+                    }
+                }
+                out
+            }
         }
     }
 
