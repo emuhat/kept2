@@ -239,6 +239,7 @@ const SIDEBAR_INDENT: f32 = 14.0;
 const SIDEBAR_ITEM_RADIUS: f32 = 6.0;
 const SIDEBAR_HEADER_FONT_SIZE: f32 = 11.0;
 const SIDEBAR_DATE_FONT_SIZE: f32 = 13.0;
+#[allow(dead_code)]
 const SIDEBAR_ITEM_FONT_SIZE: f32 = 12.0;
 
 /// Context-section header drawn in Date view between cell groups from
@@ -752,27 +753,36 @@ impl KeptApp {
             .map(|c| c.id)
     }
 
-    /// In Context view: if the viewed context is closed, switch to the most
-    /// recent open one so writes land in "today." In Date view: no-op (writes
-    /// still go to the writable context, which is found at insertion time).
-    /// Returns true if the view changed.
+    /// Make sure the current view will actually contain the cell we're
+    /// about to write at `now`. In Context view this means promoting from a
+    /// closed context to the writable one. In Date view, if the user is
+    /// looking at a past day, jump them forward to today's date so the new
+    /// note (timestamped now) is visible. Returns true if the view changed.
     fn ensure_writable_context(&mut self) -> bool {
-        let id = match self.view {
-            ViewSelection::Context(id) => id,
-            ViewSelection::Date(_) => return false,
-        };
-        let active_is_open = self
-            .contexts
-            .iter()
-            .find(|c| c.id == id)
-            .map_or(false, |c| c.end_time.is_none());
-        if active_is_open {
-            return false;
-        }
-        let target = self.writable_context_id();
-        match target {
-            Some(target_id) => self.set_active_context(target_id),
-            None => false,
+        let today = local_date_for_ms(now_epoch_ms());
+        match self.view {
+            ViewSelection::Date(d) => {
+                if d != today {
+                    self.set_active_date(today);
+                    return true;
+                }
+                false
+            }
+            ViewSelection::Context(id) => {
+                let active_is_open = self
+                    .contexts
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map_or(false, |c| c.end_time.is_none());
+                if active_is_open {
+                    return false;
+                }
+                let target = self.writable_context_id();
+                match target {
+                    Some(target_id) => self.set_active_context(target_id),
+                    None => false,
+                }
+            }
         }
     }
 
@@ -1781,34 +1791,36 @@ impl KeptApp {
             &header_paint,
         );
 
-        // Group contexts by their local start-date. Render dates descending
-        // (newest at top); within each date, contexts also descending so the
-        // most recent context sits right under the date header.
+        // Sidebar shows one row per local date that has any contexts.
+        // Individual context rows are intentionally absent — clicking a date
+        // opens the full day in the doc area; cross-context navigation
+        // happens via Ctrl+Shift+Up/Down or arrow-edge crossing.
         self.last_sidebar_rects.clear();
         self.last_sidebar_date_rects.clear();
 
-        let mut groups: std::collections::BTreeMap<chrono::NaiveDate, Vec<&Context>> =
-            std::collections::BTreeMap::new();
-        for c in &self.contexts {
-            groups
-                .entry(local_date_for_ms(c.start_time))
-                .or_default()
-                .push(c);
+        // Date rows reflect "where notes live": every date that has at least
+        // one cell, plus today (so a freshly-launched empty app still shows
+        // a usable target), plus the active Date view's date if it's been
+        // navigated away from any of those (so the active highlight has a
+        // home).
+        let mut dates_set: std::collections::BTreeSet<chrono::NaiveDate> =
+            std::collections::BTreeSet::new();
+        for c in &self.cells {
+            dates_set.insert(local_date_for_ms(c.timestamp));
         }
-        let dates: Vec<chrono::NaiveDate> = groups.keys().rev().copied().collect();
+        dates_set.insert(local_date_for_ms(now_epoch_ms()));
+        if let ViewSelection::Date(d) = self.view {
+            dates_set.insert(d);
+        }
+        let dates: Vec<chrono::NaiveDate> = dates_set.iter().rev().copied().collect();
 
         let date_font = Font::from_typeface(&self.typeface, SIDEBAR_DATE_FONT_SIZE * scale);
-        let item_font = Font::from_typeface(&self.typeface, SIDEBAR_ITEM_FONT_SIZE * scale);
         let (_, dm) = date_font.metrics();
-        let (_, im) = item_font.metrics();
         let mouse_x = self.mouse_pos.0;
         let mouse_y = self.mouse_pos.1;
 
         let mut y = pad_top + header_h;
         for d in dates {
-            let mut day_contexts: Vec<&Context> = groups.get(&d).cloned().unwrap_or_default();
-            day_contexts.sort_by_key(|c| std::cmp::Reverse(c.start_time));
-
             let date_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
             if date_rect.top > height {
                 break;
@@ -1841,58 +1853,9 @@ impl KeptApp {
                 &date_paint,
             );
             self.last_sidebar_date_rects.push((d, date_rect));
-            y += date_h + item_gap;
-
-            for ctx in day_contexts {
-                let item_rect = Rect::new(
-                    pad_x * 0.5 + indent,
-                    y,
-                    sb_w - pad_x * 0.5,
-                    y + item_h,
-                );
-                if item_rect.top > height {
-                    break;
-                }
-                let is_active = self.view == ViewSelection::Context(ctx.id);
-                let is_hovered = mouse_x >= item_rect.left
-                    && mouse_x <= item_rect.right
-                    && mouse_y >= item_rect.top
-                    && mouse_y <= item_rect.bottom;
-
-                if is_active {
-                    let mut p = Paint::default();
-                    p.set_anti_alias(true);
-                    p.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
-                    canvas.draw_round_rect(item_rect, radius, radius, &p);
-                } else if is_hovered {
-                    let mut p = Paint::default();
-                    p.set_anti_alias(true);
-                    p.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
-                    canvas.draw_round_rect(item_rect, radius, radius, &p);
-                }
-
-                let mut text_paint = Paint::default();
-                text_paint.set_anti_alias(true);
-                let text_color = if is_active {
-                    Color::from_rgb(0x1c, 0x1c, 0x1c)
-                } else {
-                    Color::from_rgb(0x55, 0x55, 0x55)
-                };
-                text_paint.set_color(text_color);
-                let baseline = y + (item_h + (-im.ascent) - im.descent) * 0.5;
-                let label = format_context_time(ctx.start_time);
-                canvas.draw_str(
-                    label,
-                    Point::new(pad_x + indent, baseline),
-                    &item_font,
-                    &text_paint,
-                );
-
-                self.last_sidebar_rects.push((ctx.id, item_rect));
-                y += item_h + item_gap;
-            }
-            y += date_gap;
+            y += date_h + item_gap + date_gap;
         }
+        let _ = (item_h, indent); // sized constants reserved for future per-context rows
     }
 
     fn render_mention_popup(&self, canvas: &Canvas) {
