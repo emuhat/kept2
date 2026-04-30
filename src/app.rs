@@ -1302,6 +1302,16 @@ impl KeptApp {
                         self.undo()
                     };
                 }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("a") => {
+                    if let Some(id) = self.focused {
+                        if let Some(cell) = self.cell_mut(id) {
+                            cell.select_all_focused();
+                        }
+                        self.coalesce_break = true;
+                        return true;
+                    }
+                    return false;
+                }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("c") => {
                     return self.copy_to_clipboard();
                 }

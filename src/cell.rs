@@ -232,6 +232,9 @@ pub struct TextBox {
     click_count: u8,
     font_scale: f32,
     links: Vec<LinkSpan>,
+    /// Body text color. Default dark gray. Cells (e.g. PopPop's output
+    /// column) may override to render their textbox in a custom color.
+    text_color: Color,
 }
 
 impl TextBox {
@@ -255,7 +258,14 @@ impl TextBox {
             click_count: 0,
             font_scale: 1.0,
             links: Vec::new(),
+            text_color: Color::from_rgb(0x1c, 0x1c, 0x1c),
         }
+    }
+
+    /// Override the body-text color. Used by PopPopCell for the output
+    /// textbox so its sentinel "42" renders in dark blue.
+    pub fn set_text_color(&mut self, color: Color) {
+        self.text_color = color;
     }
 
     pub fn x_origin(&self) -> f32 {
@@ -343,6 +353,24 @@ impl TextBox {
             i -= 1;
         }
         self.sels = Selections::single_caret(i);
+    }
+
+    /// True iff any selection has a non-empty range (anchor != head).
+    pub fn has_selection(&self) -> bool {
+        self.sels.items.iter().any(|s| !s.is_collapsed())
+    }
+
+    /// Replace selections with a single selection that spans the entire text.
+    pub fn select_all(&mut self) {
+        let len = self.text.len();
+        self.sels = Selections {
+            items: vec![Selection {
+                anchor: 0,
+                head: len,
+                affinity: Affinity::Downstream,
+            }],
+            primary: 0,
+        };
     }
 
     /// `(anchor, head)` of the primary selection, if any.
@@ -726,7 +754,7 @@ impl TextBox {
         let tag_gap = HEADING_TAG_GAP * self.font_scale;
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
-        text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        text_paint.set_color(self.text_color);
         let mut tag_paint = Paint::default();
         tag_paint.set_anti_alias(true);
         tag_paint.set_color(Color::from_rgb(0x90, 0x90, 0x90));
@@ -2512,6 +2540,13 @@ impl OutlineCell {
         self.focused_bullet
     }
 
+    /// Select all text inside the focused bullet's textbox.
+    pub fn select_all_in_focused(&mut self) {
+        if let Some(idx) = self.focused_index() {
+            self.bullets[idx].textbox.select_all();
+        }
+    }
+
     pub fn focused_text_and_caret(&self) -> Option<(&str, usize)> {
         let idx = self.focused_index()?;
         let tb = &self.bullets[idx].textbox;
@@ -3006,8 +3041,13 @@ const POPPOP_DIVIDER_PAD: f32 = 8.0;
 /// (heading + tags + mentions, same as Outline / Plain) and gets no output —
 /// calc lines start from the second source line.
 pub struct PopPopCell {
+    #[allow(dead_code)]
     typeface: Typeface,
     textbox: TextBox,
+    /// Read-only TextBox holding rendered output values ("42\n42\n…"), one
+    /// line per committed non-heading input line. Regenerated each tick.
+    /// Selectable + copyable; never receives keyboard input.
+    output: TextBox,
     x_origin: f32,
     y_origin: f32,
     width: f32,
@@ -3016,9 +3056,12 @@ pub struct PopPopCell {
 
 impl PopPopCell {
     pub fn new(typeface: Typeface) -> Self {
+        let mut output = TextBox::new(typeface.clone(), String::new());
+        output.set_text_color(Color::from_rgb(0x18, 0x3a, 0x9c));
         Self {
             typeface: typeface.clone(),
             textbox: TextBox::new(typeface, String::new()),
+            output,
             x_origin: 0.0,
             y_origin: 0.0,
             width: 0.0,
@@ -3069,14 +3112,44 @@ impl PopPopCell {
         let input_w = ((width - pad * 2.0) * POPPOP_INPUT_RATIO).max(40.0);
         let divider_x = x + input_w + pad;
         let output_x = divider_x + pad;
+        let output_w = (x + width - output_x).max(20.0);
 
-        // 1) Compute layout without drawing so we know per-source-line bands.
+        // 1) Layout the input column (no draw).
         self.textbox.layout(x, y, input_w);
 
-        // 2) Draw alternating stripes BEHIND the text. Counting only
-        //    non-heading source lines, stripe odd indices (calc-row 0 plain,
-        //    1 light blue, 2 plain, …). Stripes span the full cell width.
+        // 2) Sync output text + position. Output gets one "42" line per
+        //    committed (non-heading, not-last) input source line. We position
+        //    its y_origin at the first non-heading source line so output rows
+        //    align with input calc rows.
         let bands = self.textbox.source_line_y_bands();
+        let last_idx = bands.len().saturating_sub(1);
+        let committed_count = bands
+            .iter()
+            .enumerate()
+            .filter(|&(i, &(_, _, is_heading))| !is_heading && i != last_idx)
+            .count();
+        let mut new_output_text = String::with_capacity(committed_count * 3);
+        for (i, line) in (0..committed_count).map(|i| (i, "42")) {
+            if i > 0 {
+                new_output_text.push('\n');
+            }
+            new_output_text.push_str(line);
+        }
+        if self.output.text() != new_output_text {
+            self.output.replace_text(new_output_text);
+        }
+        // y_origin for output is the top of the first non-heading source
+        // line in the input (which is also where output row 0 should land).
+        // Falls back to `y` if there's no non-heading line yet.
+        let output_y = bands
+            .iter()
+            .find(|&&(_, _, is_heading)| !is_heading)
+            .map(|&(top, _, _)| top)
+            .unwrap_or(y);
+        self.output.layout(output_x, output_y, output_w);
+
+        // 3) Alternating stripes BEHIND text. Stripe odd calc-row indices
+        //    (0 plain, 1 blue, …); spans full cell width.
         let mut stripe = Paint::default();
         stripe.set_anti_alias(true);
         stripe.set_color(Color::from_rgb(0xed, 0xf3, 0xfa));
@@ -3091,13 +3164,12 @@ impl PopPopCell {
             calc_row_idx += 1;
         }
 
-        // 3) Render input text on top of stripes. tick re-runs layout but
-        //    the cached width matches, so the wrap step is skipped.
+        // 4) Draw input text on top of stripes.
         let input_h = self
             .textbox
             .tick(canvas, x, y, input_w, focused, show_caret);
 
-        // 4) Vertical divider (muted), full input height.
+        // 5) Vertical divider, muted.
         let mut divider = Paint::default();
         divider.set_anti_alias(true);
         divider.set_color(Color::from_argb(0x40, 0x60, 0x60, 0x60));
@@ -3108,22 +3180,12 @@ impl PopPopCell {
             &divider,
         );
 
-        // 5) Output column: render "42" only for COMMITTED non-heading source
-        //    lines. A source line is committed iff there's a `\n` after it,
-        //    i.e., it's not the last paragraph in the text.
-        let body_font = Font::from_typeface(&self.typeface, BODY_FONT_SIZE * scale);
-        let (_, m) = body_font.metrics();
-        let mut output_paint = Paint::default();
-        output_paint.set_anti_alias(true);
-        output_paint.set_color(Color::from_rgb(0x18, 0x3a, 0x9c));
-        let last_idx = bands.len().saturating_sub(1);
-        for (i, &(top, _, is_heading)) in bands.iter().enumerate() {
-            if is_heading || i == last_idx {
-                continue;
-            }
-            let baseline = top + (-m.ascent);
-            canvas.draw_str("42", Point::new(output_x, baseline), &body_font, &output_paint);
-        }
+        // 6) Output column. Render with focused=has_selection so its
+        //    selection highlight shows even though the cell's keyboard focus
+        //    is on the input. Caret is suppressed (read-only).
+        let output_focused = self.output.has_selection();
+        self.output
+            .tick(canvas, output_x, output_y, output_w, output_focused, false);
 
         self.height = input_h;
         input_h
@@ -3133,6 +3195,9 @@ impl PopPopCell {
         self.textbox.handle_key(event, modifiers)
     }
 
+    /// Click in the input column drags input selection; click in the output
+    /// column drags output selection. Whichever side wasn't clicked has its
+    /// selection collapsed so only one column shows a selection at a time.
     pub fn mouse_down(
         &mut self,
         abs_x: f32,
@@ -3140,25 +3205,44 @@ impl PopPopCell {
         modifiers: &Modifiers,
         editing: bool,
     ) -> bool {
-        // Click in the output column (right of divider) is a no-op for now;
-        // forward only clicks within the input column.
-        let input_w = self.input_width(self.width);
-        if abs_x > self.x_origin + input_w {
-            return false;
+        let input_right = self.x_origin + self.input_width(self.width);
+        if abs_x <= input_right {
+            // Input click: clear output's selection so copy uses input's.
+            self.output.set_caret_at(0);
+            self.textbox.mouse_down(abs_x, abs_y, modifiers, editing)
+        } else {
+            // Output click: clear input's selection.
+            self.textbox.set_caret_at(self.textbox.text().len());
+            // Output is read-only; pass `editing=false` so a Cmd-click on a
+            // link in the (very unlikely) output text does the right thing.
+            self.output.mouse_down(abs_x, abs_y, modifiers, false)
         }
-        self.textbox.mouse_down(abs_x, abs_y, modifiers, editing)
     }
 
     pub fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
-        // Clamp drag x to within the input column so selection doesn't run
-        // off into the output area.
-        let input_w = self.input_width(self.width);
-        let clamped_x = abs_x.min(self.x_origin + input_w);
-        self.textbox.mouse_drag_to(clamped_x, abs_y)
+        // Both textboxes ignore drag-to when they don't have an active drag,
+        // so we can forward to both — only the one that started the drag
+        // does any work.
+        let input_drag = self.textbox.mouse_drag_to(abs_x, abs_y);
+        let output_drag = self.output.mouse_drag_to(abs_x, abs_y);
+        input_drag || output_drag
     }
 
     pub fn mouse_up(&mut self) -> bool {
-        self.textbox.mouse_up()
+        let a = self.textbox.mouse_up();
+        let b = self.output.mouse_up();
+        a || b
+    }
+
+    /// Copy whichever column has a non-empty selection. Output wins ties on
+    /// the assumption that an output drag is the most recent gesture (a
+    /// fresh input click clears the output selection in `mouse_down`).
+    pub fn copy_selection(&self) -> String {
+        let out = self.output.copy_primary_selection();
+        if !out.is_empty() {
+            return out;
+        }
+        self.textbox.copy_primary_selection()
     }
 
     pub fn snapshot(&self) -> TextBoxSnapshot {
@@ -3171,6 +3255,7 @@ impl PopPopCell {
 
     pub fn set_font_scale(&mut self, scale: f32) {
         self.textbox.set_font_scale(scale);
+        self.output.set_font_scale(scale);
     }
 }
 
@@ -3297,7 +3382,7 @@ impl Cell {
         match &self.kind {
             CellKind::Plain(tb) => tb.copy_primary_selection(),
             CellKind::Outline(oc) => oc.copy_text(),
-            CellKind::PopPop(pc) => pc.textbox().copy_primary_selection(),
+            CellKind::PopPop(pc) => pc.copy_selection(),
         }
     }
 
@@ -3515,6 +3600,16 @@ impl Cell {
                 let end = pc.textbox().text().len();
                 pc.textbox_mut().set_caret_at(end);
             }
+        }
+    }
+
+    /// Select all text in the cell's active text input — entire textbox for
+    /// Plain/PopPop cells, focused bullet's textbox for Outline.
+    pub fn select_all_focused(&mut self) {
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.select_all(),
+            CellKind::Outline(oc) => oc.select_all_in_focused(),
+            CellKind::PopPop(pc) => pc.textbox_mut().select_all(),
         }
     }
 
