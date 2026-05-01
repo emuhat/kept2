@@ -129,13 +129,17 @@ impl ApplicationHandler for Application {
                 self.env.window.set_cursor(icon);
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                let (x, y) = self.last_mouse_pos;
                 if button == MouseButton::Left {
-                    let (x, y) = self.last_mouse_pos;
                     let changed = match state {
                         ElementState::Pressed => self.kept_app.mouse_down(x, y, &self.modifiers),
                         ElementState::Released => self.kept_app.mouse_up(),
                     };
                     if changed {
+                        self.env.window.request_redraw();
+                    }
+                } else if button == MouseButton::Right && state == ElementState::Pressed {
+                    if self.kept_app.right_click(x, y) {
                         self.env.window.request_redraw();
                     }
                 }

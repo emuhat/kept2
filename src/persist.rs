@@ -342,6 +342,18 @@ impl Db {
         Ok(out)
     }
 
+    /// Drop a tag row from the `tags` table. Caller is responsible for
+    /// ensuring no `cell_tags` rows reference it (the FK cascade would
+    /// silently strip them otherwise — fine, but the right-click affordance
+    /// only exposes this for empty tags).
+    pub fn delete_tag(&mut self, name: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM tags WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_cell(&mut self, id: Uuid) -> rusqlite::Result<()> {
         self.conn.execute(
             "DELETE FROM cells WHERE id = ?1",

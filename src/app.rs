@@ -115,6 +115,12 @@ fn filter_mentions(names: &[String], query: &str) -> Vec<(String, Vec<usize>)> {
     scored.into_iter().map(|(_, n, m)| (n, m)).collect()
 }
 
+struct TagContextMenu {
+    name: String,
+    anchor_x: f32,
+    anchor_y: f32,
+}
+
 struct MentionPopup {
     /// What the popup is anchored to: a focused cell's text or the search
     /// bar's input. Drives sync, render-anchor, and commit behavior.
@@ -441,6 +447,13 @@ pub struct KeptApp {
     last_sidebar_date_rects: Vec<(chrono::NaiveDate, Rect)>,
     /// Sidebar tag-row rects from last frame, for hit-testing.
     last_sidebar_tag_rects: Vec<(String, Rect)>,
+    /// Active right-click context menu for a tag (only shown for tags
+    /// with zero attached cells). When `Some`, render and hit-test the
+    /// menu at the stored anchor.
+    tag_context_menu: Option<TagContextMenu>,
+    /// "Delete tag" row rect from the last render — used by mouse_down to
+    /// dispatch the click.
+    last_tag_menu_delete_rect: Option<Rect>,
     /// Search-popup input rect (window coords) from last frame. Populated
     /// when the popup is open so `mouse_down` can route clicks into the
     /// search TextBox; None when the popup is closed.
@@ -603,6 +616,8 @@ impl KeptApp {
             last_sidebar_rects: Vec::new(),
             last_sidebar_date_rects: Vec::new(),
             last_sidebar_tag_rects: Vec::new(),
+            tag_context_menu: None,
+            last_tag_menu_delete_rect: None,
             last_search_input_rect: None,
             search_dragging: false,
             focus_mode: false,
@@ -1511,6 +1526,9 @@ impl KeptApp {
         // Mention popup also in window space; for cell-anchored mentions
         // we subtract scroll_y to convert doc-y into window-y.
         self.render_mention_popup(canvas);
+
+        // Tag right-click menu (window space).
+        self.render_tag_context_menu(canvas);
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
@@ -1804,6 +1822,11 @@ impl KeptApp {
             && !modifiers.state().alt_key()
         {
             match &event.logical_key {
+                // Esc closes the tag context menu first.
+                Key::Named(NamedKey::Escape) if self.tag_context_menu.is_some() => {
+                    self.tag_context_menu = None;
+                    return true;
+                }
                 // Esc exits focus mode first; if it wasn't on, fall through
                 // to the edit→view exit below.
                 Key::Named(NamedKey::Escape) if self.focus_mode => {
@@ -2631,6 +2654,78 @@ impl KeptApp {
                 &empty_paint,
             );
         }
+    }
+
+    fn render_tag_context_menu(&mut self, canvas: &Canvas) {
+        let Some(menu) = self.tag_context_menu.as_ref() else {
+            self.last_tag_menu_delete_rect = None;
+            return;
+        };
+        let scale = self.font_scale;
+        let pad = 6.0 * scale;
+        let row_h = 26.0 * scale;
+        let menu_w = 160.0 * scale;
+        let menu_h = row_h + pad * 2.0;
+        let rect = Rect::new(
+            menu.anchor_x,
+            menu.anchor_y,
+            menu.anchor_x + menu_w,
+            menu.anchor_y + menu_h,
+        );
+        // Drop shadow.
+        let mut shadow = Paint::default();
+        shadow.set_anti_alias(true);
+        shadow.set_color(Color::from_argb(0x40, 0, 0, 0));
+        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
+        canvas.draw_round_rect(
+            Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
+            6.0 * scale,
+            6.0 * scale,
+            &shadow,
+        );
+        // Background card.
+        let mut bg = Paint::default();
+        bg.set_anti_alias(true);
+        bg.set_color(Color::WHITE);
+        canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &bg);
+        let mut border = Paint::default();
+        border.set_anti_alias(true);
+        border.set_style(PaintStyle::Stroke);
+        border.set_stroke_width(1.0);
+        border.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &border);
+        // "Delete tag" row.
+        let row_rect = Rect::new(
+            rect.left + pad * 0.5,
+            rect.top + pad,
+            rect.right - pad * 0.5,
+            rect.top + pad + row_h,
+        );
+        let mouse_x = self.mouse_pos.0;
+        let mouse_y = self.mouse_pos.1;
+        let hovered = mouse_x >= row_rect.left
+            && mouse_x <= row_rect.right
+            && mouse_y >= row_rect.top
+            && mouse_y <= row_rect.bottom;
+        if hovered {
+            let mut hp = Paint::default();
+            hp.set_anti_alias(true);
+            hp.set_color(Color::from_argb(0x20, 0xc0, 0x30, 0x30));
+            canvas.draw_round_rect(row_rect, 4.0 * scale, 4.0 * scale, &hp);
+        }
+        let font = Font::from_typeface(&self.typeface, 13.0 * scale);
+        let (_, m) = font.metrics();
+        let baseline = row_rect.top + (row_h + (-m.ascent) - m.descent) * 0.5;
+        let mut text_paint = Paint::default();
+        text_paint.set_anti_alias(true);
+        text_paint.set_color(Color::from_rgb(0xc0, 0x30, 0x30));
+        canvas.draw_str(
+            format!("Delete tag #{}", menu.name),
+            Point::new(row_rect.left + pad, baseline),
+            &font,
+            &text_paint,
+        );
+        self.last_tag_menu_delete_rect = Some(row_rect);
     }
 
     fn render_mention_popup(&self, canvas: &Canvas) {
@@ -3470,7 +3565,60 @@ impl KeptApp {
         self.last_scroll_time = Some(Instant::now());
     }
 
+    /// Right-click handler. Currently the only surface that does anything
+    /// useful is sidebar tag rows: right-clicking on a tag with zero cells
+    /// opens a one-item "Delete tag" context menu. Returns true if the
+    /// click was consumed.
+    pub fn right_click(&mut self, x: f32, y: f32) -> bool {
+        // Right-clicking anywhere first closes any open tag menu.
+        let was_open = self.tag_context_menu.take().is_some();
+        if x >= SIDEBAR_WIDTH * self.font_scale {
+            return was_open;
+        }
+        for (name, rect) in self.last_sidebar_tag_rects.clone() {
+            if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                // Only offer the menu if the tag has no attached cells.
+                let count = self
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.cells_with_tag(&name).ok())
+                    .map(|v| v.len())
+                    .unwrap_or(usize::MAX);
+                if count == 0 {
+                    self.tag_context_menu = Some(TagContextMenu {
+                        name,
+                        anchor_x: x,
+                        anchor_y: y,
+                    });
+                    return true;
+                }
+                return was_open;
+            }
+        }
+        was_open
+    }
+
     pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
+        // Tag context menu intercepts left-clicks: clicking the "Delete
+        // tag" row deletes; clicking anywhere else closes the menu and
+        // falls through to normal click routing.
+        if self.tag_context_menu.is_some() {
+            if let Some(rect) = self.last_tag_menu_delete_rect {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.tag_context_menu.take() {
+                        if let Some(db) = self.db.as_mut() {
+                            if let Err(e) = db.delete_tag(&menu.name) {
+                                eprintln!("kept: delete_tag failed for {}: {}", menu.name, e);
+                            }
+                        }
+                    }
+                    return true;
+                }
+            }
+            self.tag_context_menu = None;
+            // Fall through to normal click handling below.
+        }
+
         // Any click dismisses an active @-mention popup.
         self.mention_popup = None;
 
