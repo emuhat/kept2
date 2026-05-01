@@ -28,7 +28,7 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, Modifiers, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    window::{Window, WindowAttributes, WindowId},
+    window::{CursorIcon, Window, WindowAttributes, WindowId},
 };
 
 use crate::app::KeptApp;
@@ -120,6 +120,12 @@ impl ApplicationHandler for Application {
                 if self.kept_app.mouse_drag_to(x, y) {
                     self.env.window.request_redraw();
                 }
+                let icon = if self.kept_app.is_hovering_link() {
+                    CursorIcon::Pointer
+                } else {
+                    CursorIcon::Default
+                };
+                self.env.window.set_cursor(icon);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {

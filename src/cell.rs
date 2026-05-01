@@ -546,6 +546,22 @@ impl TextBox {
         &self.links
     }
 
+    /// True if absolute document position `(abs_x, abs_y)` falls inside one
+    /// of this textbox's link spans, given the most recent layout. Used to
+    /// drive the hand cursor on hover.
+    pub fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        if self.links.is_empty() {
+            return false;
+        }
+        let lx = abs_x - self.x_origin;
+        let ly = abs_y - self.y_origin;
+        if lx < 0.0 || lx > self.width || ly < 0.0 || ly > self.height {
+            return false;
+        }
+        let (idx, _) = self.hit_test(lx, ly);
+        self.link_at(idx).is_some()
+    }
+
     /// Text covered by the primary selection. Empty if collapsed.
     pub fn copy_primary_selection(&self) -> String {
         let Some((anchor, head)) = self.primary_caret() else {
@@ -2478,6 +2494,18 @@ impl OutlineCell {
         }
     }
 
+    /// True if a link in the bullet under `(abs_x, abs_y)` is hit.
+    pub fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        if abs_y < self.y_origin || abs_y > self.y_origin + self.height {
+            return false;
+        }
+        let idx = self.bullet_idx_at_y(abs_y);
+        if idx >= self.bullets.len() {
+            return false;
+        }
+        self.bullets[idx].textbox.link_at_doc_pos(abs_x, abs_y)
+    }
+
     pub fn replace_in_bullet_with_link(
         &mut self,
         bullet_id: Uuid,
@@ -3256,6 +3284,12 @@ impl PopPopCell {
     /// Copy whichever column has a non-empty selection. Output wins ties on
     /// the assumption that an output drag is the most recent gesture (a
     /// fresh input click clears the output selection in `mouse_down`).
+    /// True if `(abs_x, abs_y)` lands on a link in the input column. The
+    /// output column has no links by construction, so we only check input.
+    pub fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        self.textbox.link_at_doc_pos(abs_x, abs_y)
+    }
+
     pub fn copy_selection(&self) -> String {
         let out = self.output.copy_primary_selection();
         if !out.is_empty() {
@@ -3373,6 +3407,16 @@ impl Cell {
             CellKind::Plain(tb) => tb.add_link(range, url),
             CellKind::Outline(oc) => oc.add_link_to_first(range, url),
             CellKind::PopPop(pc) => pc.textbox_mut().add_link(range, url),
+        }
+    }
+
+    /// True if document-space position `(abs_x, abs_y)` lands on a link in
+    /// this cell's most recently rendered layout. Drives the hand cursor.
+    pub fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        match &self.kind {
+            CellKind::Plain(tb) => tb.link_at_doc_pos(abs_x, abs_y),
+            CellKind::Outline(oc) => oc.link_at_doc_pos(abs_x, abs_y),
+            CellKind::PopPop(pc) => pc.link_at_doc_pos(abs_x, abs_y),
         }
     }
 

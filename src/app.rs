@@ -498,6 +498,26 @@ impl KeptApp {
         self.mouse_pos = (x, y);
     }
 
+    /// True if the mouse is currently over a link in any visible cell. Used
+    /// by the host (`main.rs`) to swap the system cursor to a hand pointer.
+    pub fn is_hovering_link(&self) -> bool {
+        let (x, y) = self.mouse_pos;
+        // Sidebar columns / out-of-bounds have no links.
+        if x < SIDEBAR_WIDTH * self.font_scale || x < 0.0 || y < 0.0 {
+            return false;
+        }
+        let doc_y = y + self.scroll_y;
+        for cell in &self.cells {
+            if !self.is_visible_for_view(cell.timestamp) {
+                continue;
+            }
+            if cell.link_at_doc_pos(x, doc_y) {
+                return true;
+            }
+        }
+        false
+    }
+
     // ----- cell access helpers -----
 
     fn cell_idx(&self, id: Uuid) -> Option<usize> {
