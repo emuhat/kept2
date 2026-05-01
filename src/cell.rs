@@ -3056,6 +3056,7 @@ pub enum CellSnapshotKind {
     /// snapshot is identical. The PopPop variant exists so restore can
     /// re-attach to a PopPop cell rather than collapsing it back to Plain.
     PopPop(TextBoxSnapshot),
+    Table(TableSnapshot),
 }
 
 impl CellSnapshot {
@@ -3072,6 +3073,15 @@ impl CellSnapshot {
                     })
             }
             (CellSnapshotKind::PopPop(a), CellSnapshotKind::PopPop(b)) => a.text == b.text,
+            (CellSnapshotKind::Table(a), CellSnapshotKind::Table(b)) => {
+                a.cells.len() == b.cells.len()
+                    && a.cells.iter().zip(b.cells.iter()).all(|(ar, br)| {
+                        ar.len() == br.len()
+                            && ar.iter().zip(br.iter()).all(|(ae, be)| {
+                                ae.readonly == be.readonly && ae.textbox.text == be.textbox.text
+                            })
+                    })
+            }
             _ => false,
         }
     }
@@ -3079,8 +3089,45 @@ impl CellSnapshot {
 
 /// Width split between input (left) and output (right) in a PopPop cell.
 const POPPOP_INPUT_RATIO: f32 = 0.7;
-/// Padding on each side of the vertical divider line.
-const POPPOP_DIVIDER_PAD: f32 = 8.0;
+
+// ----- Shared "calc grid" visual style (PopPop + Table) -----
+//
+// Alternating row stripe color (very pale calc-blue). Painted on odd-indexed
+// bands to give the spreadsheet feel.
+const GRID_STRIPE_RGB: (u8, u8, u8) = (0xed, 0xf3, 0xfa);
+/// Muted gray used for vertical column dividers.
+const GRID_DIVIDER_ARGB: (u8, u8, u8, u8) = (0x40, 0x60, 0x60, 0x60);
+/// Padding on each side of a vertical divider line, in logical pixels.
+const GRID_DIVIDER_PAD: f32 = 8.0;
+
+/// Paint odd-indexed bands of `bands` with the calc-blue stripe color,
+/// spanning `[left, right]`. Bands are `(top, bottom)` in display order.
+fn draw_alternating_row_stripes(
+    canvas: &Canvas,
+    bands: &[(f32, f32)],
+    left: f32,
+    right: f32,
+) {
+    let (r, g, b) = GRID_STRIPE_RGB;
+    let mut stripe = Paint::default();
+    stripe.set_anti_alias(true);
+    stripe.set_color(Color::from_rgb(r, g, b));
+    for (i, &(top, bot)) in bands.iter().enumerate() {
+        if i % 2 == 1 {
+            canvas.draw_rect(Rect::new(left, top, right, bot), &stripe);
+        }
+    }
+}
+
+/// Draw a single muted-gray vertical divider from `(x, y_top)` to `(x, y_bot)`.
+fn draw_vertical_divider(canvas: &Canvas, x: f32, y_top: f32, y_bot: f32) {
+    let (a, r, g, b) = GRID_DIVIDER_ARGB;
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_color(Color::from_argb(a, r, g, b));
+    paint.set_stroke_width(1.0);
+    canvas.draw_line((x, y_top), (x, y_bot), &paint);
+}
 
 /// Calculator-style "REPL" cell. Single TextBox for input on the left;
 /// each `\n`-separated source line gets a sentinel `42` rendered on the right
@@ -3138,7 +3185,7 @@ impl PopPopCell {
     }
 
     fn input_width(&self, total: f32) -> f32 {
-        ((total - POPPOP_DIVIDER_PAD * 2.0) * POPPOP_INPUT_RATIO).max(40.0)
+        ((total - GRID_DIVIDER_PAD * 2.0) * POPPOP_INPUT_RATIO).max(40.0)
     }
 
     pub fn tick(
@@ -3155,7 +3202,7 @@ impl PopPopCell {
         self.width = width;
 
         let scale = self.textbox.font_scale();
-        let pad = POPPOP_DIVIDER_PAD * scale;
+        let pad = GRID_DIVIDER_PAD * scale;
         let input_w = ((width - pad * 2.0) * POPPOP_INPUT_RATIO).max(40.0);
         let divider_x = x + input_w + pad;
         let output_x = divider_x + pad;
@@ -3196,20 +3243,13 @@ impl PopPopCell {
         self.output.layout(output_x, output_y, output_w);
 
         // 3) Alternating stripes BEHIND text. Stripe odd calc-row indices
-        //    (0 plain, 1 blue, …); spans full cell width.
-        let mut stripe = Paint::default();
-        stripe.set_anti_alias(true);
-        stripe.set_color(Color::from_rgb(0xed, 0xf3, 0xfa));
-        let mut calc_row_idx: usize = 0;
-        for &(top, bot, is_heading) in &bands {
-            if is_heading {
-                continue;
-            }
-            if calc_row_idx % 2 == 1 {
-                canvas.draw_rect(Rect::new(x, top, x + width, bot), &stripe);
-            }
-            calc_row_idx += 1;
-        }
+        //    (0 plain, 1 blue, …); spans full cell width. Heading bands are
+        //    excluded — calc rows start from the first non-heading line.
+        let calc_bands: Vec<(f32, f32)> = bands
+            .iter()
+            .filter_map(|&(top, bot, is_heading)| (!is_heading).then_some((top, bot)))
+            .collect();
+        draw_alternating_row_stripes(canvas, &calc_bands, x, x + width);
 
         // 4) Draw input text on top of stripes.
         let input_h = self
@@ -3217,15 +3257,7 @@ impl PopPopCell {
             .tick(canvas, x, y, input_w, focused, show_caret);
 
         // 5) Vertical divider, muted.
-        let mut divider = Paint::default();
-        divider.set_anti_alias(true);
-        divider.set_color(Color::from_argb(0x40, 0x60, 0x60, 0x60));
-        divider.set_stroke_width(1.0);
-        canvas.draw_line(
-            (divider_x, y + 2.0),
-            (divider_x, y + input_h - 2.0),
-            &divider,
-        );
+        draw_vertical_divider(canvas, divider_x, y + 2.0, y + input_h - 2.0);
 
         // 6) Output column. Render with focused=has_selection so its
         //    selection highlight shows even though the cell's keyboard focus
@@ -3312,6 +3344,610 @@ impl PopPopCell {
     }
 }
 
+// ============================================================================
+// Table cell
+// ============================================================================
+
+/// Default dimensions for a freshly-created Table cell.
+const TABLE_DEFAULT_ROWS: usize = 3;
+const TABLE_DEFAULT_COLS: usize = 3;
+/// Inset between the column boundary and a cell's TextBox content.
+const TABLE_CELL_PAD_X: f32 = 6.0;
+const TABLE_CELL_PAD_Y: f32 = 4.0;
+
+/// One slot in a Table. `readonly` blocks printable input (data-model-only;
+/// no UI to toggle yet — populated via the persistence layer or future API).
+pub struct TableEntry {
+    pub textbox: TextBox,
+    pub readonly: bool,
+}
+
+#[derive(Clone)]
+pub struct TableEntrySnapshot {
+    pub textbox: TextBoxSnapshot,
+    pub readonly: bool,
+}
+
+#[derive(Clone)]
+pub struct TableSnapshot {
+    pub cells: Vec<Vec<TableEntrySnapshot>>,
+}
+
+/// A grid of `M` rows by `N` cols, each cell an independently-editable
+/// `TextBox`. Visual style mirrors PopPop (alternating row stripes, muted
+/// column dividers) via the shared `draw_*` helpers. Heading / tag behavior
+/// delegates to `cells[0][0]` so typing `# Title #tag` in the top-left
+/// makes the table participate in the title/tag system like other cells.
+pub struct TableCell {
+    typeface: Typeface,
+    /// Row-major: `cells[r][c]`. Invariant: every row has the same length.
+    cells: Vec<Vec<TableEntry>>,
+    /// Active inner cell; receives keystrokes and owns the caret. The
+    /// non-focused cells render with `focused=false` so caret/selection
+    /// don't show in them.
+    focused: (usize, usize),
+    x_origin: f32,
+    y_origin: f32,
+    width: f32,
+    height: f32,
+    font_scale: f32,
+}
+
+impl TableCell {
+    pub fn new(typeface: Typeface) -> Self {
+        Self::with_dimensions(typeface, TABLE_DEFAULT_ROWS, TABLE_DEFAULT_COLS)
+    }
+
+    pub fn with_dimensions(typeface: Typeface, rows: usize, cols: usize) -> Self {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        let mut grid: Vec<Vec<TableEntry>> = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let mut row: Vec<TableEntry> = Vec::with_capacity(cols);
+            for _ in 0..cols {
+                row.push(TableEntry {
+                    textbox: TextBox::new(typeface.clone(), String::new()),
+                    readonly: false,
+                });
+            }
+            grid.push(row);
+        }
+        Self {
+            typeface,
+            cells: grid,
+            focused: (0, 0),
+            x_origin: 0.0,
+            y_origin: 0.0,
+            width: 0.0,
+            height: 0.0,
+            font_scale: 1.0,
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        self.cells.len()
+    }
+    pub fn cols(&self) -> usize {
+        self.cells.first().map(|r| r.len()).unwrap_or(0)
+    }
+    pub fn cell_at(&self, r: usize, c: usize) -> Option<&TableEntry> {
+        self.cells.get(r).and_then(|row| row.get(c))
+    }
+    pub fn cell_at_mut(&mut self, r: usize, c: usize) -> Option<&mut TableEntry> {
+        self.cells.get_mut(r).and_then(|row| row.get_mut(c))
+    }
+    pub fn focused_index(&self) -> (usize, usize) {
+        self.focused
+    }
+
+    pub fn x_origin(&self) -> f32 {
+        self.x_origin
+    }
+    pub fn y_origin(&self) -> f32 {
+        self.y_origin
+    }
+    pub fn width(&self) -> f32 {
+        self.width
+    }
+    pub fn height(&self) -> f32 {
+        self.height
+    }
+
+    /// Empty when every inner TextBox is empty. Lets `Ctrl+Enter` skip the
+    /// "no-op on empty cell" check the same way Plain/Outline/PopPop do.
+    pub fn is_empty(&self) -> bool {
+        self.cells
+            .iter()
+            .all(|row| row.iter().all(|e| e.textbox.is_empty()))
+    }
+
+    pub fn set_font_scale(&mut self, scale: f32) {
+        self.font_scale = scale;
+        for row in &mut self.cells {
+            for entry in row.iter_mut() {
+                entry.textbox.set_font_scale(scale);
+            }
+        }
+    }
+
+    /// Equal-split column widths. Inner-cell padding is subtracted before
+    /// handing widths to the TextBoxes.
+    fn col_layout(&self, total_width: f32) -> Vec<(f32, f32)> {
+        let cols = self.cols().max(1);
+        let col_w = (total_width / cols as f32).max(40.0);
+        let mut out: Vec<(f32, f32)> = Vec::with_capacity(cols);
+        for c in 0..cols {
+            let left = self.x_origin + c as f32 * col_w;
+            out.push((left, col_w));
+        }
+        out
+    }
+
+    pub fn tick(
+        &mut self,
+        canvas: &Canvas,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+        show_caret: bool,
+    ) -> f32 {
+        self.x_origin = x;
+        self.y_origin = y;
+        self.width = width;
+
+        let scale = self.font_scale;
+        let pad_x = TABLE_CELL_PAD_X * scale;
+        let pad_y = TABLE_CELL_PAD_Y * scale;
+
+        let cols_geom = self.col_layout(width);
+
+        // ---- Layout pass: lay out every TextBox, compute row heights. ----
+        let mut row_bands: Vec<(f32, f32)> = Vec::with_capacity(self.rows());
+        let mut cur_y = y;
+        for row in self.cells.iter_mut() {
+            let row_top = cur_y;
+            let mut row_h = 0.0_f32;
+            for (c, entry) in row.iter_mut().enumerate() {
+                let (col_left, col_w) = cols_geom[c];
+                let inner_w = (col_w - pad_x * 2.0).max(20.0);
+                entry
+                    .textbox
+                    .layout(col_left + pad_x, row_top + pad_y, inner_w);
+                row_h = row_h.max(entry.textbox.height() + pad_y * 2.0);
+            }
+            row_bands.push((row_top, row_top + row_h));
+            cur_y = row_top + row_h;
+        }
+        let y_bot = cur_y;
+        self.height = y_bot - y;
+
+        // ---- Draw pass ----
+
+        // 1) Alternating row stripes spanning the full table width.
+        draw_alternating_row_stripes(canvas, &row_bands, x, x + width);
+
+        // 2) Vertical dividers between columns. Skip the leading edge (c=0)
+        //    so the table doesn't get an outer left border.
+        for c in 1..self.cols() {
+            let dx = cols_geom[c].0;
+            draw_vertical_divider(canvas, dx, y + 2.0, y_bot - 2.0);
+        }
+
+        // 3) Each TextBox. Only the focused (r, c) shows caret/selection;
+        //    others render with focused=false so they're "asleep."
+        let (fr, fc) = self.focused;
+        for (r, row) in self.cells.iter_mut().enumerate() {
+            for (c, entry) in row.iter_mut().enumerate() {
+                let is_focused_inner = focused && r == fr && c == fc;
+                let inner_caret = show_caret && is_focused_inner;
+                let (col_left, col_w) = cols_geom[c];
+                let inner_w = (col_w - pad_x * 2.0).max(20.0);
+                entry.textbox.tick(
+                    canvas,
+                    col_left + pad_x,
+                    row_bands[r].0 + pad_y,
+                    inner_w,
+                    is_focused_inner,
+                    inner_caret,
+                );
+            }
+        }
+
+        self.height
+    }
+
+    /// Move keyboard focus to `(r, c)`. Collapses the previously-focused
+    /// cell's selection so it doesn't keep showing highlight after focus
+    /// leaves it (matches PopPop's two-textbox convention).
+    fn focus_cell(&mut self, r: usize, c: usize) {
+        if (r, c) == self.focused {
+            return;
+        }
+        let (pr, pc) = self.focused;
+        if let Some(prev) = self.cells.get_mut(pr).and_then(|row| row.get_mut(pc)) {
+            // Collapse to caret at current head (whichever side the head is on).
+            if let Some((_anchor, head)) = prev.textbox.primary_caret() {
+                prev.textbox.set_caret_at(head);
+            }
+        }
+        self.focused = (r, c);
+        if let Some(next) = self.cells.get_mut(r).and_then(|row| row.get_mut(c)) {
+            // Park the caret at the end of the destination cell so the user
+            // can immediately type at the tail (mirrors the rest of the app's
+            // "enter cell → caret at end" convention).
+            let end = next.textbox.text().len();
+            next.textbox.set_caret_at(end);
+        }
+    }
+
+    /// `(rows, cols)` clamp helper used by Tab and arrow nav.
+    fn dims(&self) -> (usize, usize) {
+        (self.rows(), self.cols())
+    }
+
+    /// Move focus by one cell in the row-major direction (forward = right
+    /// then wrap to next row's col 0). Returns true if focus moved. At the
+    /// last cell going forward (or the first going backward), it stays.
+    pub fn step_focus(&mut self, forward: bool) -> bool {
+        let (rows, cols) = self.dims();
+        let (r, c) = self.focused;
+        let (nr, nc) = if forward {
+            if c + 1 < cols {
+                (r, c + 1)
+            } else if r + 1 < rows {
+                (r + 1, 0)
+            } else {
+                return false;
+            }
+        } else if c > 0 {
+            (r, c - 1)
+        } else if r > 0 {
+            (r - 1, cols - 1)
+        } else {
+            return false;
+        };
+        self.focus_cell(nr, nc);
+        true
+    }
+
+    pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        // TextBox filters Pressed-only at its own entry; we have to do the
+        // same here because Tab/arrows are intercepted *before* forwarding,
+        // so a release event would step focus again.
+        if event.state != ElementState::Pressed {
+            return false;
+        }
+        let mods = modifiers.state();
+        let (rows, cols) = self.dims();
+        let (r, c) = self.focused;
+
+        // ---- Cross-cell navigation that the inner TextBox doesn't own. ----
+        match &event.logical_key {
+            Key::Named(NamedKey::Tab) => {
+                self.step_focus(!mods.shift_key());
+                return true;
+            }
+            Key::Named(NamedKey::ArrowUp) if !mods.shift_key() => {
+                let at_top = self
+                    .cell_at(r, c)
+                    .map(|e| e.textbox.at_top_visual_line())
+                    .unwrap_or(true);
+                if at_top && r > 0 {
+                    self.focus_cell(r - 1, c);
+                    return true;
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) if !mods.shift_key() => {
+                let at_bot = self
+                    .cell_at(r, c)
+                    .map(|e| e.textbox.at_bottom_visual_line())
+                    .unwrap_or(true);
+                if at_bot && r + 1 < rows {
+                    self.focus_cell(r + 1, c);
+                    return true;
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft) if !mods.shift_key() => {
+                let at_start = self
+                    .cell_at(r, c)
+                    .and_then(|e| e.textbox.primary_caret())
+                    .map(|(_, h)| h == 0)
+                    .unwrap_or(true);
+                if at_start && c > 0 {
+                    self.focus_cell(r, c - 1);
+                    return true;
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) if !mods.shift_key() => {
+                let (caret, len) = match self.cell_at(r, c) {
+                    Some(e) => (
+                        e.textbox.primary_caret().map(|(_, h)| h).unwrap_or(0),
+                        e.textbox.text().len(),
+                    ),
+                    None => (0, 0),
+                };
+                if caret == len && c + 1 < cols {
+                    self.focus_cell(r, c + 1);
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        // ---- Forward to the focused TextBox, gated on readonly. ----
+        let entry = match self.cell_at_mut(r, c) {
+            Some(e) => e,
+            None => return false,
+        };
+        if entry.readonly {
+            // Readonly cells eat printable input but allow caret/selection
+            // movement (Home/End/non-edge arrows/etc — TextBox's nav keys
+            // don't mutate text).
+            match &event.logical_key {
+                Key::Named(NamedKey::Backspace)
+                | Key::Named(NamedKey::Delete)
+                | Key::Named(NamedKey::Enter) => return false,
+                Key::Character(_) => return false,
+                _ => {}
+            }
+            // Fall through: TextBox handles arrows/Home/End harmlessly.
+        }
+        entry.textbox.handle_key(event, modifiers)
+    }
+
+    pub fn mouse_down(
+        &mut self,
+        abs_x: f32,
+        abs_y: f32,
+        modifiers: &Modifiers,
+        editing: bool,
+    ) -> bool {
+        // Hit-test row by y-band. Each cell's TextBox is laid out from the
+        // row's top + pad_y; the row's height is the max of the row's cells.
+        // We use the textbox y_origin/height as the source of truth for
+        // hit-testing so wrapped cells still give a sensible target.
+        let target = self.hit_test(abs_x, abs_y);
+        if let Some((r, c)) = target {
+            if (r, c) != self.focused {
+                self.focus_cell(r, c);
+            }
+            if let Some(entry) = self.cell_at_mut(r, c) {
+                let allow_editing = editing && !entry.readonly;
+                return entry
+                    .textbox
+                    .mouse_down(abs_x, abs_y, modifiers, allow_editing);
+            }
+        }
+        false
+    }
+
+    fn hit_test(&self, abs_x: f32, abs_y: f32) -> Option<(usize, usize)> {
+        if self.cells.is_empty() {
+            return None;
+        }
+        // Find the row whose y-band contains abs_y. Bands abut, so any
+        // out-of-range y clamps to first/last.
+        let mut row_idx = 0usize;
+        for r in 0..self.rows() {
+            let entry = self.cells[r].first()?;
+            let top = entry.textbox.y_origin() - TABLE_CELL_PAD_Y * self.font_scale;
+            let bot_entry = self.cells[r]
+                .iter()
+                .map(|e| e.textbox.y_origin() + e.textbox.height())
+                .fold(top, f32::max);
+            let bot = bot_entry + TABLE_CELL_PAD_Y * self.font_scale;
+            if abs_y < top {
+                row_idx = r;
+                break;
+            }
+            row_idx = r;
+            if abs_y < bot {
+                break;
+            }
+        }
+        // Find the col by x position using the stored col layout.
+        let cols_geom = self.col_layout(self.width);
+        let mut col_idx = 0usize;
+        for (c, &(left, w)) in cols_geom.iter().enumerate() {
+            col_idx = c;
+            if abs_x < left + w {
+                break;
+            }
+        }
+        Some((row_idx, col_idx))
+    }
+
+    pub fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
+        // Forward to all cells; only the one with an active drag responds.
+        let mut any = false;
+        for row in &mut self.cells {
+            for entry in row.iter_mut() {
+                if entry.textbox.mouse_drag_to(abs_x, abs_y) {
+                    any = true;
+                }
+            }
+        }
+        any
+    }
+
+    pub fn mouse_up(&mut self) -> bool {
+        let mut any = false;
+        for row in &mut self.cells {
+            for entry in row.iter_mut() {
+                if entry.textbox.mouse_up() {
+                    any = true;
+                }
+            }
+        }
+        any
+    }
+
+    pub fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        for row in &self.cells {
+            for entry in row {
+                if entry.textbox.link_at_doc_pos(abs_x, abs_y) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn copy_selection(&self) -> String {
+        for row in &self.cells {
+            for entry in row {
+                let s = entry.textbox.copy_primary_selection();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+        }
+        String::new()
+    }
+
+    pub fn cut_focused(&mut self) -> String {
+        let (r, c) = self.focused;
+        let entry = match self.cell_at_mut(r, c) {
+            Some(e) => e,
+            None => return String::new(),
+        };
+        if entry.readonly {
+            return entry.textbox.copy_primary_selection();
+        }
+        entry.textbox.cut_primary_selection()
+    }
+
+    pub fn paste_focused(&mut self, s: &str) {
+        let (r, c) = self.focused;
+        if let Some(entry) = self.cell_at_mut(r, c) {
+            if !entry.readonly {
+                entry.textbox.paste(s);
+            }
+        }
+    }
+
+    /// First-cell-driven heading: type `# Title` in `[0][0]` and the table
+    /// participates in the title/tag system like other cells.
+    pub fn heading_title(&self) -> Option<String> {
+        self.cells.first()?.first().and_then(|e| e.textbox.heading_title())
+    }
+    pub fn heading_tag_names(&self) -> Vec<String> {
+        self.cells
+            .first()
+            .and_then(|row| row.first())
+            .map(|e| e.textbox.heading_tag_names())
+            .unwrap_or_default()
+    }
+
+    /// Concatenated cell text in row-major order — tabs between cells in a
+    /// row, newlines between rows. Used by the search popup for substring
+    /// matching across the table.
+    pub fn full_text(&self) -> String {
+        let mut out = String::new();
+        for (r, row) in self.cells.iter().enumerate() {
+            if r > 0 {
+                out.push('\n');
+            }
+            for (c, entry) in row.iter().enumerate() {
+                if c > 0 {
+                    out.push('\t');
+                }
+                out.push_str(entry.textbox.text());
+            }
+        }
+        out
+    }
+
+    pub fn caret_doc_y_band(&self) -> Option<(f32, f32)> {
+        let (r, c) = self.focused;
+        self.cell_at(r, c)?.textbox.caret_doc_y_band()
+    }
+
+    pub fn snapshot(&self) -> TableSnapshot {
+        let cells = self
+            .cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|e| TableEntrySnapshot {
+                        textbox: e.textbox.snapshot(),
+                        readonly: e.readonly,
+                    })
+                    .collect()
+            })
+            .collect();
+        TableSnapshot { cells }
+    }
+
+    pub fn restore(&mut self, snap: TableSnapshot) {
+        let rows = snap.cells.len().max(1);
+        let cols = snap.cells.first().map(|r| r.len()).unwrap_or(1).max(1);
+        let mut grid: Vec<Vec<TableEntry>> = Vec::with_capacity(rows);
+        for snap_row in snap.cells {
+            let mut row: Vec<TableEntry> = Vec::with_capacity(cols);
+            for entry_snap in snap_row {
+                let mut tb = TextBox::new(self.typeface.clone(), String::new());
+                tb.set_font_scale(self.font_scale);
+                tb.restore(entry_snap.textbox);
+                row.push(TableEntry {
+                    textbox: tb,
+                    readonly: entry_snap.readonly,
+                });
+            }
+            grid.push(row);
+        }
+        // Clamp focused into the restored shape.
+        let (fr, fc) = self.focused;
+        self.focused = (fr.min(rows.saturating_sub(1)), fc.min(cols.saturating_sub(1)));
+        self.cells = grid;
+    }
+
+    /// Build a TableCell from raw rows of `(text, links, readonly)` triples.
+    /// Used by the persistence layer.
+    pub fn from_records(
+        typeface: Typeface,
+        rows: Vec<Vec<(String, Vec<(Range<usize>, String)>, bool)>>,
+    ) -> Self {
+        let row_count = rows.len().max(1);
+        let col_count = rows.first().map(|r| r.len()).unwrap_or(1).max(1);
+        let mut grid: Vec<Vec<TableEntry>> = Vec::with_capacity(row_count);
+        for row_recs in rows {
+            let mut row: Vec<TableEntry> = Vec::with_capacity(col_count);
+            for (text, links, readonly) in row_recs {
+                let mut tb = TextBox::new(typeface.clone(), text);
+                for (range, url) in links {
+                    tb.add_link(range, url);
+                }
+                row.push(TableEntry { textbox: tb, readonly });
+            }
+            // Pad short rows with empty cells (defensive against malformed JSON).
+            while row.len() < col_count {
+                row.push(TableEntry {
+                    textbox: TextBox::new(typeface.clone(), String::new()),
+                    readonly: false,
+                });
+            }
+            grid.push(row);
+        }
+        Self {
+            typeface,
+            cells: grid,
+            focused: (0, 0),
+            x_origin: 0.0,
+            y_origin: 0.0,
+            width: 0.0,
+            height: 0.0,
+            font_scale: 1.0,
+        }
+    }
+
+    /// Read access to the grid for persistence.
+    pub fn rows_view(&self) -> &[Vec<TableEntry>] {
+        &self.cells
+    }
+}
+
 pub struct Cell {
     pub id: Uuid,
     pub kind: CellKind,
@@ -3328,6 +3964,7 @@ pub enum CellKind {
     Plain(TextBox),
     Outline(OutlineCell),
     PopPop(PopPopCell),
+    Table(TableCell),
 }
 
 impl Cell {
@@ -3358,6 +3995,17 @@ impl Cell {
         Self {
             id: Uuid::now_v7(),
             kind: CellKind::PopPop(PopPopCell::new(typeface)),
+            timestamp: now,
+            edited_at: now,
+            context_hint_id: None,
+        }
+    }
+
+    pub fn new_table(typeface: Typeface) -> Self {
+        let now = now_epoch_ms();
+        Self {
+            id: Uuid::now_v7(),
+            kind: CellKind::Table(TableCell::new(typeface)),
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
@@ -3395,6 +4043,11 @@ impl Cell {
                 pc.restore(tbs);
                 CellKind::PopPop(pc)
             }
+            CellSnapshotKind::Table(ts) => {
+                let mut tc = TableCell::new(typeface.clone());
+                tc.restore(ts);
+                CellKind::Table(tc)
+            }
         };
         Self::from_parts(id, kind, snap.timestamp, snap.edited_at, snap.context_hint_id)
     }
@@ -3407,6 +4060,11 @@ impl Cell {
             CellKind::Plain(tb) => tb.add_link(range, url),
             CellKind::Outline(oc) => oc.add_link_to_first(range, url),
             CellKind::PopPop(pc) => pc.textbox_mut().add_link(range, url),
+            CellKind::Table(tc) => {
+                if let Some(entry) = tc.cell_at_mut(0, 0) {
+                    entry.textbox.add_link(range, url);
+                }
+            }
         }
     }
 
@@ -3417,6 +4075,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.link_at_doc_pos(abs_x, abs_y),
             CellKind::Outline(oc) => oc.link_at_doc_pos(abs_x, abs_y),
             CellKind::PopPop(pc) => pc.link_at_doc_pos(abs_x, abs_y),
+            CellKind::Table(tc) => tc.link_at_doc_pos(abs_x, abs_y),
         }
     }
 
@@ -3438,6 +4097,14 @@ impl Cell {
                 }
             }
             CellKind::PopPop(pc) => pc.textbox_mut().replace_with_link(range, text, url),
+            CellKind::Table(tc) => {
+                let (r, c) = tc.focused_index();
+                if let Some(entry) = tc.cell_at_mut(r, c) {
+                    if !entry.readonly {
+                        entry.textbox.replace_with_link(range, text, url);
+                    }
+                }
+            }
         }
     }
 
@@ -3446,21 +4113,24 @@ impl Cell {
             CellKind::Plain(tb) => tb.copy_primary_selection(),
             CellKind::Outline(oc) => oc.copy_text(),
             CellKind::PopPop(pc) => pc.copy_selection(),
+            CellKind::Table(tc) => tc.copy_selection(),
         }
     }
 
     /// Heading title for this cell, if any. Plain cells use the first
-    /// paragraph; outline cells use the first bullet's heading.
+    /// paragraph; outline cells use the first bullet's heading; tables use
+    /// the top-left cell.
     pub fn heading_title(&self) -> Option<String> {
         match &self.kind {
             CellKind::Plain(tb) => tb.heading_title(),
             CellKind::Outline(oc) => oc.bullets().first().and_then(|b| b.textbox().heading_title()),
             CellKind::PopPop(pc) => pc.textbox().heading_title(),
+            CellKind::Table(tc) => tc.heading_title(),
         }
     }
 
     /// All distinct heading-tag names attached to this cell (any heading
-    /// bullet for outlines).
+    /// bullet for outlines; top-left cell for tables).
     pub fn heading_tag_names(&self) -> Vec<String> {
         match &self.kind {
             CellKind::Plain(tb) => tb.heading_tag_names(),
@@ -3476,12 +4146,14 @@ impl Cell {
                 out
             }
             CellKind::PopPop(pc) => pc.textbox().heading_tag_names(),
+            CellKind::Table(tc) => tc.heading_tag_names(),
         }
     }
 
     /// Full text of the cell, ignoring selection state. Used as the fallback
     /// for view-mode copy when no selection is active. Outline cells join
     /// bullets with newlines, indenting nested bullets two spaces per depth.
+    /// Tables join cells with tabs (within rows) and newlines (between rows).
     pub fn full_text(&self) -> String {
         match &self.kind {
             CellKind::Plain(tb) => tb.text().to_string(),
@@ -3499,6 +4171,7 @@ impl Cell {
                 out
             }
             CellKind::PopPop(pc) => pc.textbox().text().to_string(),
+            CellKind::Table(tc) => tc.full_text(),
         }
     }
 
@@ -3507,6 +4180,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.cut_primary_selection(),
             CellKind::Outline(oc) => oc.cut_text(),
             CellKind::PopPop(pc) => pc.textbox_mut().cut_primary_selection(),
+            CellKind::Table(tc) => tc.cut_focused(),
         }
     }
 
@@ -3515,6 +4189,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.paste(s),
             CellKind::Outline(oc) => oc.paste_text(s),
             CellKind::PopPop(pc) => pc.textbox_mut().paste(s),
+            CellKind::Table(tc) => tc.paste_focused(s),
         }
     }
 
@@ -3531,6 +4206,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.tick(canvas, x, y, width, focused, show_caret),
             CellKind::Outline(oc) => oc.tick(canvas, x, y, width, focused, show_caret),
             CellKind::PopPop(pc) => pc.tick(canvas, x, y, width, focused, show_caret),
+            CellKind::Table(tc) => tc.tick(canvas, x, y, width, focused, show_caret),
         }
     }
 
@@ -3539,6 +4215,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.handle_key(event, modifiers),
             CellKind::Outline(oc) => oc.handle_key(event, modifiers),
             CellKind::PopPop(pc) => pc.handle_key(event, modifiers),
+            CellKind::Table(tc) => tc.handle_key(event, modifiers),
         }
     }
 
@@ -3553,6 +4230,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.mouse_down(abs_x, abs_y, modifiers, editing),
             CellKind::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers, editing),
             CellKind::PopPop(pc) => pc.mouse_down(abs_x, abs_y, modifiers, editing),
+            CellKind::Table(tc) => tc.mouse_down(abs_x, abs_y, modifiers, editing),
         }
     }
 
@@ -3561,6 +4239,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.mouse_drag_to(abs_x, abs_y),
             CellKind::Outline(oc) => oc.mouse_drag_to(abs_x, abs_y),
             CellKind::PopPop(pc) => pc.mouse_drag_to(abs_x, abs_y),
+            CellKind::Table(tc) => tc.mouse_drag_to(abs_x, abs_y),
         }
     }
 
@@ -3569,6 +4248,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.mouse_up(),
             CellKind::Outline(oc) => oc.mouse_up(),
             CellKind::PopPop(pc) => pc.mouse_up(),
+            CellKind::Table(tc) => tc.mouse_up(),
         }
     }
 
@@ -3577,6 +4257,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.x_origin(),
             CellKind::Outline(oc) => oc.x_origin,
             CellKind::PopPop(pc) => pc.x_origin(),
+            CellKind::Table(tc) => tc.x_origin(),
         }
     }
 
@@ -3585,6 +4266,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.y_origin(),
             CellKind::Outline(oc) => oc.y_origin,
             CellKind::PopPop(pc) => pc.y_origin(),
+            CellKind::Table(tc) => tc.y_origin(),
         }
     }
 
@@ -3593,6 +4275,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.width(),
             CellKind::Outline(oc) => oc.width,
             CellKind::PopPop(pc) => pc.width(),
+            CellKind::Table(tc) => tc.width(),
         }
     }
 
@@ -3601,6 +4284,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.height(),
             CellKind::Outline(oc) => oc.height,
             CellKind::PopPop(pc) => pc.height(),
+            CellKind::Table(tc) => tc.height(),
         }
     }
 
@@ -3609,6 +4293,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.is_empty(),
             CellKind::Outline(oc) => oc.is_empty(),
             CellKind::PopPop(pc) => pc.textbox().is_empty(),
+            CellKind::Table(tc) => tc.is_empty(),
         }
     }
 
@@ -3617,6 +4302,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.set_font_scale(scale),
             CellKind::Outline(oc) => oc.set_font_scale(scale),
             CellKind::PopPop(pc) => pc.set_font_scale(scale),
+            CellKind::Table(tc) => tc.set_font_scale(scale),
         }
     }
 
@@ -3625,6 +4311,7 @@ impl Cell {
             CellKind::Plain(tb) => tb.caret_doc_y_band(),
             CellKind::Outline(oc) => oc.caret_doc_y_band(),
             CellKind::PopPop(pc) => pc.textbox().caret_doc_y_band(),
+            CellKind::Table(tc) => tc.caret_doc_y_band(),
         }
     }
 
@@ -3633,6 +4320,14 @@ impl Cell {
             CellKind::Plain(tb) => tb.at_top_visual_line(),
             CellKind::Outline(oc) => oc.at_top_edge(),
             CellKind::PopPop(pc) => pc.textbox().at_top_visual_line(),
+            CellKind::Table(tc) => {
+                let (r, c) = tc.focused_index();
+                r == 0
+                    && tc
+                        .cell_at(r, c)
+                        .map(|e| e.textbox.at_top_visual_line())
+                        .unwrap_or(true)
+            }
         }
     }
 
@@ -3641,6 +4336,14 @@ impl Cell {
             CellKind::Plain(tb) => tb.at_bottom_visual_line(),
             CellKind::Outline(oc) => oc.at_bottom_edge(),
             CellKind::PopPop(pc) => pc.textbox().at_bottom_visual_line(),
+            CellKind::Table(tc) => {
+                let (r, c) = tc.focused_index();
+                r + 1 == tc.rows()
+                    && tc
+                        .cell_at(r, c)
+                        .map(|e| e.textbox.at_bottom_visual_line())
+                        .unwrap_or(true)
+            }
         }
     }
 
@@ -3649,6 +4352,11 @@ impl Cell {
             CellKind::Plain(tb) => tb.set_caret_at(0),
             CellKind::Outline(oc) => oc.place_caret_at_start(),
             CellKind::PopPop(pc) => pc.textbox_mut().set_caret_at(0),
+            CellKind::Table(tc) => {
+                if let Some(entry) = tc.cell_at_mut(0, 0) {
+                    entry.textbox.set_caret_at(0);
+                }
+            }
         }
     }
 
@@ -3663,16 +4371,30 @@ impl Cell {
                 let end = pc.textbox().text().len();
                 pc.textbox_mut().set_caret_at(end);
             }
+            CellKind::Table(tc) => {
+                let (r, c) = tc.focused_index();
+                if let Some(entry) = tc.cell_at_mut(r, c) {
+                    let end = entry.textbox.text().len();
+                    entry.textbox.set_caret_at(end);
+                }
+            }
         }
     }
 
     /// Select all text in the cell's active text input — entire textbox for
-    /// Plain/PopPop cells, focused bullet's textbox for Outline.
+    /// Plain/PopPop cells, focused bullet's textbox for Outline, focused
+    /// inner cell for Table.
     pub fn select_all_focused(&mut self) {
         match &mut self.kind {
             CellKind::Plain(tb) => tb.select_all(),
             CellKind::Outline(oc) => oc.select_all_in_focused(),
             CellKind::PopPop(pc) => pc.textbox_mut().select_all(),
+            CellKind::Table(tc) => {
+                let (r, c) = tc.focused_index();
+                if let Some(entry) = tc.cell_at_mut(r, c) {
+                    entry.textbox.select_all();
+                }
+            }
         }
     }
 
@@ -3686,15 +4408,21 @@ impl Cell {
                 .textbox()
                 .primary_caret()
                 .map(|(_, h)| (pc.textbox().text(), h)),
+            CellKind::Table(tc) => {
+                let (r, c) = tc.focused_index();
+                let entry = tc.cell_at(r, c)?;
+                entry.textbox.primary_caret().map(|(_, h)| (entry.textbox.text(), h))
+            }
         }
     }
 
-    /// Outline cells: ID of the focused bullet. Plain/PopPop cells: None.
+    /// Outline cells: ID of the focused bullet. Plain/PopPop/Table: None.
     pub fn focused_bullet_id(&self) -> Option<Uuid> {
         match &self.kind {
             CellKind::Plain(_) => None,
             CellKind::Outline(oc) => Some(oc.focused_bullet_id()),
             CellKind::PopPop(_) => None,
+            CellKind::Table(_) => None,
         }
     }
 
@@ -3717,6 +4445,13 @@ impl Cell {
                 let (_, bot) = pc.textbox().line_y_band_of_byte(byte)?;
                 Some((x, bot))
             }
+            (CellKind::Table(tc), None) => {
+                let (r, c) = tc.focused_index();
+                let entry = tc.cell_at(r, c)?;
+                let (x, _) = entry.textbox.doc_position_of_byte(byte)?;
+                let (_, bot) = entry.textbox.line_y_band_of_byte(byte)?;
+                Some((x, bot))
+            }
             _ => None,
         }
     }
@@ -3730,6 +4465,7 @@ impl Cell {
                 CellKind::Plain(tb) => CellSnapshotKind::Plain(tb.snapshot()),
                 CellKind::Outline(oc) => CellSnapshotKind::Outline(oc.snapshot()),
                 CellKind::PopPop(pc) => CellSnapshotKind::PopPop(pc.snapshot()),
+                CellKind::Table(tc) => CellSnapshotKind::Table(tc.snapshot()),
             },
         }
     }
@@ -3746,6 +4482,7 @@ impl Cell {
             (CellKind::Plain(tb), CellSnapshotKind::Plain(tbs)) => tb.restore(tbs),
             (CellKind::Outline(oc), CellSnapshotKind::Outline(os)) => oc.restore(os),
             (CellKind::PopPop(pc), CellSnapshotKind::PopPop(tbs)) => pc.restore(tbs),
+            (CellKind::Table(tc), CellSnapshotKind::Table(ts)) => tc.restore(ts),
             _ => {}
         }
     }
@@ -3952,5 +4689,77 @@ mod tests {
         assert_eq!(tb.links().len(), 1, "link restored on undo");
         assert_eq!(tb.links()[0].range, 7..11);
         assert_eq!(tb.links()[0].url, "https://example.com/");
+    }
+
+    // ----- Table cell -----
+
+    #[test]
+    fn table_default_dimensions_are_3x3() {
+        let tc = TableCell::new(typeface());
+        assert_eq!(tc.rows(), 3);
+        assert_eq!(tc.cols(), 3);
+        assert_eq!(tc.focused_index(), (0, 0));
+        assert!(tc.is_empty());
+    }
+
+    #[test]
+    fn table_focus_moves_with_tab() {
+        let mut tc = TableCell::new(typeface());
+        // Forward through every cell in row-major order.
+        for col in 1..3 {
+            assert!(tc.step_focus(true));
+            assert_eq!(tc.focused_index(), (0, col));
+        }
+        // (0,2) → wrap to (1,0).
+        assert!(tc.step_focus(true));
+        assert_eq!(tc.focused_index(), (1, 0));
+        // Walk all the way to (2,2) and verify the next forward step is a no-op.
+        while tc.focused_index() != (2, 2) {
+            assert!(tc.step_focus(true));
+        }
+        assert!(!tc.step_focus(true), "no-op past last cell");
+        assert_eq!(tc.focused_index(), (2, 2));
+        // Shift+Tab from (2,2) goes to (2,1).
+        assert!(tc.step_focus(false));
+        assert_eq!(tc.focused_index(), (2, 1));
+    }
+
+    #[test]
+    fn table_first_cell_heading_drives_title() {
+        let mut tc = TableCell::new(typeface());
+        let entry = tc.cell_at_mut(0, 0).unwrap();
+        entry.textbox.replace_text("# Things\nbody".to_string());
+        assert_eq!(tc.heading_title().as_deref(), Some("Things"));
+    }
+
+    #[test]
+    fn table_first_cell_heading_drives_tags() {
+        let mut tc = TableCell::new(typeface());
+        let entry = tc.cell_at_mut(0, 0).unwrap();
+        entry.textbox.replace_text("# Notes #urgent #person".to_string());
+        let tags = tc.heading_tag_names();
+        assert!(tags.contains(&"urgent".to_string()));
+        assert!(tags.contains(&"person".to_string()));
+    }
+
+    #[test]
+    fn table_snapshot_round_trip() {
+        let mut tc = TableCell::new(typeface());
+        tc.cell_at_mut(0, 0).unwrap().textbox.replace_text("# Title".to_string());
+        tc.cell_at_mut(1, 2).unwrap().textbox.replace_text("hello".to_string());
+        tc.cell_at_mut(2, 0).unwrap().readonly = true;
+        let snap = tc.snapshot();
+        // Mutate after snapshot.
+        tc.cell_at_mut(0, 0).unwrap().textbox.replace_text("DIFFERENT".to_string());
+        tc.cell_at_mut(1, 2).unwrap().textbox.replace_text(String::new());
+        tc.cell_at_mut(2, 0).unwrap().readonly = false;
+        // Restore.
+        tc.restore(snap);
+        assert_eq!(tc.cell_at(0, 0).unwrap().textbox.text(), "# Title");
+        assert_eq!(tc.cell_at(1, 2).unwrap().textbox.text(), "hello");
+        assert!(tc.cell_at(2, 0).unwrap().readonly);
+        // Other cells are still empty + editable.
+        assert!(tc.cell_at(0, 1).unwrap().textbox.is_empty());
+        assert!(!tc.cell_at(0, 1).unwrap().readonly);
     }
 }

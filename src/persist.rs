@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use skia_safe::Typeface;
 use uuid::Uuid;
 
-use crate::cell::{Bullet, Cell, CellKind, OutlineCell, PopPopCell, TextBox};
+use crate::cell::{Bullet, Cell, CellKind, OutlineCell, PopPopCell, TableCell, TextBox};
 
 /// Resolved database path: env override → OS data dir → CWD fallback.
 pub fn db_path() -> PathBuf {
@@ -349,6 +349,11 @@ enum CellBody {
         #[serde(default)]
         links: Vec<LinkRecord>,
     },
+    Table {
+        rows: usize,
+        cols: usize,
+        cells: Vec<Vec<TableEntryRecord>>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -365,6 +370,15 @@ struct BlockRecord {
     text: String,
     #[serde(default)]
     links: Vec<LinkRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TableEntryRecord {
+    text: String,
+    #[serde(default)]
+    links: Vec<LinkRecord>,
+    #[serde(default)]
+    readonly: bool,
 }
 
 fn cell_to_body(cell: &Cell) -> CellBody {
@@ -415,6 +429,35 @@ fn cell_to_body(cell: &Cell) -> CellBody {
                 })
                 .collect(),
         },
+        CellKind::Table(tc) => {
+            let cells: Vec<Vec<TableEntryRecord>> = tc
+                .rows_view()
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| TableEntryRecord {
+                            text: e.textbox.text().to_string(),
+                            links: e
+                                .textbox
+                                .links()
+                                .iter()
+                                .map(|l| LinkRecord {
+                                    start: l.range.start,
+                                    end: l.range.end,
+                                    url: l.url.clone(),
+                                })
+                                .collect(),
+                            readonly: e.readonly,
+                        })
+                        .collect()
+                })
+                .collect();
+            CellBody::Table {
+                rows: tc.rows(),
+                cols: tc.cols(),
+                cells,
+            }
+        }
     }
 }
 
@@ -447,6 +490,13 @@ fn tag_names_from_body(body: &CellBody) -> Vec<String> {
             }
         }
         CellBody::PopPop { text, .. } => push_from(text),
+        CellBody::Table { cells, .. } => {
+            // Heading lives in [0][0] only — matches the Cell::heading_*
+            // delegation. Other table cells don't contribute tags.
+            if let Some(first) = cells.first().and_then(|row| row.first()) {
+                push_from(&first.text);
+            }
+        }
     }
     out
 }
@@ -508,6 +558,42 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
                 pc.textbox_mut().add_link(l.start..l.end, l.url);
             }
             CellKind::PopPop(pc)
+        }
+        CellBody::Table { rows: _, cols: _, cells } => {
+            // `rows`/`cols` are advisory; trust the actual `cells` shape so
+            // a hand-edited or migrated row that disagrees still loads.
+            let row_records: Vec<Vec<(std::ops::Range<usize>, String)>> = cells
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .flat_map(|e| {
+                            e.links
+                                .iter()
+                                .map(|l| (l.start..l.end, l.url.clone()))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect()
+                })
+                .collect();
+            // Build the (text, links, readonly) triples expected by
+            // TableCell::from_records.
+            let triples: Vec<Vec<(String, Vec<(std::ops::Range<usize>, String)>, bool)>> = cells
+                .into_iter()
+                .zip(row_records.into_iter())
+                .map(|(row, _)| {
+                    row.into_iter()
+                        .map(|e| {
+                            let links: Vec<(std::ops::Range<usize>, String)> = e
+                                .links
+                                .into_iter()
+                                .map(|l| (l.start..l.end, l.url))
+                                .collect();
+                            (e.text, links, e.readonly)
+                        })
+                        .collect()
+                })
+                .collect();
+            CellKind::Table(TableCell::from_records(typeface.clone(), triples))
         }
     }
 }
