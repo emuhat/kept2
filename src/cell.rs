@@ -4362,6 +4362,13 @@ impl Cell {
         // then the body. Caret + selection live on whichever side is
         // `title_focused`-gated; the other side gets focused=false so its
         // caret is suppressed.
+        // An empty title that nobody's editing is just visual padding —
+        // drop it so the cell collapses back to body-only.
+        if !self.title_focused
+            && self.title.as_ref().map(|t| t.is_empty()).unwrap_or(false)
+        {
+            self.title = None;
+        }
         let title_focused = self.title_focused;
         let mut consumed = 0.0_f32;
         let mut body_y = y;
@@ -4422,7 +4429,7 @@ impl Cell {
                         .map(|t| t.at_bottom_visual_line())
                         .unwrap_or(true);
                     if title_at_bottom {
-                        self.title_focused = false;
+                        self.unfocus_title_drop_if_empty();
                         self.place_caret_at_start_of_body();
                         return true;
                     }
@@ -4432,7 +4439,7 @@ impl Cell {
                 Key::Named(NamedKey::Enter)
                     if !mods.shift_key() && self.title_focused =>
                 {
-                    self.title_focused = false;
+                    self.unfocus_title_drop_if_empty();
                     self.place_caret_at_start_of_body();
                     return true;
                 }
@@ -4473,7 +4480,7 @@ impl Cell {
                 return title.mouse_down(abs_x, abs_y, modifiers, editing);
             }
         }
-        self.title_focused = false;
+        self.unfocus_title_drop_if_empty();
         match &mut self.kind {
             CellKind::Plain(tb) => tb.mouse_down(abs_x, abs_y, modifiers, editing),
             CellKind::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers, editing),
@@ -4539,6 +4546,15 @@ impl Cell {
         if let Some(title) = self.title.as_mut() {
             let end = title.text().len();
             title.set_caret_at(end);
+        }
+    }
+
+    /// Move focus off the title and into the body. If the title was empty,
+    /// drop it entirely — an empty title slot is just visual noise.
+    fn unfocus_title_drop_if_empty(&mut self) {
+        self.title_focused = false;
+        if self.title.as_ref().map(|t| t.is_empty()).unwrap_or(false) {
+            self.title = None;
         }
     }
 

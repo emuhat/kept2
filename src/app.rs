@@ -19,6 +19,9 @@ const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
 const MARGIN_X: f32 = 40.0;
 const MARGIN_TOP: f32 = 60.0;
 const CELL_GAP: f32 = 32.0;
+/// Outer padding around the focused cell in focus mode (Ctrl+F). Smaller
+/// than `MARGIN_X` so the cell really feels "kinda fullscreen."
+const FOCUS_MODE_PAD: f32 = 16.0;
 const FOCUS_PAD: f32 = 10.0;
 const FOCUS_RADIUS: f32 = 10.0;
 const FOCUS_STROKE: f32 = 1.0;
@@ -401,6 +404,10 @@ pub struct KeptApp {
     /// True while the user is mouse-dragging inside the search input
     /// (selecting text). Drives `mouse_drag_to` / `mouse_up` routing.
     search_dragging: bool,
+    /// "Focus mode" — Ctrl+F. When true, the doc area renders only the
+    /// focused cell at full width (everything except the sidebar). Esc and
+    /// any sidebar interaction exit it.
+    focus_mode: bool,
     /// Most recent cursor position in window (logical) coords, used for hover.
     mouse_pos: (f32, f32),
 }
@@ -554,6 +561,7 @@ impl KeptApp {
             last_sidebar_tag_rects: Vec::new(),
             last_search_input_rect: None,
             search_dragging: false,
+            focus_mode: false,
             mouse_pos: (-1.0, -1.0),
         }
     }
@@ -1122,15 +1130,39 @@ impl KeptApp {
         canvas.save();
         canvas.translate((0.0, -self.scroll_y));
 
+        let scale = self.font_scale;
+        // Focus mode pulls the cell out near the sidebar with smaller pad so
+        // it visually expands to fill the available area; normal mode uses
+        // MARGIN_X on both sides for the multi-cell layout.
+        let (cells_left, outer_cell_width) = if self.focus_mode {
+            let left = SIDEBAR_WIDTH * scale + FOCUS_MODE_PAD * scale;
+            let outer = (width - left - FOCUS_MODE_PAD * scale).max(80.0);
+            (left, outer)
+        } else {
+            let left = SIDEBAR_WIDTH * scale + MARGIN_X;
+            let outer = (width - left - MARGIN_X).max(80.0);
+            (left, outer)
+        };
+        let content_width = (outer_cell_width - KEBAB_RESERVE).max(60.0);
+
         // Capture focused-cell geometry up front. The card backdrop (drawn
         // *before* cell content) and the focus ring (drawn after) both use
         // this so they stay in lockstep — at most one frame of lag when the
         // cell grows from typing, but they always match each other.
+        // In focus mode we override the x/width to match the wider focus
+        // layout (otherwise the card would draw at last frame's normal-mode
+        // size); the ring is suppressed since there's nothing to compare to.
         let focused_geom = self
             .focused
             .and_then(|id| self.cell(id))
             .filter(|c| c.height() > 0.0)
-            .map(|c| (c.x_origin(), c.y_origin(), c.width(), c.height()));
+            .map(|c| {
+                if self.focus_mode {
+                    (cells_left, MARGIN_TOP, content_width, c.height())
+                } else {
+                    (c.x_origin(), c.y_origin(), c.width(), c.height())
+                }
+            });
 
         if let Some((cx, cy, cw, ch)) = focused_geom {
             let card_rect = Rect::new(
@@ -1163,9 +1195,6 @@ impl KeptApp {
         }
 
         let mut y = MARGIN_TOP;
-        let cells_left = SIDEBAR_WIDTH * self.font_scale + MARGIN_X;
-        let outer_cell_width = (width - cells_left - MARGIN_X).max(80.0);
-        let content_width = (outer_cell_width - KEBAB_RESERVE).max(60.0);
         self.last_kebab_rects.clear();
         let mouse_doc_x = self.mouse_pos.0;
         let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
@@ -1173,11 +1202,19 @@ impl KeptApp {
 
         // Precompute per-cell visibility and section headers (Date view only)
         // so the mutable cell loop below doesn't have to re-borrow self.
-        let visible: Vec<bool> = self
-            .cells
-            .iter()
-            .map(|c| self.is_visible_for_view(c))
-            .collect();
+        // In focus mode only the focused cell is visible — everything else
+        // is suppressed regardless of the current view's filters.
+        let visible: Vec<bool> = if self.focus_mode {
+            self.cells
+                .iter()
+                .map(|c| Some(c.id) == focused_id)
+                .collect()
+        } else {
+            self.cells
+                .iter()
+                .map(|c| self.is_visible_for_view(c))
+                .collect()
+        };
         // Headers are aligned to self.cells indices but computed in DISPLAY
         // order (descending) so a header lands above the first cell of each
         // group as the user scrolls top-down.
@@ -1191,10 +1228,14 @@ impl KeptApp {
             ByDate,
             None,
         }
-        let header_mode = match self.view.time {
-            TimeWindow::Day(_) => HeaderMode::ByContext,
-            TimeWindow::All => HeaderMode::ByDate,
-            TimeWindow::Context(_) => HeaderMode::None,
+        let header_mode = if self.focus_mode {
+            HeaderMode::None
+        } else {
+            match self.view.time {
+                TimeWindow::Day(_) => HeaderMode::ByContext,
+                TimeWindow::All => HeaderMode::ByDate,
+                TimeWindow::Context(_) => HeaderMode::None,
+            }
         };
         let headers: Vec<Option<String>> = if header_mode == HeaderMode::None {
             vec![None; self.cells.len()]
@@ -1222,7 +1263,6 @@ impl KeptApp {
             hs
         };
 
-        let scale = self.font_scale;
         let header_font =
             Font::from_typeface(&self.typeface, CONTEXT_HEADER_FONT_SIZE * scale);
         let (_, hm) = header_font.metrics();
@@ -1319,7 +1359,9 @@ impl KeptApp {
         }
 
         // Focus ring — subtle when viewing, brighter and thicker when editing.
-        if let Some((cx, cy, cw, ch)) = focused_geom {
+        // Suppressed in focus mode where the white card backdrop alone marks
+        // the active area (no other cells to compete with).
+        if let Some((cx, cy, cw, ch)) = focused_geom.filter(|_| !self.focus_mode) {
             let (stroke, alpha) = if self.editing {
                 (FOCUS_STROKE_EDIT, FOCUS_RING_ALPHA_EDIT)
             } else {
@@ -1618,12 +1660,28 @@ impl KeptApp {
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("p") => {
                     return self.insert_cell_after_focused(NewCellKind::PopPop);
                 }
-                Key::Character(s) if s.as_str().eq_ignore_ascii_case("t") => {
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("j") => {
                     return self.insert_cell_after_focused(NewCellKind::Table);
                 }
-                Key::Character(s) if s.as_str().eq_ignore_ascii_case("h") => {
-                    // Ctrl+H: create + focus the title slot on the focused
-                    // cell. Idempotent — focuses an existing title.
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("f") => {
+                    // Ctrl+F: enter "focus mode" — render only the focused
+                    // cell at full width. Esc or any sidebar click exits.
+                    if self.focused.is_none() {
+                        return false;
+                    }
+                    if self.focus_mode {
+                        return false;
+                    }
+                    self.focus_mode = true;
+                    self.scroll_y = 0.0;
+                    self.coalesce_break = true;
+                    return true;
+                }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("t") => {
+                    // Ctrl/Cmd+T: create + focus the title slot on the
+                    // focused cell. Idempotent — focuses an existing title.
+                    // (Cmd+H is reserved by macOS for "hide app," so title
+                    // gets T and tables move to J.)
                     let Some(id) = self.focused else { return false };
                     let changed = self
                         .cell_mut(id)
@@ -1647,6 +1705,14 @@ impl KeptApp {
             && !modifiers.state().alt_key()
         {
             match &event.logical_key {
+                // Esc exits focus mode first; if it wasn't on, fall through
+                // to the edit→view exit below.
+                Key::Named(NamedKey::Escape) if self.focus_mode => {
+                    self.focus_mode = false;
+                    self.coalesce_break = true;
+                    self.pending_caret_scroll = true;
+                    return true;
+                }
                 Key::Named(NamedKey::Escape) if self.editing => {
                     self.editing = false;
                     self.mention_popup = None;
@@ -3234,8 +3300,11 @@ impl KeptApp {
         }
 
         // Sidebar clicks switch the view. Sidebar lives in window (logical)
-        // space, so use raw (x, y) — not doc_y.
+        // space, so use raw (x, y) — not doc_y. Any sidebar interaction
+        // also exits focus mode so the new selection lands in the normal
+        // multi-cell layout.
         if x < SIDEBAR_WIDTH * self.font_scale {
+            self.focus_mode = false;
             // Context rows first (they're indented inside dates so their bbox
             // overlaps date row gaps in some edge cases — context wins).
             for (id, rect) in self.last_sidebar_rects.clone() {
