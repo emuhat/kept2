@@ -269,7 +269,6 @@ impl Db {
     }
 
     /// All known tag names, sorted alphabetically.
-    #[allow(dead_code)]
     pub fn all_tags(&self) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT name FROM tags ORDER BY name")?;
         let rows = stmt
