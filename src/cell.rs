@@ -856,12 +856,31 @@ impl TextBox {
                 let title_end = title_end.min(visible_offset);
                 let first_tag = first_tag.min(visible_offset);
                 if title_end > 0 {
-                    canvas.draw_str(
-                        &line_text[..title_end],
-                        Point::new(x, baseline),
-                        line_font,
-                        &text_paint,
-                    );
+                    let title_range = line.start..(line.start + title_end);
+                    if self.links.is_empty() {
+                        canvas.draw_str(
+                            &line_text[..title_end],
+                            Point::new(x, baseline),
+                            line_font,
+                            &text_paint,
+                        );
+                    } else {
+                        // Title may contain links (e.g. an `@`-mention to a
+                        // person cell, which inserts a `kept://…` link). Run
+                        // the link-aware drawer over just the title bytes.
+                        draw_line_with_links(
+                            canvas,
+                            &self.text,
+                            &title_range,
+                            &self.links,
+                            x,
+                            baseline,
+                            line_font,
+                            &text_paint,
+                            &link_paint,
+                            &underline_paint,
+                        );
+                    }
                 }
                 if first_tag < visible_offset {
                     let title_w = line_font

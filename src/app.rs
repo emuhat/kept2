@@ -124,6 +124,17 @@ struct MentionPopup {
     selected: usize,
 }
 
+/// Top-of-viewport search popup, opened with Ctrl/Cmd+K. While open, all
+/// keystrokes (other than nav/commit/cancel) are typeahead for the query.
+struct SearchState {
+    query: String,
+    /// Index in the filtered result list.
+    selected: usize,
+    /// View + focus to restore on Esc-cancel.
+    pre_view: ViewSelection,
+    pre_focused: Option<Uuid>,
+}
+
 /// What the user is viewing in the doc area / highlighting in the sidebar.
 /// Decoupled from the writable-target context (which is always the most
 /// recent open one).
@@ -255,7 +266,25 @@ const SIDEBAR_ITEM_FONT_SIZE: f32 = 12.0;
 /// pad must clear `FOCUS_PAD` on the cell that follows, plus breathing room.
 const CONTEXT_HEADER_H: f32 = 50.0;
 const CONTEXT_HEADER_PAD_TOP: f32 = 14.0;
-const CONTEXT_HEADER_FONT_SIZE: f32 = 11.0;
+const CONTEXT_HEADER_FONT_SIZE: f32 = 12.0;
+/// Faint horizontal rule drawn in the gap between adjacent cells. Suppressed
+/// when either neighbour is the focused cell, and skipped entirely when a
+/// context-header divider was drawn instead.
+const CELL_SEPARATOR_ALPHA: u8 = 0x20;
+const CELL_SEPARATOR_INSET: f32 = 8.0;
+
+/// Search popup (Ctrl/Cmd+K).
+const SEARCH_WIDTH: f32 = 520.0;
+const SEARCH_TOP: f32 = 48.0;
+const SEARCH_PAD: f32 = 12.0;
+const SEARCH_RADIUS: f32 = 8.0;
+const SEARCH_INPUT_H: f32 = 36.0;
+const SEARCH_INPUT_FONT_SIZE: f32 = 16.0;
+const SEARCH_RESULT_H: f32 = 32.0;
+const SEARCH_RESULT_FONT_SIZE: f32 = 13.0;
+const SEARCH_DATE_FONT_SIZE: f32 = 12.0;
+const SEARCH_MAX_VISIBLE: usize = 8;
+const SEARCH_SNIPPET_LEN: usize = 80;
 
 const KEBAB_SIZE: f32 = 22.0;
 const KEBAB_INSET_X: f32 = 4.0;
@@ -298,6 +327,7 @@ pub struct KeptApp {
     last_edit_time: Option<Instant>,
     coalesce_break: bool,
     mention_popup: Option<MentionPopup>,
+    search: Option<SearchState>,
     clipboard: Option<Clipboard>,
     db: Option<Db>,
     dirty_cells: HashSet<Uuid>,
@@ -321,10 +351,11 @@ impl KeptApp {
             .expect("failed to load embedded TTF");
 
         let path = db_path();
+        eprintln!("kept: opening DB at {}", path.display());
         let mut db = match Db::open(&path) {
             Ok(d) => Some(d),
             Err(e) => {
-                eprintln!("kept: failed to open DB at {:?}: {e}", path);
+                eprintln!("kept: failed to open DB at {}: {e}", path.display());
                 None
             }
         };
@@ -392,15 +423,17 @@ impl KeptApp {
             }
             contexts.push(ctx);
         }
-        // Pick the most recent context. Prefer an open one; among ties, the
-        // one with the latest start. `(end_time.is_none(), start_time)` works
-        // because bool sorts false < true.
+        // Pick the most recent context as the writable target — needed even
+        // though we default the view to today, because seed cells claim it
+        // as their context_hint_id below.
         let initial_context = contexts
             .iter()
             .max_by_key(|c| (c.end_time.is_none(), c.start_time))
             .map(|c| c.id)
             .expect("at least one context exists after seeding");
-        let view = ViewSelection::Context(initial_context);
+        // Default the view to today's date so the "Today" sidebar row is
+        // highlighted on launch and new notes land where the user expects.
+        let view = ViewSelection::Date(local_date_for_ms(now_epoch_ms()));
 
         if cells.is_empty() {
             for (i, text) in SEED_TEXTS.iter().enumerate() {
@@ -446,6 +479,7 @@ impl KeptApp {
             last_edit_time: None,
             coalesce_break: false,
             mention_popup: None,
+            search: None,
             clipboard: Clipboard::new().ok(),
             db,
             dirty_cells: HashSet::new(),
@@ -1060,17 +1094,20 @@ impl KeptApp {
         // Render cells newest-first (descending) — index walked in reverse so
         // self.cells (asc) iterates from end to start.
         let total_cells = self.cells.len();
+        let mut prev_was_focused = false;
+        let mut prev_drew_cell = false;
         for i in (0..total_cells).rev() {
             let cell = &mut self.cells[i];
             if !visible[i] {
                 continue;
             }
+            let header_drawn = headers[i].is_some();
             if let Some(label) = &headers[i] {
                 let header_y = y + header_pad_top;
                 let baseline = header_y + (-hm.ascent);
                 let mut hp = Paint::default();
                 hp.set_anti_alias(true);
-                hp.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+                hp.set_color(Color::from_rgb(0x70, 0x68, 0x58));
                 canvas.draw_str(
                     label,
                     Point::new(cells_left, baseline),
@@ -1081,8 +1118,8 @@ impl KeptApp {
                 let line_y = baseline - hm.ascent / 3.0;
                 let mut lp = Paint::default();
                 lp.set_anti_alias(true);
-                lp.set_color(Color::from_argb(0x40, 0x90, 0x88, 0x7a));
-                lp.set_stroke_width(1.0);
+                lp.set_color(Color::from_argb(0x80, 0x70, 0x68, 0x58));
+                lp.set_stroke_width(1.5);
                 canvas.draw_line(
                     Point::new(cells_left + label_w + 8.0 * scale, line_y),
                     Point::new(cells_left + outer_cell_width, line_y),
@@ -1093,6 +1130,34 @@ impl KeptApp {
             let cell_x = cells_left;
             let cell_y = y;
             let cell_is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
+
+            // Subtle horizontal rule between consecutive cells. Skip it when
+            // a context header was just drawn (that's the divider for that
+            // boundary), or when either neighbour is the focused cell — the
+            // focus card / ring already provides the boundary there.
+            if prev_drew_cell
+                && !header_drawn
+                && !prev_was_focused
+                && !cell_is_focused
+            {
+                let sep_y = y - CELL_GAP * 0.5;
+                let mut sep = Paint::default();
+                sep.set_anti_alias(false);
+                sep.set_color(Color::from_argb(
+                    CELL_SEPARATOR_ALPHA,
+                    0x1c,
+                    0x1c,
+                    0x1c,
+                ));
+                sep.set_stroke_width(1.0);
+                let inset = CELL_SEPARATOR_INSET * scale;
+                canvas.draw_line(
+                    Point::new(cell_x + inset, sep_y),
+                    Point::new(cell_x + outer_cell_width - inset, sep_y),
+                    &sep,
+                );
+            }
+
             // Selection highlights are visible whenever the cell is focused
             // (so view-mode users can drag-select). Caret only renders in
             // edit mode.
@@ -1117,6 +1182,9 @@ impl KeptApp {
                 && mouse_doc_y <= kebab_rect.bottom;
             draw_kebab(canvas, kebab_rect, hovered);
             self.last_kebab_rects.push((cell.id, kebab_rect));
+
+            prev_was_focused = cell_is_focused;
+            prev_drew_cell = true;
             y += h + CELL_GAP;
         }
 
@@ -1207,6 +1275,9 @@ impl KeptApp {
 
         // Sidebar (window space — does not scroll with content).
         self.render_sidebar(canvas, height);
+
+        // Search popup (window space, drawn last so it's on top of everything).
+        self.render_search_popup(canvas, width);
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
@@ -1217,6 +1288,63 @@ impl KeptApp {
         {
             self.cell_menu_open = None;
             return true;
+        }
+
+        // Search popup. Ctrl/Cmd+K opens; while open, all keys go to it.
+        if event.state == ElementState::Pressed
+            && primary_mod(modifiers.state())
+            && matches!(&event.logical_key, Key::Character(s) if s.as_str().eq_ignore_ascii_case("k"))
+        {
+            if self.search.is_some() {
+                self.close_search_cancel();
+            } else {
+                self.open_search();
+            }
+            return true;
+        }
+        if event.state == ElementState::Pressed && self.search.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.close_search_cancel();
+                    return true;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.close_search_commit();
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.search_move(-1);
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.search_move(1);
+                    return true;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.search_backspace();
+                    return true;
+                }
+                _ => {
+                    // Append any plain text (regardless of mods that aren't
+                    // primary_mod, so e.g. Shift+letter still inserts).
+                    if !primary_mod(modifiers.state()) {
+                        if let Some(s) = &event.text {
+                            // Skip control chars (newlines, tabs).
+                            let clean: String = s
+                                .chars()
+                                .filter(|c| !c.is_control())
+                                .collect();
+                            if !clean.is_empty() {
+                                self.search_typed(&clean);
+                                return true;
+                            }
+                        }
+                    }
+                    // Swallow keystrokes while the popup is up so the
+                    // underlying cells don't get edited behind it.
+                    return true;
+                }
+            }
         }
 
         // While the @-mention popup is open, intercept navigation/commit/dismiss
@@ -1879,6 +2007,175 @@ impl KeptApp {
         let _ = (item_h, indent); // sized constants reserved for future per-context rows
     }
 
+    fn render_search_popup(&self, canvas: &Canvas, width: f32) {
+        let Some(state) = self.search.as_ref() else { return };
+        let scale = self.font_scale;
+        let pad = SEARCH_PAD * scale;
+        let radius = SEARCH_RADIUS * scale;
+        let popup_w = (SEARCH_WIDTH * scale).min(width - pad * 2.0).max(200.0);
+        let popup_x = (width - popup_w) * 0.5;
+        let popup_y = SEARCH_TOP * scale;
+
+        let input_h = SEARCH_INPUT_H * scale;
+        let result_h = SEARCH_RESULT_H * scale;
+        let results = self.search_results(&state.query);
+        let visible = results.len().min(SEARCH_MAX_VISIBLE);
+        let popup_h = input_h + (visible as f32) * result_h + pad * 2.0;
+
+        // Drop shadow.
+        let mut shadow = Paint::default();
+        shadow.set_anti_alias(true);
+        shadow.set_color(Color::from_argb(0x40, 0, 0, 0));
+        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 14.0, false));
+        canvas.draw_round_rect(
+            Rect::new(popup_x, popup_y + 4.0, popup_x + popup_w, popup_y + popup_h + 4.0),
+            radius,
+            radius,
+            &shadow,
+        );
+
+        // Background card.
+        let mut bg = Paint::default();
+        bg.set_anti_alias(true);
+        bg.set_color(Color::WHITE);
+        let card = Rect::new(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h);
+        canvas.draw_round_rect(card, radius, radius, &bg);
+
+        let mut border = Paint::default();
+        border.set_anti_alias(true);
+        border.set_style(PaintStyle::Stroke);
+        border.set_stroke_width(1.0);
+        border.set_color(Color::from_rgb(0xc8, 0xc0, 0xb0));
+        canvas.draw_round_rect(card, radius, radius, &border);
+
+        // Input row.
+        let input_font =
+            Font::from_typeface(&self.typeface, SEARCH_INPUT_FONT_SIZE * scale);
+        let (_, im) = input_font.metrics();
+        let input_baseline = popup_y + pad + (-im.ascent);
+        let mut text_paint = Paint::default();
+        text_paint.set_anti_alias(true);
+        text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        let placeholder = "Search…";
+        let display_text: &str = if state.query.is_empty() {
+            placeholder
+        } else {
+            state.query.as_str()
+        };
+        let text_color = if state.query.is_empty() {
+            Color::from_rgb(0xa8, 0xa0, 0x90)
+        } else {
+            Color::from_rgb(0x1c, 0x1c, 0x1c)
+        };
+        let mut display_paint = Paint::default();
+        display_paint.set_anti_alias(true);
+        display_paint.set_color(text_color);
+        canvas.draw_str(
+            display_text,
+            Point::new(popup_x + pad, input_baseline),
+            &input_font,
+            &display_paint,
+        );
+
+        // Caret at the end of the query (no blink for prototype).
+        let caret_x = popup_x
+            + pad
+            + if state.query.is_empty() {
+                0.0
+            } else {
+                input_font
+                    .measure_str(&state.query, Some(&display_paint))
+                    .0
+            };
+        let caret_top = input_baseline + im.ascent;
+        let caret_bot = input_baseline + im.descent;
+        let mut caret = Paint::default();
+        caret.set_anti_alias(false);
+        caret.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        canvas.draw_rect(
+            Rect::new(caret_x, caret_top, caret_x + 1.5, caret_bot),
+            &caret,
+        );
+
+        // Divider between input and results.
+        let div_y = popup_y + pad + input_h - 4.0 * scale;
+        let mut div = Paint::default();
+        div.set_anti_alias(false);
+        div.set_color(Color::from_argb(0x30, 0x40, 0x40, 0x40));
+        canvas.draw_line(
+            (popup_x + pad, div_y),
+            (popup_x + popup_w - pad, div_y),
+            &div,
+        );
+
+        // Result rows.
+        let result_font =
+            Font::from_typeface(&self.typeface, SEARCH_RESULT_FONT_SIZE * scale);
+        let date_font =
+            Font::from_typeface(&self.typeface, SEARCH_DATE_FONT_SIZE * scale);
+        let (_, rm) = result_font.metrics();
+        let mut date_paint = Paint::default();
+        date_paint.set_anti_alias(true);
+        date_paint.set_color(Color::from_rgb(0x80, 0x78, 0x68));
+        let mut row_paint = Paint::default();
+        row_paint.set_anti_alias(true);
+        row_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+
+        let mut row_y = popup_y + pad + input_h;
+        for (i, &id) in results.iter().take(SEARCH_MAX_VISIBLE).enumerate() {
+            let is_selected = i == state.selected.min(visible.saturating_sub(1));
+            if is_selected {
+                let mut sel = Paint::default();
+                sel.set_anti_alias(true);
+                sel.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+                canvas.draw_rect(
+                    Rect::new(
+                        popup_x + pad * 0.5,
+                        row_y,
+                        popup_x + popup_w - pad * 0.5,
+                        row_y + result_h,
+                    ),
+                    &sel,
+                );
+            }
+
+            if let Some(cell) = self.cell(id) {
+                let date_label = format_date_label(local_date_for_ms(cell.timestamp));
+                let baseline = row_y + (result_h + (-rm.ascent) - rm.descent) * 0.5;
+                let date_w = date_font
+                    .measure_str(&date_label, Some(&date_paint))
+                    .0;
+                canvas.draw_str(
+                    &date_label,
+                    Point::new(popup_x + pad, baseline),
+                    &date_font,
+                    &date_paint,
+                );
+                let snippet = result_snippet(&cell.full_text(), &state.query);
+                canvas.draw_str(
+                    &snippet,
+                    Point::new(popup_x + pad + date_w + 12.0 * scale, baseline),
+                    &result_font,
+                    &row_paint,
+                );
+            }
+            row_y += result_h;
+        }
+
+        if visible == 0 && !state.query.is_empty() {
+            let baseline = popup_y + pad + input_h + (result_h + (-rm.ascent) - rm.descent) * 0.5;
+            let mut empty_paint = Paint::default();
+            empty_paint.set_anti_alias(true);
+            empty_paint.set_color(Color::from_rgb(0x90, 0x88, 0x78));
+            canvas.draw_str(
+                "no matches",
+                Point::new(popup_x + pad, baseline),
+                &result_font,
+                &empty_paint,
+            );
+        }
+    }
+
     fn render_mention_popup(&self, canvas: &Canvas) {
         let Some(popup) = self.mention_popup.as_ref() else {
             return;
@@ -2070,6 +2367,96 @@ impl KeptApp {
         }
         self.coalesce_break = true;
         true
+    }
+
+    // ----- Search popup (Ctrl/Cmd+K) -----
+
+    fn open_search(&mut self) {
+        if self.search.is_some() {
+            return;
+        }
+        self.search = Some(SearchState {
+            query: String::new(),
+            selected: 0,
+            pre_view: self.view,
+            pre_focused: self.focused,
+        });
+        // Drop other transient overlays so they don't compete for input.
+        self.mention_popup = None;
+        self.cell_menu_open = None;
+    }
+
+    fn close_search_cancel(&mut self) {
+        if let Some(s) = self.search.take() {
+            self.view = s.pre_view;
+            self.focused = s.pre_focused;
+            self.editing = false;
+            self.coalesce_break = true;
+            self.pending_caret_scroll = true;
+        }
+    }
+
+    fn close_search_commit(&mut self) {
+        let Some(state) = self.search.take() else { return };
+        let results = self.search_results(&state.query);
+        let Some(&id) = results.get(state.selected) else {
+            // Nothing to commit; behave like cancel.
+            self.view = state.pre_view;
+            self.focused = state.pre_focused;
+            self.coalesce_break = true;
+            return;
+        };
+        if let Some(cell) = self.cell(id) {
+            let target_date = local_date_for_ms(cell.timestamp);
+            self.view = ViewSelection::Date(target_date);
+        }
+        self.focused = Some(id);
+        self.editing = false;
+        self.coalesce_break = true;
+        self.pending_caret_scroll = true;
+    }
+
+    /// Case-insensitive substring scan across every cell's full text.
+    /// Empty query returns nothing (popup just shows blank state). Results
+    /// are ordered most-recent-first.
+    fn search_results(&self, query: &str) -> Vec<Uuid> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let needle = query.to_lowercase();
+        let mut hits: Vec<&Cell> = self
+            .cells
+            .iter()
+            .filter(|c| c.full_text().to_lowercase().contains(&needle))
+            .collect();
+        hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        hits.into_iter().map(|c| c.id).collect()
+    }
+
+    fn search_move(&mut self, delta: i32) {
+        let Some(state) = self.search.as_ref() else { return };
+        let results = self.search_results(&state.query);
+        let count = results.len().min(SEARCH_MAX_VISIBLE);
+        if count == 0 {
+            return;
+        }
+        let cur = state.selected.min(count - 1) as i32;
+        let new = ((cur + delta).rem_euclid(count as i32)) as usize;
+        if let Some(s) = self.search.as_mut() {
+            s.selected = new;
+        }
+    }
+
+    fn search_typed(&mut self, text: &str) {
+        let Some(s) = self.search.as_mut() else { return };
+        s.query.push_str(text);
+        s.selected = 0;
+    }
+
+    fn search_backspace(&mut self) {
+        let Some(s) = self.search.as_mut() else { return };
+        s.query.pop();
+        s.selected = 0;
     }
 
     fn record_edit(&mut self, pre: CellSnapshot, post: CellSnapshot) {
@@ -2763,6 +3150,33 @@ fn local_date_for_ms(epoch_ms: i64) -> chrono::NaiveDate {
                 .unwrap()
                 .date_naive()
         })
+}
+
+/// Trim a cell's full text to a single-line snippet centered around the
+/// match. If `query` appears, show ~40 chars before + the match + ~40 after.
+/// Falls back to the first `SEARCH_SNIPPET_LEN` chars if no match (shouldn't
+/// happen for actual results but harmless).
+fn result_snippet(text: &str, query: &str) -> String {
+    let flat: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let lower = flat.to_lowercase();
+    let needle = query.to_lowercase();
+    let center = if needle.is_empty() {
+        0
+    } else {
+        lower.find(&needle).unwrap_or(0)
+    };
+    let pre = SEARCH_SNIPPET_LEN / 2;
+    let start_chars = center.saturating_sub(pre);
+    let end_chars = (start_chars + SEARCH_SNIPPET_LEN).min(flat.chars().count());
+    let mut iter = flat.chars();
+    let snippet: String = iter
+        .by_ref()
+        .skip(start_chars)
+        .take(end_chars - start_chars)
+        .collect();
+    let prefix = if start_chars > 0 { "…" } else { "" };
+    let suffix = if end_chars < flat.chars().count() { "…" } else { "" };
+    format!("{prefix}{snippet}{suffix}")
 }
 
 fn format_date_label(d: chrono::NaiveDate) -> String {
