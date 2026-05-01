@@ -4320,6 +4320,47 @@ impl Cell {
         }
     }
 
+    /// Every link URL in the cell — title (if any), body, all inner
+    /// elements. Used by the query executor to resolve `kept://<uuid>`
+    /// references.
+    pub fn all_link_urls(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if let Some(t) = self.title.as_ref() {
+            for l in t.links() {
+                out.push(l.url.clone());
+            }
+        }
+        match &self.kind {
+            CellKind::Plain(tb) => {
+                for l in tb.links() {
+                    out.push(l.url.clone());
+                }
+            }
+            CellKind::Outline(oc) => {
+                for b in oc.bullets() {
+                    for l in b.textbox().links() {
+                        out.push(l.url.clone());
+                    }
+                }
+            }
+            CellKind::PopPop(pc) => {
+                for l in pc.textbox().links() {
+                    out.push(l.url.clone());
+                }
+            }
+            CellKind::Table(tc) => {
+                for row in tc.rows_view() {
+                    for entry in row {
+                        for l in entry.textbox.links() {
+                            out.push(l.url.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn cut_text(&mut self) -> String {
         if self.title_focused {
             if let Some(title) = self.title.as_mut() {

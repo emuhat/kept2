@@ -1,6 +1,7 @@
 mod app;
 mod cell;
 mod persist;
+mod query;
 
 use std::{
     ffi::CString,
