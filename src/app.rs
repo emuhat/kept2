@@ -465,9 +465,24 @@ pub struct KeptApp {
     /// focused cell at full width (everything except the sidebar). Esc and
     /// any sidebar interaction exit it.
     focus_mode: bool,
+    /// View-history back stack. Pushed on deliberate user nav (sidebar
+    /// click, search commit). Pop = "go back". Top = most-recent past.
+    nav_back: Vec<HistoryEntry>,
+    /// View-history forward stack. Populated when the user goes back; any
+    /// new `push_view` clears it (the abandoned future is gone).
+    nav_forward: Vec<HistoryEntry>,
     /// Most recent cursor position in window (logical) coords, used for hover.
     mouse_pos: (f32, f32),
 }
+
+#[derive(Clone)]
+struct HistoryEntry {
+    query: Query,
+    focused: Option<Uuid>,
+    scroll_y: f32,
+}
+
+const NAV_HISTORY_CAP: usize = 100;
 
 impl KeptApp {
     pub fn new() -> Self {
@@ -621,6 +636,8 @@ impl KeptApp {
             last_search_input_rect: None,
             search_dragging: false,
             focus_mode: false,
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
             mouse_pos: (-1.0, -1.0),
         }
     }
@@ -1035,6 +1052,7 @@ impl KeptApp {
     }
 
     /// Switch the view to "all cells carrying this tag" mode (no time bound).
+    #[allow(dead_code)]
     fn set_active_tag(&mut self, name: String) -> bool {
         let next = Query::tag(name);
         if self.view == next {
@@ -1049,6 +1067,86 @@ impl KeptApp {
         self.coalesce_break = true;
         self.pending_caret_scroll = true;
         true
+    }
+
+    // ----- View history (Cmd/Ctrl+[ / ]) -----
+
+    /// Snapshot the current `(view, focused, scroll_y)` onto the back
+    /// stack, clear the forward stack, and transition to `new`. Called by
+    /// deliberate-nav sites (sidebar clicks, search commit). Auto-flows
+    /// (rotation, ensure_writable_context, undo) bypass this and mutate
+    /// the view directly.
+    fn push_view(&mut self, new: Query) -> bool {
+        if self.view == new {
+            return false;
+        }
+        self.nav_back.push(HistoryEntry {
+            query: self.view.clone(),
+            focused: self.focused,
+            scroll_y: self.scroll_y,
+        });
+        if self.nav_back.len() > NAV_HISTORY_CAP {
+            self.nav_back.remove(0);
+        }
+        self.nav_forward.clear();
+        self.view = new;
+        self.focused = self.visible_cell_ids().first().copied();
+        self.editing = false;
+        self.dragging_cell = None;
+        self.cell_menu_open = None;
+        self.scroll_y = 0.0;
+        self.coalesce_break = true;
+        self.pending_caret_scroll = true;
+        true
+    }
+
+    /// Cmd/Ctrl+[: pop the back stack onto the active view, pushing the
+    /// current view onto the forward stack first. No-op when the back
+    /// stack is empty.
+    fn nav_back(&mut self) -> bool {
+        let Some(prev) = self.nav_back.pop() else { return false };
+        self.nav_forward.push(HistoryEntry {
+            query: self.view.clone(),
+            focused: self.focused,
+            scroll_y: self.scroll_y,
+        });
+        if self.nav_forward.len() > NAV_HISTORY_CAP {
+            self.nav_forward.remove(0);
+        }
+        self.restore_history_entry(prev);
+        true
+    }
+
+    /// Cmd/Ctrl+]: mirror of `nav_back`. No-op when the forward stack is
+    /// empty (which is the case until the user has gone back at least
+    /// once and not yet pushed a new view).
+    fn nav_forward(&mut self) -> bool {
+        let Some(next) = self.nav_forward.pop() else { return false };
+        self.nav_back.push(HistoryEntry {
+            query: self.view.clone(),
+            focused: self.focused,
+            scroll_y: self.scroll_y,
+        });
+        if self.nav_back.len() > NAV_HISTORY_CAP {
+            self.nav_back.remove(0);
+        }
+        self.restore_history_entry(next);
+        true
+    }
+
+    fn restore_history_entry(&mut self, e: HistoryEntry) {
+        self.view = e.query;
+        self.focused = e.focused;
+        self.scroll_y = e.scroll_y;
+        self.editing = false;
+        self.dragging_cell = None;
+        self.cell_menu_open = None;
+        self.coalesce_break = true;
+        self.pending_caret_scroll = true;
+        // Drop focus mode — the new view's focused cell may not be the
+        // same; "fullscreen on a different cell" is jarring after a
+        // back-nav. The user can re-enter focus mode with Ctrl+F.
+        self.focus_mode = false;
     }
 
     /// IDs of cells visible under the active view, in DISPLAY order — newest
@@ -1689,6 +1787,14 @@ impl KeptApp {
 
         if event.state == ElementState::Pressed && primary_mod(modifiers.state()) {
             match &event.logical_key {
+                // View history: Cmd/Ctrl+[ = back, Cmd/Ctrl+] = forward.
+                // No-op when the corresponding stack is empty.
+                Key::Character(s) if s.as_str() == "[" => {
+                    return self.nav_back();
+                }
+                Key::Character(s) if s.as_str() == "]" => {
+                    return self.nav_forward();
+                }
                 Key::Named(NamedKey::Delete) => {
                     return self.delete_focused_cell();
                 }
@@ -3002,7 +3108,10 @@ impl KeptApp {
         };
         if let Some(cell) = self.cell(id) {
             let target_date = local_date_for_ms(cell.timestamp);
-            self.view = Query::date(target_date);
+            // Deliberate nav: push the pre-search view onto history so
+            // Cmd+[ returns to where the user was before searching.
+            // No-op when target view equals the current one.
+            self.push_view(Query::date(target_date));
         }
         self.focused = Some(id);
         self.editing = false;
@@ -3649,19 +3758,19 @@ impl KeptApp {
             for (id, rect) in self.last_sidebar_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_menu_open = None;
-                    return self.set_active_context(id);
+                    return self.push_view(Query::context(id));
                 }
             }
             for (date, rect) in self.last_sidebar_date_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_menu_open = None;
-                    return self.set_active_date(date);
+                    return self.push_view(Query::date(date));
                 }
             }
             for (name, rect) in self.last_sidebar_tag_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_menu_open = None;
-                    return self.set_active_tag(name);
+                    return self.push_view(Query::tag(name));
                 }
             }
             self.cell_menu_open = None;
