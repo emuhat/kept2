@@ -14,9 +14,9 @@ const HEADING_FONT_SCALE: f32 = 1.12;
 /// font size, in muted gray, with extra space separating them from the title.
 const HEADING_TAG_FONT_SCALE: f32 = 0.85;
 const HEADING_TAG_GAP: f32 = 12.0;
-/// Vertical padding above and below the thin rule that separates a cell's
-/// title slot from its body. Logical pixels; scaled with `font_scale`.
-const TITLE_RULE_PAD: f32 = 4.0;
+/// Vertical breathing room between a cell's title slot and its body.
+/// Logical pixels; scaled with `font_scale`.
+const TITLE_BODY_GAP: f32 = 6.0;
 const CARET_WIDTH: f32 = 1.5;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const MULTI_CLICK_DIST: f32 = 5.0;
@@ -3245,17 +3245,11 @@ impl PopPopCell {
         // 1) Layout the input column (no draw).
         self.textbox.layout(x, y, input_w);
 
-        // 2) Sync output text + position. Output gets one "42" line per
-        //    committed (non-heading, not-last) input source line. We position
-        //    its y_origin at the first non-heading source line so output rows
-        //    align with input calc rows.
+        // 2) Sync output text + position. Each non-last input source line
+        //    gets a sentinel "42"; output row N aligns with input row N.
         let bands = self.textbox.source_line_y_bands();
         let last_idx = bands.len().saturating_sub(1);
-        let committed_count = bands
-            .iter()
-            .enumerate()
-            .filter(|&(i, &(_, _, is_heading))| !is_heading && i != last_idx)
-            .count();
+        let committed_count = bands.len().saturating_sub(1);
         let mut new_output_text = String::with_capacity(committed_count * 3);
         for (i, line) in (0..committed_count).map(|i| (i, "42")) {
             if i > 0 {
@@ -3266,22 +3260,14 @@ impl PopPopCell {
         if self.output.text() != new_output_text {
             self.output.replace_text(new_output_text);
         }
-        // y_origin for output is the top of the first non-heading source
-        // line in the input (which is also where output row 0 should land).
-        // Falls back to `y` if there's no non-heading line yet.
-        let output_y = bands
-            .iter()
-            .find(|&&(_, _, is_heading)| !is_heading)
-            .map(|&(top, _, _)| top)
-            .unwrap_or(y);
-        self.output.layout(output_x, output_y, output_w);
+        let _ = last_idx;
+        self.output.layout(output_x, y, output_w);
 
-        // 3) Alternating stripes BEHIND text. Stripe odd calc-row indices
-        //    (0 plain, 1 blue, …); spans full cell width. Heading bands are
-        //    excluded — calc rows start from the first non-heading line.
+        // 3) Alternating stripes BEHIND text. Stripe odd-indexed bands so
+        //    rows alternate plain/blue down the full cell width.
         let calc_bands: Vec<(f32, f32)> = bands
             .iter()
-            .filter_map(|&(top, bot, is_heading)| (!is_heading).then_some((top, bot)))
+            .map(|&(top, bot, _)| (top, bot))
             .collect();
         draw_alternating_row_stripes(canvas, &calc_bands, x, x + width);
 
@@ -3298,7 +3284,7 @@ impl PopPopCell {
         //    is on the input. Caret is suppressed (read-only).
         let output_focused = self.output.has_selection();
         self.output
-            .tick(canvas, output_x, output_y, output_w, output_focused, false);
+            .tick(canvas, output_x, y, output_w, output_focused, false);
 
         self.height = input_h;
         input_h
@@ -4381,7 +4367,7 @@ impl Cell {
         let mut body_y = y;
         if let Some(title) = self.title.as_mut() {
             let scale = title.font_scale();
-            let pad = TITLE_RULE_PAD * scale;
+            let pad = TITLE_BODY_GAP * scale;
             let title_h = title.tick(
                 canvas,
                 x,
@@ -4390,14 +4376,10 @@ impl Cell {
                 focused && title_focused,
                 show_caret && title_focused,
             );
-            // Thin muted rule across the body content area.
-            let rule_y = y + title_h + pad;
-            let mut rule_paint = Paint::default();
-            rule_paint.set_anti_alias(false);
-            rule_paint.set_color(Color::from_argb(0x40, 0x60, 0x60, 0x60));
-            rule_paint.set_stroke_width(1.0);
-            canvas.draw_line((x, rule_y), (x + width, rule_y), &rule_paint);
-            let block = title_h + pad * 2.0 + 1.0;
+            // Just vertical breathing room between title and body — no rule.
+            // The heading font on the title is cue enough; a full-width line
+            // here reads as "two cells" instead of "title + body."
+            let block = title_h + pad;
             consumed += block;
             body_y = y + block;
         }

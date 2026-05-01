@@ -18,7 +18,7 @@ const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
 
 const MARGIN_X: f32 = 40.0;
 const MARGIN_TOP: f32 = 60.0;
-const CELL_GAP: f32 = 20.0;
+const CELL_GAP: f32 = 32.0;
 const FOCUS_PAD: f32 = 10.0;
 const FOCUS_RADIUS: f32 = 10.0;
 const FOCUS_STROKE: f32 = 1.0;
@@ -319,11 +319,11 @@ const SIDEBAR_ITEM_FONT_SIZE: f32 = 12.0;
 const CONTEXT_HEADER_H: f32 = 50.0;
 const CONTEXT_HEADER_PAD_TOP: f32 = 14.0;
 const CONTEXT_HEADER_FONT_SIZE: f32 = 12.0;
-/// Faint horizontal rule drawn in the gap between adjacent cells. Suppressed
-/// when either neighbour is the focused cell, and skipped entirely when a
-/// context-header divider was drawn instead.
-const CELL_SEPARATOR_ALPHA: u8 = 0x20;
-const CELL_SEPARATOR_INSET: f32 = 8.0;
+/// Faint outline drawn around non-focused cells so each one reads as a
+/// distinct unit on the page. The focused cell's blue ring + card backdrop
+/// supersede this — only non-focused cells get the outline.
+const CELL_OUTLINE_ALPHA: u8 = 0x28;
+const CELL_OUTLINE_STROKE: f32 = 1.0;
 
 /// Search popup (Ctrl/Cmd+K).
 const SEARCH_WIDTH: f32 = 520.0;
@@ -1232,14 +1232,11 @@ impl KeptApp {
         // Render cells newest-first (descending) — index walked in reverse so
         // self.cells (asc) iterates from end to start.
         let total_cells = self.cells.len();
-        let mut prev_was_focused = false;
-        let mut prev_drew_cell = false;
         for i in (0..total_cells).rev() {
             let cell = &mut self.cells[i];
             if !visible[i] {
                 continue;
             }
-            let header_drawn = headers[i].is_some();
             if let Some(label) = &headers[i] {
                 let header_y = y + header_pad_top;
                 let baseline = header_y + (-hm.ascent);
@@ -1269,33 +1266,6 @@ impl KeptApp {
             let cell_y = y;
             let cell_is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
 
-            // Subtle horizontal rule between consecutive cells. Skip it when
-            // a context header was just drawn (that's the divider for that
-            // boundary), or when either neighbour is the focused cell — the
-            // focus card / ring already provides the boundary there.
-            if prev_drew_cell
-                && !header_drawn
-                && !prev_was_focused
-                && !cell_is_focused
-            {
-                let sep_y = y - CELL_GAP * 0.5;
-                let mut sep = Paint::default();
-                sep.set_anti_alias(false);
-                sep.set_color(Color::from_argb(
-                    CELL_SEPARATOR_ALPHA,
-                    0x1c,
-                    0x1c,
-                    0x1c,
-                ));
-                sep.set_stroke_width(1.0);
-                let inset = CELL_SEPARATOR_INSET * scale;
-                canvas.draw_line(
-                    Point::new(cell_x + inset, sep_y),
-                    Point::new(cell_x + outer_cell_width - inset, sep_y),
-                    &sep,
-                );
-            }
-
             // Selection highlights are visible whenever the cell is focused
             // (so view-mode users can drag-select). Caret only renders in
             // edit mode.
@@ -1309,6 +1279,30 @@ impl KeptApp {
                 render_focused,
                 show_caret,
             );
+
+            // Faint outline around non-focused cells so each one reads as a
+            // distinct unit. Drawn in the same position the focus ring would
+            // occupy so cells don't visually shift when focus moves.
+            if !cell_is_focused {
+                let mut outline = Paint::default();
+                outline.set_anti_alias(true);
+                outline.set_style(PaintStyle::Stroke);
+                outline.set_stroke_width(CELL_OUTLINE_STROKE);
+                outline.set_color(Color::from_argb(
+                    CELL_OUTLINE_ALPHA,
+                    0x1c,
+                    0x1c,
+                    0x1c,
+                ));
+                let rect = Rect::new(
+                    cell_x - FOCUS_PAD,
+                    cell_y - FOCUS_PAD,
+                    cell_x + content_width + FOCUS_PAD,
+                    cell_y + h + FOCUS_PAD,
+                );
+                canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
+            }
+
             let kebab_right = cell_x + outer_cell_width - KEBAB_INSET_X;
             let kebab_left = kebab_right - KEBAB_SIZE;
             let kebab_top = cell_y + KEBAB_INSET_Y;
@@ -1321,8 +1315,6 @@ impl KeptApp {
             draw_kebab(canvas, kebab_rect, hovered);
             self.last_kebab_rects.push((cell.id, kebab_rect));
 
-            prev_was_focused = cell_is_focused;
-            prev_drew_cell = true;
             y += h + CELL_GAP;
         }
 
