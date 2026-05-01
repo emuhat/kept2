@@ -407,20 +407,31 @@ fn collect_kept_link_uuids(cell: &Cell) -> HashSet<Uuid> {
 // ============================================================================
 
 /// Given the query's entity refs and the current `(name, uuid)` index of
-/// person cells, return the UUIDs that satisfy "title contains the
-/// post-sigil id substring" (case-insensitive). Used to populate
-/// `MatchContext::person_targets` / `person_excludes`.
+/// person cells, return the UUIDs that satisfy "normalized title contains
+/// normalized id". Normalization strips whitespace + underscores and
+/// lowercases — so `@patrick`, `@Patrick_Foy`, and `@patrickfoy` all
+/// resolve against a person titled "Patrick Foy".
 pub fn resolve_persons(refs: &[EntityRef], index: &[(String, Uuid)]) -> Vec<Uuid> {
     let mut out: Vec<Uuid> = Vec::new();
     for r in refs.iter().filter(|r| matches!(r.kind, EntityKind::Person)) {
-        let needle = r.id.to_lowercase();
+        let needle = normalize_entity_token(&r.id);
+        if needle.is_empty() {
+            continue;
+        }
         for (name, id) in index {
-            if name.to_lowercase().contains(&needle) && !out.contains(id) {
+            if normalize_entity_token(name).contains(&needle) && !out.contains(id) {
                 out.push(*id);
             }
         }
     }
     out
+}
+
+fn normalize_entity_token(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && *c != '_')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 // ============================================================================

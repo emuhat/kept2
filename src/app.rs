@@ -116,16 +116,21 @@ fn filter_mentions(names: &[String], query: &str) -> Vec<(String, Vec<usize>)> {
 }
 
 struct MentionPopup {
-    /// Cell the popup is anchored to.
-    cell_id: Uuid,
-    /// For outline cells, the specific bullet's id. None for plain cells.
-    bullet_id: Option<Uuid>,
-    /// Byte position of the '@' in the active textbox.
+    /// What the popup is anchored to: a focused cell's text or the search
+    /// bar's input. Drives sync, render-anchor, and commit behavior.
+    source: MentionSource,
+    /// Byte position of the '@' in the source's text.
     anchor_byte: usize,
     /// Currently typed query (text after the '@', no whitespace).
     query: String,
     /// Index of the highlighted item in the filtered list.
     selected: usize,
+}
+
+#[derive(Clone, Copy)]
+enum MentionSource {
+    Cell { cell_id: Uuid, bullet_id: Option<Uuid> },
+    SearchBar,
 }
 
 /// Top-of-viewport search popup, opened with Ctrl/Cmd+K. The query is a
@@ -140,6 +145,11 @@ struct SearchState {
     input: TextBox,
     /// Index of the highlighted result row. Reset to 0 on text change.
     selected: usize,
+    /// Result list from the last render where the @-mention popup was
+    /// closed. While the user is mid-pick (mention popup open), we keep
+    /// showing these so the search-popup result list doesn't churn on
+    /// every keystroke of the in-progress `@<query>` token.
+    cached_results: Vec<Uuid>,
 }
 
 /// Which kind of cell to spawn from a "new cell" hotkey.
@@ -1434,8 +1444,6 @@ impl KeptApp {
             self.render_cell_menu(canvas, id);
         }
 
-        self.render_mention_popup(canvas);
-
         canvas.restore();
 
         // Update bookkeeping for scroll math + clamp again in case content shrank.
@@ -1499,6 +1507,10 @@ impl KeptApp {
 
         // Search popup (window space, drawn last so it's on top of everything).
         self.render_search_popup(canvas, width);
+
+        // Mention popup also in window space; for cell-anchored mentions
+        // we subtract scroll_y to convert doc-y into window-y.
+        self.render_mention_popup(canvas);
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
@@ -1525,6 +1537,30 @@ impl KeptApp {
         }
         if event.state == ElementState::Pressed && self.search.is_some() {
             let mods = modifiers.state();
+            // When the @-mention popup is open over the search input, it
+            // owns Enter/Tab/Esc/Up/Down — those select / commit / dismiss
+            // a person, not the search-popup result list.
+            if self.mention_popup.is_some() {
+                match &event.logical_key {
+                    Key::Named(NamedKey::Escape) => {
+                        self.mention_popup = None;
+                        return true;
+                    }
+                    Key::Named(NamedKey::ArrowUp) => {
+                        self.mention_popup_move(-1);
+                        return true;
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        self.mention_popup_move(1);
+                        return true;
+                    }
+                    Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
+                        self.commit_mention();
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
             // Popup-specific keys take precedence over text editing.
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => {
@@ -1588,6 +1624,7 @@ impl KeptApp {
             // Forward to the input. Reset selected on text change so the
             // result list always tracks the current query.
             let pre = self.search.as_ref().map(|s| s.input.text().to_string());
+            let popup_was_open = self.mention_popup.is_some();
             if let Some(state) = self.search.as_mut() {
                 state.input.handle_key(event, modifiers);
             }
@@ -1597,6 +1634,13 @@ impl KeptApp {
                     state.selected = 0;
                 }
             }
+            // @-mention popup hooks: maybe open if the user just typed '@';
+            // sync against the new caret/text otherwise so a shrinking
+            // query backs out the popup or updates its filter.
+            if !popup_was_open && event.text.as_deref() == Some("@") {
+                self.try_open_mention_popup();
+            }
+            self.sync_mention_popup();
             return true;
         }
 
@@ -1968,6 +2012,30 @@ impl KeptApp {
     }
 
     fn try_open_mention_popup(&mut self) {
+        // Prefer the search bar when it has the keyboard focus — typing in
+        // the popup never goes through cell.handle_key, so the cell-source
+        // path would be a no-op here.
+        if let Some(state) = self.search.as_ref() {
+            let text = state.input.text();
+            let caret = state
+                .input
+                .primary_caret()
+                .map(|(_, h)| h)
+                .unwrap_or(0);
+            if caret == 0 {
+                return;
+            }
+            if text.get(caret - 1..caret) != Some("@") {
+                return;
+            }
+            self.mention_popup = Some(MentionPopup {
+                source: MentionSource::SearchBar,
+                anchor_byte: caret - 1,
+                query: String::new(),
+                selected: 0,
+            });
+            return;
+        }
         let Some(focused_id) = self.focused else {
             return;
         };
@@ -1985,8 +2053,10 @@ impl KeptApp {
             return;
         }
         self.mention_popup = Some(MentionPopup {
-            cell_id: focused_id,
-            bullet_id: cell.focused_bullet_id(),
+            source: MentionSource::Cell {
+                cell_id: focused_id,
+                bullet_id: cell.focused_bullet_id(),
+            },
             anchor_byte: caret - 1,
             query: String::new(),
             selected: 0,
@@ -1997,49 +2067,53 @@ impl KeptApp {
         let Some(popup) = self.mention_popup.as_ref() else {
             return;
         };
-        // Cell focus must still match.
-        if self.focused != Some(popup.cell_id) {
+        let anchor_byte = popup.anchor_byte;
+        let source = popup.source;
+        // Pull the current `(text, caret)` from whichever source is anchored.
+        let cur: Option<(String, usize)> = match source {
+            MentionSource::Cell { cell_id, bullet_id } => {
+                if self.focused != Some(cell_id) {
+                    None
+                } else if let Some(cell) = self.cell(cell_id) {
+                    if cell.focused_bullet_id() != bullet_id {
+                        None
+                    } else {
+                        cell.focused_text_and_caret()
+                            .map(|(t, c)| (t.to_string(), c))
+                    }
+                } else {
+                    None
+                }
+            }
+            MentionSource::SearchBar => self.search.as_ref().and_then(|s| {
+                let caret = s.input.primary_caret().map(|(_, h)| h)?;
+                Some((s.input.text().to_string(), caret))
+            }),
+        };
+        let Some((text, caret)) = cur else {
+            self.mention_popup = None;
+            return;
+        };
+        // The '@' must still be at anchor_byte.
+        if text.get(anchor_byte..).map_or(true, |s| !s.starts_with('@')) {
             self.mention_popup = None;
             return;
         }
-        let cell_id = popup.cell_id;
-        let bullet_id = popup.bullet_id;
-        let anchor_byte = popup.anchor_byte;
-        let query: String = {
-            let Some(cell) = self.cell(cell_id) else {
-                self.mention_popup = None;
-                return;
-            };
-            // Bullet must still match (outline only).
-            if cell.focused_bullet_id() != bullet_id {
-                self.mention_popup = None;
-                return;
-            }
-            let Some((text, caret)) = cell.focused_text_and_caret() else {
-                self.mention_popup = None;
-                return;
-            };
-            // The '@' must still be at anchor_byte.
-            if text.get(anchor_byte..).map_or(true, |s| !s.starts_with('@')) {
-                self.mention_popup = None;
-                return;
-            }
-            // Caret must be at or past the '@' itself.
-            if caret < anchor_byte + 1 {
-                self.mention_popup = None;
-                return;
-            }
-            // Query is everything between the '@' and the caret. Whitespace breaks it.
-            let Some(q) = text.get(anchor_byte + 1..caret) else {
-                self.mention_popup = None;
-                return;
-            };
-            if q.chars().any(|c| c.is_whitespace()) {
-                self.mention_popup = None;
-                return;
-            }
-            q.to_string()
+        // Caret must be at or past the '@' itself.
+        if caret < anchor_byte + 1 {
+            self.mention_popup = None;
+            return;
+        }
+        // Query is everything between the '@' and the caret. Whitespace breaks it.
+        let Some(q) = text.get(anchor_byte + 1..caret) else {
+            self.mention_popup = None;
+            return;
         };
+        if q.chars().any(|c| c.is_whitespace()) {
+            self.mention_popup = None;
+            return;
+        }
+        let query = q.to_string();
         let names = self.person_names();
         if let Some(p) = self.mention_popup.as_mut() {
             let count = filter_mentions(&names, &query).len().min(MENTION_POPUP_MAX_VISIBLE);
@@ -2401,7 +2475,23 @@ impl KeptApp {
             .as_ref()
             .map(|s| s.input.text().to_string())
             .unwrap_or_default();
-        let results = self.search_results(&query);
+        // Only recompute results when the @-mention popup is closed —
+        // otherwise the in-progress `@<query>` token would churn the list
+        // on every keystroke. Cache survives until the mention popup
+        // closes (commit or cancel), at which point the next render
+        // refreshes against the now-final query text.
+        let results: Vec<Uuid> = if self.mention_popup.is_none() {
+            let fresh = self.search_results(&query);
+            if let Some(state) = self.search.as_mut() {
+                state.cached_results = fresh.clone();
+            }
+            fresh
+        } else {
+            self.search
+                .as_ref()
+                .map(|s| s.cached_results.clone())
+                .unwrap_or_default()
+        };
         let visible = results.len().min(SEARCH_MAX_VISIBLE);
         let popup_h = input_h + (visible as f32) * result_h + pad * 2.0;
 
@@ -2547,13 +2637,27 @@ impl KeptApp {
         let Some(popup) = self.mention_popup.as_ref() else {
             return;
         };
-        let Some(cell) = self.cell(popup.cell_id) else {
-            return;
-        };
-        let Some((anchor_x, anchor_y_below)) =
-            cell.anchor_doc_pos(popup.bullet_id, popup.anchor_byte)
-        else {
-            return;
+        let (anchor_x, anchor_y_below) = match popup.source {
+            MentionSource::Cell { cell_id, bullet_id } => {
+                let Some(cell) = self.cell(cell_id) else {
+                    return;
+                };
+                let Some((x, y)) = cell.anchor_doc_pos(bullet_id, popup.anchor_byte) else {
+                    return;
+                };
+                // Doc-space → window-space: subtract scroll.
+                (x, y - self.scroll_y)
+            }
+            MentionSource::SearchBar => {
+                let Some(state) = self.search.as_ref() else { return };
+                let Some((x, _)) = state.input.doc_position_of_byte(popup.anchor_byte) else {
+                    return;
+                };
+                let Some((_, bot)) = state.input.line_y_band_of_byte(popup.anchor_byte) else {
+                    return;
+                };
+                (x, bot)
+            }
         };
 
         let scale = self.font_scale;
@@ -2710,26 +2814,55 @@ impl KeptApp {
         };
         let source_id = *source_id;
 
-        let cell_id = popup.cell_id;
-        let bullet_id = popup.bullet_id;
         let start = popup.anchor_byte;
         let end = start + 1 + popup.query.len();
 
-        let pre = match self.cell(cell_id) {
-            Some(c) => c.snapshot(),
-            None => return true,
-        };
-        let url = format!("kept://{}", source_id);
-        if let Some(c) = self.cell_mut(cell_id) {
-            c.replace_focused_with_link(bullet_id, start..end, chosen_name, url);
-        }
-        if let Some(c) = self.cell(cell_id) {
-            let post = c.snapshot();
-            if !pre.doc_eq(&post) {
-                let saved_focused = self.focused;
-                self.focused = Some(cell_id);
-                self.record_edit(pre, post);
-                self.focused = saved_focused.or(Some(cell_id));
+        match popup.source {
+            MentionSource::Cell { cell_id, bullet_id } => {
+                let pre = match self.cell(cell_id) {
+                    Some(c) => c.snapshot(),
+                    None => return true,
+                };
+                let url = format!("kept://{}", source_id);
+                if let Some(c) = self.cell_mut(cell_id) {
+                    c.replace_focused_with_link(bullet_id, start..end, chosen_name, url);
+                }
+                if let Some(c) = self.cell(cell_id) {
+                    let post = c.snapshot();
+                    if !pre.doc_eq(&post) {
+                        let saved_focused = self.focused;
+                        self.focused = Some(cell_id);
+                        self.record_edit(pre, post);
+                        self.focused = saved_focused.or(Some(cell_id));
+                    }
+                }
+            }
+            MentionSource::SearchBar => {
+                // Replace `@<query>` with `@<Title_Cased_With_Underscores>` so
+                // the resulting query string is readable and parses cleanly
+                // (entity tokens can't contain whitespace). The executor's
+                // resolver normalizes both sides — strips whitespace and
+                // underscores, lowercases — so `@Patrick_Foy` matches the
+                // person cell titled "Patrick Foy".
+                let slug = chosen_name
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join("_");
+                let replacement = format!("@{slug}");
+                if let Some(state) = self.search.as_mut() {
+                    let txt = state.input.text();
+                    if start <= txt.len() && end <= txt.len() {
+                        // Build new text: prefix + replacement + suffix.
+                        let prefix = &txt[..start];
+                        let suffix = &txt[end..];
+                        let new_text = format!("{prefix}{replacement}{suffix}");
+                        state.input.replace_text(new_text);
+                        state
+                            .input
+                            .set_caret_at(start + replacement.len());
+                    }
+                    state.selected = 0;
+                }
             }
         }
         self.coalesce_break = true;
@@ -2747,6 +2880,7 @@ impl KeptApp {
         self.search = Some(SearchState {
             input,
             selected: 0,
+            cached_results: Vec::new(),
         });
         // Drop other transient overlays so they don't compete for input.
         self.mention_popup = None;
