@@ -98,7 +98,43 @@ impl Db {
             )?;
             self.backfill_cell_tags()?;
         }
+        if version < 4 {
+            // v3 → v4: explicit title slot per cell. Walk every row, extract
+            // any leading `# ...` heading line into the new `title` field on
+            // the wrapped JSON, drop the `# ` from body text, and rebuild the
+            // tag index from the now-canonical title source.
+            self.migrate_extract_titles()?;
+            self.conn.execute_batch(
+                "BEGIN; PRAGMA user_version = 4; COMMIT;",
+            )?;
+            self.backfill_cell_tags()?;
+        }
         Ok(())
+    }
+
+    /// v3 → v4 step: walk every cell row and, where the body opens with a
+    /// markdown `# ` heading line, extract it into the new top-level `title`
+    /// field. Idempotent — cells already carrying a title are left alone, as
+    /// are cells whose body does not open with `# `.
+    fn migrate_extract_titles(&mut self) -> rusqlite::Result<()> {
+        let rows: Vec<(Vec<u8>, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, body FROM cells")?;
+            let it = stmt.query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let tx = self.conn.transaction()?;
+        for (id_bytes, body_json) in rows {
+            let Some(updated) = extract_title_from_body_json(&body_json) else {
+                continue;
+            };
+            tx.execute(
+                "UPDATE cells SET body = ?1 WHERE id = ?2",
+                params![updated, id_bytes],
+            )?;
+        }
+        tx.commit()
     }
 
     /// Walk every existing cell row, parse its stored body JSON for tags,
@@ -113,11 +149,11 @@ impl Db {
             it.collect::<rusqlite::Result<Vec<_>>>()?
         };
         for (id_bytes, body_json) in rows {
-            let body: CellBody = match serde_json::from_str(&body_json) {
+            let pc: PersistedCell = match serde_json::from_str(&body_json) {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let names = tag_names_from_body(&body);
+            let names = tag_names_from_persisted(&pc);
             self.write_cell_tags(&id_bytes, &names)?;
         }
         Ok(())
@@ -189,15 +225,23 @@ impl Db {
 
         let mut cells = Vec::with_capacity(rows.len());
         for (id, timestamp, body_json, edited_at, hint) in rows {
-            let body: CellBody = serde_json::from_str(&body_json).map_err(|e| {
+            let pc: PersistedCell = serde_json::from_str(&body_json).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     0,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
             })?;
-            let kind = body_to_kind(body, typeface);
-            cells.push(Cell::from_parts(id, kind, timestamp, edited_at, hint));
+            let title = pc.title.map(|t| {
+                let mut tb = TextBox::new(typeface.clone(), t.text);
+                tb.set_force_heading(true);
+                for l in t.links {
+                    tb.add_link(l.start..l.end, l.url);
+                }
+                tb
+            });
+            let kind = body_to_kind(pc.body, typeface);
+            cells.push(Cell::from_parts(id, kind, title, timestamp, edited_at, hint));
         }
         Ok(cells)
     }
@@ -228,8 +272,8 @@ impl Db {
     }
 
     pub fn save_cell(&mut self, cell: &Cell) -> rusqlite::Result<()> {
-        let body = cell_to_body(cell);
-        let body_json = serde_json::to_string(&body)
+        let pc = persisted_cell_from(cell);
+        let body_json = serde_json::to_string(&pc)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let hint_bytes = cell.context_hint_id.map(|u| u.as_bytes().to_vec());
         let cell_id_bytes = cell.id.as_bytes().to_vec();
@@ -249,7 +293,7 @@ impl Db {
                 hint_bytes,
             ],
         )?;
-        let names = tag_names_from_body(&body);
+        let names = tag_names_from_persisted(&pc);
         self.write_cell_tags(&cell_id_bytes, &names)?;
         Ok(())
     }
@@ -332,6 +376,25 @@ impl Db {
 // Serde shape for cells.body — kept private to this module.
 // ---------------------------------------------------------------------------
 
+/// Top-level shape persisted as the JSON `body` column. Wraps a kind-tagged
+/// `CellBody` with an optional structured title slot. Old rows stored as
+/// bare CellBody (`{"kind":"plain","text":"..."}`) deserialize as
+/// `PersistedCell { title: None, body: ... }` thanks to `#[serde(flatten)]`.
+#[derive(Serialize, Deserialize)]
+struct PersistedCell {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<TitleRecord>,
+    #[serde(flatten)]
+    body: CellBody,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TitleRecord {
+    text: String,
+    #[serde(default)]
+    links: Vec<LinkRecord>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum CellBody {
@@ -379,6 +442,27 @@ struct TableEntryRecord {
     links: Vec<LinkRecord>,
     #[serde(default)]
     readonly: bool,
+}
+
+/// Build the wrapped persisted form from a live Cell. Captures the title
+/// slot (if any) and the kind-tagged body.
+fn persisted_cell_from(cell: &Cell) -> PersistedCell {
+    let title = cell.title.as_ref().map(|tb| TitleRecord {
+        text: tb.text().to_string(),
+        links: tb
+            .links()
+            .iter()
+            .map(|l| LinkRecord {
+                start: l.range.start,
+                end: l.range.end,
+                url: l.url.clone(),
+            })
+            .collect(),
+    });
+    PersistedCell {
+        title,
+        body: cell_to_body(cell),
+    }
 }
 
 fn cell_to_body(cell: &Cell) -> CellBody {
@@ -461,10 +545,163 @@ fn cell_to_body(cell: &Cell) -> CellBody {
     }
 }
 
-/// Extract distinct, source-ordered tag names from a cell body. For Plain
-/// cells, parses the heading paragraph. For Outline cells, every bullet
-/// whose text starts with `# ` contributes its trailing tags. The leading
-/// `#` is stripped so names match the canonical form stored in `tags.name`.
+/// Migration helper: deserialize legacy/new body JSON, and if the body
+/// starts with a `# ` heading (and no explicit `title` is already set),
+/// extract the heading line into a `title` field. Returns Some(json) when
+/// the row needs to be rewritten, or None to skip.
+fn extract_title_from_body_json(body_json: &str) -> Option<String> {
+    let mut pc: PersistedCell = serde_json::from_str(body_json).ok()?;
+    if pc.title.is_some() {
+        return None;
+    }
+    let extracted = match &mut pc.body {
+        CellBody::Plain { text, links } => take_heading_from_inline(text, links),
+        CellBody::PopPop { text, links } => take_heading_from_inline(text, links),
+        CellBody::Outline { blocks } => take_heading_from_outline(blocks),
+        CellBody::Table { cells, .. } => take_heading_from_table(cells),
+    };
+    let title = extracted?;
+    pc.title = Some(title);
+    serde_json::to_string(&pc).ok()
+}
+
+/// Pull a leading `# ...` heading paragraph out of a Plain/PopPop body's
+/// `(text, links)` pair. Returns the extracted TitleRecord (with `# ` stripped
+/// and link offsets shifted to the title's local frame) and mutates `text` /
+/// `links` in place to reflect the post-heading remainder. None when the
+/// text does not start with `# `.
+fn take_heading_from_inline(
+    text: &mut String,
+    links: &mut Vec<LinkRecord>,
+) -> Option<TitleRecord> {
+    if !text.starts_with("# ") {
+        return None;
+    }
+    let heading_end = text.find('\n').unwrap_or(text.len());
+    // Title text: drop the leading "# " (2 bytes).
+    let title_text = text[2..heading_end].to_string();
+
+    // Partition links: those wholly inside [2, heading_end) move to the
+    // title (offsets shifted by -2); those wholly past heading_end+1
+    // remain on the body (offsets shifted by -(heading_end + nl_skip)).
+    let nl_skip = if heading_end < text.len() { 1 } else { 0 };
+    let body_start = heading_end + nl_skip;
+    let mut title_links: Vec<LinkRecord> = Vec::new();
+    let mut body_links: Vec<LinkRecord> = Vec::new();
+    for l in links.drain(..) {
+        if l.start >= 2 && l.end <= heading_end {
+            title_links.push(LinkRecord {
+                start: l.start - 2,
+                end: l.end - 2,
+                url: l.url,
+            });
+        } else if l.start >= body_start {
+            body_links.push(LinkRecord {
+                start: l.start - body_start,
+                end: l.end - body_start,
+                url: l.url,
+            });
+        }
+        // Links that straddle the heading/body boundary are dropped — there's
+        // no sensible place to put them, and they're vanishingly rare in
+        // existing data (the heading line ends at a `\n`).
+    }
+    *links = body_links;
+    *text = text[body_start..].to_string();
+    Some(TitleRecord {
+        text: title_text,
+        links: title_links,
+    })
+}
+
+fn take_heading_from_outline(blocks: &mut Vec<BlockRecord>) -> Option<TitleRecord> {
+    if !blocks.first().map(|b| b.text.starts_with("# ")).unwrap_or(false) {
+        return None;
+    }
+    let first = blocks.remove(0);
+    let title_text = first.text[2..].to_string();
+    let title_links: Vec<LinkRecord> = first
+        .links
+        .into_iter()
+        .filter(|l| l.start >= 2 && l.end >= 2)
+        .map(|l| LinkRecord {
+            start: l.start - 2,
+            end: l.end - 2,
+            url: l.url,
+        })
+        .collect();
+    if blocks.is_empty() {
+        // Maintain the "outline always has at least one block" invariant.
+        blocks.push(BlockRecord {
+            id: Uuid::now_v7(),
+            depth: 0,
+            text: String::new(),
+            links: Vec::new(),
+        });
+    }
+    Some(TitleRecord {
+        text: title_text,
+        links: title_links,
+    })
+}
+
+fn take_heading_from_table(
+    cells: &mut Vec<Vec<TableEntryRecord>>,
+) -> Option<TitleRecord> {
+    let first = cells.first_mut()?.first_mut()?;
+    if !first.text.starts_with("# ") {
+        return None;
+    }
+    let heading_end = first.text.find('\n').unwrap_or(first.text.len());
+    let title_text = first.text[2..heading_end].to_string();
+    let nl_skip = if heading_end < first.text.len() { 1 } else { 0 };
+    let body_start = heading_end + nl_skip;
+    let mut title_links: Vec<LinkRecord> = Vec::new();
+    let mut body_links: Vec<LinkRecord> = Vec::new();
+    for l in first.links.drain(..) {
+        if l.start >= 2 && l.end <= heading_end {
+            title_links.push(LinkRecord {
+                start: l.start - 2,
+                end: l.end - 2,
+                url: l.url,
+            });
+        } else if l.start >= body_start {
+            body_links.push(LinkRecord {
+                start: l.start - body_start,
+                end: l.end - body_start,
+                url: l.url,
+            });
+        }
+    }
+    first.links = body_links;
+    first.text = first.text[body_start..].to_string();
+    Some(TitleRecord {
+        text: title_text,
+        links: title_links,
+    })
+}
+
+/// Distinct, source-ordered tag names sourced from the cell's title slot.
+/// Body content never contributes to the tag index after v4 — the title is
+/// the single source of truth.
+fn tag_names_from_persisted(pc: &PersistedCell) -> Vec<String> {
+    let Some(t) = pc.title.as_ref() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    let heading_end = t.text.find('\n').unwrap_or(t.text.len());
+    for r in parse_trailing_tags(&t.text, heading_end) {
+        if r.end > r.start + 1 {
+            let name = t.text[r.start + 1..r.end].to_string();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+#[allow(dead_code)]
 fn tag_names_from_body(body: &CellBody) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push_from = |text: &str| {
@@ -518,7 +755,7 @@ fn parse_trailing_tags(text: &str, heading_end: usize) -> Vec<std::ops::Range<us
         while start > 0 && !(bytes[start - 1] as char).is_whitespace() {
             start -= 1;
         }
-        if start >= 2 && start < end && bytes[start] == b'#' {
+        if start < end && bytes[start] == b'#' {
             tags.push(start..end);
             end = start;
         } else {
@@ -595,5 +832,59 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
                 .collect();
             CellKind::Table(TableCell::from_records(typeface.clone(), triples))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_extracts_plain_heading_into_title() {
+        // Legacy v3 row: bare CellBody, body opens with `# Title #urgent`.
+        let json = r##"{"kind":"plain","text":"# My Notes #urgent\nbody line","links":[]}"##;
+        let updated = extract_title_from_body_json(json).expect("should rewrite");
+        let pc: PersistedCell = serde_json::from_str(&updated).unwrap();
+        assert_eq!(
+            pc.title.as_ref().map(|t| t.text.as_str()),
+            Some("My Notes #urgent")
+        );
+        match &pc.body {
+            CellBody::Plain { text, .. } => assert_eq!(text, "body line"),
+            _ => panic!("kind survives migration"),
+        }
+        assert_eq!(tag_names_from_persisted(&pc), vec!["urgent".to_string()]);
+    }
+
+    #[test]
+    fn migration_skips_cells_without_heading_prefix() {
+        let json = r##"{"kind":"plain","text":"no heading here","links":[]}"##;
+        assert!(extract_title_from_body_json(json).is_none());
+    }
+
+    #[test]
+    fn migration_is_idempotent_on_already_migrated_rows() {
+        let json =
+            r##"{"title":{"text":"Foo","links":[]},"kind":"plain","text":"body","links":[]}"##;
+        assert!(extract_title_from_body_json(json).is_none());
+    }
+
+    #[test]
+    fn migration_extracts_outline_first_bullet() {
+        let json = r##"{"kind":"outline","blocks":[{"id":"00000000-0000-7000-8000-000000000001","depth":0,"text":"# Topic #person","links":[]},{"id":"00000000-0000-7000-8000-000000000002","depth":0,"text":"first child","links":[]}]}"##;
+        let updated = extract_title_from_body_json(json).expect("should rewrite");
+        let pc: PersistedCell = serde_json::from_str(&updated).unwrap();
+        assert_eq!(
+            pc.title.as_ref().map(|t| t.text.as_str()),
+            Some("Topic #person")
+        );
+        match &pc.body {
+            CellBody::Outline { blocks } => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].text, "first child");
+            }
+            _ => panic!("kind survives migration"),
+        }
+        assert_eq!(tag_names_from_persisted(&pc), vec!["person".to_string()]);
     }
 }

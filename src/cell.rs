@@ -14,6 +14,9 @@ const HEADING_FONT_SCALE: f32 = 1.12;
 /// font size, in muted gray, with extra space separating them from the title.
 const HEADING_TAG_FONT_SCALE: f32 = 0.85;
 const HEADING_TAG_GAP: f32 = 12.0;
+/// Vertical padding above and below the thin rule that separates a cell's
+/// title slot from its body. Logical pixels; scaled with `font_scale`.
+const TITLE_RULE_PAD: f32 = 4.0;
 const CARET_WIDTH: f32 = 1.5;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const MULTI_CLICK_DIST: f32 = 5.0;
@@ -235,6 +238,11 @@ pub struct TextBox {
     /// Body text color. Default dark gray. Cells (e.g. PopPop's output
     /// column) may override to render their textbox in a custom color.
     text_color: Color,
+    /// When true, every visual line renders in the heading font and trailing
+    /// `#tags` parse from the end of the first paragraph. Used by the cell
+    /// title slot. When false, the textbox is plain body text — no auto-
+    /// heading from a leading `# `.
+    force_heading: bool,
 }
 
 impl TextBox {
@@ -259,6 +267,7 @@ impl TextBox {
             font_scale: 1.0,
             links: Vec::new(),
             text_color: Color::from_rgb(0x1c, 0x1c, 0x1c),
+            force_heading: false,
         }
     }
 
@@ -268,6 +277,21 @@ impl TextBox {
         self.text_color = color;
     }
 
+    /// Mark this textbox as the cell's title slot: every line renders in the
+    /// heading font and trailing `#tag` tokens get the smaller-font tag
+    /// styling. Idempotent; rewraps when the flag changes so layout
+    /// reflects the new line metrics.
+    pub fn set_force_heading(&mut self, on: bool) {
+        if self.force_heading == on {
+            return;
+        }
+        self.force_heading = on;
+        // Wrap cache must be rebuilt because line height / font changed.
+        self.body_lines_width = f32::NAN;
+        self.rewrap();
+    }
+
+    #[allow(dead_code)]
     pub fn x_origin(&self) -> f32 {
         self.x_origin
     }
@@ -276,6 +300,7 @@ impl TextBox {
         self.y_origin
     }
 
+    #[allow(dead_code)]
     pub fn width(&self) -> f32 {
         self.width
     }
@@ -499,30 +524,12 @@ impl TextBox {
         }
     }
 
-    /// If this textbox starts with a markdown heading (`# …`), return the
-    /// title portion: text after `# ` up to (but not including) the first
-    /// trailing `#tag` token, with whitespace trimmed.
-    pub fn heading_title(&self) -> Option<String> {
-        if !self.text.starts_with("# ") {
-            return None;
-        }
-        let heading_end = self.text.find('\n').unwrap_or(self.text.len());
-        let tags = parse_heading_tags(&self.text, heading_end);
-        let bytes = self.text.as_bytes();
-        let mut end = tags.first().map(|r| r.start).unwrap_or(heading_end);
-        while end > 2 && (bytes[end - 1] as char).is_whitespace() {
-            end -= 1;
-        }
-        if end <= 2 {
-            return None;
-        }
-        Some(self.text[2..end].to_string())
-    }
-
-    /// Distinct tag names (without the leading `#`) on this textbox's
-    /// heading, in source order. Bare `#` is skipped.
+    /// Distinct tag names (without the leading `#`) parsed from trailing
+    /// `#tag` tokens on the first paragraph. Only meaningful when this
+    /// TextBox is in `force_heading` mode (i.e., a cell title); plain body
+    /// TextBoxes return an empty list. Bare `#` is skipped.
     pub fn heading_tag_names(&self) -> Vec<String> {
-        if !self.text.starts_with("# ") {
+        if !self.force_heading {
             return Vec::new();
         }
         let heading_end = self.text.find('\n').unwrap_or(self.text.len());
@@ -670,8 +677,9 @@ impl TextBox {
     fn recompute_line_tag_layout(&mut self) {
         self.line_tag_layout.clear();
         self.line_tag_layout.resize(self.body_lines.len(), None);
-        // Tags only exist on heading lines. Find heading paragraph end.
-        if !self.text.starts_with("# ") {
+        // Tags only exist on heading lines, which is the entire textbox
+        // when `force_heading` is set (title slot).
+        if !self.force_heading {
             return;
         }
         let heading_end = self.text.find('\n').unwrap_or(self.text.len());
@@ -721,6 +729,7 @@ impl TextBox {
                 &heading_font,
                 &paint,
                 max_text_width,
+                self.force_heading,
             );
             self.body_lines = lines;
             self.line_is_heading = headings;
@@ -1557,6 +1566,7 @@ impl TextBox {
             &heading_font,
             &paint,
             self.body_lines_width,
+            self.force_heading,
         );
         self.body_lines = lines;
         self.line_is_heading = headings;
@@ -1645,8 +1655,9 @@ fn line_x_at_offset(
 /// paragraph ends (exclusive). Returns absolute-in-`text` byte ranges for
 /// each tag, in source order. Tags are whitespace-separated tokens starting
 /// with `#`. A bare `#` (length 1) counts as a tag-in-progress so the user
-/// gets stable rendering as they type out the next tag's name. Tokens at
-/// positions 0..2 are the leading `# ` heading marker and are never tags.
+/// gets stable rendering as they type out the next tag's name. Operates on
+/// title text only (no leading `# ` marker), so any `#`-prefixed token —
+/// including the very first one — is a tag candidate.
 fn parse_heading_tags(text: &str, heading_end: usize) -> Vec<Range<usize>> {
     let bytes = text.as_bytes();
     let mut tags: Vec<Range<usize>> = Vec::new();
@@ -1664,9 +1675,9 @@ fn parse_heading_tags(text: &str, heading_end: usize) -> Vec<Range<usize>> {
         while start > 0 && !(bytes[start - 1] as char).is_whitespace() {
             start -= 1;
         }
-        // Past the leading `# ` marker, any `#`-prefixed word is a tag —
-        // even a bare `#` (the user is mid-typing a new tag).
-        if start >= 2 && start < end && bytes[start] == b'#' {
+        // Any `#`-prefixed word is a tag — even a bare `#` (the user is
+        // mid-typing a new tag).
+        if start < end && bytes[start] == b'#' {
             tags.push(start..end);
             end = start;
         } else {
@@ -1930,20 +1941,18 @@ fn wrap_text_styled(
     heading_font: &Font,
     paint: &Paint,
     max_width: f32,
+    force_heading: bool,
 ) -> (Vec<Range<usize>>, Vec<bool>) {
     if text.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    let has_heading = text.starts_with("# ");
     let mut lines: Vec<Range<usize>> = Vec::new();
     let mut is_heading: Vec<bool> = Vec::new();
     let mut start = 0usize;
-    let mut first_paragraph = true;
     loop {
         let nl = text[start..].find('\n').map(|p| start + p);
         let para_end = nl.unwrap_or(text.len());
-        let use_heading = first_paragraph && has_heading;
-        let font = if use_heading { heading_font } else { body_font };
+        let font = if force_heading { heading_font } else { body_font };
         let prev = lines.len();
         wrap_paragraph_into(text, start, para_end, font, paint, max_width, &mut lines);
         let consumed_to = nl.map(|i| i + 1).unwrap_or(text.len());
@@ -1951,9 +1960,8 @@ fn wrap_text_styled(
             last.end = consumed_to;
         }
         for _ in prev..lines.len() {
-            is_heading.push(use_heading);
+            is_heading.push(force_heading);
         }
-        first_paragraph = false;
         match nl {
             Some(i) => start = i + 1,
             None => break,
@@ -2221,27 +2229,14 @@ impl OutlineCell {
         let mut bullet_y_bands: Vec<(f32, f32)> = Vec::with_capacity(self.bullets.len());
         let suppress_caret = active_indices.is_some();
         let mut cur_y = y;
-        for (idx, bullet) in self.bullets.iter_mut().enumerate() {
-            // The first bullet, when it's a markdown heading, is rendered as
-            // a title: its bullet marker is suppressed and the `#` shifts left
-            // to occupy the marker's slot.
-            let is_title_bullet = idx == 0 && bullet.textbox.text().starts_with("# ");
-
+        for (_idx, bullet) in self.bullets.iter_mut().enumerate() {
             let depth_offset = (bullet.depth as f32) * indent_per_level;
-            if !is_title_bullet {
-                let marker_x = x + depth_offset + indent_per_level / 2.0;
-                let marker_y = cur_y + line_height / 2.0;
-                canvas.draw_circle((marker_x, marker_y), radius, &bullet_paint);
-            }
+            let marker_x = x + depth_offset + indent_per_level / 2.0;
+            let marker_y = cur_y + line_height / 2.0;
+            canvas.draw_circle((marker_x, marker_y), radius, &bullet_paint);
 
-            let (text_x, text_w) = if is_title_bullet {
-                (x + depth_offset, (width - depth_offset).max(40.0))
-            } else {
-                (
-                    x + depth_offset + indent_per_level,
-                    (width - depth_offset - indent_per_level).max(40.0),
-                )
-            };
+            let text_x = x + depth_offset + indent_per_level;
+            let text_w = (width - depth_offset - indent_per_level).max(40.0);
             let is_focused_bullet = focused && bullet.id == self.focused_bullet;
             // Selection (highlight) for the active bullet whenever the cell is
             // focused. Caret only when also editing.
@@ -3045,6 +3040,9 @@ pub struct CellSnapshot {
     pub timestamp: i64,
     pub edited_at: i64,
     pub context_hint_id: Option<Uuid>,
+    /// Snapshot of the optional title TextBox. None when the cell has no
+    /// title slot.
+    pub title: Option<TextBoxSnapshot>,
     pub kind: CellSnapshotKind,
 }
 
@@ -3064,6 +3062,14 @@ impl CellSnapshot {
     /// by undo to detect "cursor moved but text didn't change" events that
     /// shouldn't record a new undo entry.
     pub fn doc_eq(&self, other: &Self) -> bool {
+        let title_eq = match (&self.title, &other.title) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.text == b.text,
+            _ => false,
+        };
+        if !title_eq {
+            return false;
+        }
         match (&self.kind, &other.kind) {
             (CellSnapshotKind::Plain(a), CellSnapshotKind::Plain(b)) => a.text == b.text,
             (CellSnapshotKind::Outline(a), CellSnapshotKind::Outline(b)) => {
@@ -3171,15 +3177,19 @@ impl PopPopCell {
         &mut self.textbox
     }
 
+    #[allow(dead_code)]
     pub fn x_origin(&self) -> f32 {
         self.x_origin
     }
+    #[allow(dead_code)]
     pub fn y_origin(&self) -> f32 {
         self.y_origin
     }
+    #[allow(dead_code)]
     pub fn width(&self) -> f32 {
         self.width
     }
+    #[allow(dead_code)]
     pub fn height(&self) -> f32 {
         self.height
     }
@@ -3440,15 +3450,19 @@ impl TableCell {
         self.focused
     }
 
+    #[allow(dead_code)]
     pub fn x_origin(&self) -> f32 {
         self.x_origin
     }
+    #[allow(dead_code)]
     pub fn y_origin(&self) -> f32 {
         self.y_origin
     }
+    #[allow(dead_code)]
     pub fn width(&self) -> f32 {
         self.width
     }
+    #[allow(dead_code)]
     pub fn height(&self) -> f32 {
         self.height
     }
@@ -3827,19 +3841,6 @@ impl TableCell {
         }
     }
 
-    /// First-cell-driven heading: type `# Title` in `[0][0]` and the table
-    /// participates in the title/tag system like other cells.
-    pub fn heading_title(&self) -> Option<String> {
-        self.cells.first()?.first().and_then(|e| e.textbox.heading_title())
-    }
-    pub fn heading_tag_names(&self) -> Vec<String> {
-        self.cells
-            .first()
-            .and_then(|row| row.first())
-            .map(|e| e.textbox.heading_tag_names())
-            .unwrap_or_default()
-    }
-
     /// Concatenated cell text in row-major order — tabs between cells in a
     /// row, newlines between rows. Used by the search popup for substring
     /// matching across the table.
@@ -3951,6 +3952,22 @@ impl TableCell {
 pub struct Cell {
     pub id: Uuid,
     pub kind: CellKind,
+    /// Optional title TextBox rendered above the body. Created via Ctrl+H,
+    /// rendered with `force_heading=true` (heading font, trailing #tags
+    /// styled). Tag indexing keys off this field exclusively. None means
+    /// "no title slot" — body has no auto-heading anymore.
+    pub title: Option<TextBox>,
+    /// When true, keystrokes / caret / selection live on the `title`
+    /// TextBox; when false, they go to the kind-specific body element.
+    /// Meaningless when `title` is None.
+    pub title_focused: bool,
+    /// Cell-level geometry recorded by `tick`. Spans the title slot (when
+    /// present) plus the body, so focus rings, hit-tests, and cell
+    /// separators see the cell as one unit. Zero before the first tick.
+    cell_x: f32,
+    cell_y: f32,
+    cell_w: f32,
+    cell_h: f32,
     /// Stream position. Set once at creation; never moves.
     pub timestamp: i64,
     /// Bumped on any content change. Display-only metadata.
@@ -3973,6 +3990,12 @@ impl Cell {
         Self {
             id: Uuid::now_v7(),
             kind: CellKind::Plain(TextBox::new(typeface, initial_text)),
+            title: None,
+            title_focused: false,
+            cell_x: 0.0,
+            cell_y: 0.0,
+            cell_w: 0.0,
+            cell_h: 0.0,
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
@@ -3984,6 +4007,12 @@ impl Cell {
         Self {
             id: Uuid::now_v7(),
             kind: CellKind::Outline(OutlineCell::new(typeface)),
+            title: None,
+            title_focused: false,
+            cell_x: 0.0,
+            cell_y: 0.0,
+            cell_w: 0.0,
+            cell_h: 0.0,
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
@@ -3995,6 +4024,12 @@ impl Cell {
         Self {
             id: Uuid::now_v7(),
             kind: CellKind::PopPop(PopPopCell::new(typeface)),
+            title: None,
+            title_focused: false,
+            cell_x: 0.0,
+            cell_y: 0.0,
+            cell_w: 0.0,
+            cell_h: 0.0,
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
@@ -4006,6 +4041,12 @@ impl Cell {
         Self {
             id: Uuid::now_v7(),
             kind: CellKind::Table(TableCell::new(typeface)),
+            title: None,
+            title_focused: false,
+            cell_x: 0.0,
+            cell_y: 0.0,
+            cell_w: 0.0,
+            cell_h: 0.0,
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
@@ -4016,11 +4057,75 @@ impl Cell {
     pub fn from_parts(
         id: Uuid,
         kind: CellKind,
+        title: Option<TextBox>,
         timestamp: i64,
         edited_at: i64,
         context_hint_id: Option<Uuid>,
     ) -> Self {
-        Self { id, kind, timestamp, edited_at, context_hint_id }
+        Self {
+            id,
+            kind,
+            title,
+            title_focused: false,
+            cell_x: 0.0,
+            cell_y: 0.0,
+            cell_w: 0.0,
+            cell_h: 0.0,
+            timestamp,
+            edited_at,
+            context_hint_id,
+        }
+    }
+
+    /// Lazily create the title TextBox if none. Returns a mutable reference.
+    /// New title TextBoxes have `force_heading=true` and inherit the body's
+    /// font scale so they match the rest of the cell visually.
+    fn ensure_title(&mut self) -> &mut TextBox {
+        if self.title.is_none() {
+            let typeface = self.body_typeface().clone();
+            let scale = self.body_font_scale();
+            let mut tb = TextBox::new(typeface, String::new());
+            tb.set_force_heading(true);
+            tb.set_font_scale(scale);
+            self.title = Some(tb);
+        }
+        self.title.as_mut().expect("just created")
+    }
+
+    /// Ctrl+H handler: create a title if missing and focus it; otherwise
+    /// just focus the existing title. Non-destructive — does not remove an
+    /// existing title or its content. Returns true if focus moved or a
+    /// title was created.
+    pub fn toggle_title_focus(&mut self) -> bool {
+        let created = self.title.is_none();
+        self.ensure_title();
+        if !self.title_focused || created {
+            self.title_focused = true;
+            return true;
+        }
+        false
+    }
+
+    /// Reach into the body for typeface (every CellKind owns at least one
+    /// TextBox internally). Used by `ensure_title`.
+    fn body_typeface(&self) -> Typeface {
+        match &self.kind {
+            CellKind::Plain(tb) => tb.typeface.clone(),
+            CellKind::Outline(oc) => oc.typeface.clone(),
+            CellKind::PopPop(pc) => pc.textbox.typeface.clone(),
+            CellKind::Table(tc) => tc.typeface.clone(),
+        }
+    }
+
+    /// Cell-wide font scale. Pulled from the body since body sets are the
+    /// authoritative source via `set_font_scale`.
+    fn body_font_scale(&self) -> f32 {
+        match &self.kind {
+            CellKind::Plain(tb) => tb.font_scale(),
+            CellKind::Outline(oc) => oc.font_scale,
+            CellKind::PopPop(pc) => pc.textbox.font_scale(),
+            CellKind::Table(tc) => tc.font_scale,
+        }
     }
 
     /// Reconstruct a cell from a snapshot + id, using `typeface` for fresh
@@ -4049,7 +4154,13 @@ impl Cell {
                 CellKind::Table(tc)
             }
         };
-        Self::from_parts(id, kind, snap.timestamp, snap.edited_at, snap.context_hint_id)
+        let title = snap.title.map(|tbs| {
+            let mut tb = TextBox::new(typeface.clone(), String::new());
+            tb.set_force_heading(true);
+            tb.restore(tbs);
+            tb
+        });
+        Self::from_parts(id, kind, title, snap.timestamp, snap.edited_at, snap.context_hint_id)
     }
 
     /// Add a link span to the cell's first textbox (plain) or first bullet
@@ -4071,6 +4182,11 @@ impl Cell {
     /// True if document-space position `(abs_x, abs_y)` lands on a link in
     /// this cell's most recently rendered layout. Drives the hand cursor.
     pub fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        if let Some(title) = self.title.as_ref() {
+            if title.link_at_doc_pos(abs_x, abs_y) {
+                return true;
+            }
+        }
         match &self.kind {
             CellKind::Plain(tb) => tb.link_at_doc_pos(abs_x, abs_y),
             CellKind::Outline(oc) => oc.link_at_doc_pos(abs_x, abs_y),
@@ -4089,6 +4205,12 @@ impl Cell {
         text: String,
         url: String,
     ) {
+        if self.title_focused {
+            if let Some(title) = self.title.as_mut() {
+                title.replace_with_link(range, text, url);
+            }
+            return;
+        }
         match &mut self.kind {
             CellKind::Plain(tb) => tb.replace_with_link(range, text, url),
             CellKind::Outline(oc) => {
@@ -4109,6 +4231,14 @@ impl Cell {
     }
 
     pub fn copy_text(&self) -> String {
+        if self.title_focused {
+            if let Some(title) = self.title.as_ref() {
+                let s = title.copy_primary_selection();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+        }
         match &self.kind {
             CellKind::Plain(tb) => tb.copy_primary_selection(),
             CellKind::Outline(oc) => oc.copy_text(),
@@ -4117,45 +4247,40 @@ impl Cell {
         }
     }
 
-    /// Heading title for this cell, if any. Plain cells use the first
-    /// paragraph; outline cells use the first bullet's heading; tables use
-    /// the top-left cell.
+    /// Cell title, if any: the title slot's text with trailing #tags
+    /// stripped. None when there is no title slot or the title contains
+    /// only tags / whitespace.
     pub fn heading_title(&self) -> Option<String> {
-        match &self.kind {
-            CellKind::Plain(tb) => tb.heading_title(),
-            CellKind::Outline(oc) => oc.bullets().first().and_then(|b| b.textbox().heading_title()),
-            CellKind::PopPop(pc) => pc.textbox().heading_title(),
-            CellKind::Table(tc) => tc.heading_title(),
+        let title_tb = self.title.as_ref()?;
+        let text = title_tb.text();
+        let title_end = text.find('\n').unwrap_or(text.len());
+        let tags = parse_heading_tags(text, title_end);
+        let bytes = text.as_bytes();
+        let mut end = tags.first().map(|r| r.start).unwrap_or(title_end);
+        while end > 0 && (bytes[end - 1] as char).is_whitespace() {
+            end -= 1;
         }
+        if end == 0 {
+            return None;
+        }
+        Some(text[..end].to_string())
     }
 
-    /// All distinct heading-tag names attached to this cell (any heading
-    /// bullet for outlines; top-left cell for tables).
+    /// All distinct heading-tag names attached to this cell. Sourced from
+    /// the title TextBox; cells without a title contribute no tags.
     pub fn heading_tag_names(&self) -> Vec<String> {
-        match &self.kind {
-            CellKind::Plain(tb) => tb.heading_tag_names(),
-            CellKind::Outline(oc) => {
-                let mut out: Vec<String> = Vec::new();
-                for b in oc.bullets() {
-                    for n in b.textbox().heading_tag_names() {
-                        if !out.contains(&n) {
-                            out.push(n);
-                        }
-                    }
-                }
-                out
-            }
-            CellKind::PopPop(pc) => pc.textbox().heading_tag_names(),
-            CellKind::Table(tc) => tc.heading_tag_names(),
+        match &self.title {
+            Some(tb) => tb.heading_tag_names(),
+            None => Vec::new(),
         }
     }
 
-    /// Full text of the cell, ignoring selection state. Used as the fallback
-    /// for view-mode copy when no selection is active. Outline cells join
-    /// bullets with newlines, indenting nested bullets two spaces per depth.
-    /// Tables join cells with tabs (within rows) and newlines (between rows).
+    /// Full text of the cell, ignoring selection state. Title (if any) is
+    /// prepended on its own line so the search popup can match against it.
+    /// Outline cells join bullets with newlines (indented two spaces per
+    /// depth); tables join cells with tabs and rows with newlines.
     pub fn full_text(&self) -> String {
-        match &self.kind {
+        let body = match &self.kind {
             CellKind::Plain(tb) => tb.text().to_string(),
             CellKind::Outline(oc) => {
                 let mut out = String::new();
@@ -4172,10 +4297,25 @@ impl Cell {
             }
             CellKind::PopPop(pc) => pc.textbox().text().to_string(),
             CellKind::Table(tc) => tc.full_text(),
+        };
+        match self.title.as_ref() {
+            Some(t) if !t.text().is_empty() => {
+                let mut out = String::with_capacity(t.text().len() + body.len() + 1);
+                out.push_str(t.text());
+                out.push('\n');
+                out.push_str(&body);
+                out
+            }
+            _ => body,
         }
     }
 
     pub fn cut_text(&mut self) -> String {
+        if self.title_focused {
+            if let Some(title) = self.title.as_mut() {
+                return title.cut_primary_selection();
+            }
+        }
         match &mut self.kind {
             CellKind::Plain(tb) => tb.cut_primary_selection(),
             CellKind::Outline(oc) => oc.cut_text(),
@@ -4185,6 +4325,12 @@ impl Cell {
     }
 
     pub fn paste_text(&mut self, s: &str) {
+        if self.title_focused {
+            if let Some(title) = self.title.as_mut() {
+                title.paste(s);
+                return;
+            }
+        }
         match &mut self.kind {
             CellKind::Plain(tb) => tb.paste(s),
             CellKind::Outline(oc) => oc.paste_text(s),
@@ -4202,15 +4348,99 @@ impl Cell {
         focused: bool,
         show_caret: bool,
     ) -> f32 {
-        match &mut self.kind {
-            CellKind::Plain(tb) => tb.tick(canvas, x, y, width, focused, show_caret),
-            CellKind::Outline(oc) => oc.tick(canvas, x, y, width, focused, show_caret),
-            CellKind::PopPop(pc) => pc.tick(canvas, x, y, width, focused, show_caret),
-            CellKind::Table(tc) => tc.tick(canvas, x, y, width, focused, show_caret),
+        // Layout/render the title slot first (if present), then a thin rule,
+        // then the body. Caret + selection live on whichever side is
+        // `title_focused`-gated; the other side gets focused=false so its
+        // caret is suppressed.
+        let title_focused = self.title_focused;
+        let mut consumed = 0.0_f32;
+        let mut body_y = y;
+        if let Some(title) = self.title.as_mut() {
+            let scale = title.font_scale();
+            let pad = TITLE_RULE_PAD * scale;
+            let title_h = title.tick(
+                canvas,
+                x,
+                y,
+                width,
+                focused && title_focused,
+                show_caret && title_focused,
+            );
+            // Thin muted rule across the body content area.
+            let rule_y = y + title_h + pad;
+            let mut rule_paint = Paint::default();
+            rule_paint.set_anti_alias(false);
+            rule_paint.set_color(Color::from_argb(0x40, 0x60, 0x60, 0x60));
+            rule_paint.set_stroke_width(1.0);
+            canvas.draw_line((x, rule_y), (x + width, rule_y), &rule_paint);
+            let block = title_h + pad * 2.0 + 1.0;
+            consumed += block;
+            body_y = y + block;
         }
+        let body_focused = focused && !title_focused;
+        let body_caret = show_caret && !title_focused;
+        let body_h = match &mut self.kind {
+            CellKind::Plain(tb) => tb.tick(canvas, x, body_y, width, body_focused, body_caret),
+            CellKind::Outline(oc) => oc.tick(canvas, x, body_y, width, body_focused, body_caret),
+            CellKind::PopPop(pc) => pc.tick(canvas, x, body_y, width, body_focused, body_caret),
+            CellKind::Table(tc) => tc.tick(canvas, x, body_y, width, body_focused, body_caret),
+        };
+        let total_h = consumed + body_h;
+        // Record cell-level geometry so focus ring, hit-test, kebab placement,
+        // and inter-cell separators see the title + body as a single unit.
+        self.cell_x = x;
+        self.cell_y = y;
+        self.cell_w = width;
+        self.cell_h = total_h;
+        total_h
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        // Cross-slot transitions: ArrowUp at top of body crosses up into the
+        // title; ArrowDown at bottom of title crosses down into the body.
+        // Done before forwarding so the inner element doesn't see the key.
+        if event.state == ElementState::Pressed && self.title.is_some() {
+            let mods = modifiers.state();
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowUp) if !mods.shift_key() && !self.title_focused => {
+                    if self.body_at_top_edge() {
+                        self.title_focused = true;
+                        self.place_caret_at_end_of_title();
+                        return true;
+                    }
+                }
+                Key::Named(NamedKey::ArrowDown) if !mods.shift_key() && self.title_focused => {
+                    let title_at_bottom = self
+                        .title
+                        .as_ref()
+                        .map(|t| t.at_bottom_visual_line())
+                        .unwrap_or(true);
+                    if title_at_bottom {
+                        self.title_focused = false;
+                        self.place_caret_at_start_of_body();
+                        return true;
+                    }
+                }
+                // Enter inside the title commits + drops into the body. The
+                // title is single-line; newlines belong in the body.
+                Key::Named(NamedKey::Enter)
+                    if !mods.shift_key() && self.title_focused =>
+                {
+                    self.title_focused = false;
+                    self.place_caret_at_start_of_body();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        if self.title_focused {
+            if let Some(title) = self.title.as_mut() {
+                return title.handle_key(event, modifiers);
+            }
+            // Stale title_focused with no title — fall through to body.
+            self.title_focused = false;
+        }
         match &mut self.kind {
             CellKind::Plain(tb) => tb.handle_key(event, modifiers),
             CellKind::Outline(oc) => oc.handle_key(event, modifiers),
@@ -4226,6 +4456,18 @@ impl Cell {
         modifiers: &Modifiers,
         editing: bool,
     ) -> bool {
+        // If the click lands in the title's vertical band, focus the title;
+        // otherwise focus the body. The title's y_origin/height come from
+        // the last `tick` so an unrendered cell falls through harmlessly.
+        if let Some(title) = self.title.as_mut() {
+            let top = title.y_origin();
+            let bot = top + title.height();
+            if abs_y >= top && abs_y < bot {
+                self.title_focused = true;
+                return title.mouse_down(abs_x, abs_y, modifiers, editing);
+            }
+        }
+        self.title_focused = false;
         match &mut self.kind {
             CellKind::Plain(tb) => tb.mouse_down(abs_x, abs_y, modifiers, editing),
             CellKind::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers, editing),
@@ -4235,69 +4477,109 @@ impl Cell {
     }
 
     pub fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
-        match &mut self.kind {
+        // Forward to title too — only the textbox with an active drag responds.
+        let mut any = false;
+        if let Some(title) = self.title.as_mut() {
+            if title.mouse_drag_to(abs_x, abs_y) {
+                any = true;
+            }
+        }
+        let body = match &mut self.kind {
             CellKind::Plain(tb) => tb.mouse_drag_to(abs_x, abs_y),
             CellKind::Outline(oc) => oc.mouse_drag_to(abs_x, abs_y),
             CellKind::PopPop(pc) => pc.mouse_drag_to(abs_x, abs_y),
             CellKind::Table(tc) => tc.mouse_drag_to(abs_x, abs_y),
-        }
+        };
+        any || body
     }
 
     pub fn mouse_up(&mut self) -> bool {
-        match &mut self.kind {
+        let mut any = false;
+        if let Some(title) = self.title.as_mut() {
+            if title.mouse_up() {
+                any = true;
+            }
+        }
+        let body = match &mut self.kind {
             CellKind::Plain(tb) => tb.mouse_up(),
             CellKind::Outline(oc) => oc.mouse_up(),
             CellKind::PopPop(pc) => pc.mouse_up(),
             CellKind::Table(tc) => tc.mouse_up(),
+        };
+        any || body
+    }
+
+    /// True iff the body's keyboard caret is on the body's topmost visual
+    /// line. Used by Cell::handle_key to detect "ArrowUp should escape into
+    /// the title slot." Outline / Table delegate to their existing edge
+    /// helpers which already account for inner-cell focus.
+    fn body_at_top_edge(&self) -> bool {
+        match &self.kind {
+            CellKind::Plain(tb) => tb.at_top_visual_line(),
+            CellKind::Outline(oc) => oc.at_top_edge(),
+            CellKind::PopPop(pc) => pc.textbox().at_top_visual_line(),
+            CellKind::Table(tc) => {
+                let (r, c) = tc.focused_index();
+                r == 0
+                    && tc
+                        .cell_at(r, c)
+                        .map(|e| e.textbox.at_top_visual_line())
+                        .unwrap_or(true)
+            }
+        }
+    }
+
+    fn place_caret_at_end_of_title(&mut self) {
+        if let Some(title) = self.title.as_mut() {
+            let end = title.text().len();
+            title.set_caret_at(end);
+        }
+    }
+
+    fn place_caret_at_start_of_body(&mut self) {
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.set_caret_at(0),
+            CellKind::Outline(oc) => oc.place_caret_at_start(),
+            CellKind::PopPop(pc) => pc.textbox_mut().set_caret_at(0),
+            CellKind::Table(tc) => {
+                if let Some(entry) = tc.cell_at_mut(0, 0) {
+                    entry.textbox.set_caret_at(0);
+                }
+            }
         }
     }
 
     pub fn x_origin(&self) -> f32 {
-        match &self.kind {
-            CellKind::Plain(tb) => tb.x_origin(),
-            CellKind::Outline(oc) => oc.x_origin,
-            CellKind::PopPop(pc) => pc.x_origin(),
-            CellKind::Table(tc) => tc.x_origin(),
-        }
+        self.cell_x
     }
 
     pub fn y_origin(&self) -> f32 {
-        match &self.kind {
-            CellKind::Plain(tb) => tb.y_origin(),
-            CellKind::Outline(oc) => oc.y_origin,
-            CellKind::PopPop(pc) => pc.y_origin(),
-            CellKind::Table(tc) => tc.y_origin(),
-        }
+        self.cell_y
     }
 
     pub fn width(&self) -> f32 {
-        match &self.kind {
-            CellKind::Plain(tb) => tb.width(),
-            CellKind::Outline(oc) => oc.width,
-            CellKind::PopPop(pc) => pc.width(),
-            CellKind::Table(tc) => tc.width(),
-        }
+        self.cell_w
     }
 
     pub fn height(&self) -> f32 {
-        match &self.kind {
-            CellKind::Plain(tb) => tb.height(),
-            CellKind::Outline(oc) => oc.height,
-            CellKind::PopPop(pc) => pc.height(),
-            CellKind::Table(tc) => tc.height(),
-        }
+        self.cell_h
     }
 
     pub fn is_empty(&self) -> bool {
-        match &self.kind {
+        let title_empty = self.title.as_ref().map(|t| t.is_empty()).unwrap_or(true);
+        let body_empty = match &self.kind {
             CellKind::Plain(tb) => tb.is_empty(),
             CellKind::Outline(oc) => oc.is_empty(),
             CellKind::PopPop(pc) => pc.textbox().is_empty(),
             CellKind::Table(tc) => tc.is_empty(),
-        }
+        };
+        title_empty && body_empty
     }
 
     pub fn set_font_scale(&mut self, scale: f32) {
+        if let Some(title) = self.title.as_mut() {
+            title.set_font_scale(scale);
+        }
         match &mut self.kind {
             CellKind::Plain(tb) => tb.set_font_scale(scale),
             CellKind::Outline(oc) => oc.set_font_scale(scale),
@@ -4307,6 +4589,11 @@ impl Cell {
     }
 
     pub fn caret_doc_y_band(&self) -> Option<(f32, f32)> {
+        if self.title_focused {
+            if let Some(title) = self.title.as_ref() {
+                return title.caret_doc_y_band();
+            }
+        }
         match &self.kind {
             CellKind::Plain(tb) => tb.caret_doc_y_band(),
             CellKind::Outline(oc) => oc.caret_doc_y_band(),
@@ -4316,6 +4603,20 @@ impl Cell {
     }
 
     pub fn at_top_edge(&self) -> bool {
+        // Caret is at the cell's top edge iff the active focus area's caret
+        // is at its own topmost line AND there's nothing above it within
+        // this cell. Title above body means body is never at top edge for
+        // cross-cell-nav purposes; title is always the top edge when focused.
+        if self.title_focused {
+            return self
+                .title
+                .as_ref()
+                .map(|t| t.at_top_visual_line())
+                .unwrap_or(true);
+        }
+        if self.title.is_some() {
+            return false;
+        }
         match &self.kind {
             CellKind::Plain(tb) => tb.at_top_visual_line(),
             CellKind::Outline(oc) => oc.at_top_edge(),
@@ -4332,6 +4633,10 @@ impl Cell {
     }
 
     pub fn at_bottom_edge(&self) -> bool {
+        // Title focused → body is below us, so we're not at the bottom edge.
+        if self.title_focused {
+            return false;
+        }
         match &self.kind {
             CellKind::Plain(tb) => tb.at_bottom_visual_line(),
             CellKind::Outline(oc) => oc.at_bottom_edge(),
@@ -4348,6 +4653,12 @@ impl Cell {
     }
 
     pub fn place_caret_at_start(&mut self) {
+        if self.title_focused {
+            if let Some(title) = self.title.as_mut() {
+                title.set_caret_at(0);
+                return;
+            }
+        }
         match &mut self.kind {
             CellKind::Plain(tb) => tb.set_caret_at(0),
             CellKind::Outline(oc) => oc.place_caret_at_start(),
@@ -4361,6 +4672,13 @@ impl Cell {
     }
 
     pub fn place_caret_at_end(&mut self) {
+        if self.title_focused {
+            if let Some(title) = self.title.as_mut() {
+                let end = title.text().len();
+                title.set_caret_at(end);
+                return;
+            }
+        }
         match &mut self.kind {
             CellKind::Plain(tb) => {
                 let end = tb.text().len();
@@ -4381,10 +4699,15 @@ impl Cell {
         }
     }
 
-    /// Select all text in the cell's active text input — entire textbox for
-    /// Plain/PopPop cells, focused bullet's textbox for Outline, focused
-    /// inner cell for Table.
+    /// Select all text in the cell's active text input — title when focused,
+    /// otherwise the kind-specific body element.
     pub fn select_all_focused(&mut self) {
+        if self.title_focused {
+            if let Some(title) = self.title.as_mut() {
+                title.select_all();
+                return;
+            }
+        }
         match &mut self.kind {
             CellKind::Plain(tb) => tb.select_all(),
             CellKind::Outline(oc) => oc.select_all_in_focused(),
@@ -4398,9 +4721,15 @@ impl Cell {
         }
     }
 
-    /// `(text, caret_byte)` for the active text input — the cell's textbox
-    /// for plain cells, or the focused bullet's textbox for outline cells.
+    /// `(text, caret_byte)` for the active text input — title when focused,
+    /// otherwise the kind-specific body element (or focused inner element
+    /// for outline / table).
     pub fn focused_text_and_caret(&self) -> Option<(&str, usize)> {
+        if self.title_focused {
+            if let Some(title) = self.title.as_ref() {
+                return title.primary_caret().map(|(_, h)| (title.text(), h));
+            }
+        }
         match &self.kind {
             CellKind::Plain(tb) => tb.primary_caret().map(|(_, h)| (tb.text(), h)),
             CellKind::Outline(oc) => oc.focused_text_and_caret(),
@@ -4416,8 +4745,12 @@ impl Cell {
         }
     }
 
-    /// Outline cells: ID of the focused bullet. Plain/PopPop/Table: None.
+    /// Outline cells: ID of the focused bullet (None when title is focused).
+    /// Plain/PopPop/Table: None always.
     pub fn focused_bullet_id(&self) -> Option<Uuid> {
+        if self.title_focused {
+            return None;
+        }
         match &self.kind {
             CellKind::Plain(_) => None,
             CellKind::Outline(oc) => Some(oc.focused_bullet_id()),
@@ -4427,12 +4760,20 @@ impl Cell {
     }
 
     /// Anchor position for an overlay tied to byte `byte` in this cell's
-    /// active textbox (focused bullet for outline). Used by the @-mention popup.
+    /// active textbox (focused bullet for outline; title when focused).
+    /// Used by the @-mention popup.
     pub fn anchor_doc_pos(
         &self,
         bullet_id: Option<Uuid>,
         byte: usize,
     ) -> Option<(f32, f32)> {
+        if self.title_focused && bullet_id.is_none() {
+            if let Some(title) = self.title.as_ref() {
+                let (x, _) = title.doc_position_of_byte(byte)?;
+                let (_, bot) = title.line_y_band_of_byte(byte)?;
+                return Some((x, bot));
+            }
+        }
         match (&self.kind, bullet_id) {
             (CellKind::Plain(tb), None) => {
                 let (x, _) = tb.doc_position_of_byte(byte)?;
@@ -4461,6 +4802,7 @@ impl Cell {
             timestamp: self.timestamp,
             edited_at: self.edited_at,
             context_hint_id: self.context_hint_id,
+            title: self.title.as_ref().map(|t| t.snapshot()),
             kind: match &self.kind {
                 CellKind::Plain(tb) => CellSnapshotKind::Plain(tb.snapshot()),
                 CellKind::Outline(oc) => CellSnapshotKind::Outline(oc.snapshot()),
@@ -4472,12 +4814,23 @@ impl Cell {
 
     /// Restore from a snapshot of the same variant. Variant mismatches are a
     /// bug (undo stack and live state disagree); fall through silently rather
-    /// than panic. All metadata (timestamp, edited_at, context_hint_id) is
-    /// preserved from the snapshot.
+    /// than panic. All metadata (timestamp, edited_at, context_hint_id, and
+    /// the title slot) is preserved from the snapshot.
     pub fn restore(&mut self, snap: CellSnapshot) {
         self.timestamp = snap.timestamp;
         self.edited_at = snap.edited_at;
         self.context_hint_id = snap.context_hint_id;
+        self.title = snap.title.map(|tbs| {
+            let typeface = self.body_typeface();
+            let mut tb = TextBox::new(typeface, String::new());
+            tb.set_force_heading(true);
+            tb.set_font_scale(self.body_font_scale());
+            tb.restore(tbs);
+            tb
+        });
+        if self.title.is_none() {
+            self.title_focused = false;
+        }
         match (&mut self.kind, snap.kind) {
             (CellKind::Plain(tb), CellSnapshotKind::Plain(tbs)) => tb.restore(tbs),
             (CellKind::Outline(oc), CellSnapshotKind::Outline(os)) => oc.restore(os),
@@ -4579,11 +4932,12 @@ mod tests {
     }
 
     #[test]
-    fn poppop_cell_title_line_is_heading_subsequent_are_calc() {
-        // A poppop cell with `# Notes #urgent\n42 + 1\nfoo` should mark the
-        // heading paragraph as heading (no output) and the two calc lines
-        // as non-heading (each gets a "42").
-        let mut tb = TextBox::new(typeface(), "# Notes #urgent\n2 + 2\nfoo".to_string());
+    fn poppop_body_has_no_auto_heading() {
+        // After v4 the `# ` prefix no longer triggers heading rendering on
+        // body text. A PopPop input that opens with `# Foo` is treated as a
+        // plain calc line, and its source-line bands all report
+        // is_heading=false.
+        let mut tb = TextBox::new(typeface(), "# Notes\n2 + 2\nfoo".to_string());
         tb.tick(
             &skia_safe::surfaces::raster_n32_premul((400, 200))
                 .unwrap()
@@ -4595,13 +4949,33 @@ mod tests {
             false,
         );
         let bands = tb.source_line_y_bands();
-        assert_eq!(bands.len(), 3, "three source lines");
-        assert!(bands[0].2, "first line is heading");
-        assert!(!bands[1].2, "second line is calc");
-        assert!(!bands[2].2, "third line is calc");
-        // Heading title and tags propagate to the cell-level accessors.
-        assert_eq!(tb.heading_title().as_deref(), Some("Notes"));
-        assert_eq!(tb.heading_tag_names(), vec!["urgent".to_string()]);
+        assert_eq!(bands.len(), 3);
+        for &(_, _, is_heading) in &bands {
+            assert!(!is_heading, "body lines never auto-classify as heading");
+        }
+        assert!(tb.heading_tag_names().is_empty());
+    }
+
+    #[test]
+    fn force_heading_marks_every_line_as_heading() {
+        let mut tb = TextBox::new(typeface(), "Notes #urgent #person".to_string());
+        tb.set_force_heading(true);
+        tb.tick(
+            &skia_safe::surfaces::raster_n32_premul((400, 200))
+                .unwrap()
+                .canvas(),
+            0.0,
+            0.0,
+            400.0,
+            false,
+            false,
+        );
+        let bands = tb.source_line_y_bands();
+        assert_eq!(bands.len(), 1);
+        assert!(bands[0].2, "title line is heading without `# ` prefix");
+        let tags = tb.heading_tag_names();
+        assert!(tags.contains(&"urgent".to_string()));
+        assert!(tags.contains(&"person".to_string()));
     }
 
     #[test]
@@ -4725,27 +5099,43 @@ mod tests {
     }
 
     #[test]
-    fn table_first_cell_heading_drives_title() {
-        let mut tc = TableCell::new(typeface());
-        let entry = tc.cell_at_mut(0, 0).unwrap();
-        entry.textbox.replace_text("# Things\nbody".to_string());
-        assert_eq!(tc.heading_title().as_deref(), Some("Things"));
+    fn cell_toggle_title_focus_creates_title() {
+        let mut cell = Cell::new(typeface(), String::new());
+        assert!(cell.title.is_none());
+        assert!(cell.toggle_title_focus());
+        assert!(cell.title.is_some());
+        assert!(cell.title_focused);
+        // Idempotent: a second call with the title already focused returns
+        // false (no observable change).
+        assert!(!cell.toggle_title_focus());
+        assert!(cell.title_focused);
     }
 
     #[test]
-    fn table_first_cell_heading_drives_tags() {
-        let mut tc = TableCell::new(typeface());
-        let entry = tc.cell_at_mut(0, 0).unwrap();
-        entry.textbox.replace_text("# Notes #urgent #person".to_string());
-        let tags = tc.heading_tag_names();
+    fn cell_toggle_title_focus_focuses_existing() {
+        let mut cell = Cell::new(typeface(), String::new());
+        cell.toggle_title_focus();
+        cell.title_focused = false;
+        assert!(cell.toggle_title_focus());
+        assert!(cell.title_focused);
+    }
+
+    #[test]
+    fn title_trailing_tags_parse_without_hash_prefix() {
+        let mut cell = Cell::new(typeface(), String::new());
+        cell.toggle_title_focus();
+        let title = cell.title.as_mut().unwrap();
+        title.replace_text("My Notes #urgent #person".to_string());
+        let tags = cell.heading_tag_names();
         assert!(tags.contains(&"urgent".to_string()));
         assert!(tags.contains(&"person".to_string()));
+        assert_eq!(cell.heading_title().as_deref(), Some("My Notes"));
     }
 
     #[test]
     fn table_snapshot_round_trip() {
         let mut tc = TableCell::new(typeface());
-        tc.cell_at_mut(0, 0).unwrap().textbox.replace_text("# Title".to_string());
+        tc.cell_at_mut(0, 0).unwrap().textbox.replace_text("alpha".to_string());
         tc.cell_at_mut(1, 2).unwrap().textbox.replace_text("hello".to_string());
         tc.cell_at_mut(2, 0).unwrap().readonly = true;
         let snap = tc.snapshot();
@@ -4755,7 +5145,7 @@ mod tests {
         tc.cell_at_mut(2, 0).unwrap().readonly = false;
         // Restore.
         tc.restore(snap);
-        assert_eq!(tc.cell_at(0, 0).unwrap().textbox.text(), "# Title");
+        assert_eq!(tc.cell_at(0, 0).unwrap().textbox.text(), "alpha");
         assert_eq!(tc.cell_at(1, 2).unwrap().textbox.text(), "hello");
         assert!(tc.cell_at(2, 0).unwrap().readonly);
         // Other cells are still empty + editable.

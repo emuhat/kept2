@@ -1591,6 +1591,22 @@ impl KeptApp {
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("t") => {
                     return self.insert_cell_after_focused(NewCellKind::Table);
                 }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("h") => {
+                    // Ctrl+H: create + focus the title slot on the focused
+                    // cell. Idempotent — focuses an existing title.
+                    let Some(id) = self.focused else { return false };
+                    let changed = self
+                        .cell_mut(id)
+                        .map(|c| c.toggle_title_focus())
+                        .unwrap_or(false);
+                    if changed {
+                        self.editing = true;
+                        self.coalesce_break = true;
+                        self.pending_caret_scroll = true;
+                        self.mark_cell_dirty(id);
+                    }
+                    return changed;
+                }
                 _ => {}
             }
         }
