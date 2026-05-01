@@ -11,7 +11,7 @@ use winit::{
     keyboard::{Key, NamedKey},
 };
 
-use crate::cell::{Cell, CellSnapshot, now_epoch_ms, primary_mod};
+use crate::cell::{Cell, CellSnapshot, TextBox, now_epoch_ms, primary_mod};
 use crate::persist::{ContextRef, Db, db_path};
 
 const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
@@ -124,10 +124,13 @@ struct MentionPopup {
     selected: usize,
 }
 
-/// Top-of-viewport search popup, opened with Ctrl/Cmd+K. While open, all
-/// keystrokes (other than nav/commit/cancel) are typeahead for the query.
+/// Top-of-viewport search popup, opened with Ctrl/Cmd+K. The query is a
+/// real `TextBox` so the input gets the same arrow / word-nav / selection /
+/// line-edge / paste behavior the rest of the app has. Esc/Enter/ArrowUp/
+/// ArrowDown are intercepted at the popup layer; everything else flows to
+/// the TextBox.
 struct SearchState {
-    query: String,
+    input: TextBox,
     /// Index in the filtered result list.
     selected: usize,
     /// View + focus to restore on Esc-cancel.
@@ -391,6 +394,13 @@ pub struct KeptApp {
     last_sidebar_date_rects: Vec<(chrono::NaiveDate, Rect)>,
     /// Sidebar tag-row rects from last frame, for hit-testing.
     last_sidebar_tag_rects: Vec<(String, Rect)>,
+    /// Search-popup input rect (window coords) from last frame. Populated
+    /// when the popup is open so `mouse_down` can route clicks into the
+    /// search TextBox; None when the popup is closed.
+    last_search_input_rect: Option<Rect>,
+    /// True while the user is mouse-dragging inside the search input
+    /// (selecting text). Drives `mouse_drag_to` / `mouse_up` routing.
+    search_dragging: bool,
     /// Most recent cursor position in window (logical) coords, used for hover.
     mouse_pos: (f32, f32),
 }
@@ -542,6 +552,8 @@ impl KeptApp {
             last_sidebar_rects: Vec::new(),
             last_sidebar_date_rects: Vec::new(),
             last_sidebar_tag_rects: Vec::new(),
+            last_search_input_rect: None,
+            search_dragging: false,
             mouse_pos: (-1.0, -1.0),
         }
     }
@@ -1429,6 +1441,8 @@ impl KeptApp {
             return true;
         }
         if event.state == ElementState::Pressed && self.search.is_some() {
+            let mods = modifiers.state();
+            // Popup-specific keys take precedence over text editing.
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => {
                     self.close_search_cancel();
@@ -1438,39 +1452,63 @@ impl KeptApp {
                     self.close_search_commit();
                     return true;
                 }
-                Key::Named(NamedKey::ArrowUp) => {
+                Key::Named(NamedKey::ArrowUp) if !mods.shift_key() => {
                     self.search_move(-1);
                     return true;
                 }
-                Key::Named(NamedKey::ArrowDown) => {
+                Key::Named(NamedKey::ArrowDown) if !mods.shift_key() => {
                     self.search_move(1);
                     return true;
                 }
-                Key::Named(NamedKey::Backspace) => {
-                    self.search_backspace();
+                _ => {}
+            }
+            // Cmd/Ctrl + letter combos: clipboard + select-all are routed
+            // to the search input; other letter shortcuts (zoom, new cell,
+            // undo, etc.) are swallowed so they don't fire behind the
+            // popup. Named keys (arrows, Home/End, Backspace) under
+            // primary_mod fall through to the TextBox so line-edge
+            // (Cmd+Arrow on Mac), word-nav (Ctrl+Arrow on Linux/Win), and
+            // word-Backspace all work.
+            if primary_mod(mods) {
+                if let Key::Character(s) = &event.logical_key {
+                    let s = s.as_str();
+                    if s.eq_ignore_ascii_case("c") {
+                        self.search_copy_to_clipboard();
+                        return true;
+                    }
+                    if s.eq_ignore_ascii_case("x") {
+                        self.search_cut_to_clipboard();
+                        return true;
+                    }
+                    if s.eq_ignore_ascii_case("v") {
+                        self.search_paste_from_clipboard();
+                        return true;
+                    }
+                    if s.eq_ignore_ascii_case("a") {
+                        if let Some(state) = self.search.as_mut() {
+                            state.input.select_all();
+                        }
+                        return true;
+                    }
+                    // Other letter combos: swallow so app shortcuts don't
+                    // fire while the popup is up.
                     return true;
                 }
-                _ => {
-                    // Append any plain text (regardless of mods that aren't
-                    // primary_mod, so e.g. Shift+letter still inserts).
-                    if !primary_mod(modifiers.state()) {
-                        if let Some(s) = &event.text {
-                            // Skip control chars (newlines, tabs).
-                            let clean: String = s
-                                .chars()
-                                .filter(|c| !c.is_control())
-                                .collect();
-                            if !clean.is_empty() {
-                                self.search_typed(&clean);
-                                return true;
-                            }
-                        }
-                    }
-                    // Swallow keystrokes while the popup is up so the
-                    // underlying cells don't get edited behind it.
-                    return true;
+                // Fall through for Named keys.
+            }
+            // Forward to the input. Resets `selected` on text change so the
+            // result list always tracks the current query.
+            let pre = self.search.as_ref().map(|s| s.input.text().to_string());
+            if let Some(state) = self.search.as_mut() {
+                state.input.handle_key(event, modifiers);
+            }
+            let post = self.search.as_ref().map(|s| s.input.text().to_string());
+            if pre != post {
+                if let Some(state) = self.search.as_mut() {
+                    state.selected = 0;
                 }
             }
+            return true;
         }
 
         // While the @-mention popup is open, intercept navigation/commit/dismiss
@@ -2224,8 +2262,11 @@ impl KeptApp {
         }
     }
 
-    fn render_search_popup(&self, canvas: &Canvas, width: f32) {
-        let Some(state) = self.search.as_ref() else { return };
+    fn render_search_popup(&mut self, canvas: &Canvas, width: f32) {
+        if self.search.is_none() {
+            self.last_search_input_rect = None;
+            return;
+        }
         let scale = self.font_scale;
         let pad = SEARCH_PAD * scale;
         let radius = SEARCH_RADIUS * scale;
@@ -2235,7 +2276,12 @@ impl KeptApp {
 
         let input_h = SEARCH_INPUT_H * scale;
         let result_h = SEARCH_RESULT_H * scale;
-        let results = self.search_results(&state.query);
+        let query = self
+            .search
+            .as_ref()
+            .map(|s| s.input.text().to_string())
+            .unwrap_or_default();
+        let results = self.search_results(&query);
         let visible = results.len().min(SEARCH_MAX_VISIBLE);
         let popup_h = input_h + (visible as f32) * result_h + pad * 2.0;
 
@@ -2265,54 +2311,37 @@ impl KeptApp {
         border.set_color(Color::from_rgb(0xc8, 0xc0, 0xb0));
         canvas.draw_round_rect(card, radius, radius, &border);
 
-        // Input row.
-        let input_font =
-            Font::from_typeface(&self.typeface, SEARCH_INPUT_FONT_SIZE * scale);
-        let (_, im) = input_font.metrics();
-        let input_baseline = popup_y + pad + (-im.ascent);
-        let mut text_paint = Paint::default();
-        text_paint.set_anti_alias(true);
-        text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
-        let placeholder = "Search…";
-        let display_text: &str = if state.query.is_empty() {
-            placeholder
-        } else {
-            state.query.as_str()
-        };
-        let text_color = if state.query.is_empty() {
-            Color::from_rgb(0xa8, 0xa0, 0x90)
-        } else {
-            Color::from_rgb(0x1c, 0x1c, 0x1c)
-        };
-        let mut display_paint = Paint::default();
-        display_paint.set_anti_alias(true);
-        display_paint.set_color(text_color);
-        canvas.draw_str(
-            display_text,
-            Point::new(popup_x + pad, input_baseline),
-            &input_font,
-            &display_paint,
-        );
+        // Input row: drive the TextBox directly so caret, selection, arrow
+        // nav, word jumps, and line edges all work natively.
+        let input_x = popup_x + pad;
+        let input_y = popup_y + pad;
+        let input_w = popup_w - pad * 2.0;
+        if let Some(state) = self.search.as_mut() {
+            state.input.tick(canvas, input_x, input_y, input_w, true, true);
+        }
+        self.last_search_input_rect = Some(Rect::new(
+            input_x,
+            input_y,
+            input_x + input_w,
+            input_y + input_h - SEARCH_PAD * scale,
+        ));
 
-        // Caret at the end of the query (no blink for prototype).
-        let caret_x = popup_x
-            + pad
-            + if state.query.is_empty() {
-                0.0
-            } else {
-                input_font
-                    .measure_str(&state.query, Some(&display_paint))
-                    .0
-            };
-        let caret_top = input_baseline + im.ascent;
-        let caret_bot = input_baseline + im.descent;
-        let mut caret = Paint::default();
-        caret.set_anti_alias(false);
-        caret.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
-        canvas.draw_rect(
-            Rect::new(caret_x, caret_top, caret_x + 1.5, caret_bot),
-            &caret,
-        );
+        // Placeholder text rendered ON TOP only when the input is empty.
+        if query.is_empty() {
+            let input_font =
+                Font::from_typeface(&self.typeface, SEARCH_INPUT_FONT_SIZE * scale);
+            let (_, im) = input_font.metrics();
+            let baseline = input_y + (-im.ascent);
+            let mut hint = Paint::default();
+            hint.set_anti_alias(true);
+            hint.set_color(Color::from_rgb(0xa8, 0xa0, 0x90));
+            canvas.draw_str(
+                "Search…",
+                Point::new(input_x, baseline),
+                &input_font,
+                &hint,
+            );
+        }
 
         // Divider between input and results.
         let div_y = popup_y + pad + input_h - 4.0 * scale;
@@ -2338,9 +2367,10 @@ impl KeptApp {
         row_paint.set_anti_alias(true);
         row_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
 
+        let selected = self.search.as_ref().map(|s| s.selected).unwrap_or(0);
         let mut row_y = popup_y + pad + input_h;
         for (i, &id) in results.iter().take(SEARCH_MAX_VISIBLE).enumerate() {
-            let is_selected = i == state.selected.min(visible.saturating_sub(1));
+            let is_selected = i == selected.min(visible.saturating_sub(1));
             if is_selected {
                 let mut sel = Paint::default();
                 sel.set_anti_alias(true);
@@ -2368,7 +2398,7 @@ impl KeptApp {
                     &date_font,
                     &date_paint,
                 );
-                let snippet = result_snippet(&cell.full_text(), &state.query);
+                let snippet = result_snippet(&cell.full_text(), &query);
                 canvas.draw_str(
                     &snippet,
                     Point::new(popup_x + pad + date_w + 12.0 * scale, baseline),
@@ -2379,7 +2409,7 @@ impl KeptApp {
             row_y += result_h;
         }
 
-        if visible == 0 && !state.query.is_empty() {
+        if visible == 0 && !query.is_empty() {
             let baseline = popup_y + pad + input_h + (result_h + (-rm.ascent) - rm.descent) * 0.5;
             let mut empty_paint = Paint::default();
             empty_paint.set_anti_alias(true);
@@ -2592,8 +2622,10 @@ impl KeptApp {
         if self.search.is_some() {
             return;
         }
+        let mut input = TextBox::new(self.typeface.clone(), String::new());
+        input.set_font_scale(self.font_scale);
         self.search = Some(SearchState {
-            query: String::new(),
+            input,
             selected: 0,
             pre_view: self.view.clone(),
             pre_focused: self.focused,
@@ -2615,7 +2647,8 @@ impl KeptApp {
 
     fn close_search_commit(&mut self) {
         let Some(state) = self.search.take() else { return };
-        let results = self.search_results(&state.query);
+        let query = state.input.text().to_string();
+        let results = self.search_results(&query);
         let Some(&id) = results.get(state.selected) else {
             // Nothing to commit; behave like cancel.
             self.view = state.pre_view;
@@ -2652,7 +2685,8 @@ impl KeptApp {
 
     fn search_move(&mut self, delta: i32) {
         let Some(state) = self.search.as_ref() else { return };
-        let results = self.search_results(&state.query);
+        let query = state.input.text().to_string();
+        let results = self.search_results(&query);
         let count = results.len().min(SEARCH_MAX_VISIBLE);
         if count == 0 {
             return;
@@ -2664,16 +2698,52 @@ impl KeptApp {
         }
     }
 
-    fn search_typed(&mut self, text: &str) {
-        let Some(s) = self.search.as_mut() else { return };
-        s.query.push_str(text);
-        s.selected = 0;
+    /// Cmd/Ctrl+C while the search popup has focus: copy the input's
+    /// selection. No fallback to "copy the whole query" — that's atypical
+    /// for an input field and not worth the ambiguity.
+    fn search_copy_to_clipboard(&mut self) -> bool {
+        let Some(state) = self.search.as_ref() else { return false };
+        let text = state.input.copy_primary_selection();
+        if text.is_empty() {
+            return false;
+        }
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set_text(text);
+        }
+        true
     }
 
-    fn search_backspace(&mut self) {
-        let Some(s) = self.search.as_mut() else { return };
-        s.query.pop();
-        s.selected = 0;
+    fn search_cut_to_clipboard(&mut self) -> bool {
+        let Some(state) = self.search.as_mut() else { return false };
+        let text = state.input.cut_primary_selection();
+        if text.is_empty() {
+            return false;
+        }
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set_text(text);
+        }
+        if let Some(s) = self.search.as_mut() {
+            s.selected = 0;
+        }
+        true
+    }
+
+    fn search_paste_from_clipboard(&mut self) -> bool {
+        let Some(cb) = self.clipboard.as_mut() else { return false };
+        let text = match cb.get_text() {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        if text.is_empty() {
+            return false;
+        }
+        // Search input is single-line; strip newlines on paste.
+        let cleaned: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+        if let Some(state) = self.search.as_mut() {
+            state.input.paste(&cleaned);
+            state.selected = 0;
+        }
+        true
     }
 
     fn record_edit(&mut self, pre: CellSnapshot, post: CellSnapshot) {
@@ -3155,6 +3225,22 @@ impl KeptApp {
         // Any click dismisses an active @-mention popup.
         self.mention_popup = None;
 
+        // Search popup is modal-ish: while open, clicks inside the input
+        // route to its TextBox; clicks elsewhere are swallowed so the cells
+        // beneath don't get focus changes / selections.
+        if self.search.is_some() {
+            self.search_dragging = false;
+            if let Some(rect) = self.last_search_input_rect {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    self.search_dragging = true;
+                    if let Some(state) = self.search.as_mut() {
+                        return state.input.mouse_down(x, y, modifiers, true);
+                    }
+                }
+            }
+            return true;
+        }
+
         // Sidebar clicks switch the view. Sidebar lives in window (logical)
         // space, so use raw (x, y) — not doc_y.
         if x < SIDEBAR_WIDTH * self.font_scale {
@@ -3226,6 +3312,11 @@ impl KeptApp {
     }
 
     pub fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool {
+        if self.search_dragging {
+            if let Some(state) = self.search.as_mut() {
+                return state.input.mouse_drag_to(x, y);
+            }
+        }
         let doc_y = y + self.scroll_y;
         if let Some(id) = self.dragging_cell {
             match self.cell_mut(id) {
@@ -3238,6 +3329,12 @@ impl KeptApp {
     }
 
     pub fn mouse_up(&mut self) -> bool {
+        if self.search_dragging {
+            self.search_dragging = false;
+            if let Some(state) = self.search.as_mut() {
+                return state.input.mouse_up();
+            }
+        }
         if let Some(id) = self.dragging_cell.take() {
             match self.cell_mut(id) {
                 Some(cell) => cell.mouse_up(),
