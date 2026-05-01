@@ -132,13 +132,14 @@ struct MentionPopup {
 /// real `TextBox` so the input gets the same arrow / word-nav / selection /
 /// line-edge / paste behavior the rest of the app has. Esc/Enter are
 /// intercepted at the popup layer; everything else flows to the TextBox.
-/// On every keystroke the input text is parsed into an `Ast` and the
-/// active view's AST is replaced live — the doc area filters as you type.
+/// The popup parses input through the query language and shows the top N
+/// matching cells in a list. Selecting a result jumps to it; the doc area
+/// behind the popup is *not* live-filtered (use sidebar tag/date entries
+/// for persistent filtered views).
 struct SearchState {
     input: TextBox,
-    /// View + focus to restore on Esc-cancel.
-    pre_view: Query,
-    pre_focused: Option<Uuid>,
+    /// Index of the highlighted result row. Reset to 0 on text change.
+    selected: usize,
 }
 
 /// Which kind of cell to spawn from a "new cell" hotkey.
@@ -184,6 +185,7 @@ impl Query {
         ast.include.tags = vec![name.to_lowercase()];
         Self { context_view: None, ast }
     }
+    #[allow(dead_code)]
     fn from_text(input: &str) -> Self {
         Self { context_view: None, ast: query::parse(input) }
     }
@@ -367,6 +369,11 @@ const SEARCH_PAD: f32 = 12.0;
 const SEARCH_RADIUS: f32 = 8.0;
 const SEARCH_INPUT_H: f32 = 36.0;
 const SEARCH_INPUT_FONT_SIZE: f32 = 16.0;
+const SEARCH_RESULT_H: f32 = 32.0;
+const SEARCH_RESULT_FONT_SIZE: f32 = 13.0;
+const SEARCH_DATE_FONT_SIZE: f32 = 12.0;
+const SEARCH_MAX_VISIBLE: usize = 8;
+const SEARCH_SNIPPET_LEN: usize = 80;
 
 const KEBAB_SIZE: f32 = 22.0;
 const KEBAB_INSET_X: f32 = 4.0;
@@ -1528,6 +1535,14 @@ impl KeptApp {
                     self.close_search_commit();
                     return true;
                 }
+                Key::Named(NamedKey::ArrowUp) if !mods.shift_key() => {
+                    self.search_move(-1);
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowDown) if !mods.shift_key() => {
+                    self.search_move(1);
+                    return true;
+                }
                 _ => {}
             }
             // Cmd/Ctrl + letter combos: clipboard + select-all are routed
@@ -1546,12 +1561,16 @@ impl KeptApp {
                     }
                     if s.eq_ignore_ascii_case("x") {
                         self.search_cut_to_clipboard();
-                        self.refresh_search_view();
+                        if let Some(state) = self.search.as_mut() {
+                            state.selected = 0;
+                        }
                         return true;
                     }
                     if s.eq_ignore_ascii_case("v") {
                         self.search_paste_from_clipboard();
-                        self.refresh_search_view();
+                        if let Some(state) = self.search.as_mut() {
+                            state.selected = 0;
+                        }
                         return true;
                     }
                     if s.eq_ignore_ascii_case("a") {
@@ -1566,15 +1585,17 @@ impl KeptApp {
                 }
                 // Fall through for Named keys.
             }
-            // Forward to the input. If the text changed, re-parse and apply
-            // the new AST live so the doc area filters as the user types.
+            // Forward to the input. Reset selected on text change so the
+            // result list always tracks the current query.
             let pre = self.search.as_ref().map(|s| s.input.text().to_string());
             if let Some(state) = self.search.as_mut() {
                 state.input.handle_key(event, modifiers);
             }
             let post = self.search.as_ref().map(|s| s.input.text().to_string());
             if pre != post {
-                self.refresh_search_view();
+                if let Some(state) = self.search.as_mut() {
+                    state.selected = 0;
+                }
             }
             return true;
         }
@@ -2374,13 +2395,15 @@ impl KeptApp {
         let popup_y = SEARCH_TOP * scale;
 
         let input_h = SEARCH_INPUT_H * scale;
+        let result_h = SEARCH_RESULT_H * scale;
         let query = self
             .search
             .as_ref()
             .map(|s| s.input.text().to_string())
             .unwrap_or_default();
-        // Result list lives in the doc area now — popup is just an input bar.
-        let popup_h = input_h + pad * 2.0;
+        let results = self.search_results(&query);
+        let visible = results.len().min(SEARCH_MAX_VISIBLE);
+        let popup_h = input_h + (visible as f32) * result_h + pad * 2.0;
 
         // Drop shadow.
         let mut shadow = Paint::default();
@@ -2440,7 +2463,84 @@ impl KeptApp {
             );
         }
 
-        let _ = query; // placeholder rendered above when empty; results live in the doc.
+        // Divider between input and results.
+        let div_y = popup_y + pad + input_h - 4.0 * scale;
+        let mut div = Paint::default();
+        div.set_anti_alias(false);
+        div.set_color(Color::from_argb(0x30, 0x40, 0x40, 0x40));
+        canvas.draw_line(
+            (popup_x + pad, div_y),
+            (popup_x + popup_w - pad, div_y),
+            &div,
+        );
+
+        // Result rows.
+        let result_font =
+            Font::from_typeface(&self.typeface, SEARCH_RESULT_FONT_SIZE * scale);
+        let date_font =
+            Font::from_typeface(&self.typeface, SEARCH_DATE_FONT_SIZE * scale);
+        let (_, rm) = result_font.metrics();
+        let mut date_paint = Paint::default();
+        date_paint.set_anti_alias(true);
+        date_paint.set_color(Color::from_rgb(0x80, 0x78, 0x68));
+        let mut row_paint = Paint::default();
+        row_paint.set_anti_alias(true);
+        row_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+
+        let selected = self.search.as_ref().map(|s| s.selected).unwrap_or(0);
+        let mut row_y = popup_y + pad + input_h;
+        for (i, &id) in results.iter().take(SEARCH_MAX_VISIBLE).enumerate() {
+            let is_selected = i == selected.min(visible.saturating_sub(1));
+            if is_selected {
+                let mut sel = Paint::default();
+                sel.set_anti_alias(true);
+                sel.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+                canvas.draw_rect(
+                    Rect::new(
+                        popup_x + pad * 0.5,
+                        row_y,
+                        popup_x + popup_w - pad * 0.5,
+                        row_y + result_h,
+                    ),
+                    &sel,
+                );
+            }
+
+            if let Some(cell) = self.cell(id) {
+                let date_label = format_date_label(local_date_for_ms(cell.timestamp));
+                let baseline = row_y + (result_h + (-rm.ascent) - rm.descent) * 0.5;
+                let date_w = date_font
+                    .measure_str(&date_label, Some(&date_paint))
+                    .0;
+                canvas.draw_str(
+                    &date_label,
+                    Point::new(popup_x + pad, baseline),
+                    &date_font,
+                    &date_paint,
+                );
+                let snippet = result_snippet(&cell.full_text(), &query);
+                canvas.draw_str(
+                    &snippet,
+                    Point::new(popup_x + pad + date_w + 12.0 * scale, baseline),
+                    &result_font,
+                    &row_paint,
+                );
+            }
+            row_y += result_h;
+        }
+
+        if visible == 0 && !query.trim().is_empty() {
+            let baseline = popup_y + pad + input_h + (result_h + (-rm.ascent) - rm.descent) * 0.5;
+            let mut empty_paint = Paint::default();
+            empty_paint.set_anti_alias(true);
+            empty_paint.set_color(Color::from_rgb(0x90, 0x88, 0x78));
+            canvas.draw_str(
+                "no matches",
+                Point::new(popup_x + pad, baseline),
+                &result_font,
+                &empty_paint,
+            );
+        }
     }
 
     fn render_mention_popup(&self, canvas: &Canvas) {
@@ -2646,8 +2746,7 @@ impl KeptApp {
         input.set_font_scale(self.font_scale);
         self.search = Some(SearchState {
             input,
-            pre_view: self.view.clone(),
-            pre_focused: self.focused,
+            selected: 0,
         });
         // Drop other transient overlays so they don't compete for input.
         self.mention_popup = None;
@@ -2655,39 +2754,68 @@ impl KeptApp {
     }
 
     fn close_search_cancel(&mut self) {
-        if let Some(s) = self.search.take() {
-            self.view = s.pre_view;
-            self.focused = s.pre_focused;
-            self.editing = false;
-            self.coalesce_break = true;
-            self.pending_caret_scroll = true;
-        }
-    }
-
-    /// Enter on the search popup: close it, leave the live-previewed view
-    /// in place. The doc area is already filtered to the parsed query.
-    fn close_search_commit(&mut self) {
         if self.search.take().is_some() {
-            self.editing = false;
+            // Doc area was never replaced; nothing to restore.
             self.coalesce_break = true;
-            self.pending_caret_scroll = true;
         }
     }
 
-    /// Re-parse the search input and apply the resulting AST to the active
-    /// view. Called on every keystroke so the doc area filters live.
-    fn refresh_search_view(&mut self) {
-        let text = match self.search.as_ref() {
-            Some(s) => s.input.text().to_string(),
-            None => return,
+    /// Enter on the search popup: jump to the highlighted result. View
+    /// becomes that cell's date and the cell is focused. Empty / no-match
+    /// input just closes the popup.
+    fn close_search_commit(&mut self) {
+        let Some(state) = self.search.take() else { return };
+        let query = state.input.text().to_string();
+        let results = self.search_results(&query);
+        let Some(&id) = results.get(state.selected) else {
+            self.coalesce_break = true;
+            return;
         };
-        // Empty input → match everything (clear of any prior preview).
-        self.view = Query::from_text(&text);
-        // Focus is dropped while previewing — the result set may not contain
-        // whatever was previously focused.
-        self.focused = None;
+        if let Some(cell) = self.cell(id) {
+            let target_date = local_date_for_ms(cell.timestamp);
+            self.view = Query::date(target_date);
+        }
+        self.focused = Some(id);
         self.editing = false;
         self.coalesce_break = true;
+        self.pending_caret_scroll = true;
+    }
+
+    /// Top-N matching cell IDs for the popup result list. Parses `query`
+    /// through the language, runs the executor, and sorts most-recent first.
+    fn search_results(&self, query: &str) -> Vec<Uuid> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        let ast = query::parse(query);
+        let person_index = self.person_entries();
+        let ctx = query::MatchContext {
+            today: local_date_for_ms(now_epoch_ms()),
+            person_targets: query::resolve_persons(&ast.include.entities, &person_index),
+            person_excludes: query::resolve_persons(&ast.exclude.entities, &person_index),
+        };
+        let mut hits: Vec<&Cell> = self
+            .cells
+            .iter()
+            .filter(|c| query::matches(&ast, c, &ctx))
+            .collect();
+        hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        hits.into_iter().map(|c| c.id).collect()
+    }
+
+    fn search_move(&mut self, delta: i32) {
+        let Some(state) = self.search.as_ref() else { return };
+        let query = state.input.text().to_string();
+        let results = self.search_results(&query);
+        let count = results.len().min(SEARCH_MAX_VISIBLE);
+        if count == 0 {
+            return;
+        }
+        let cur = state.selected.min(count - 1) as i32;
+        let new = ((cur + delta).rem_euclid(count as i32)) as usize;
+        if let Some(s) = self.search.as_mut() {
+            s.selected = new;
+        }
     }
 
     /// Cmd/Ctrl+C while the search popup has focus: copy the input's
@@ -3461,6 +3589,36 @@ fn local_date_for_ms(epoch_ms: i64) -> chrono::NaiveDate {
                 .unwrap()
                 .date_naive()
         })
+}
+
+/// Trim a cell's full text to a single-line snippet centered around the
+/// match. If `query`'s residual text appears, show ~40 chars before + the
+/// match + ~40 after. Falls back to the leading window for queries that are
+/// entirely structured (`#tag`, `today`, etc. — no text to find).
+fn result_snippet(text: &str, query: &str) -> String {
+    let flat: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    // Pull the residual-text tail out of the parsed AST so structured
+    // tokens (#tag / @person / today / dates) don't drive snippet centering.
+    let residual = query::parse(query).text;
+    let lower = flat.to_lowercase();
+    let needle = residual.to_lowercase();
+    let center = if needle.is_empty() {
+        0
+    } else {
+        lower.find(&needle).unwrap_or(0)
+    };
+    let pre = SEARCH_SNIPPET_LEN / 2;
+    let start_chars = center.saturating_sub(pre);
+    let end_chars = (start_chars + SEARCH_SNIPPET_LEN).min(flat.chars().count());
+    let mut iter = flat.chars();
+    let snippet: String = iter
+        .by_ref()
+        .skip(start_chars)
+        .take(end_chars - start_chars)
+        .collect();
+    let prefix = if start_chars > 0 { "…" } else { "" };
+    let suffix = if end_chars < flat.chars().count() { "…" } else { "" };
+    format!("{prefix}{snippet}{suffix}")
 }
 
 fn format_date_label(d: chrono::NaiveDate) -> String {
