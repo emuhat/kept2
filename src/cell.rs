@@ -3168,14 +3168,59 @@ pub struct PopPopCell {
     #[allow(dead_code)]
     typeface: Typeface,
     textbox: TextBox,
-    /// Read-only TextBox holding rendered output values ("42\n42\n…"), one
-    /// line per committed non-heading input line. Regenerated each tick.
-    /// Selectable + copyable; never receives keyboard input.
+    /// Read-only TextBox holding the formatted result of each committed
+    /// (non-last) input source line. Recomputed only when input text
+    /// changes — see `cached_input`. Selectable + copyable; never
+    /// receives keyboard input.
     output: TextBox,
+    /// Stateful evaluator. Held across renders so we can `reset()` and
+    /// replay instead of paying for unit-registry construction every
+    /// recompute.
+    engine: poppop::Engine,
+    /// Last input-text snapshot the output was computed against. Output
+    /// is recomputed only when this differs from the live `textbox.text()`.
+    cached_input: String,
     x_origin: f32,
     y_origin: f32,
     width: f32,
     height: f32,
+}
+
+/// For each non-last `\n`-separated paragraph in `input`, evaluate it
+/// through the poppop engine and produce the formatted result. The last
+/// paragraph is skipped — it's the line being typed, where mid-stream
+/// parse errors would be noisy. Output index `i` aligns with input
+/// paragraph `i`. Empty / whitespace-only lines and parse / eval errors
+/// render as empty strings (the row is left blank).
+///
+/// `engine.reset()` runs at the top so stale bindings from prior
+/// invocations don't leak. The caller controls when this helper runs
+/// (currently: only when input text changes), so the cost is bounded.
+fn compute_poppop_output(input: &str, engine: &mut poppop::Engine) -> Vec<String> {
+    engine.reset();
+    let paragraphs: Vec<&str> = input.split('\n').collect();
+    if paragraphs.len() <= 1 {
+        return Vec::new();
+    }
+    let committed = &paragraphs[..paragraphs.len() - 1];
+    let mut out: Vec<String> = Vec::with_capacity(committed.len());
+    for line in committed {
+        if line.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        match engine.eval(line) {
+            Ok(answer) => {
+                let v = match &answer {
+                    poppop::Answer::Bare(v) => v,
+                    poppop::Answer::Assigned { value, .. } => value,
+                };
+                out.push(poppop::format_value(v));
+            }
+            Err(_) => out.push(String::new()),
+        }
+    }
+    out
 }
 
 impl PopPopCell {
@@ -3186,6 +3231,8 @@ impl PopPopCell {
             typeface: typeface.clone(),
             textbox: TextBox::new(typeface, String::new()),
             output,
+            engine: poppop::Engine::new(),
+            cached_input: String::new(),
             x_origin: 0.0,
             y_origin: 0.0,
             width: 0.0,
@@ -3246,21 +3293,19 @@ impl PopPopCell {
         self.textbox.layout(x, y, input_w);
 
         // 2) Sync output text + position. Each non-last input source line
-        //    gets a sentinel "42"; output row N aligns with input row N.
+        //    gets the formatted poppop result; output row N aligns with
+        //    input row N. Recompute only when the input text has changed
+        //    (gated on `cached_input`) so we don't re-eval every render.
         let bands = self.textbox.source_line_y_bands();
-        let last_idx = bands.len().saturating_sub(1);
-        let committed_count = bands.len().saturating_sub(1);
-        let mut new_output_text = String::with_capacity(committed_count * 3);
-        for (i, line) in (0..committed_count).map(|i| (i, "42")) {
-            if i > 0 {
-                new_output_text.push('\n');
+        let current_input = self.textbox.text().to_string();
+        if current_input != self.cached_input {
+            let lines = compute_poppop_output(&current_input, &mut self.engine);
+            let new_output_text = lines.join("\n");
+            if self.output.text() != new_output_text {
+                self.output.replace_text(new_output_text);
             }
-            new_output_text.push_str(line);
+            self.cached_input = current_input;
         }
-        if self.output.text() != new_output_text {
-            self.output.replace_text(new_output_text);
-        }
-        let _ = last_idx;
         self.output.layout(output_x, y, output_w);
 
         // 3) Alternating stripes BEHIND text. Stripe odd-indexed bands so
@@ -5018,6 +5063,40 @@ mod tests {
             assert!(!is_heading, "body lines never auto-classify as heading");
         }
         assert!(tb.heading_tag_names().is_empty());
+    }
+
+    #[test]
+    fn poppop_evaluates_committed_lines() {
+        // "2 + 3\nx" — first line is committed, second is the line being
+        // typed (last → skipped). Output is one line: "5".
+        let mut e = poppop::Engine::new();
+        let out = compute_poppop_output("2 + 3\nx", &mut e);
+        assert_eq!(out, vec!["5".to_string()]);
+    }
+
+    #[test]
+    fn poppop_engine_state_threads_across_lines() {
+        // Assignment on line 1 binds x; line 2 reads it. Both lines are
+        // committed thanks to the trailing newline (final paragraph is
+        // empty and skipped as the "last").
+        let mut e = poppop::Engine::new();
+        let out = compute_poppop_output("x = 4\nx * 2\n", &mut e);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], "4");
+        assert_eq!(out[1], "8");
+    }
+
+    #[test]
+    fn poppop_blank_and_error_lines_are_empty() {
+        // Blank line → empty. Parse error (`1 +`) → empty. Valid line
+        // produces its formatted result. All three are committed because
+        // of the trailing newline.
+        let mut e = poppop::Engine::new();
+        let out = compute_poppop_output("\n1 +\n3 + 4\n", &mut e);
+        assert_eq!(
+            out,
+            vec![String::new(), String::new(), "7".to_string()]
+        );
     }
 
     #[test]
