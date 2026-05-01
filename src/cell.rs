@@ -163,6 +163,23 @@ pub(crate) fn word_mod(state: winit::keyboard::ModifiersState) -> bool {
     }
 }
 
+/// Mac-only: Cmd+Left / Cmd+Right move to start / end of the current visual
+/// line (with Shift, extend the selection there). Linux/Windows already
+/// have dedicated Home/End keys, so there's no equivalent on those
+/// platforms — this returns false off-Mac and the existing Home/End keys
+/// stay the canonical line-edge gesture.
+pub(crate) fn line_edge_mod(state: winit::keyboard::ModifiersState) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        state.super_key()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+        false
+    }
+}
+
 fn transform_index(i: usize, start: usize, del: usize, ins: usize) -> usize {
     if i < start {
         i
@@ -993,9 +1010,14 @@ impl TextBox {
         // Word nav (Ctrl on Linux/Win, Option on Mac). `word` here gates the
         // word-versus-char branches in the arrow / Home / End handlers below.
         let word = word_mod(mods);
+        // Mac-only: Cmd+Left/Right is line-edge nav (Shift extends selection).
+        // Off-Mac, line_edge is always false; users have Home/End for this.
+        let line_edge = line_edge_mod(mods);
         match &event.logical_key {
             Key::Named(NamedKey::ArrowLeft) => {
-                if word {
+                if line_edge {
+                    self.move_to_line_edge(false, shift);
+                } else if word {
                     self.move_horizontal_word(-1, shift);
                 } else {
                     self.move_horizontal(-1, shift);
@@ -1003,7 +1025,9 @@ impl TextBox {
                 true
             }
             Key::Named(NamedKey::ArrowRight) => {
-                if word {
+                if line_edge {
+                    self.move_to_line_edge(true, shift);
+                } else if word {
                     self.move_horizontal_word(1, shift);
                 } else {
                     self.move_horizontal(1, shift);
