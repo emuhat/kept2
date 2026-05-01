@@ -4260,6 +4260,7 @@ impl Cell {
     /// Cell title, if any: the title slot's text with trailing #tags
     /// stripped. None when there is no title slot or the title contains
     /// only tags / whitespace.
+    #[allow(dead_code)]
     pub fn heading_title(&self) -> Option<String> {
         let title_tb = self.title.as_ref()?;
         let text = title_tb.text();

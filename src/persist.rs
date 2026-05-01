@@ -38,6 +38,20 @@ pub struct ContextRef<'a> {
     pub title: Option<&'a str>,
 }
 
+/// First-class entity. `id` is canonical identity — runtime must never
+/// assume it equals any cell id (the migration bootstraps them equal for
+/// `#person` cells, but that's a one-shot convention, not an invariant).
+pub struct Entity {
+    pub id: Uuid,
+    pub kind: String,
+    pub display_name: String,
+    pub primary_cell_id: Option<Uuid>,
+    #[allow(dead_code)]
+    pub created_at: i64,
+    #[allow(dead_code)]
+    pub updated_at: i64,
+}
+
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -109,7 +123,85 @@ impl Db {
             )?;
             self.backfill_cell_tags()?;
         }
+        if version < 5 {
+            // v4 → v5: first-class entity table. `#person` cells bootstrap
+            // entity rows (entity.id = cell.id, primary_cell_id = cell.id)
+            // with normalized aliases. Bootstrap-only — runtime code never
+            // assumes the equality.
+            self.conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE entities (
+                     id              BLOB PRIMARY KEY,
+                     kind            TEXT NOT NULL,
+                     display_name    TEXT NOT NULL,
+                     primary_cell_id BLOB,
+                     created_at      INTEGER NOT NULL,
+                     updated_at      INTEGER NOT NULL
+                 );
+                 CREATE INDEX entities_by_kind ON entities (kind);
+                 CREATE INDEX entities_by_primary_cell ON entities (primary_cell_id);
+                 CREATE TABLE entity_aliases (
+                     entity_id BLOB NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                     alias     TEXT NOT NULL,
+                     PRIMARY KEY (entity_id, alias)
+                 );
+                 CREATE INDEX entity_aliases_by_alias ON entity_aliases (alias);
+                 PRAGMA user_version = 5;
+                 COMMIT;",
+            )?;
+            self.backfill_entities_from_persons()?;
+        }
         Ok(())
+    }
+
+    /// v4 → v5 step: walk every cell row; for each cell carrying the
+    /// `#person` tag with a non-empty extractable title, insert an entity
+    /// row + canonical alias. Bootstrap rule: `entity.id = cell.id`,
+    /// `primary_cell_id = cell.id`. Idempotent.
+    fn backfill_entities_from_persons(&mut self) -> rusqlite::Result<()> {
+        let rows: Vec<(Vec<u8>, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, body FROM cells")?;
+            let it = stmt.query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let tx = self.conn.transaction()?;
+        for (id_bytes, body_json) in rows {
+            let pc: PersistedCell = match serde_json::from_str(&body_json) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !tag_names_from_persisted(&pc).iter().any(|n| n == "person") {
+                continue;
+            }
+            let title_text = match pc.title.as_ref() {
+                Some(t) => t.text.as_str(),
+                None => continue,
+            };
+            let Some(display) = extract_display_name(title_text) else {
+                continue;
+            };
+            let alias = normalize_alias(&display);
+            tx.execute(
+                "INSERT OR REPLACE INTO entities \
+                    (id, kind, display_name, primary_cell_id, created_at, updated_at) \
+                 VALUES (?1, 'person', ?2, ?1, \
+                         COALESCE((SELECT created_at FROM entities WHERE id = ?1), ?3), \
+                         ?3)",
+                params![id_bytes, display, now],
+            )?;
+            tx.execute(
+                "DELETE FROM entity_aliases WHERE entity_id = ?1",
+                params![id_bytes],
+            )?;
+            tx.execute(
+                "INSERT INTO entity_aliases (entity_id, alias) VALUES (?1, ?2)",
+                params![id_bytes, alias],
+            )?;
+        }
+        tx.commit()
     }
 
     /// v3 → v4 step: walk every cell row and, where the body opens with a
@@ -295,6 +387,17 @@ impl Db {
         )?;
         let names = tag_names_from_persisted(&pc);
         self.write_cell_tags(&cell_id_bytes, &names)?;
+
+        // Entity sync (invariants #5, #6): only when `#person` is observed
+        // AND a non-empty display_name extracts from the title. Otherwise
+        // the entity table is left untouched — identity stays frozen.
+        if names.iter().any(|n| n == "person") {
+            if let Some(title) = pc.title.as_ref() {
+                if let Some(display) = extract_display_name(&title.text) {
+                    self.upsert_person_entity(cell.id, &display)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -358,6 +461,129 @@ impl Db {
         self.conn.execute(
             "DELETE FROM cells WHERE id = ?1",
             params![id.as_bytes().to_vec()],
+        )?;
+        // Detach (don't delete) any entities backed by this cell.
+        // Entity lifecycle is independent of cell lifecycle.
+        self.detach_entities_from_cell(id)?;
+        Ok(())
+    }
+
+    /// All entities, in insertion order. Used by KeptApp to refresh its
+    /// in-memory entity caches after save/delete.
+    pub fn all_entities(&self) -> rusqlite::Result<Vec<Entity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, display_name, primary_cell_id, created_at, updated_at \
+             FROM entities ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let display_name: String = row.get(2)?;
+                let primary_bytes: Option<Vec<u8>> = row.get(3)?;
+                let created_at: i64 = row.get(4)?;
+                let updated_at: i64 = row.get(5)?;
+                Ok(Entity {
+                    id: Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::nil()),
+                    kind,
+                    display_name,
+                    primary_cell_id: primary_bytes
+                        .and_then(|b| Uuid::from_slice(&b).ok()),
+                    created_at,
+                    updated_at,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// All `(alias, entity_id, kind)` rows. Used to build the in-memory
+    /// resolver index without per-query joins.
+    pub fn entity_alias_index(&self) -> rusqlite::Result<Vec<(String, Uuid, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.alias, a.entity_id, e.kind \
+             FROM entity_aliases a \
+             JOIN entities e ON e.id = a.entity_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let alias: String = row.get(0)?;
+                let id_bytes: Vec<u8> = row.get(1)?;
+                let kind: String = row.get(2)?;
+                Ok((
+                    alias,
+                    Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::nil()),
+                    kind,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// `(primary_cell_id, entity_id)` pairs for entities with a backing
+    /// cell. Used by the title-fallback gate (invariant #2).
+    pub fn cell_to_entity_index(&self) -> rusqlite::Result<Vec<(Uuid, Uuid)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT primary_cell_id, id FROM entities \
+             WHERE primary_cell_id IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let cell_bytes: Vec<u8> = row.get(0)?;
+                let entity_bytes: Vec<u8> = row.get(1)?;
+                Ok((
+                    Uuid::from_slice(&cell_bytes).unwrap_or_else(|_| Uuid::nil()),
+                    Uuid::from_slice(&entity_bytes).unwrap_or_else(|_| Uuid::nil()),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Insert-or-update for a cell-backed person entity. Re-applied every
+    /// time `save_cell` observes `#person` on a cell — including across
+    /// tag-removal / tag-readd cycles. The first call for a given cell
+    /// allocates the entity with `entity.id = cell.id` (bootstrap rule).
+    /// Subsequent calls re-derive `display_name` and replace alias rows.
+    pub fn upsert_person_entity(
+        &mut self,
+        cell_id: Uuid,
+        display_name: &str,
+    ) -> rusqlite::Result<()> {
+        let id_bytes = cell_id.as_bytes().to_vec();
+        let now = chrono::Utc::now().timestamp_millis();
+        let alias = normalize_alias(display_name);
+        let tx = self.conn.transaction()?;
+        // Preserve created_at on update; bump updated_at.
+        tx.execute(
+            "INSERT OR REPLACE INTO entities \
+                (id, kind, display_name, primary_cell_id, created_at, updated_at) \
+             VALUES (?1, 'person', ?2, ?1, \
+                     COALESCE((SELECT created_at FROM entities WHERE id = ?1), ?3), \
+                     ?3)",
+            params![id_bytes, display_name, now],
+        )?;
+        tx.execute(
+            "DELETE FROM entity_aliases WHERE entity_id = ?1",
+            params![id_bytes],
+        )?;
+        tx.execute(
+            "INSERT INTO entity_aliases (entity_id, alias) VALUES (?1, ?2)",
+            params![id_bytes, alias],
+        )?;
+        tx.commit()
+    }
+
+    /// Set `primary_cell_id = NULL` on every entity that points to this
+    /// cell. Called from `delete_cell`. Does NOT delete the entity —
+    /// identity persists as orphan (invariant #7).
+    pub fn detach_entities_from_cell(&mut self, cell_id: Uuid) -> rusqlite::Result<()> {
+        let id_bytes = cell_id.as_bytes().to_vec();
+        let now = chrono::Utc::now().timestamp_millis();
+        self.conn.execute(
+            "UPDATE entities SET primary_cell_id = NULL, updated_at = ?2 \
+             WHERE primary_cell_id = ?1",
+            params![id_bytes, now],
         )?;
         Ok(())
     }
@@ -696,6 +922,35 @@ fn take_heading_from_table(
 /// Distinct, source-ordered tag names sourced from the cell's title slot.
 /// Body content never contributes to the tag index after v4 — the title is
 /// the single source of truth.
+/// Extract a person entity's display_name from a cell's title text.
+/// Mirrors `Cell::heading_title` — strips trailing `#tag` tokens and
+/// trims surrounding whitespace. Returns None when nothing is left
+/// (title is empty / only tags / only whitespace).
+fn extract_display_name(title_text: &str) -> Option<String> {
+    let title_end = title_text.find('\n').unwrap_or(title_text.len());
+    let tags = parse_trailing_tags(title_text, title_end);
+    let bytes = title_text.as_bytes();
+    let mut end = tags.first().map(|r| r.start).unwrap_or(title_end);
+    while end > 0 && (bytes[end - 1] as char).is_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    Some(title_text[..end].to_string())
+}
+
+/// Canonical alias derived from a display_name: lowercase + spaces → `_`.
+/// `"Patrick Foy" → "patrick_foy"`. Resolution-time normalization (strip
+/// underscores too) happens in `query::normalize_entity_token`.
+fn normalize_alias(display_name: &str) -> String {
+    display_name
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
 fn tag_names_from_persisted(pc: &PersistedCell) -> Vec<String> {
     let Some(t) = pc.title.as_ref() else {
         return Vec::new();

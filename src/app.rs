@@ -12,7 +12,7 @@ use winit::{
 };
 
 use crate::cell::{Cell, CellSnapshot, TextBox, now_epoch_ms, primary_mod};
-use crate::persist::{ContextRef, Db, db_path};
+use crate::persist::{ContextRef, Db, Entity, db_path};
 use crate::query;
 
 const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
@@ -52,6 +52,7 @@ const MENTION_BODY_FONT_SIZE: f32 = 16.0;
 
 /// Tag name used to mark a cell as a "person" — its heading title shows up
 /// in the `@`-mention popup. Convention: `# Alice Smith #person`.
+#[allow(dead_code)]
 const PERSON_TAG: &str = "person";
 
 /// Subsequence fuzzy match. Returns `(score, matched_byte_positions)` if every
@@ -471,6 +472,21 @@ pub struct KeptApp {
     /// View-history forward stack. Populated when the user goes back; any
     /// new `push_view` clears it (the abandoned future is gone).
     nav_forward: Vec<HistoryEntry>,
+    // ---- Entity caches (invariants #1–#7) ----
+    /// All entity rows from the DB. Source of identity (kind, display_name).
+    entities: Vec<Entity>,
+    /// `(alias, entity_id, kind)` index. Built from the DB; rebuilt on
+    /// save/delete via `refresh_entities`.
+    entity_alias_index: Vec<(String, Uuid, String)>,
+    /// `cell_id → entity_id` for entities that have a backing cell. Gates
+    /// the title fallback (invariant #2) and lets the @-popup speak in
+    /// entity-id space without scanning entities each time.
+    cell_to_entity: std::collections::HashMap<Uuid, Uuid>,
+    /// `(entity_id, normalize(display_name))` for entities with a backing
+    /// cell. The title-fallback corpus — entirely entity-derived. Cells
+    /// without a corresponding entity are *not* here, even if their title
+    /// matches (invariant #2). Rebuilt with the other entity caches.
+    entity_title_fallback: Vec<(Uuid, String)>,
     /// Most recent cursor position in window (logical) coords, used for hover.
     mouse_pos: (f32, f32),
 }
@@ -525,6 +541,40 @@ impl KeptApp {
             }
             None => Vec::new(),
         };
+
+        // Initial entity load. The migration backfilled `entities` from
+        // `#person` cells in v4→v5, so this should be populated.
+        let entities: Vec<Entity> = match db.as_ref().map(|d| d.all_entities()) {
+            Some(Ok(rows)) => rows,
+            Some(Err(e)) => {
+                eprintln!("kept: failed to load entities: {e}");
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        let entity_alias_index: Vec<(String, Uuid, String)> =
+            match db.as_ref().map(|d| d.entity_alias_index()) {
+                Some(Ok(rows)) => rows,
+                Some(Err(e)) => {
+                    eprintln!("kept: failed to load entity alias index: {e}");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            };
+        let cell_to_entity: std::collections::HashMap<Uuid, Uuid> =
+            match db.as_ref().map(|d| d.cell_to_entity_index()) {
+                Some(Ok(rows)) => rows.into_iter().collect(),
+                Some(Err(e)) => {
+                    eprintln!("kept: failed to load cell→entity index: {e}");
+                    std::collections::HashMap::new()
+                }
+                None => std::collections::HashMap::new(),
+            };
+        let entity_title_fallback: Vec<(Uuid, String)> = entities
+            .iter()
+            .filter(|e| e.primary_cell_id.is_some())
+            .map(|e| (e.id, normalize_title_for_fallback(&e.display_name)))
+            .collect();
 
         // Sweep: drop any closed context whose window contains no cells.
         // These are leftovers from earlier rotations on already-empty
@@ -638,6 +688,10 @@ impl KeptApp {
             focus_mode: false,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
+            entities,
+            entity_alias_index,
+            cell_to_entity,
+            entity_title_fallback,
             mouse_pos: (-1.0, -1.0),
         }
     }
@@ -683,27 +737,44 @@ impl KeptApp {
 
     /// Most recent open context's id — the writable target. Always Some in
     /// normal operation (the rotation/seed logic preserves the invariant).
-    /// `(title, source cell id)` for every cell tagged `#person`, deduped
-    /// case-insensitively by title and sorted alphabetically. Drives the
-    /// `@`-mention popup and supplies the link target for committed picks.
+    /// `(display_name, entity_id)` for every person entity, sorted
+    /// alphabetically. Thin view over `self.entities`. Drives the
+    /// `@`-mention popup; commit inserts `kept://<entity_id>` (invariant
+    /// #1 — the @-popup speaks entity-id space).
     fn person_entries(&self) -> Vec<(String, Uuid)> {
-        let mut out: Vec<(String, Uuid)> = Vec::new();
-        for cell in &self.cells {
-            if !cell
-                .heading_tag_names()
-                .iter()
-                .any(|n| n == PERSON_TAG)
-            {
-                continue;
-            }
-            if let Some(title) = cell.heading_title() {
-                if !out.iter().any(|(n, _)| n.eq_ignore_ascii_case(&title)) {
-                    out.push((title, cell.id));
-                }
-            }
-        }
+        let mut out: Vec<(String, Uuid)> = self
+            .entities
+            .iter()
+            .filter(|e| e.kind == "person")
+            .map(|e| (e.display_name.clone(), e.id))
+            .collect();
         out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
         out
+    }
+
+    /// Reload the entity caches from the DB. Called after every
+    /// `save_cell` / `delete_cell` so the in-memory state stays in lockstep
+    /// with the persistence layer's authoritative entity table.
+    fn refresh_entities(&mut self) {
+        let Some(db) = self.db.as_ref() else { return };
+        match db.all_entities() {
+            Ok(rows) => self.entities = rows,
+            Err(e) => eprintln!("kept: refresh_entities failed: {e}"),
+        }
+        match db.entity_alias_index() {
+            Ok(rows) => self.entity_alias_index = rows,
+            Err(e) => eprintln!("kept: entity_alias_index reload failed: {e}"),
+        }
+        match db.cell_to_entity_index() {
+            Ok(rows) => self.cell_to_entity = rows.into_iter().collect(),
+            Err(e) => eprintln!("kept: cell_to_entity_index reload failed: {e}"),
+        }
+        self.entity_title_fallback = self
+            .entities
+            .iter()
+            .filter(|e| e.primary_cell_id.is_some())
+            .map(|e| (e.id, normalize_title_for_fallback(&e.display_name)))
+            .collect();
     }
 
     fn person_names(&self) -> Vec<String> {
@@ -736,16 +807,21 @@ impl KeptApp {
     }
 
     /// Build the per-render `MatchContext`: today's date plus the resolved
-    /// person-cell UUID sets for any `@id` entity refs in the active AST.
-    /// Cheap (one pass over `cells` to build the person index, then one
-    /// per entity ref to resolve).
+    /// entity-id sets for any `@id` refs in the active AST. Both the alias
+    /// index and the title-fallback corpus are entity-derived (invariants
+    /// #1, #2). Cheap — both inputs are already cached on `self`.
     fn match_context(&self) -> query::MatchContext {
         let today = local_date_for_ms(now_epoch_ms());
-        let person_index = self.person_entries();
-        let person_targets =
-            query::resolve_persons(&self.view.ast.include.entities, &person_index);
-        let person_excludes =
-            query::resolve_persons(&self.view.ast.exclude.entities, &person_index);
+        let person_targets = query::resolve_persons(
+            &self.view.ast.include.entities,
+            &self.entity_alias_index,
+            &self.entity_title_fallback,
+        );
+        let person_excludes = query::resolve_persons(
+            &self.view.ast.exclude.entities,
+            &self.entity_alias_index,
+            &self.entity_title_fallback,
+        );
         query::MatchContext {
             today,
             person_targets,
@@ -1240,6 +1316,9 @@ impl KeptApp {
                 }
             }
         }
+        // Entity caches may have shifted from save/delete cell hooks
+        // (`#person`-tagged saves upsert; cell deletes detach). Reload.
+        self.refresh_entities();
     }
 
     fn set_font_scale(&mut self, scale: f32) -> bool {
@@ -3126,11 +3205,18 @@ impl KeptApp {
             return Vec::new();
         }
         let ast = query::parse(query);
-        let person_index = self.person_entries();
         let ctx = query::MatchContext {
             today: local_date_for_ms(now_epoch_ms()),
-            person_targets: query::resolve_persons(&ast.include.entities, &person_index),
-            person_excludes: query::resolve_persons(&ast.exclude.entities, &person_index),
+            person_targets: query::resolve_persons(
+                &ast.include.entities,
+                &self.entity_alias_index,
+                &self.entity_title_fallback,
+            ),
+            person_excludes: query::resolve_persons(
+                &ast.exclude.entities,
+                &self.entity_alias_index,
+                &self.entity_title_fallback,
+            ),
         };
         let mut hits: Vec<&Cell> = self
             .cells
@@ -3986,6 +4072,17 @@ fn local_date_for_ms(epoch_ms: i64) -> chrono::NaiveDate {
 /// match. If `query`'s residual text appears, show ~40 chars before + the
 /// match + ~40 after. Falls back to the leading window for queries that are
 /// entirely structured (`#tag`, `today`, etc. — no text to find).
+/// Normalize an entity's `display_name` into the form the resolver's
+/// title fallback substring-matches against. Same shape as
+/// `query::normalize_entity_token` — lowercase, strip whitespace and
+/// underscores — so a query token and a fallback entry compare cleanly.
+fn normalize_title_for_fallback(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && *c != '_')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 fn result_snippet(text: &str, query: &str) -> String {
     let flat: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
     // Pull the residual-text tail out of the parsed AST so structured

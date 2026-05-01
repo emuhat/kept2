@@ -406,28 +406,60 @@ fn collect_kept_link_uuids(cell: &Cell) -> HashSet<Uuid> {
 // Entity resolution helpers (used by KeptApp to build MatchContext)
 // ============================================================================
 
-/// Given the query's entity refs and the current `(name, uuid)` index of
-/// person cells, return the UUIDs that satisfy "normalized title contains
-/// normalized id". Normalization strips whitespace + underscores and
-/// lowercases — so `@patrick`, `@Patrick_Foy`, and `@patrickfoy` all
-/// resolve against a person titled "Patrick Foy".
-pub fn resolve_persons(refs: &[EntityRef], index: &[(String, Uuid)]) -> Vec<Uuid> {
+/// Resolve `@<id>` refs into entity UUIDs. Output is **always** entity
+/// IDs — never cell IDs (invariant #1).
+///
+/// Precedence (frozen):
+///   1. **Alias index.** Normalize the ref's id (lowercase, strip
+///      whitespace + underscores). Substring-match against normalized
+///      aliases for entries with `kind == "person"`. Collect entity_ids.
+///   2. **Title fallback.** Only runs for refs that scored zero hits in
+///      step 1. The candidate set is `title_fallback`, a precomputed
+///      list of `(entity_id, normalized_display_name)` for entities
+///      that have a `primary_cell_id`. Cells without an entity are
+///      *not* in this list and cannot contribute (invariant #2). The
+///      matching surface is the entity's canonical `display_name`,
+///      not the cell's mutable title (invariant #6 — `display_name`
+///      is the identity surface).
+///
+/// Tags are NOT consulted at any step (invariant #4).
+pub fn resolve_persons(
+    refs: &[EntityRef],
+    alias_index: &[(String, Uuid, String)],
+    title_fallback: &[(Uuid, String)],
+) -> Vec<Uuid> {
     let mut out: Vec<Uuid> = Vec::new();
     for r in refs.iter().filter(|r| matches!(r.kind, EntityKind::Person)) {
         let needle = normalize_entity_token(&r.id);
         if needle.is_empty() {
             continue;
         }
-        for (name, id) in index {
-            if normalize_entity_token(name).contains(&needle) && !out.contains(id) {
-                out.push(*id);
+        let before = out.len();
+        // Step 1: alias index.
+        for (alias, entity_id, kind) in alias_index {
+            if kind != "person" {
+                continue;
+            }
+            if normalize_entity_token(alias).contains(&needle)
+                && !out.contains(entity_id)
+            {
+                out.push(*entity_id);
+            }
+        }
+        if out.len() > before {
+            continue;
+        }
+        // Step 2: title fallback (entity-derived only).
+        for (entity_id, normalized_display) in title_fallback {
+            if normalized_display.contains(&needle) && !out.contains(entity_id) {
+                out.push(*entity_id);
             }
         }
     }
     out
 }
 
-fn normalize_entity_token(s: &str) -> String {
+pub(crate) fn normalize_entity_token(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_whitespace() && *c != '_')
         .map(|c| c.to_ascii_lowercase())
@@ -619,5 +651,81 @@ mod tests {
             resolve_time(&TimeFilter::Range(day(2026, 4, 1), day(2026, 4, 3)), t),
             (day(2026, 4, 1), day(2026, 4, 4))
         );
+    }
+
+    // ----- entity resolution -----
+
+    fn person_ref(id: &str) -> EntityRef {
+        EntityRef {
+            kind: EntityKind::Person,
+            id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_alias_match_returns_entity_id() {
+        let entity_id = Uuid::now_v7();
+        let cell_id = Uuid::now_v7(); // distinct from entity_id — invariant #1/3
+        let alias_index = vec![("patrick_foy".to_string(), entity_id, "person".to_string())];
+        // title_fallback contains a different entity to prove the alias path
+        // wins and returns its own entity_id, never the cell_id.
+        let title_fallback = vec![(cell_id, "patrickfoy".to_string())];
+        let got = resolve_persons(&[person_ref("Patrick_Foy")], &alias_index, &title_fallback);
+        assert_eq!(got, vec![entity_id]);
+    }
+
+    #[test]
+    fn resolve_excludes_non_person_kinds() {
+        let thread_id = Uuid::now_v7();
+        let alias_index = vec![("login_bug".to_string(), thread_id, "thread".to_string())];
+        let got = resolve_persons(&[person_ref("login_bug")], &alias_index, &[]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn resolve_title_fallback_returns_entity_id() {
+        let entity_id = Uuid::now_v7();
+        // Empty alias index forces the fallback.
+        let title_fallback = vec![(entity_id, "patrickfoy".to_string())];
+        let got = resolve_persons(&[person_ref("patrick")], &[], &title_fallback);
+        assert_eq!(got, vec![entity_id]);
+    }
+
+    #[test]
+    fn resolve_title_fallback_only_has_entities() {
+        // Cells without an entity row contribute nothing to the fallback —
+        // the fallback corpus is entity-derived. Empty fallback → no match.
+        let got = resolve_persons(&[person_ref("patrick")], &[], &[]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn resolve_alias_wins_over_fallback() {
+        let alias_entity = Uuid::now_v7();
+        let fallback_entity = Uuid::now_v7();
+        let alias_index = vec![
+            ("patrick_foy".to_string(), alias_entity, "person".to_string()),
+        ];
+        let title_fallback = vec![(fallback_entity, "patrickfoy".to_string())];
+        let got = resolve_persons(&[person_ref("patrick")], &alias_index, &title_fallback);
+        assert_eq!(got, vec![alias_entity]);
+    }
+
+    #[test]
+    fn resolve_falls_back_only_for_refs_with_zero_alias_hits() {
+        // Two refs: `@patrick` (alias-hits), `@dana` (alias-misses → fallback).
+        let patrick_id = Uuid::now_v7();
+        let dana_id = Uuid::now_v7();
+        let alias_index = vec![
+            ("patrick_foy".to_string(), patrick_id, "person".to_string()),
+        ];
+        let title_fallback = vec![(dana_id, "danadoe".to_string())];
+        let got = resolve_persons(
+            &[person_ref("patrick"), person_ref("dana")],
+            &alias_index,
+            &title_fallback,
+        );
+        assert!(got.contains(&patrick_id));
+        assert!(got.contains(&dana_id));
     }
 }
