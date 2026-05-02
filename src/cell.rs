@@ -231,6 +231,17 @@ pub struct TextBox {
     /// markdown heading (text starts with `"# "` — heading is the first
     /// paragraph). Used to render that paragraph in bold.
     line_is_heading: Vec<bool>,
+    /// Aligned with `body_lines`: true when the source paragraph the line
+    /// belongs to is a comment (only meaningful when
+    /// `enable_comment_coloring` is set). PopPop input cells use this to
+    /// paint `#`-prefixed lines in dark green; everywhere else this stays
+    /// all-false and is a no-op.
+    line_is_comment: Vec<bool>,
+    /// Aligned with `body_lines`: extra vertical space (logical px) added
+    /// at the bottom of each visual line. Used by PopPop to reserve room
+    /// for an error message immediately under the failing input row;
+    /// elsewhere this stays empty (or all-zero) and is a no-op.
+    line_extra_below: Vec<f32>,
     /// Aligned with `body_lines`: for heading lines that contain trailing
     /// `#tag` tokens, holds `(title_end_offset, first_tag_offset)` line-
     /// relative byte offsets. The title spans `[0, title_end_offset)`,
@@ -260,6 +271,16 @@ pub struct TextBox {
     /// title slot. When false, the textbox is plain body text — no auto-
     /// heading from a leading `# `.
     force_heading: bool,
+    /// When true, source paragraphs that start with `#` are classified as
+    /// comments at wrap time and painted in dark green at draw time.
+    /// PopPop input cells flip this on; everywhere else it's false.
+    enable_comment_coloring: bool,
+    /// URL set by a click on a link, drained by the app layer post-click.
+    /// We can't navigate from inside `mouse_down` because routing
+    /// `kept://...` requires the entity / cell caches that live on
+    /// `KeptApp`. Buffering here keeps click detection in the cell while
+    /// keeping navigation policy in the app.
+    pending_link_url: Option<String>,
 }
 
 impl TextBox {
@@ -270,6 +291,8 @@ impl TextBox {
             sels: Selections::single_caret(0),
             body_lines: Vec::new(),
             line_is_heading: Vec::new(),
+            line_is_comment: Vec::new(),
+            line_extra_below: Vec::new(),
             line_tag_layout: Vec::new(),
             body_lines_width: f32::NAN,
             line_bands: Vec::new(),
@@ -285,7 +308,17 @@ impl TextBox {
             links: Vec::new(),
             text_color: Color::from_rgb(0x1c, 0x1c, 0x1c),
             force_heading: false,
+            enable_comment_coloring: false,
+            pending_link_url: None,
         }
+    }
+
+    /// Drain a link URL set by a click in the most recent `mouse_down`.
+    /// The app layer calls this after dispatching mouse_down to route
+    /// `kept://...` URLs to the entity / cell view (or fall through to
+    /// `open_url` for external URLs).
+    pub fn take_pending_link_url(&mut self) -> Option<String> {
+        self.pending_link_url.take()
     }
 
     /// Override the body-text color. Used by PopPopCell for the output
@@ -304,6 +337,30 @@ impl TextBox {
         }
         self.force_heading = on;
         // Wrap cache must be rebuilt because line height / font changed.
+        self.body_lines_width = f32::NAN;
+        self.rewrap();
+    }
+
+    /// Per-visual-line extra vertical space (logical px), aligned with
+    /// `body_lines`. PopPopCell uses this to reserve room beneath an
+    /// erroring input row for the error message; both the input and
+    /// output columns get the same extras so rows stay aligned.
+    /// Vectors of the wrong length are tolerated — `layout()` resizes to
+    /// match `body_lines` next call (zero-padding new lines, truncating
+    /// overflow).
+    pub fn set_line_extra_below(&mut self, extras: Vec<f32>) {
+        self.line_extra_below = extras;
+    }
+
+    /// Opt this textbox into comment coloring: source paragraphs that
+    /// start with `#` get classified as comments at wrap time and painted
+    /// in dark green. Used by `PopPopCell`'s input column.
+    pub fn set_enable_comment_coloring(&mut self, on: bool) {
+        if self.enable_comment_coloring == on {
+            return;
+        }
+        self.enable_comment_coloring = on;
+        // Re-classify lines on next layout.
         self.body_lines_width = f32::NAN;
         self.rewrap();
     }
@@ -740,18 +797,26 @@ impl TextBox {
 
         let max_text_width = width.max(80.0);
         if self.body_lines_width != max_text_width {
-            let (lines, headings) = wrap_text_styled(
+            let (lines, headings, comments) = wrap_text_styled(
                 &self.text,
                 &body_font,
                 &heading_font,
                 &paint,
                 max_text_width,
                 self.force_heading,
+                self.enable_comment_coloring,
             );
             self.body_lines = lines;
             self.line_is_heading = headings;
+            self.line_is_comment = comments;
             self.body_lines_width = max_text_width;
             self.recompute_line_tag_layout();
+        }
+        // Keep `line_extra_below` aligned with `body_lines` length. New
+        // entries default to 0 (no extra spacing). PopPopCell may
+        // overwrite this via `set_line_extra_below` between layout calls.
+        if self.line_extra_below.len() != self.body_lines.len() {
+            self.line_extra_below.resize(self.body_lines.len(), 0.0);
         }
 
         let (_, body_metrics) = body_font.metrics();
@@ -767,7 +832,8 @@ impl TextBox {
             };
             let step = -m.ascent + m.descent + m.leading;
             let extra = step * 0.25;
-            let line_advance = step + extra;
+            let line_advance = step + extra
+                + self.line_extra_below.get(li).copied().unwrap_or(0.0);
             // top = cur_local; bottom = top + line_advance.
             self.line_bands.push((cur_local, cur_local + line_advance));
             cur_local += line_advance;
@@ -881,6 +947,11 @@ impl TextBox {
         underline_paint.set_anti_alias(true);
         underline_paint.set_color(Color::from_rgb(0x1a, 0x66, 0xc4));
         underline_paint.set_stroke_width(1.0);
+        // Dark-green paint used for `#`-comment lines when comment coloring
+        // is enabled (PopPop input cells). Built once per tick.
+        let mut comment_paint = Paint::default();
+        comment_paint.set_anti_alias(true);
+        comment_paint.set_color(Color::from_rgb(0x1f, 0x6b, 0x2a));
         for (li, line) in self.body_lines.iter().enumerate() {
             let baseline = baselines_local[li] + y;
             // Trailing '\n' is part of the line range but not drawn.
@@ -890,6 +961,11 @@ impl TextBox {
                 &heading_font
             } else {
                 &body_font
+            };
+            let line_paint = if self.line_is_comment.get(li).copied().unwrap_or(false) {
+                &comment_paint
+            } else {
+                &text_paint
             };
             let layout = self.line_tag_layout.get(li).copied().flatten();
             if let Some((title_end, first_tag)) = layout {
@@ -940,7 +1016,7 @@ impl TextBox {
                     &self.text[visible_line.clone()],
                     Point::new(x, baseline),
                     line_font,
-                    &text_paint,
+                    line_paint,
                 );
             } else {
                 draw_line_with_links(
@@ -951,7 +1027,7 @@ impl TextBox {
                     x,
                     baseline,
                     line_font,
-                    &text_paint,
+                    line_paint,
                     &link_paint,
                     &underline_paint,
                 );
@@ -1104,7 +1180,7 @@ impl TextBox {
             editing && primary_mod(mods) && !mods.shift_key() && !mods.alt_key();
         if plain_in_view || modified_in_edit {
             if let Some(link) = self.link_at(idx) {
-                open_url(&link.url);
+                self.pending_link_url = Some(link.url.clone());
                 return true;
             }
         }
@@ -1578,22 +1654,26 @@ impl TextBox {
         if self.body_lines_width.is_nan() {
             self.body_lines.clear();
             self.line_is_heading.clear();
+            self.line_is_comment.clear();
+            self.line_extra_below.clear();
             self.line_tag_layout.clear();
             return;
         }
         let body_font = self.body_font();
         let heading_font = self.heading_font();
         let paint = Paint::default();
-        let (lines, headings) = wrap_text_styled(
+        let (lines, headings, comments) = wrap_text_styled(
             &self.text,
             &body_font,
             &heading_font,
             &paint,
             self.body_lines_width,
             self.force_heading,
+            self.enable_comment_coloring,
         );
         self.body_lines = lines;
         self.line_is_heading = headings;
+        self.line_is_comment = comments;
         self.recompute_line_tag_layout();
     }
 }
@@ -1966,17 +2046,26 @@ fn wrap_text_styled(
     paint: &Paint,
     max_width: f32,
     force_heading: bool,
-) -> (Vec<Range<usize>>, Vec<bool>) {
+    enable_comment_coloring: bool,
+) -> (Vec<Range<usize>>, Vec<bool>, Vec<bool>) {
     if text.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let mut lines: Vec<Range<usize>> = Vec::new();
     let mut is_heading: Vec<bool> = Vec::new();
+    let mut is_comment: Vec<bool> = Vec::new();
     let mut start = 0usize;
     loop {
         let nl = text[start..].find('\n').map(|p| start + p);
         let para_end = nl.unwrap_or(text.len());
         let font = if force_heading { heading_font } else { body_font };
+        // Comment classification per source paragraph: leading `#`
+        // (after optional whitespace) marks the whole paragraph,
+        // including any wrapped continuations, as a comment.
+        let para_is_comment = enable_comment_coloring
+            && text[start..para_end]
+                .trim_start()
+                .starts_with('#');
         let prev = lines.len();
         wrap_paragraph_into(text, start, para_end, font, paint, max_width, &mut lines);
         let consumed_to = nl.map(|i| i + 1).unwrap_or(text.len());
@@ -1985,13 +2074,14 @@ fn wrap_text_styled(
         }
         for _ in prev..lines.len() {
             is_heading.push(force_heading);
+            is_comment.push(para_is_comment);
         }
         match nl {
             Some(i) => start = i + 1,
             None => break,
         }
     }
-    (lines, is_heading)
+    (lines, is_heading, is_comment)
 }
 
 /// Word-wrap a single paragraph (no '\n' inside) and append its lines to `out`.
@@ -2090,6 +2180,13 @@ impl Bullet {
     pub fn textbox(&self) -> &TextBox {
         &self.textbox
     }
+
+    /// Drain any pending link URL the bullet's textbox stashed during
+    /// the most recent `mouse_down`. Used by the `Cell` aggregator that
+    /// feeds `KeptApp::handle_link_click`.
+    pub fn take_pending_link_url(&mut self) -> Option<String> {
+        self.textbox.take_pending_link_url()
+    }
 }
 
 struct OutlineDrag {
@@ -2179,6 +2276,17 @@ impl OutlineCell {
 
     pub fn bullets(&self) -> &[Bullet] {
         &self.bullets
+    }
+
+    /// Drain the first pending link URL across all bullets. At most one
+    /// can be set per `mouse_down` (only the clicked bullet stashes it).
+    pub fn take_pending_link_url(&mut self) -> Option<String> {
+        for b in &mut self.bullets {
+            if let Some(url) = b.take_pending_link_url() {
+                return Some(url);
+            }
+        }
+        None
     }
 
     /// Resolve the bullet index containing the given absolute y. Clamps to
@@ -3119,6 +3227,19 @@ impl CellSnapshot {
 
 /// Width split between input (left) and output (right) in a PopPop cell.
 const POPPOP_INPUT_RATIO: f32 = 0.7;
+/// Font size used to render PopPop error messages beneath the input row
+/// that produced them. Chosen smaller than the body so a long error fits
+/// in the gap and reads as subordinate to the expression above it.
+const POPPOP_ERROR_FONT_SIZE: f32 = 13.0;
+/// Horizontal indent (logical px) of the error text from the cell's left
+/// edge. Mild indent makes the error visually attach to its row.
+const POPPOP_ERROR_INDENT: f32 = 14.0;
+/// Padding (logical px) added below the error baseline before the next
+/// row begins. Keeps the error from kissing the divider above the row
+/// underneath.
+const POPPOP_ERROR_BOTTOM_PAD: f32 = 4.0;
+/// Dark red used for PopPop error text.
+const POPPOP_ERROR_RGB: (u8, u8, u8) = (0x9a, 0x1e, 0x1e);
 
 // ----- Shared "calc grid" visual style (PopPop + Table) -----
 //
@@ -3180,6 +3301,10 @@ pub struct PopPopCell {
     /// Last input-text snapshot the output was computed against. Output
     /// is recomputed only when this differs from the live `textbox.text()`.
     cached_input: String,
+    /// `(committed_paragraph_idx, message)` for input lines that failed
+    /// to evaluate. Refreshed on each recompute alongside the output.
+    /// Rendered in dark red beneath the input row at draw time.
+    errors: Vec<(usize, String)>,
     x_origin: f32,
     y_origin: f32,
     width: f32,
@@ -3191,21 +3316,34 @@ pub struct PopPopCell {
 /// paragraph is skipped — it's the line being typed, where mid-stream
 /// parse errors would be noisy. Output index `i` aligns with input
 /// paragraph `i`. Empty / whitespace-only lines and parse / eval errors
-/// render as empty strings (the row is left blank).
+/// render as empty strings in the output column; errors are surfaced
+/// separately as `(paragraph_idx, message)` so the cell can render them
+/// in red beneath the failing row.
 ///
 /// `engine.reset()` runs at the top so stale bindings from prior
 /// invocations don't leak. The caller controls when this helper runs
 /// (currently: only when input text changes), so the cost is bounded.
-fn compute_poppop_output(input: &str, engine: &mut poppop::Engine) -> Vec<String> {
+fn compute_poppop_output(
+    input: &str,
+    engine: &mut poppop::Engine,
+) -> (Vec<String>, Vec<(usize, String)>) {
     engine.reset();
     let paragraphs: Vec<&str> = input.split('\n').collect();
     if paragraphs.len() <= 1 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let committed = &paragraphs[..paragraphs.len() - 1];
     let mut out: Vec<String> = Vec::with_capacity(committed.len());
-    for line in committed {
-        if line.trim().is_empty() {
+    let mut errs: Vec<(usize, String)> = Vec::new();
+    for (idx, line) in committed.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        // Comments: lines starting with `#` are notes, not expressions.
+        // They render in dark green on the input side and emit no output.
+        if trimmed.starts_with('#') {
             out.push(String::new());
             continue;
         }
@@ -3217,22 +3355,35 @@ fn compute_poppop_output(input: &str, engine: &mut poppop::Engine) -> Vec<String
                 };
                 out.push(poppop::format_value(v));
             }
-            Err(_) => out.push(String::new()),
+            Err(e) => {
+                out.push(String::new());
+                // Some errors (notably pest parse errors) carry multi-line
+                // messages with visual pointers. Trim to the first line so
+                // the error fits on a single line under the input row.
+                let full = e.to_string();
+                let first = full.lines().next().unwrap_or("").to_string();
+                errs.push((idx, first));
+            }
         }
     }
-    out
+    (out, errs)
 }
 
 impl PopPopCell {
     pub fn new(typeface: Typeface) -> Self {
         let mut output = TextBox::new(typeface.clone(), String::new());
         output.set_text_color(Color::from_rgb(0x18, 0x3a, 0x9c));
+        let mut input = TextBox::new(typeface.clone(), String::new());
+        // PopPop is the only cell type that wants `#`-prefixed lines
+        // colored as comments (and skipped by the evaluator).
+        input.set_enable_comment_coloring(true);
         Self {
             typeface: typeface.clone(),
-            textbox: TextBox::new(typeface, String::new()),
+            textbox: input,
             output,
             engine: poppop::Engine::new(),
             cached_input: String::new(),
+            errors: Vec::new(),
             x_origin: 0.0,
             y_origin: 0.0,
             width: 0.0,
@@ -3242,6 +3393,13 @@ impl PopPopCell {
 
     pub fn textbox(&self) -> &TextBox {
         &self.textbox
+    }
+
+    /// Drain a pending link URL from either the input or output column.
+    pub fn take_pending_link_url(&mut self) -> Option<String> {
+        self.textbox
+            .take_pending_link_url()
+            .or_else(|| self.output.take_pending_link_url())
     }
 
     pub fn textbox_mut(&mut self) -> &mut TextBox {
@@ -3289,26 +3447,62 @@ impl PopPopCell {
         let output_x = divider_x + pad;
         let output_w = (x + width - output_x).max(20.0);
 
-        // 1) Layout the input column (no draw).
+        // 1) Layout the input column (no draw). Populates body_lines so
+        //    we can size error padding per row.
         self.textbox.layout(x, y, input_w);
 
-        // 2) Sync output text + position. Each non-last input source line
+        // 2) Sync output text + errors. Each non-last input source line
         //    gets the formatted poppop result; output row N aligns with
         //    input row N. Recompute only when the input text has changed
         //    (gated on `cached_input`) so we don't re-eval every render.
-        let bands = self.textbox.source_line_y_bands();
         let current_input = self.textbox.text().to_string();
         if current_input != self.cached_input {
-            let lines = compute_poppop_output(&current_input, &mut self.engine);
+            let (lines, errs) = compute_poppop_output(&current_input, &mut self.engine);
             let new_output_text = lines.join("\n");
             if self.output.text() != new_output_text {
                 self.output.replace_text(new_output_text);
             }
+            self.errors = errs;
             self.cached_input = current_input;
         }
+
+        // 3) Reserve vertical space beneath any erroring row for the
+        //    error message. Apply identical extras to both columns so
+        //    rows stay aligned. v1: assumes one body_line per source
+        //    paragraph (no wrap), so paragraph_idx == body_line_idx.
+        let err_font = Font::from_typeface(
+            &self.typeface,
+            POPPOP_ERROR_FONT_SIZE * scale,
+        );
+        let (_, err_m) = err_font.metrics();
+        let err_step = -err_m.ascent + err_m.descent + err_m.leading;
+        let err_total = err_step + POPPOP_ERROR_BOTTOM_PAD * scale;
+
+        let input_line_count = self.textbox.visual_line_count();
+        let mut input_extras = vec![0.0_f32; input_line_count];
+        for &(paragraph_idx, _) in &self.errors {
+            if let Some(slot) = input_extras.get_mut(paragraph_idx) {
+                *slot += err_total;
+            }
+        }
+        self.textbox.set_line_extra_below(input_extras);
+        // Re-layout the input so source_line_y_bands reflects the new
+        // extras (the next textbox.tick call will be a no-op layout).
+        self.textbox.layout(x, y, input_w);
+
+        let output_line_count = self.output.visual_line_count();
+        let mut output_extras = vec![0.0_f32; output_line_count];
+        for &(paragraph_idx, _) in &self.errors {
+            if let Some(slot) = output_extras.get_mut(paragraph_idx) {
+                *slot += err_total;
+            }
+        }
+        self.output.set_line_extra_below(output_extras);
         self.output.layout(output_x, y, output_w);
 
-        // 3) Alternating stripes BEHIND text. Stripe odd-indexed bands so
+        let bands = self.textbox.source_line_y_bands();
+
+        // 4) Alternating stripes BEHIND text. Stripe odd-indexed bands so
         //    rows alternate plain/blue down the full cell width.
         let calc_bands: Vec<(f32, f32)> = bands
             .iter()
@@ -3316,20 +3510,42 @@ impl PopPopCell {
             .collect();
         draw_alternating_row_stripes(canvas, &calc_bands, x, x + width);
 
-        // 4) Draw input text on top of stripes.
+        // 5) Draw input text on top of stripes.
         let input_h = self
             .textbox
             .tick(canvas, x, y, input_w, focused, show_caret);
 
-        // 5) Vertical divider, muted.
+        // 6) Vertical divider, muted.
         draw_vertical_divider(canvas, divider_x, y + 2.0, y + input_h - 2.0);
 
-        // 6) Output column. Render with focused=has_selection so its
+        // 7) Output column. Render with focused=has_selection so its
         //    selection highlight shows even though the cell's keyboard focus
         //    is on the input. Caret is suppressed (read-only).
         let output_focused = self.output.has_selection();
         self.output
             .tick(canvas, output_x, y, output_w, output_focused, false);
+
+        // 8) Draw error messages in dark red within the reserved extra
+        //    space at the bottom of each erroring row's input band. The
+        //    baseline sits `BOTTOM_PAD + descent` above the band's bot.
+        if !self.errors.is_empty() {
+            let mut err_paint = Paint::default();
+            err_paint.set_anti_alias(true);
+            let (er, eg, eb) = POPPOP_ERROR_RGB;
+            err_paint.set_color(Color::from_rgb(er, eg, eb));
+            for (paragraph_idx, msg) in &self.errors {
+                let Some(&(_, bot_abs, _)) = bands.get(*paragraph_idx) else {
+                    continue;
+                };
+                let baseline = bot_abs - POPPOP_ERROR_BOTTOM_PAD * scale - err_m.descent;
+                canvas.draw_str(
+                    msg,
+                    Point::new(x + POPPOP_ERROR_INDENT * scale, baseline),
+                    &err_font,
+                    &err_paint,
+                );
+            }
+        }
 
         self.height = input_h;
         input_h
@@ -4002,6 +4218,18 @@ impl TableCell {
     pub fn rows_view(&self) -> &[Vec<TableEntry>] {
         &self.cells
     }
+
+    /// Drain the first pending link URL from any of the inner cells.
+    pub fn take_pending_link_url(&mut self) -> Option<String> {
+        for row in &mut self.cells {
+            for entry in row {
+                if let Some(url) = entry.textbox.take_pending_link_url() {
+                    return Some(url);
+                }
+            }
+        }
+        None
+    }
 }
 
 pub struct Cell {
@@ -4363,6 +4591,24 @@ impl Cell {
                 out
             }
             _ => body,
+        }
+    }
+
+    /// Drain the first link URL stashed by any inner `TextBox` during
+    /// the most recent `mouse_down`. The app layer calls this after
+    /// dispatching the click and routes the URL via `handle_link_click`.
+    /// Walks title + body + nested elements in order.
+    pub fn take_pending_link_url(&mut self) -> Option<String> {
+        if let Some(t) = self.title.as_mut() {
+            if let Some(url) = t.take_pending_link_url() {
+                return Some(url);
+            }
+        }
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.take_pending_link_url(),
+            CellKind::Outline(oc) => oc.take_pending_link_url(),
+            CellKind::PopPop(pc) => pc.take_pending_link_url(),
+            CellKind::Table(tc) => tc.take_pending_link_url(),
         }
     }
 
@@ -5068,10 +5314,11 @@ mod tests {
     #[test]
     fn poppop_evaluates_committed_lines() {
         // "2 + 3\nx" — first line is committed, second is the line being
-        // typed (last → skipped). Output is one line: "5".
+        // typed (last → skipped). Output is one line: "5". No errors.
         let mut e = poppop::Engine::new();
-        let out = compute_poppop_output("2 + 3\nx", &mut e);
+        let (out, errs) = compute_poppop_output("2 + 3\nx", &mut e);
         assert_eq!(out, vec!["5".to_string()]);
+        assert!(errs.is_empty());
     }
 
     #[test]
@@ -5080,22 +5327,75 @@ mod tests {
         // committed thanks to the trailing newline (final paragraph is
         // empty and skipped as the "last").
         let mut e = poppop::Engine::new();
-        let out = compute_poppop_output("x = 4\nx * 2\n", &mut e);
+        let (out, errs) = compute_poppop_output("x = 4\nx * 2\n", &mut e);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], "4");
         assert_eq!(out[1], "8");
+        assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn poppop_comments_are_skipped_and_not_evaluated() {
+        // Lines starting with `#` are notes — they don't go through the
+        // engine and they emit no output (the row stays blank). Whatever
+        // follows still evaluates with the engine state untouched.
+        let mut e = poppop::Engine::new();
+        let (out, errs) = compute_poppop_output("# rent calc\nx = 1200\nx * 12\n", &mut e);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], "");      // comment row
+        assert_eq!(out[1], "1200");  // x = 1200 binds + emits the value
+        assert_eq!(out[2], "14400"); // x * 12 sees x = 1200
+        assert!(errs.is_empty());
     }
 
     #[test]
     fn poppop_blank_and_error_lines_are_empty() {
-        // Blank line → empty. Parse error (`1 +`) → empty. Valid line
-        // produces its formatted result. All three are committed because
-        // of the trailing newline.
+        // Blank line → empty (no error). Parse error (`1 +`) → empty
+        // output, recorded in `errs`. Valid line produces its formatted
+        // result. All three are committed because of the trailing newline.
         let mut e = poppop::Engine::new();
-        let out = compute_poppop_output("\n1 +\n3 + 4\n", &mut e);
+        let (out, errs) = compute_poppop_output("\n1 +\n3 + 4\n", &mut e);
         assert_eq!(
             out,
             vec![String::new(), String::new(), "7".to_string()]
+        );
+        // Only the `1 +` line (paragraph 1) errors. Blank lines don't
+        // hit the engine; valid lines don't error.
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].0, 1);
+        assert!(!errs[0].1.is_empty(), "error message is non-empty");
+    }
+
+    #[test]
+    fn poppop_undefined_variable_surfaces_as_error() {
+        // Reading an unbound name produces an `undefined variable: …`
+        // error from the engine. The output column for that row stays
+        // blank; the error is reported via the second return.
+        let mut e = poppop::Engine::new();
+        let (out, errs) = compute_poppop_output("y\n", &mut e);
+        assert_eq!(out, vec![String::new()]);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].0, 0);
+        // Should mention the offending name.
+        assert!(
+            errs[0].1.contains('y'),
+            "error message should mention the variable: {:?}",
+            errs[0].1
+        );
+    }
+
+    #[test]
+    fn poppop_error_message_is_single_line() {
+        // Pest parse errors produce multi-line messages with visual
+        // pointers. We trim to the first line so the message renders in
+        // the single-line slot below the input row.
+        let mut e = poppop::Engine::new();
+        let (_out, errs) = compute_poppop_output("1 +\n", &mut e);
+        assert_eq!(errs.len(), 1);
+        assert!(
+            !errs[0].1.contains('\n'),
+            "error message must not contain newlines: {:?}",
+            errs[0].1
         );
     }
 

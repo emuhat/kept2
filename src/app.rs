@@ -11,7 +11,7 @@ use winit::{
     keyboard::{Key, NamedKey},
 };
 
-use crate::cell::{Cell, CellSnapshot, TextBox, now_epoch_ms, primary_mod};
+use crate::cell::{self, Cell, CellSnapshot, TextBox, now_epoch_ms, primary_mod};
 use crate::persist::{ContextRef, Db, Entity, db_path};
 use crate::query;
 
@@ -57,7 +57,8 @@ const PERSON_TAG: &str = "person";
 
 /// Subsequence fuzzy match. Returns `(score, matched_byte_positions)` if every
 /// query char appears in `candidate` (case-insensitive) in order; None otherwise.
-/// Bonuses: start-of-string, post-separator, contiguous-with-previous-match.
+/// Bonuses: start-of-string, post-separator (whitespace/punctuation OR a
+/// camelCase boundary in the original candidate), contiguous-with-previous-match.
 /// Length penalty so shorter candidates win ties.
 fn fuzzy_score(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
     if query.is_empty() {
@@ -67,6 +68,12 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
     let c_lower = candidate.to_lowercase();
     let q = q_lower.as_bytes();
     let c = c_lower.as_bytes();
+    // CamelCase detection reads the original candidate to spot the
+    // lower→upper transition that splits "PeterCarr" into "Peter|Carr".
+    // Only valid when lowercased and original line up byte-for-byte
+    // (true for ASCII names; false when `to_lowercase` reflowed bytes).
+    let orig = candidate.as_bytes();
+    let camel_aligned = orig.len() == c.len();
 
     let mut matches: Vec<usize> = Vec::with_capacity(q.len());
     let mut qi = 0;
@@ -82,6 +89,14 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
             if i == 0 {
                 score += 8;
             } else if !c[i - 1].is_ascii_alphanumeric() {
+                score += 4;
+            } else if camel_aligned
+                && orig[i].is_ascii_uppercase()
+                && orig[i - 1].is_ascii_lowercase()
+            {
+                // CamelCase boundary inside an otherwise unbroken run —
+                // e.g. the `C` in `PeterCarr` starts a new name component
+                // even though there's no separator character.
                 score += 4;
             }
             if let Some(prev) = prev_match {
@@ -104,6 +119,41 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
 
 /// Rank `names` by fuzzy match against `query`. Empty query returns the
 /// names in their input order.
+/// Split a cell title's text into `(name_part, trailing_tags)` so a rename
+/// can substitute the name without losing tags. Tags are recognized as a
+/// trailing run of whitespace-delimited `#word` tokens (matching the
+/// persistence layer's parse_trailing_tags). Both pieces have their
+/// surrounding whitespace stripped at the boundary; `tags` retains its
+/// `#` prefix and any internal spacing.
+fn split_title_name_and_tags(text: &str) -> (String, String) {
+    let bytes = text.as_bytes();
+    let mut end = bytes.len();
+    let mut tags_start = end;
+    loop {
+        while end > 0 && (bytes[end - 1] as char).is_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            break;
+        }
+        let mut start = end;
+        while start > 0 && !(bytes[start - 1] as char).is_whitespace() {
+            start -= 1;
+        }
+        if start < end && bytes[start] == b'#' {
+            tags_start = start;
+            end = start;
+        } else {
+            break;
+        }
+    }
+    let mut name_end = tags_start;
+    while name_end > 0 && (bytes[name_end - 1] as char).is_whitespace() {
+        name_end -= 1;
+    }
+    (text[..name_end].to_string(), text[tags_start..].to_string())
+}
+
 fn filter_mentions(names: &[String], query: &str) -> Vec<(String, Vec<usize>)> {
     if query.is_empty() {
         return names.iter().map(|n| (n.clone(), Vec::new())).collect();
@@ -168,19 +218,64 @@ enum NewCellKind {
     Table,
 }
 
+/// Sidebar PAGES section row identity. v1 has just `People`; new entries
+/// land here as the section grows (threads, saved queries, etc).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageKind {
+    People,
+}
+
+/// In-progress inline rename of a People-page row. While `Some`, the row's
+/// static label is replaced by `input.tick(...)` and Enter / Esc / clicks
+/// outside drive commit / cancel.
+struct PeopleRenameState {
+    entity_id: Uuid,
+    input: TextBox,
+}
+
+/// Right-click menu over a People-page row. `deletable` and `ref_count`
+/// are precomputed at open time so the menu render doesn't have to walk
+/// every cell's links each frame; if the user creates a new mention
+/// while the menu is open, they'll see stale state — that's fine, the
+/// menu is dismissed by any click anyway.
+struct PeopleContextMenu {
+    entity_id: Uuid,
+    anchor_x: f32,
+    anchor_y: f32,
+    /// True when the entity has no `primary_cell_id` AND zero `kept://`
+    /// references in any cell. Drives the Delete row's enabled state.
+    deletable: bool,
+    /// Reference count surfaced as muted text under "Delete" when the
+    /// entity isn't deletable. `None` when deletable (zero, suppressed).
+    ref_count: Option<usize>,
+}
+
 /// What the user is viewing in the doc area / highlighting in the sidebar.
-/// One of two modes:
-/// - `context_view = Some(uuid)` → show that context's `[start, end)`
-///   window. Used by the sidebar's context rows + rotation flow. Doesn't
-///   fit the spec's time grammar cleanly so it's a dedicated escape hatch.
-/// - `context_view = None` → filter cells through `ast` (the v0.1 query
-///   language). Empty AST matches every cell.
 ///
-/// Decoupled from the writable-target context (which is always the most
-/// recent open one).
+/// - `Ast` — filter cells through `Query.ast` (the v0.1 query language).
+///   Empty AST matches every cell.
+/// - `Context(uuid)` — show that context's `[start, end)` window. Used by
+///   the sidebar's context rows + rotation flow. Doesn't fit the spec's
+///   time grammar cleanly so it's a dedicated escape hatch.
+/// - `Entity(uuid)` — entity page for that entity (header + backing-cell
+///   section). Cells loop is bypassed; the page is rendered bespoke.
+/// - `People` — directory of `kind=person` entities. Bespoke render.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+enum ViewKind {
+    #[default]
+    Ast,
+    Context(Uuid),
+    Entity(Uuid),
+    People,
+}
+
+/// What the user is viewing in the doc area / highlighting in the sidebar.
+/// `view_kind` is the discriminator; `ast` is consulted only when
+/// `view_kind == Ast`. Decoupled from the writable-target context (which
+/// is always the most recent open one).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 struct Query {
-    context_view: Option<Uuid>,
+    view_kind: ViewKind,
     ast: query::Ast,
 }
 
@@ -190,35 +285,50 @@ impl Query {
         Self::default()
     }
     fn context(id: Uuid) -> Self {
-        Self { context_view: Some(id), ast: query::Ast::default() }
+        Self { view_kind: ViewKind::Context(id), ast: query::Ast::default() }
     }
     fn date(d: chrono::NaiveDate) -> Self {
         let mut ast = query::Ast::default();
         ast.include.time = Some(query::TimeFilter::Day(d));
-        Self { context_view: None, ast }
+        Self { view_kind: ViewKind::Ast, ast }
     }
     fn tag(name: String) -> Self {
         let mut ast = query::Ast::default();
         ast.include.tags = vec![name.to_lowercase()];
-        Self { context_view: None, ast }
+        Self { view_kind: ViewKind::Ast, ast }
+    }
+    fn entity(id: Uuid) -> Self {
+        Self { view_kind: ViewKind::Entity(id), ast: query::Ast::default() }
+    }
+    #[allow(dead_code)]
+    fn people() -> Self {
+        Self { view_kind: ViewKind::People, ast: query::Ast::default() }
     }
     #[allow(dead_code)]
     fn from_text(input: &str) -> Self {
-        Self { context_view: None, ast: query::parse(input) }
+        Self { view_kind: ViewKind::Ast, ast: query::parse(input) }
     }
-    /// Round-trip back into a query-language string. None when this is a
-    /// context view (no clean text representation).
+    /// Context id when in Context view; None otherwise. Convenience for
+    /// the prev/next-context navigation that only operates in that view.
+    fn context_view(&self) -> Option<Uuid> {
+        match self.view_kind {
+            ViewKind::Context(id) => Some(id),
+            _ => None,
+        }
+    }
+    /// Round-trip back into a query-language string. None for any non-Ast
+    /// view (no clean text representation).
     #[allow(dead_code)]
     fn to_text(&self) -> Option<String> {
-        if self.context_view.is_some() {
+        if !matches!(self.view_kind, ViewKind::Ast) {
             return None;
         }
         Some(query::to_text(&self.ast))
     }
     /// True when the active view is exactly `#name` (sidebar tag-row
-    /// highlighting). Excludes context view, multi-filter queries, etc.
+    /// highlighting). Excludes non-Ast views, multi-filter queries, etc.
     fn is_solo_tag(&self, name: &str) -> bool {
-        self.context_view.is_none()
+        matches!(self.view_kind, ViewKind::Ast)
             && self.ast.exclude.tags.is_empty()
             && self.ast.exclude.entities.is_empty()
             && self.ast.include.entities.is_empty()
@@ -234,9 +344,9 @@ impl Query {
                 .unwrap_or(false)
     }
     /// Sidebar-date highlighting: true when the AST is exactly `Day(d)`
-    /// with no other filters / text and not in context view.
+    /// with no other filters / text in an Ast view.
     fn is_solo_date(&self, d: chrono::NaiveDate) -> bool {
-        self.context_view.is_none()
+        matches!(self.view_kind, ViewKind::Ast)
             && self.ast.exclude.tags.is_empty()
             && self.ast.exclude.entities.is_empty()
             && self.ast.include.tags.is_empty()
@@ -247,10 +357,11 @@ impl Query {
 }
 
 /// View transform applied after a context rotation. If the user was viewing
-/// the rotated-out context, follow them to the new one. AST views stay put
-/// — their filters / time-bounds don't depend on the rotation target.
+/// the rotated-out context, follow them to the new one. Other views (AST,
+/// entity, people) stay put — their content doesn't depend on the rotation
+/// target.
 fn rotate_view_to(prev: &Query, new_context_id: Uuid) -> Query {
-    if prev.context_view.is_some() {
+    if matches!(prev.view_kind, ViewKind::Context(_)) {
         Query::context(new_context_id)
     } else {
         prev.clone()
@@ -379,6 +490,25 @@ const CONTEXT_HEADER_FONT_SIZE: f32 = 12.0;
 const CELL_OUTLINE_ALPHA: u8 = 0x28;
 const CELL_OUTLINE_STROKE: f32 = 1.0;
 
+/// Entity page layout. Title is a large heading with `display_name`;
+/// metadata line below it carries kind + alias; section headers borrow
+/// the sidebar header styling.
+const ENTITY_TITLE_FONT_SIZE: f32 = 26.0;
+const ENTITY_META_FONT_SIZE: f32 = 13.0;
+const ENTITY_SECTION_GAP: f32 = 32.0;
+const ENTITY_SECTION_HEADER_GAP: f32 = 14.0;
+const ENTITY_CREATE_BTN_H: f32 = 36.0;
+const ENTITY_CREATE_BTN_W: f32 = 220.0;
+
+/// People-page layout. Single-column rows with hairline dividers; a
+/// muted "Add person…" footer pinned at the bottom of the list. Row
+/// font size matches `cell.rs::BODY_FONT_SIZE` so the embedded rename /
+/// add `TextBox` (whose font scale is the app's) renders at exactly
+/// the same size as the static row text — same glyphs, same baseline.
+const PEOPLE_ROW_H: f32 = 36.0;
+const PEOPLE_ROW_PAD_X: f32 = 12.0;
+const PEOPLE_ROW_FONT_SIZE: f32 = 18.0;
+
 /// Search popup (Ctrl/Cmd+K).
 const SEARCH_WIDTH: f32 = 520.0;
 const SEARCH_TOP: f32 = 48.0;
@@ -459,6 +589,37 @@ pub struct KeptApp {
     /// when the popup is open so `mouse_down` can route clicks into the
     /// search TextBox; None when the popup is closed.
     last_search_input_rect: Option<Rect>,
+    /// "+ Create backing cell" button rect on the entity page from the
+    /// last frame (doc coords). Some only when the current view is
+    /// `Entity(eid)` and the entity has no `primary_cell_id`. Used by
+    /// `mouse_down` to route a click into the create flow (Chunk 2).
+    last_entity_create_button_rect: Option<Rect>,
+    /// Sidebar PAGES section row rects (window coords) from last frame.
+    /// Hit-tested by `mouse_down` to dispatch to `push_view(Query::people())`.
+    last_sidebar_pages_rects: Vec<(PageKind, Rect)>,
+    /// People-page row rects (entity_id, doc-space rect) from last frame.
+    /// Used by `mouse_down` to route clicks into entity nav or rename.
+    last_people_row_rects: Vec<(Uuid, Rect)>,
+    /// "+ Add person…" footer-row rect (doc coords) from the last People
+    /// render. None when the People page isn't active.
+    last_people_add_rect: Option<Rect>,
+    /// Inline rename in progress on the People page. While `Some`, that
+    /// row renders an editable `TextBox` instead of static text.
+    people_rename: Option<PeopleRenameState>,
+    /// Inline "Add person" input. While `Some`, the footer row's "+ Add
+    /// person…" prompt is replaced by this `TextBox`. On Enter, the
+    /// trimmed text becomes a new cell-less entity; Esc cancels with no
+    /// row created. Mutually exclusive with `people_rename`.
+    people_add: Option<TextBox>,
+    /// Active right-click menu over a People-page row.
+    people_context_menu: Option<PeopleContextMenu>,
+    /// "Rename" row rect on the People context menu, captured each
+    /// render for hit-testing.
+    last_people_menu_rename_rect: Option<Rect>,
+    /// "Delete person" row rect on the People context menu. None when
+    /// the entity isn't deletable (the row still renders but click is
+    /// suppressed).
+    last_people_menu_delete_rect: Option<Rect>,
     /// True while the user is mouse-dragging inside the search input
     /// (selecting text). Drives `mouse_drag_to` / `mouse_up` routing.
     search_dragging: bool,
@@ -684,6 +845,15 @@ impl KeptApp {
             tag_context_menu: None,
             last_tag_menu_delete_rect: None,
             last_search_input_rect: None,
+            last_entity_create_button_rect: None,
+            last_sidebar_pages_rects: Vec::new(),
+            last_people_row_rects: Vec::new(),
+            last_people_add_rect: None,
+            people_rename: None,
+            people_add: None,
+            people_context_menu: None,
+            last_people_menu_rename_rect: None,
+            last_people_menu_delete_rect: None,
             search_dragging: false,
             focus_mode: false,
             nav_back: Vec::new(),
@@ -791,19 +961,31 @@ impl KeptApp {
 
     /// Test whether `cell` is visible under the current query.
     ///
-    /// Two modes:
-    /// - `view.context_view = Some(id)` → the cell's timestamp must fall in
-    ///   that context's `[start, end)` window (the legacy context-window
-    ///   filter; doesn't go through the AST executor).
-    /// - Otherwise → delegate to `query::matches` against `view.ast`.
+    /// - `Context(id)` → the cell's timestamp must fall in that context's
+    ///   `[start, end)` window (legacy context-window filter; bypasses
+    ///   the AST executor).
+    /// - `Entity(eid)` → the cell must be that entity's `primary_cell_id`.
+    ///   Cell-less entity pages have no visible cells; the embedded
+    ///   backing cell is drawn directly by `render_entity_page`.
+    /// - `People` → no cells visible (the page is bespoke).
+    /// - `Ast` → delegate to `query::matches` against `view.ast`.
     fn is_visible_for_view(&self, cell: &Cell, ctx: &query::MatchContext) -> bool {
-        if let Some(id) = self.view.context_view {
-            let cell_ts = cell.timestamp;
-            return self.contexts.iter().find(|c| c.id == id).map_or(false, |c| {
-                cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
-            });
+        match self.view.view_kind {
+            ViewKind::Context(id) => {
+                let cell_ts = cell.timestamp;
+                self.contexts.iter().find(|c| c.id == id).map_or(false, |c| {
+                    cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
+                })
+            }
+            ViewKind::Entity(eid) => self
+                .entities
+                .iter()
+                .find(|e| e.id == eid)
+                .and_then(|e| e.primary_cell_id)
+                .map_or(false, |pid| pid == cell.id),
+            ViewKind::People => false,
+            ViewKind::Ast => query::matches(&self.view.ast, cell, ctx),
         }
-        query::matches(&self.view.ast, cell, ctx)
     }
 
     /// Build the per-render `MatchContext`: today's date plus the resolved
@@ -987,12 +1169,9 @@ impl KeptApp {
     }
 
     /// Previous context (older `start_time`) relative to the currently
-    /// viewed one. None when in Date view (use date-arrow nav for that).
+    /// viewed one. None when not in Context view.
     fn prev_context(&self) -> Option<Uuid> {
-        let current = match self.view.context_view {
-            Some(id) => id,
-            None => return None,
-        };
+        let current = self.view.context_view()?;
         let mut sorted: Vec<&Context> = self.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
@@ -1003,12 +1182,9 @@ impl KeptApp {
         }
     }
 
-    /// Next context (newer `start_time`). None when in Date view.
+    /// Next context (newer `start_time`). None when not in Context view.
     fn next_context(&self) -> Option<Uuid> {
-        let current = match self.view.context_view {
-            Some(id) => id,
-            None => return None,
-        };
+        let current = self.view.context_view()?;
         let mut sorted: Vec<&Context> = self.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
@@ -1027,10 +1203,7 @@ impl KeptApp {
     /// Used for arrow-nav cross-context jumps so an empty newer context
     /// doesn't trap the cursor.
     fn next_context_with_cells(&self) -> Option<Uuid> {
-        let current = match self.view.context_view {
-            Some(id) => id,
-            None => return None,
-        };
+        let current = self.view.context_view()?;
         let mut sorted: Vec<&Context> = self.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
@@ -1043,10 +1216,7 @@ impl KeptApp {
 
     /// Walk contexts backward in time, skipping empties.
     fn prev_context_with_cells(&self) -> Option<Uuid> {
-        let current = match self.view.context_view {
-            Some(id) => id,
-            None => return None,
-        };
+        let current = self.view.context_view()?;
         let mut sorted: Vec<&Context> = self.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
@@ -1068,7 +1238,7 @@ impl KeptApp {
     /// Returns true if the view changed.
     fn ensure_writable_context(&mut self) -> bool {
         let today = local_date_for_ms(now_epoch_ms());
-        if let Some(id) = self.view.context_view {
+        if let Some(id) = self.view.context_view() {
             let active_is_open = self
                 .contexts
                 .iter()
@@ -1391,17 +1561,34 @@ impl KeptApp {
         // In focus mode we override the x/width to match the wider focus
         // layout (otherwise the card would draw at last frame's normal-mode
         // size); the ring is suppressed since there's nothing to compare to.
-        let focused_geom = self
-            .focused
-            .and_then(|id| self.cell(id))
-            .filter(|c| c.height() > 0.0)
-            .map(|c| {
-                if self.focus_mode {
-                    (cells_left, MARGIN_TOP, content_width, c.height())
-                } else {
-                    (c.x_origin(), c.y_origin(), c.width(), c.height())
-                }
-            });
+        let mut y = MARGIN_TOP;
+        self.last_kebab_rects.clear();
+        let mouse_doc_x = self.mouse_pos.0;
+        let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
+        let focused_id = self.focused;
+
+        // Cell-loop views (Ast / Context) draw the cell stream with the
+        // focused-cell card backdrop + ring. Entity / People views draw
+        // bespoke pages and bypass that entire path.
+        let view_kind_local = self.view.view_kind.clone();
+        if !matches!(view_kind_local, ViewKind::Ast | ViewKind::Context(_)) {
+            self.last_entity_create_button_rect = None;
+        }
+
+        let focused_geom = if matches!(view_kind_local, ViewKind::Ast | ViewKind::Context(_)) {
+            self.focused
+                .and_then(|id| self.cell(id))
+                .filter(|c| c.height() > 0.0)
+                .map(|c| {
+                    if self.focus_mode {
+                        (cells_left, MARGIN_TOP, content_width, c.height())
+                    } else {
+                        (c.x_origin(), c.y_origin(), c.width(), c.height())
+                    }
+                })
+        } else {
+            None
+        };
 
         if let Some((cx, cy, cw, ch)) = focused_geom {
             let card_rect = Rect::new(
@@ -1433,180 +1620,209 @@ impl KeptApp {
             canvas.draw_round_rect(card_rect, FOCUS_RADIUS, FOCUS_RADIUS, &fill_paint);
         }
 
-        let mut y = MARGIN_TOP;
-        self.last_kebab_rects.clear();
-        let mouse_doc_x = self.mouse_pos.0;
-        let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
-        let focused_id = self.focused;
-
-        // Precompute per-cell visibility and section headers (Date view only)
-        // so the mutable cell loop below doesn't have to re-borrow self.
-        // In focus mode only the focused cell is visible — everything else
-        // is suppressed regardless of the current view's filters.
-        let visible: Vec<bool> = if self.focus_mode {
-            self.cells
-                .iter()
-                .map(|c| Some(c.id) == focused_id)
-                .collect()
-        } else {
-            let match_ctx = self.match_context();
-            self.cells
-                .iter()
-                .map(|c| self.is_visible_for_view(c, &match_ctx))
-                .collect()
-        };
-        // Headers are aligned to self.cells indices but computed in DISPLAY
-        // order (descending) so a header lands above the first cell of each
-        // group as the user scrolls top-down.
-        //
-        // Date view groups by context (multiple contexts can land in one day).
-        // Any other AST view (tag, search query, multi-filter, free-text)
-        // groups by local date since cells can span days. Context view and
-        // focus mode have no inter-group headers.
-        #[derive(PartialEq, Eq)]
-        enum HeaderMode {
-            ByContext,
-            ByDate,
-            None,
-        }
-        let header_mode = if self.focus_mode {
-            HeaderMode::None
-        } else if self.view.context_view.is_some() {
-            HeaderMode::None
-        } else if matches!(
-            self.view.ast.include.time,
-            Some(query::TimeFilter::Day(_))
-        ) && self.view.ast.include.tags.is_empty()
-            && self.view.ast.include.entities.is_empty()
-            && self.view.ast.exclude.tags.is_empty()
-            && self.view.ast.exclude.entities.is_empty()
-            && self.view.ast.text.is_empty()
-        {
-            // Pure date view — show context-section headers within the day.
-            HeaderMode::ByContext
-        } else {
-            // Tag / search / multi-filter — group by date across the result set.
-            HeaderMode::ByDate
-        };
-        let headers: Vec<Option<String>> = if header_mode == HeaderMode::None {
-            vec![None; self.cells.len()]
-        } else {
-            let mut hs: Vec<Option<String>> = vec![None; self.cells.len()];
-            let mut last_label: Option<String> = None;
-            for i in (0..self.cells.len()).rev() {
-                if !visible[i] {
-                    continue;
-                }
-                let cell = &self.cells[i];
-                let label: String = match header_mode {
-                    HeaderMode::ByContext => self
-                        .context_for_timestamp(cell.timestamp)
-                        .map(|c| format_context_time(c.start_time))
-                        .unwrap_or_default(),
-                    HeaderMode::ByDate => format_date_label(local_date_for_ms(cell.timestamp)),
-                    HeaderMode::None => unreachable!(),
+        match view_kind_local {
+            ViewKind::Ast | ViewKind::Context(_) => {
+                // Precompute per-cell visibility and section headers (Date view only)
+                // so the mutable cell loop below doesn't have to re-borrow self.
+                // In focus mode only the focused cell is visible — everything else
+                // is suppressed regardless of the current view's filters.
+                let visible: Vec<bool> = if self.focus_mode {
+                    self.cells
+                        .iter()
+                        .map(|c| Some(c.id) == focused_id)
+                        .collect()
+                } else {
+                    let match_ctx = self.match_context();
+                    self.cells
+                        .iter()
+                        .map(|c| self.is_visible_for_view(c, &match_ctx))
+                        .collect()
                 };
-                if last_label.as_deref() != Some(label.as_str()) {
-                    last_label = Some(label.clone());
-                    hs[i] = Some(label);
+                // Headers are aligned to self.cells indices but computed in DISPLAY
+                // order (descending) so a header lands above the first cell of each
+                // group as the user scrolls top-down.
+                //
+                // Date view groups by context (multiple contexts can land in one day).
+                // Any other AST view (tag, search query, multi-filter, free-text)
+                // groups by local date since cells can span days. Context view and
+                // focus mode have no inter-group headers.
+                #[derive(PartialEq, Eq)]
+                enum HeaderMode {
+                    ByContext,
+                    ByDate,
+                    None,
+                }
+                let header_mode = if self.focus_mode {
+                    HeaderMode::None
+                } else if !matches!(self.view.view_kind, ViewKind::Ast) {
+                    HeaderMode::None
+                } else if matches!(
+                    self.view.ast.include.time,
+                    Some(query::TimeFilter::Day(_))
+                ) && self.view.ast.include.tags.is_empty()
+                    && self.view.ast.include.entities.is_empty()
+                    && self.view.ast.exclude.tags.is_empty()
+                    && self.view.ast.exclude.entities.is_empty()
+                    && self.view.ast.text.is_empty()
+                {
+                    // Pure date view — show context-section headers within the day.
+                    HeaderMode::ByContext
+                } else {
+                    // Tag / search / multi-filter — group by date across the result set.
+                    HeaderMode::ByDate
+                };
+                let headers: Vec<Option<String>> = if header_mode == HeaderMode::None {
+                    vec![None; self.cells.len()]
+                } else {
+                    let mut hs: Vec<Option<String>> = vec![None; self.cells.len()];
+                    let mut last_label: Option<String> = None;
+                    for i in (0..self.cells.len()).rev() {
+                        if !visible[i] {
+                            continue;
+                        }
+                        let cell = &self.cells[i];
+                        let label: String = match header_mode {
+                            HeaderMode::ByContext => self
+                                .context_for_timestamp(cell.timestamp)
+                                .map(|c| format_context_time(c.start_time))
+                                .unwrap_or_default(),
+                            HeaderMode::ByDate => {
+                                format_date_label(local_date_for_ms(cell.timestamp))
+                            }
+                            HeaderMode::None => unreachable!(),
+                        };
+                        if last_label.as_deref() != Some(label.as_str()) {
+                            last_label = Some(label.clone());
+                            hs[i] = Some(label);
+                        }
+                    }
+                    hs
+                };
+
+                let header_font = Font::from_typeface(
+                    &self.typeface,
+                    CONTEXT_HEADER_FONT_SIZE * scale,
+                );
+                let (_, hm) = header_font.metrics();
+                let header_h = CONTEXT_HEADER_H * scale;
+                let header_pad_top = CONTEXT_HEADER_PAD_TOP * scale;
+
+                // Render cells newest-first (descending) — index walked in reverse so
+                // self.cells (asc) iterates from end to start.
+                let total_cells = self.cells.len();
+                for i in (0..total_cells).rev() {
+                    let cell = &mut self.cells[i];
+                    if !visible[i] {
+                        continue;
+                    }
+                    if let Some(label) = &headers[i] {
+                        let header_y = y + header_pad_top;
+                        let baseline = header_y + (-hm.ascent);
+                        let mut hp = Paint::default();
+                        hp.set_anti_alias(true);
+                        hp.set_color(Color::from_rgb(0x70, 0x68, 0x58));
+                        canvas.draw_str(
+                            label,
+                            Point::new(cells_left, baseline),
+                            &header_font,
+                            &hp,
+                        );
+                        let label_w = header_font.measure_str(label, Some(&hp)).0;
+                        let line_y = baseline - hm.ascent / 3.0;
+                        let mut lp = Paint::default();
+                        lp.set_anti_alias(true);
+                        lp.set_color(Color::from_argb(0x80, 0x70, 0x68, 0x58));
+                        lp.set_stroke_width(1.5);
+                        canvas.draw_line(
+                            Point::new(cells_left + label_w + 8.0 * scale, line_y),
+                            Point::new(cells_left + outer_cell_width, line_y),
+                            &lp,
+                        );
+                        y += header_h;
+                    }
+                    let cell_x = cells_left;
+                    let cell_y = y;
+                    let cell_is_focused =
+                        focused_id.map(|f| f == cell.id).unwrap_or(false);
+
+                    // Selection highlights are visible whenever the cell is focused
+                    // (so view-mode users can drag-select). Caret only renders in
+                    // edit mode.
+                    let render_focused = cell_is_focused;
+                    let show_caret = cell_is_focused && self.editing;
+                    let h = cell.tick(
+                        canvas,
+                        cell_x,
+                        cell_y,
+                        content_width,
+                        render_focused,
+                        show_caret,
+                    );
+
+                    // Faint outline around non-focused cells so each one reads as a
+                    // distinct unit. Drawn in the same position the focus ring would
+                    // occupy so cells don't visually shift when focus moves.
+                    if !cell_is_focused {
+                        let mut outline = Paint::default();
+                        outline.set_anti_alias(true);
+                        outline.set_style(PaintStyle::Stroke);
+                        outline.set_stroke_width(CELL_OUTLINE_STROKE);
+                        outline.set_color(Color::from_argb(
+                            CELL_OUTLINE_ALPHA,
+                            0x1c,
+                            0x1c,
+                            0x1c,
+                        ));
+                        let rect = Rect::new(
+                            cell_x - FOCUS_PAD,
+                            cell_y - FOCUS_PAD,
+                            cell_x + content_width + FOCUS_PAD,
+                            cell_y + h + FOCUS_PAD,
+                        );
+                        canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
+                    }
+
+                    let kebab_right = cell_x + outer_cell_width - KEBAB_INSET_X;
+                    let kebab_left = kebab_right - KEBAB_SIZE;
+                    let kebab_top = cell_y + KEBAB_INSET_Y;
+                    let kebab_bot = kebab_top + KEBAB_SIZE;
+                    let kebab_rect =
+                        Rect::new(kebab_left, kebab_top, kebab_right, kebab_bot);
+                    let hovered = mouse_doc_x >= kebab_rect.left
+                        && mouse_doc_x <= kebab_rect.right
+                        && mouse_doc_y >= kebab_rect.top
+                        && mouse_doc_y <= kebab_rect.bottom;
+                    draw_kebab(canvas, kebab_rect, hovered);
+                    self.last_kebab_rects.push((cell.id, kebab_rect));
+
+                    y += h + CELL_GAP;
                 }
             }
-            hs
-        };
-
-        let header_font =
-            Font::from_typeface(&self.typeface, CONTEXT_HEADER_FONT_SIZE * scale);
-        let (_, hm) = header_font.metrics();
-        let header_h = CONTEXT_HEADER_H * scale;
-        let header_pad_top = CONTEXT_HEADER_PAD_TOP * scale;
-
-        // Render cells newest-first (descending) — index walked in reverse so
-        // self.cells (asc) iterates from end to start.
-        let total_cells = self.cells.len();
-        for i in (0..total_cells).rev() {
-            let cell = &mut self.cells[i];
-            if !visible[i] {
-                continue;
-            }
-            if let Some(label) = &headers[i] {
-                let header_y = y + header_pad_top;
-                let baseline = header_y + (-hm.ascent);
-                let mut hp = Paint::default();
-                hp.set_anti_alias(true);
-                hp.set_color(Color::from_rgb(0x70, 0x68, 0x58));
-                canvas.draw_str(
-                    label,
-                    Point::new(cells_left, baseline),
-                    &header_font,
-                    &hp,
+            ViewKind::Entity(eid) => {
+                let h = self.render_entity_page(
+                    canvas,
+                    eid,
+                    cells_left,
+                    content_width,
+                    scale,
+                    mouse_doc_x,
+                    mouse_doc_y,
                 );
-                let label_w = header_font.measure_str(label, Some(&hp)).0;
-                let line_y = baseline - hm.ascent / 3.0;
-                let mut lp = Paint::default();
-                lp.set_anti_alias(true);
-                lp.set_color(Color::from_argb(0x80, 0x70, 0x68, 0x58));
-                lp.set_stroke_width(1.5);
-                canvas.draw_line(
-                    Point::new(cells_left + label_w + 8.0 * scale, line_y),
-                    Point::new(cells_left + outer_cell_width, line_y),
-                    &lp,
-                );
-                y += header_h;
+                // +CELL_GAP so the doc_height formula (`y - CELL_GAP +
+                // DOC_BOTTOM_PAD`) matches the cell-loop convention.
+                y = MARGIN_TOP + h + CELL_GAP;
             }
-            let cell_x = cells_left;
-            let cell_y = y;
-            let cell_is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
-
-            // Selection highlights are visible whenever the cell is focused
-            // (so view-mode users can drag-select). Caret only renders in
-            // edit mode.
-            let render_focused = cell_is_focused;
-            let show_caret = cell_is_focused && self.editing;
-            let h = cell.tick(
-                canvas,
-                cell_x,
-                cell_y,
-                content_width,
-                render_focused,
-                show_caret,
-            );
-
-            // Faint outline around non-focused cells so each one reads as a
-            // distinct unit. Drawn in the same position the focus ring would
-            // occupy so cells don't visually shift when focus moves.
-            if !cell_is_focused {
-                let mut outline = Paint::default();
-                outline.set_anti_alias(true);
-                outline.set_style(PaintStyle::Stroke);
-                outline.set_stroke_width(CELL_OUTLINE_STROKE);
-                outline.set_color(Color::from_argb(
-                    CELL_OUTLINE_ALPHA,
-                    0x1c,
-                    0x1c,
-                    0x1c,
-                ));
-                let rect = Rect::new(
-                    cell_x - FOCUS_PAD,
-                    cell_y - FOCUS_PAD,
-                    cell_x + content_width + FOCUS_PAD,
-                    cell_y + h + FOCUS_PAD,
+            ViewKind::People => {
+                let h = self.render_people_page(
+                    canvas,
+                    cells_left,
+                    content_width,
+                    scale,
+                    mouse_doc_x,
+                    mouse_doc_y,
                 );
-                canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
+                y = MARGIN_TOP + h + CELL_GAP;
             }
-
-            let kebab_right = cell_x + outer_cell_width - KEBAB_INSET_X;
-            let kebab_left = kebab_right - KEBAB_SIZE;
-            let kebab_top = cell_y + KEBAB_INSET_Y;
-            let kebab_bot = kebab_top + KEBAB_SIZE;
-            let kebab_rect = Rect::new(kebab_left, kebab_top, kebab_right, kebab_bot);
-            let hovered = mouse_doc_x >= kebab_rect.left
-                && mouse_doc_x <= kebab_rect.right
-                && mouse_doc_y >= kebab_rect.top
-                && mouse_doc_y <= kebab_rect.bottom;
-            draw_kebab(canvas, kebab_rect, hovered);
-            self.last_kebab_rects.push((cell.id, kebab_rect));
-
-            y += h + CELL_GAP;
         }
 
         // Focus ring — subtle when viewing, brighter and thicker when editing.
@@ -1706,6 +1922,7 @@ impl KeptApp {
 
         // Tag right-click menu (window space).
         self.render_tag_context_menu(canvas);
+        self.render_people_context_menu(canvas);
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
@@ -1837,6 +2054,45 @@ impl KeptApp {
             }
             self.sync_mention_popup();
             return true;
+        }
+
+        // People-page rename input: while active, Enter commits, Esc
+        // cancels, every other key flows into the embedded TextBox.
+        if event.state == ElementState::Pressed && self.people_rename.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.cancel_people_rename();
+                    return true;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.commit_people_rename();
+                    return true;
+                }
+                _ => {}
+            }
+            // Everything else: route to the input so caret / arrows /
+            // selection / typing / clipboard work like a normal TextBox.
+            if let Some(rs) = self.people_rename.as_mut() {
+                return rs.input.handle_key(event, modifiers);
+            }
+        }
+
+        // People-page Add input: same shape as rename.
+        if event.state == ElementState::Pressed && self.people_add.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.cancel_people_add();
+                    return true;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.commit_people_add();
+                    return true;
+                }
+                _ => {}
+            }
+            if let Some(input) = self.people_add.as_mut() {
+                return input.handle_key(event, modifiers);
+            }
         }
 
         // While the @-mention popup is open, intercept navigation/commit/dismiss
@@ -2010,6 +2266,11 @@ impl KeptApp {
                 // Esc closes the tag context menu first.
                 Key::Named(NamedKey::Escape) if self.tag_context_menu.is_some() => {
                     self.tag_context_menu = None;
+                    return true;
+                }
+                // Same for the People context menu.
+                Key::Named(NamedKey::Escape) if self.people_context_menu.is_some() => {
+                    self.people_context_menu = None;
                     return true;
                 }
                 // Esc exits focus mode first; if it wasn't on, fall through
@@ -2476,6 +2737,520 @@ impl KeptApp {
         );
     }
 
+    /// Render the entity page for `entity_id` into the doc area. Returns
+    /// the total content height (so `tick` can update `doc_height` for the
+    /// scrollbar). Layout, top to bottom: display_name heading, metadata
+    /// line, "BACKING CELL" section, the embedded backing cell (drawn via
+    /// `Cell::tick`) or a "+ Create backing cell" affordance for cell-less
+    /// entities. The embedded cell uses the same focus/edit state as the
+    /// doc loop, so editing inline Just Works.
+    fn render_entity_page(
+        &mut self,
+        canvas: &Canvas,
+        entity_id: Uuid,
+        cells_left: f32,
+        content_width: f32,
+        scale: f32,
+        mouse_doc_x: f32,
+        mouse_doc_y: f32,
+    ) -> f32 {
+        self.last_entity_create_button_rect = None;
+
+        let entity = match self.entities.iter().find(|e| e.id == entity_id).cloned() {
+            Some(e) => e,
+            None => {
+                let font = Font::from_typeface(&self.typeface, ENTITY_META_FONT_SIZE * scale);
+                let (_, fm) = font.metrics();
+                let mut paint = Paint::default();
+                paint.set_anti_alias(true);
+                paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+                canvas.draw_str(
+                    "Entity not found",
+                    Point::new(cells_left, MARGIN_TOP + (-fm.ascent)),
+                    &font,
+                    &paint,
+                );
+                return -fm.ascent + fm.descent + 60.0 * scale;
+            }
+        };
+
+        let mut y = MARGIN_TOP;
+
+        // Title (display_name).
+        let title_font = Font::from_typeface(&self.typeface, ENTITY_TITLE_FONT_SIZE * scale);
+        let (_, tm) = title_font.metrics();
+        let mut title_paint = Paint::default();
+        title_paint.set_anti_alias(true);
+        title_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        canvas.draw_str(
+            &entity.display_name,
+            Point::new(cells_left, y + (-tm.ascent)),
+            &title_font,
+            &title_paint,
+        );
+        y += -tm.ascent + tm.descent;
+
+        // Metadata: "<kind> · @<alias>". Alias may be missing for very old
+        // entity rows or fresh inserts; render just the kind in that case.
+        let alias = self
+            .entity_alias_index
+            .iter()
+            .find(|(_, eid, _)| *eid == entity.id)
+            .map(|(a, _, _)| a.clone());
+        let meta = match alias {
+            Some(a) => format!("{} · @{a}", entity.kind),
+            None => entity.kind.clone(),
+        };
+        let meta_font = Font::from_typeface(&self.typeface, ENTITY_META_FONT_SIZE * scale);
+        let (_, mm) = meta_font.metrics();
+        let mut meta_paint = Paint::default();
+        meta_paint.set_anti_alias(true);
+        meta_paint.set_color(Color::from_rgb(0x70, 0x68, 0x58));
+        y += 4.0 * scale;
+        canvas.draw_str(
+            &meta,
+            Point::new(cells_left, y + (-mm.ascent)),
+            &meta_font,
+            &meta_paint,
+        );
+        y += -mm.ascent + mm.descent;
+        y += ENTITY_SECTION_GAP * scale;
+
+        // BACKING CELL section header (sidebar-header styling).
+        let header_font =
+            Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
+        let (_, hm) = header_font.metrics();
+        let mut header_paint = Paint::default();
+        header_paint.set_anti_alias(true);
+        header_paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+        canvas.draw_str(
+            "BACKING CELL",
+            Point::new(cells_left, y + (-hm.ascent)),
+            &header_font,
+            &header_paint,
+        );
+        y += -hm.ascent + hm.descent + ENTITY_SECTION_HEADER_GAP * scale;
+
+        // Backing-cell body.
+        if let Some(pid) = entity.primary_cell_id {
+            if let Some(cell_idx) = self.cells.iter().position(|c| c.id == pid) {
+                let focused_id = self.focused;
+                let editing = self.editing;
+                let cell = &mut self.cells[cell_idx];
+                let cell_is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
+                let render_focused = cell_is_focused;
+                let show_caret = cell_is_focused && editing;
+                let h = cell.tick(
+                    canvas,
+                    cells_left,
+                    y,
+                    content_width,
+                    render_focused,
+                    show_caret,
+                );
+                if !cell_is_focused {
+                    let mut outline = Paint::default();
+                    outline.set_anti_alias(true);
+                    outline.set_style(PaintStyle::Stroke);
+                    outline.set_stroke_width(CELL_OUTLINE_STROKE);
+                    outline.set_color(Color::from_argb(
+                        CELL_OUTLINE_ALPHA,
+                        0x1c,
+                        0x1c,
+                        0x1c,
+                    ));
+                    let rect = Rect::new(
+                        cells_left - FOCUS_PAD,
+                        y - FOCUS_PAD,
+                        cells_left + content_width + FOCUS_PAD,
+                        y + h + FOCUS_PAD,
+                    );
+                    canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
+                }
+                y += h;
+            } else {
+                // primary_cell_id refers to a cell we don't have loaded —
+                // shouldn't happen post-load but render a stub rather than
+                // panicking.
+                let mut paint = Paint::default();
+                paint.set_anti_alias(true);
+                paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+                canvas.draw_str(
+                    "Backing cell missing",
+                    Point::new(cells_left, y + (-mm.ascent)),
+                    &meta_font,
+                    &paint,
+                );
+                y += -mm.ascent + mm.descent;
+            }
+        } else {
+            // Cell-less entity — show a "+ Create backing cell" affordance.
+            // Wire-up of the click is deferred to Chunk 2; for now the
+            // button just records its rect for hit-testing.
+            let btn_h = ENTITY_CREATE_BTN_H * scale;
+            let btn_w = (ENTITY_CREATE_BTN_W * scale).min(content_width);
+            let btn_rect = Rect::new(
+                cells_left,
+                y,
+                cells_left + btn_w,
+                y + btn_h,
+            );
+            let hovered = mouse_doc_x >= btn_rect.left
+                && mouse_doc_x <= btn_rect.right
+                && mouse_doc_y >= btn_rect.top
+                && mouse_doc_y <= btn_rect.bottom;
+            let bg_alpha: u8 = if hovered { 0x18 } else { 0x08 };
+            let mut bg = Paint::default();
+            bg.set_anti_alias(true);
+            bg.set_color(Color::from_argb(bg_alpha, 0x1c, 0x1c, 0x1c));
+            canvas.draw_round_rect(btn_rect, 6.0 * scale, 6.0 * scale, &bg);
+            let mut border = Paint::default();
+            border.set_anti_alias(true);
+            border.set_style(PaintStyle::Stroke);
+            border.set_stroke_width(1.0);
+            border.set_color(Color::from_argb(0x40, 0x1c, 0x1c, 0x1c));
+            canvas.draw_round_rect(btn_rect, 6.0 * scale, 6.0 * scale, &border);
+
+            let mut lp = Paint::default();
+            lp.set_anti_alias(true);
+            lp.set_color(Color::from_rgb(0x60, 0x58, 0x48));
+            let label = "+ Create backing cell";
+            let lw = meta_font.measure_str(label, Some(&lp)).0;
+            let label_baseline =
+                btn_rect.top + (btn_h + (-mm.ascent) - mm.descent) * 0.5;
+            canvas.draw_str(
+                label,
+                Point::new(btn_rect.left + (btn_w - lw) * 0.5, label_baseline),
+                &meta_font,
+                &lp,
+            );
+            self.last_entity_create_button_rect = Some(btn_rect);
+            y += btn_h;
+        }
+
+        y - MARGIN_TOP
+    }
+
+    /// Render the People page: alphabetical list of `kind=person`
+    /// entities, each as a clickable row, with an "+ Add person…" footer.
+    /// While `people_rename` is `Some`, that row's static label is
+    /// replaced by an embedded `TextBox` for inline editing. Returns the
+    /// total content height so `tick` can update `doc_height`.
+    fn render_people_page(
+        &mut self,
+        canvas: &Canvas,
+        cells_left: f32,
+        content_width: f32,
+        scale: f32,
+        mouse_doc_x: f32,
+        mouse_doc_y: f32,
+    ) -> f32 {
+        self.last_people_row_rects.clear();
+        self.last_people_add_rect = None;
+
+        let mut y = MARGIN_TOP;
+
+        // Title
+        let title_font =
+            Font::from_typeface(&self.typeface, ENTITY_TITLE_FONT_SIZE * scale);
+        let (_, tm) = title_font.metrics();
+        let mut title_paint = Paint::default();
+        title_paint.set_anti_alias(true);
+        title_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        canvas.draw_str(
+            "People",
+            Point::new(cells_left, y + (-tm.ascent)),
+            &title_font,
+            &title_paint,
+        );
+        y += -tm.ascent + tm.descent + 24.0 * scale;
+
+        // Sorted snapshot — case-insensitive by display_name.
+        let mut people: Vec<(String, Uuid)> = self
+            .entities
+            .iter()
+            .filter(|e| e.kind == PERSON_TAG)
+            .map(|e| (e.display_name.clone(), e.id))
+            .collect();
+        people.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+
+        let row_h = PEOPLE_ROW_H * scale;
+        let row_pad_x = PEOPLE_ROW_PAD_X * scale;
+        let row_w = content_width;
+        let row_font =
+            Font::from_typeface(&self.typeface, PEOPLE_ROW_FONT_SIZE * scale);
+        let (_, rm) = row_font.metrics();
+        let text_baseline_offset = (row_h + (-rm.ascent) - rm.descent) * 0.5;
+
+        let renaming_id = self.people_rename.as_ref().map(|s| s.entity_id);
+        let adding = self.people_add.is_some();
+        // Suppress doc-area hover paints while a menu is open — the menu
+        // renders in window space, so the cursor is "over the menu," not
+        // the row underneath. Showing both highlights at once is
+        // disorienting.
+        let menu_open = self.people_context_menu.is_some();
+
+        let mut text_paint = Paint::default();
+        text_paint.set_anti_alias(true);
+        text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        let mut divider_paint = Paint::default();
+        divider_paint.set_anti_alias(true);
+        divider_paint.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+        divider_paint.set_stroke_width(1.0);
+        let mut hover_paint = Paint::default();
+        hover_paint.set_anti_alias(true);
+        hover_paint.set_color(Color::from_argb(0x14, 0x1c, 0x1c, 0x1c));
+
+        for (display_name, entity_id) in &people {
+            let row_rect = Rect::new(cells_left, y, cells_left + row_w, y + row_h);
+            let hovered = mouse_doc_x >= row_rect.left
+                && mouse_doc_x <= row_rect.right
+                && mouse_doc_y >= row_rect.top
+                && mouse_doc_y <= row_rect.bottom;
+            let is_renaming = renaming_id == Some(*entity_id);
+            if hovered && !is_renaming && !menu_open {
+                canvas.draw_rect(row_rect, &hover_paint);
+            }
+
+            if is_renaming {
+                if let Some(rs) = self.people_rename.as_mut() {
+                    // Align TextBox baseline with the static row baseline:
+                    // baseline = top + text_baseline_offset, and TextBox
+                    // draws its baseline at `tb_y + (-ascent)`, so
+                    // tb_y = top + text_baseline_offset + ascent (negative).
+                    let tb_y = row_rect.top + text_baseline_offset + rm.ascent;
+                    rs.input.tick(
+                        canvas,
+                        row_rect.left + row_pad_x,
+                        tb_y,
+                        row_w - row_pad_x * 2.0,
+                        true,
+                        true,
+                    );
+                }
+            } else {
+                canvas.draw_str(
+                    display_name,
+                    Point::new(
+                        row_rect.left + row_pad_x,
+                        row_rect.top + text_baseline_offset,
+                    ),
+                    &row_font,
+                    &text_paint,
+                );
+            }
+
+            // Hairline divider at the bottom of each row.
+            canvas.draw_line(
+                Point::new(row_rect.left, row_rect.bottom),
+                Point::new(row_rect.right, row_rect.bottom),
+                &divider_paint,
+            );
+
+            self.last_people_row_rects.push((*entity_id, row_rect));
+            y += row_h;
+        }
+
+        // "+ Add person…" footer row. When `people_add` is Some, this
+        // row hosts the inline input; otherwise it shows muted prompt
+        // text. Living at the bottom of the list (rather than wherever
+        // the new name would sort) keeps the user visually anchored.
+        let add_rect = Rect::new(cells_left, y, cells_left + row_w, y + row_h);
+        let add_hovered = mouse_doc_x >= add_rect.left
+            && mouse_doc_x <= add_rect.right
+            && mouse_doc_y >= add_rect.top
+            && mouse_doc_y <= add_rect.bottom;
+        if add_hovered && !adding && !menu_open {
+            canvas.draw_rect(add_rect, &hover_paint);
+        }
+        if adding {
+            if let Some(input) = self.people_add.as_mut() {
+                let tb_y = add_rect.top + text_baseline_offset + rm.ascent;
+                input.tick(
+                    canvas,
+                    add_rect.left + row_pad_x,
+                    tb_y,
+                    row_w - row_pad_x * 2.0,
+                    true,
+                    true,
+                );
+            }
+        } else {
+            let mut muted = Paint::default();
+            muted.set_anti_alias(true);
+            muted.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+            canvas.draw_str(
+                "+ Add person…",
+                Point::new(
+                    add_rect.left + row_pad_x,
+                    add_rect.top + text_baseline_offset,
+                ),
+                &row_font,
+                &muted,
+            );
+        }
+        self.last_people_add_rect = Some(add_rect);
+        y += row_h;
+
+        y - MARGIN_TOP
+    }
+
+    /// Begin inline rename for a People-page row. Pre-fills the input
+    /// with the entity's current `display_name` and selects all so the
+    /// next keystroke replaces it. Cancels any in-progress Add input.
+    fn start_people_rename(&mut self, entity_id: Uuid) {
+        self.people_add = None;
+        let display_name = self
+            .entities
+            .iter()
+            .find(|e| e.id == entity_id)
+            .map(|e| e.display_name.clone())
+            .unwrap_or_default();
+        let mut input = TextBox::new(self.typeface.clone(), display_name);
+        input.set_font_scale(self.font_scale);
+        input.select_all();
+        self.people_rename = Some(PeopleRenameState { entity_id, input });
+    }
+
+    /// Drop any in-progress rename without persisting changes.
+    fn cancel_people_rename(&mut self) {
+        self.people_rename = None;
+    }
+
+    /// Commit the in-progress rename. Writes the new display_name to the
+    /// entity row and replaces alias rows. If the entity has a backing
+    /// cell, the cell's title text is rewritten (preserving trailing tags)
+    /// and the cell is marked dirty so `flush_persistence` saves it on
+    /// the next idle window.
+    fn commit_people_rename(&mut self) {
+        let Some(rs) = self.people_rename.take() else { return };
+        let new_text = rs.input.text().trim().to_string();
+        if new_text.is_empty() {
+            return;
+        }
+        let entity_id = rs.entity_id;
+
+        let primary_cell_id = self
+            .entities
+            .iter()
+            .find(|e| e.id == entity_id)
+            .and_then(|e| e.primary_cell_id);
+
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.rename_person_entity(entity_id, &new_text) {
+                eprintln!("kept: rename_person_entity failed: {e}");
+                return;
+            }
+        }
+
+        if let Some(cell_id) = primary_cell_id {
+            if let Some(cell) = self.cell_mut(cell_id) {
+                if let Some(title) = cell.title.as_mut() {
+                    let cur = title.text().to_string();
+                    let (_, tags) = split_title_name_and_tags(&cur);
+                    let new_title = if tags.is_empty() {
+                        new_text.clone()
+                    } else {
+                        format!("{} {}", new_text, tags)
+                    };
+                    title.replace_text(new_title);
+                }
+            }
+            self.mark_cell_dirty(cell_id);
+        }
+
+        self.refresh_entities();
+        self.coalesce_break = true;
+    }
+
+    /// Count `kept://<entity_id>` mentions across every cell's links.
+    /// Used to gate "Delete person" — a deleted entity with live
+    /// mentions would leave dangling links. Walks all cells (title +
+    /// body + nested elements) via `Cell::all_link_urls`.
+    fn count_entity_references(&self, entity_id: Uuid) -> usize {
+        let target = format!("kept://{}", entity_id);
+        let mut n = 0usize;
+        for cell in &self.cells {
+            for url in cell.all_link_urls() {
+                if url == target {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Open the People right-click context menu for `entity_id`,
+    /// anchored at window-space `(x, y)`. Precomputes deletability
+    /// (no backing cell + zero references). The menu closes on any
+    /// subsequent click or Esc.
+    fn open_people_context_menu(&mut self, entity_id: Uuid, x: f32, y: f32) {
+        let primary = self
+            .entities
+            .iter()
+            .find(|e| e.id == entity_id)
+            .and_then(|e| e.primary_cell_id);
+        let refs = self.count_entity_references(entity_id);
+        let deletable = primary.is_none() && refs == 0;
+        let ref_count = if deletable { None } else { Some(refs) };
+        self.people_context_menu = Some(PeopleContextMenu {
+            entity_id,
+            anchor_x: x,
+            anchor_y: y,
+            deletable,
+            ref_count,
+        });
+    }
+
+    /// Hard-delete an entity that has no backing cell and no references.
+    /// Caller must have verified those conditions (the menu does that at
+    /// open time). Refreshes entity caches so the People list reflects
+    /// the removal on the next frame.
+    fn delete_person_entity(&mut self, entity_id: Uuid) {
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.delete_entity(entity_id) {
+                eprintln!("kept: delete_entity failed: {e}");
+                return;
+            }
+        }
+        self.refresh_entities();
+        self.coalesce_break = true;
+    }
+
+    /// Begin inline "Add person" mode. The footer row's prompt is
+    /// replaced by an empty editable `TextBox`; on Enter, the typed
+    /// name is committed as a fresh cell-less entity. Cancels any
+    /// in-progress rename so only one input is active at a time.
+    fn start_people_add(&mut self) {
+        self.people_rename = None;
+        let mut input = TextBox::new(self.typeface.clone(), String::new());
+        input.set_font_scale(self.font_scale);
+        self.people_add = Some(input);
+    }
+
+    /// Commit the inline Add-person input. Trimmed-empty input cancels
+    /// silently (no entity created); otherwise inserts a cell-less
+    /// person entity with the typed name.
+    fn commit_people_add(&mut self) {
+        let Some(input) = self.people_add.take() else { return };
+        let name = input.text().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.create_cell_less_person_entity(&name) {
+                eprintln!("kept: create_cell_less_person_entity failed: {e}");
+                return;
+            }
+        }
+        self.refresh_entities();
+        self.coalesce_break = true;
+    }
+
+    fn cancel_people_add(&mut self) {
+        self.people_add = None;
+    }
+
     fn render_sidebar(&mut self, canvas: &Canvas, height: f32) {
         let scale = self.font_scale;
         let sb_w = SIDEBAR_WIDTH * scale;
@@ -2503,20 +3278,12 @@ impl KeptApp {
             &sep,
         );
 
-        // Header.
         let header_font =
             Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
         let mut header_paint = Paint::default();
         header_paint.set_anti_alias(true);
         header_paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
         let (_, hm) = header_font.metrics();
-        let header_baseline = pad_top + (-hm.ascent);
-        canvas.draw_str(
-            "CONTEXTS",
-            Point::new(pad_x, header_baseline),
-            &header_font,
-            &header_paint,
-        );
 
         // Sidebar shows one row per local date that has any contexts.
         // Individual context rows are intentionally absent — clicking a date
@@ -2525,6 +3292,70 @@ impl KeptApp {
         self.last_sidebar_rects.clear();
         self.last_sidebar_date_rects.clear();
         self.last_sidebar_tag_rects.clear();
+        self.last_sidebar_pages_rects.clear();
+
+        let date_font_for_pages =
+            Font::from_typeface(&self.typeface, SIDEBAR_DATE_FONT_SIZE * scale);
+        let (_, dm_pages) = date_font_for_pages.metrics();
+        let mouse_x_pages = self.mouse_pos.0;
+        let mouse_y_pages = self.mouse_pos.1;
+
+        // ---- PAGES section ----
+        let pages_header_baseline = pad_top + (-hm.ascent);
+        canvas.draw_str(
+            "PAGES",
+            Point::new(pad_x, pages_header_baseline),
+            &header_font,
+            &header_paint,
+        );
+        let mut sidebar_y = pad_top + header_h;
+        // People row.
+        let people_rect = Rect::new(
+            pad_x * 0.5,
+            sidebar_y,
+            sb_w - pad_x * 0.5,
+            sidebar_y + date_h,
+        );
+        let people_active = matches!(self.view.view_kind, ViewKind::People);
+        let people_hovered = mouse_x_pages >= people_rect.left
+            && mouse_x_pages <= people_rect.right
+            && mouse_y_pages >= people_rect.top
+            && mouse_y_pages <= people_rect.bottom;
+        if people_active {
+            let mut p = Paint::default();
+            p.set_anti_alias(true);
+            p.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+            canvas.draw_round_rect(people_rect, radius, radius, &p);
+        } else if people_hovered {
+            let mut p = Paint::default();
+            p.set_anti_alias(true);
+            p.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+            canvas.draw_round_rect(people_rect, radius, radius, &p);
+        }
+        let mut row_paint = Paint::default();
+        row_paint.set_anti_alias(true);
+        row_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        let people_baseline =
+            sidebar_y + (date_h + (-dm_pages.ascent) - dm_pages.descent) * 0.5;
+        canvas.draw_str(
+            "People",
+            Point::new(pad_x, people_baseline),
+            &date_font_for_pages,
+            &row_paint,
+        );
+        self.last_sidebar_pages_rects
+            .push((PageKind::People, people_rect));
+        sidebar_y += date_h + item_gap + date_gap;
+
+        // ---- CONTEXTS section ----
+        let contexts_header_baseline = sidebar_y + (-hm.ascent);
+        canvas.draw_str(
+            "CONTEXTS",
+            Point::new(pad_x, contexts_header_baseline),
+            &header_font,
+            &header_paint,
+        );
+        sidebar_y += header_h;
 
         // Date rows reflect "where notes live": every date that has at least
         // one cell, plus today (so a freshly-launched empty app still shows
@@ -2537,7 +3368,7 @@ impl KeptApp {
             dates_set.insert(local_date_for_ms(c.timestamp));
         }
         dates_set.insert(local_date_for_ms(now_epoch_ms()));
-        let active_date = if self.view.context_view.is_none() {
+        let active_date = if matches!(self.view.view_kind, ViewKind::Ast) {
             match self.view.ast.include.time {
                 Some(query::TimeFilter::Day(d)) => Some(d),
                 _ => None,
@@ -2569,7 +3400,7 @@ impl KeptApp {
         let mouse_x = self.mouse_pos.0;
         let mouse_y = self.mouse_pos.1;
 
-        let mut y = pad_top + header_h;
+        let mut y = sidebar_y;
         for d in dates {
             let date_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
             if date_rect.top > height {
@@ -2911,6 +3742,137 @@ impl KeptApp {
             &text_paint,
         );
         self.last_tag_menu_delete_rect = Some(row_rect);
+    }
+
+    /// Right-click menu rendered over a People-page row. Two actions:
+    /// Rename (always enabled) and Delete person (disabled when the
+    /// entity has a backing cell or any `kept://` references; the row
+    /// shows the count so the user knows what's blocking).
+    fn render_people_context_menu(&mut self, canvas: &Canvas) {
+        let Some(menu) = self.people_context_menu.as_ref() else {
+            self.last_people_menu_rename_rect = None;
+            self.last_people_menu_delete_rect = None;
+            return;
+        };
+        let scale = self.font_scale;
+        let pad = 6.0 * scale;
+        let row_h = 26.0 * scale;
+        let menu_w = 200.0 * scale;
+        let menu_h = row_h * 2.0 + pad * 2.0;
+        let rect = Rect::new(
+            menu.anchor_x,
+            menu.anchor_y,
+            menu.anchor_x + menu_w,
+            menu.anchor_y + menu_h,
+        );
+        // Drop shadow.
+        let mut shadow = Paint::default();
+        shadow.set_anti_alias(true);
+        shadow.set_color(Color::from_argb(0x40, 0, 0, 0));
+        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
+        canvas.draw_round_rect(
+            Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
+            6.0 * scale,
+            6.0 * scale,
+            &shadow,
+        );
+        // Background.
+        let mut bg = Paint::default();
+        bg.set_anti_alias(true);
+        bg.set_color(Color::WHITE);
+        canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &bg);
+        let mut border = Paint::default();
+        border.set_anti_alias(true);
+        border.set_style(PaintStyle::Stroke);
+        border.set_stroke_width(1.0);
+        border.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &border);
+
+        let font = Font::from_typeface(&self.typeface, 13.0 * scale);
+        let (_, m) = font.metrics();
+        let mouse_x = self.mouse_pos.0;
+        let mouse_y = self.mouse_pos.1;
+        let mut text_paint = Paint::default();
+        text_paint.set_anti_alias(true);
+        text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        let mut dim_paint = Paint::default();
+        dim_paint.set_anti_alias(true);
+        dim_paint.set_color(Color::from_rgb(0xa0, 0x9a, 0x90));
+        let mut delete_paint = Paint::default();
+        delete_paint.set_anti_alias(true);
+        delete_paint.set_color(Color::from_rgb(0xc0, 0x30, 0x30));
+
+        // Rename row.
+        let rename_rect = Rect::new(
+            rect.left + pad * 0.5,
+            rect.top + pad,
+            rect.right - pad * 0.5,
+            rect.top + pad + row_h,
+        );
+        let rename_hovered = mouse_x >= rename_rect.left
+            && mouse_x <= rename_rect.right
+            && mouse_y >= rename_rect.top
+            && mouse_y <= rename_rect.bottom;
+        if rename_hovered {
+            let mut hp = Paint::default();
+            hp.set_anti_alias(true);
+            hp.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+            canvas.draw_round_rect(rename_rect, 4.0 * scale, 4.0 * scale, &hp);
+        }
+        let rename_baseline =
+            rename_rect.top + (row_h + (-m.ascent) - m.descent) * 0.5;
+        canvas.draw_str(
+            "Rename",
+            Point::new(rename_rect.left + pad, rename_baseline),
+            &font,
+            &text_paint,
+        );
+        self.last_people_menu_rename_rect = Some(rename_rect);
+
+        // Delete row.
+        let delete_rect = Rect::new(
+            rect.left + pad * 0.5,
+            rect.top + pad + row_h,
+            rect.right - pad * 0.5,
+            rect.top + pad + row_h * 2.0,
+        );
+        let delete_hovered = menu.deletable
+            && mouse_x >= delete_rect.left
+            && mouse_x <= delete_rect.right
+            && mouse_y >= delete_rect.top
+            && mouse_y <= delete_rect.bottom;
+        if delete_hovered {
+            let mut hp = Paint::default();
+            hp.set_anti_alias(true);
+            hp.set_color(Color::from_argb(0x20, 0xc0, 0x30, 0x30));
+            canvas.draw_round_rect(delete_rect, 4.0 * scale, 4.0 * scale, &hp);
+        }
+        let delete_baseline =
+            delete_rect.top + (row_h + (-m.ascent) - m.descent) * 0.5;
+        let label = if menu.deletable {
+            "Delete person".to_string()
+        } else {
+            match menu.ref_count {
+                Some(n) if n > 0 => format!("Delete person ({n} refs)"),
+                _ => "Delete person (in use)".to_string(),
+            }
+        };
+        let label_paint = if menu.deletable {
+            &delete_paint
+        } else {
+            &dim_paint
+        };
+        canvas.draw_str(
+            label,
+            Point::new(delete_rect.left + pad, delete_baseline),
+            &font,
+            label_paint,
+        );
+        if menu.deletable {
+            self.last_people_menu_delete_rect = Some(delete_rect);
+        } else {
+            self.last_people_menu_delete_rect = None;
+        }
     }
 
     fn render_mention_popup(&self, canvas: &Canvas) {
@@ -3524,7 +4486,7 @@ impl KeptApp {
                         // the new open one; otherwise leave the view alone
                         // (e.g., AST views stay put).
                         let prev_view = self.view.clone();
-                        let new_view = if prev_view.context_view == Some(ctx.id) {
+                        let new_view = if prev_view.context_view() == Some(ctx.id) {
                             Query::context(nid)
                         } else {
                             prev_view.clone()
@@ -3765,29 +4727,42 @@ impl KeptApp {
     /// opens a one-item "Delete tag" context menu. Returns true if the
     /// click was consumed.
     pub fn right_click(&mut self, x: f32, y: f32) -> bool {
-        // Right-clicking anywhere first closes any open tag menu.
-        let was_open = self.tag_context_menu.take().is_some();
-        if x >= SIDEBAR_WIDTH * self.font_scale {
+        // Right-clicking anywhere first closes any open menu.
+        let was_open = self.tag_context_menu.take().is_some()
+            | self.people_context_menu.take().is_some();
+        // Sidebar: tag rows offer a context menu (delete-tag for empty
+        // tags). Everything else in the sidebar dismisses an open menu.
+        if x < SIDEBAR_WIDTH * self.font_scale {
+            for (name, rect) in self.last_sidebar_tag_rects.clone() {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    let count = self
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.cells_with_tag(&name).ok())
+                        .map(|v| v.len())
+                        .unwrap_or(usize::MAX);
+                    if count == 0 {
+                        self.tag_context_menu = Some(TagContextMenu {
+                            name,
+                            anchor_x: x,
+                            anchor_y: y,
+                        });
+                        return true;
+                    }
+                    return was_open;
+                }
+            }
             return was_open;
         }
-        for (name, rect) in self.last_sidebar_tag_rects.clone() {
-            if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                // Only offer the menu if the tag has no attached cells.
-                let count = self
-                    .db
-                    .as_ref()
-                    .and_then(|db| db.cells_with_tag(&name).ok())
-                    .map(|v| v.len())
-                    .unwrap_or(usize::MAX);
-                if count == 0 {
-                    self.tag_context_menu = Some(TagContextMenu {
-                        name,
-                        anchor_x: x,
-                        anchor_y: y,
-                    });
+        // Doc-area right-clicks: People-page rows open the rename/delete
+        // context menu. Other doc-area clicks dismiss any open menu.
+        if matches!(self.view.view_kind, ViewKind::People) {
+            let doc_y = y + self.scroll_y;
+            for (entity_id, rect) in self.last_people_row_rects.clone() {
+                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
+                    self.open_people_context_menu(entity_id, x, y);
                     return true;
                 }
-                return was_open;
             }
         }
         was_open
@@ -3812,6 +4787,29 @@ impl KeptApp {
             }
             self.tag_context_menu = None;
             // Fall through to normal click handling below.
+        }
+
+        // People context menu: same pattern. Rename starts inline edit;
+        // Delete drops the entity; click outside dismisses.
+        if self.people_context_menu.is_some() {
+            if let Some(rect) = self.last_people_menu_rename_rect {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.people_context_menu.take() {
+                        self.start_people_rename(menu.entity_id);
+                    }
+                    return true;
+                }
+            }
+            if let Some(rect) = self.last_people_menu_delete_rect {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.people_context_menu.take() {
+                        self.delete_person_entity(menu.entity_id);
+                    }
+                    return true;
+                }
+            }
+            self.people_context_menu = None;
+            // Fall through to normal click handling.
         }
 
         // Any click dismisses an active @-mention popup.
@@ -3839,6 +4837,23 @@ impl KeptApp {
         // multi-cell layout.
         if x < SIDEBAR_WIDTH * self.font_scale {
             self.focus_mode = false;
+            // Any sidebar interaction commits an in-progress People
+            // rename or add (don't lose typed input on nav).
+            if self.people_rename.is_some() {
+                self.commit_people_rename();
+            }
+            if self.people_add.is_some() {
+                self.commit_people_add();
+            }
+            // PAGES section first (top of the sidebar).
+            for (kind, rect) in self.last_sidebar_pages_rects.clone() {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    self.cell_menu_open = None;
+                    return match kind {
+                        PageKind::People => self.push_view(Query::people()),
+                    };
+                }
+            }
             // Context rows first (they're indented inside dates so their bbox
             // overlaps date row gaps in some edge cases — context wins).
             for (id, rect) in self.last_sidebar_rects.clone() {
@@ -3884,6 +4899,80 @@ impl KeptApp {
         // normal cell routing.
         self.cell_menu_open = None;
 
+        // Entity-page "+ Create backing cell" button (only present when
+        // viewing a cell-less entity). Wire-up of the actual create flow
+        // is deferred to Chunk 2; for now, swallow the click so it doesn't
+        // fall through.
+        if let Some(rect) = self.last_entity_create_button_rect {
+            if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
+                // TODO(chunk-2): trigger create_backing_cell_for_entity.
+                return true;
+            }
+        }
+
+        // People-page click flow. Click inside the active rename or add
+        // input forwards to that input; click outside commits whichever
+        // is active, then continues processing the click. Clicking the
+        // "Add person" footer (when no input is active) starts an Add.
+        // Plain row click navigates to that entity's page.
+        if matches!(self.view.view_kind, ViewKind::People) {
+            // Forward-into-input checks come first so caret moves work
+            // when the user clicks within their own input.
+            let renaming_id = self.people_rename.as_ref().map(|s| s.entity_id);
+            if let Some(rid) = renaming_id {
+                let rename_rect = self
+                    .last_people_row_rects
+                    .iter()
+                    .find(|(eid, _)| *eid == rid)
+                    .map(|(_, r)| *r);
+                if let Some(rr) = rename_rect {
+                    if x >= rr.left
+                        && x <= rr.right
+                        && doc_y >= rr.top
+                        && doc_y <= rr.bottom
+                    {
+                        if let Some(rs) = self.people_rename.as_mut() {
+                            rs.input.mouse_down(x, doc_y, modifiers, true);
+                        }
+                        return true;
+                    }
+                }
+                // Click outside the renaming row → commit, then keep
+                // processing.
+                self.commit_people_rename();
+            }
+            if self.people_add.is_some() {
+                if let Some(ar) = self.last_people_add_rect {
+                    if x >= ar.left
+                        && x <= ar.right
+                        && doc_y >= ar.top
+                        && doc_y <= ar.bottom
+                    {
+                        if let Some(input) = self.people_add.as_mut() {
+                            input.mouse_down(x, doc_y, modifiers, true);
+                        }
+                        return true;
+                    }
+                }
+                self.commit_people_add();
+            }
+
+            // No input was inside the click → "Add person" footer starts
+            // an Add input; a row click navigates to its entity page.
+            if let Some(rect) = self.last_people_add_rect {
+                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
+                    self.start_people_add();
+                    return true;
+                }
+            }
+            for (entity_id, rect) in self.last_people_row_rects.clone() {
+                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
+                    return self.push_view(Query::entity(entity_id));
+                }
+            }
+            return false;
+        }
+
         let Some(target) = self.find_cell_at(x, doc_y) else {
             return false;
         };
@@ -3900,10 +4989,46 @@ impl KeptApp {
         self.coalesce_break = true;
         self.dragging_cell = Some(target);
         let editing = self.editing;
-        match self.cell_mut(target) {
+        let result = match self.cell_mut(target) {
             Some(cell) => cell.mouse_down(x, doc_y, modifiers, editing),
             None => false,
+        };
+        // The cell's mouse_down may have stashed a `kept://...` (or other)
+        // URL because the click landed on a link. Drain it here and route
+        // through the navigation policy that lives on `KeptApp`.
+        let pending = self
+            .cell_mut(target)
+            .and_then(|c| c.take_pending_link_url());
+        if let Some(url) = pending {
+            self.handle_link_click(&url);
         }
+        result
+    }
+
+    /// Resolve a clicked link URL. `kept://<uuid>` routes by uuid kind:
+    /// entity match → entity page; cell match → date view + focus the
+    /// cell; neither → drop (don't shell out, that produces a useless
+    /// OS error). Other URLs hand off to `cell::open_url` (xdg-open).
+    fn handle_link_click(&mut self, url: &str) {
+        if let Some(rest) = url.strip_prefix("kept://") {
+            if let Ok(uuid) = Uuid::parse_str(rest) {
+                if self.entities.iter().any(|e| e.id == uuid) {
+                    self.push_view(Query::entity(uuid));
+                    return;
+                }
+                if let Some(cell) = self.cell(uuid) {
+                    let target_date = local_date_for_ms(cell.timestamp);
+                    self.push_view(Query::date(target_date));
+                    self.focused = Some(uuid);
+                    self.editing = false;
+                    self.pending_caret_scroll = true;
+                    return;
+                }
+                eprintln!("kept: dangling kept:// link: {url}");
+                return;
+            }
+        }
+        cell::open_url(url);
     }
 
     pub fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool {
@@ -4136,5 +5261,82 @@ fn context_ref<'a>(c: &'a Context) -> ContextRef<'a> {
         start_time: c.start_time,
         end_time: c.end_time,
         title: c.title.as_deref(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_camelcase_boundary_outranks_inside_word_match() {
+        // Both "PatrickFoy" and "PeterCarr" are spaceless person names —
+        // the @-mention convention. With `pc` as the query, `PeterCarr`
+        // should win because its `C` is a camelCase boundary, while
+        // `PatrickFoy`'s `c` sits mid-word in "patrick".
+        let pf = fuzzy_score("pc", "PatrickFoy").expect("matches");
+        let pc = fuzzy_score("pc", "PeterCarr").expect("matches");
+        assert!(
+            pc.0 > pf.0,
+            "PeterCarr ({}) must outrank PatrickFoy ({})",
+            pc.0,
+            pf.0,
+        );
+    }
+
+    #[test]
+    fn fuzzy_space_separator_still_wins() {
+        // "pc" vs "Peter Carr" (with space) used to win on the
+        // post-separator bonus. Make sure that still holds — the fix
+        // adds a camelCase path; it doesn't remove the space path.
+        let pf = fuzzy_score("pc", "PatrickFoy").expect("matches");
+        let pc = fuzzy_score("pc", "Peter Carr").expect("matches");
+        assert!(pc.0 > pf.0);
+    }
+
+    #[test]
+    fn filter_mentions_orders_camelcase_correctly() {
+        let names = vec!["PatrickFoy".to_string(), "PeterCarr".to_string()];
+        let ranked = filter_mentions(&names, "pc");
+        assert_eq!(ranked[0].0, "PeterCarr");
+    }
+
+    #[test]
+    fn split_title_name_and_tags_basic() {
+        let (name, tags) = split_title_name_and_tags("Patrick Foy #person");
+        assert_eq!(name, "Patrick Foy");
+        assert_eq!(tags, "#person");
+    }
+
+    #[test]
+    fn split_title_name_and_tags_no_tags() {
+        let (name, tags) = split_title_name_and_tags("PatrickFoy");
+        assert_eq!(name, "PatrickFoy");
+        assert_eq!(tags, "");
+    }
+
+    #[test]
+    fn split_title_name_and_tags_multiple_tags() {
+        let (name, tags) = split_title_name_and_tags("Big Idea #urgent #person");
+        assert_eq!(name, "Big Idea");
+        assert_eq!(tags, "#urgent #person");
+    }
+
+    #[test]
+    fn split_title_name_and_tags_only_tags() {
+        let (name, tags) = split_title_name_and_tags("#person");
+        // No name remains; the whole string is tags.
+        assert_eq!(name, "");
+        assert_eq!(tags, "#person");
+    }
+
+    #[test]
+    fn split_title_name_and_tags_internal_hash_is_not_a_tag() {
+        // `#abc` mid-name (not at the trailing edge) doesn't count — the
+        // walk-from-end logic stops at the first non-`#` whitespace-
+        // delimited token.
+        let (name, tags) = split_title_name_and_tags("Notes #abc Foo");
+        assert_eq!(name, "Notes #abc Foo");
+        assert_eq!(tags, "");
     }
 }

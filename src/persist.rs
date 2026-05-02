@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use skia_safe::Typeface;
 use uuid::Uuid;
@@ -41,6 +41,7 @@ pub struct ContextRef<'a> {
 /// First-class entity. `id` is canonical identity — runtime must never
 /// assume it equals any cell id (the migration bootstraps them equal for
 /// `#person` cells, but that's a one-shot convention, not an invariant).
+#[derive(Clone)]
 pub struct Entity {
     pub id: Uuid,
     pub kind: String,
@@ -497,6 +498,38 @@ impl Db {
         Ok(rows)
     }
 
+    /// Look up a single entity by id. Returns `Ok(None)` when the row
+    /// doesn't exist (caller decides what "missing" means — e.g., the
+    /// entity page renders an error stub). Used by the entity-page render
+    /// path and the `kept://<uuid>` click resolver.
+    #[allow(dead_code)]
+    pub fn find_entity(&self, id: Uuid) -> rusqlite::Result<Option<Entity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, display_name, primary_cell_id, created_at, updated_at \
+             FROM entities WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![id.as_bytes().to_vec()], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let display_name: String = row.get(2)?;
+                let primary_bytes: Option<Vec<u8>> = row.get(3)?;
+                let created_at: i64 = row.get(4)?;
+                let updated_at: i64 = row.get(5)?;
+                Ok(Entity {
+                    id: Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::nil()),
+                    kind,
+                    display_name,
+                    primary_cell_id: primary_bytes
+                        .and_then(|b| Uuid::from_slice(&b).ok()),
+                    created_at,
+                    updated_at,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
     /// All `(alias, entity_id, kind)` rows. Used to build the in-memory
     /// resolver index without per-query joins.
     pub fn entity_alias_index(&self) -> rusqlite::Result<Vec<(String, Uuid, String)>> {
@@ -570,6 +603,81 @@ impl Db {
         tx.execute(
             "INSERT INTO entity_aliases (entity_id, alias) VALUES (?1, ?2)",
             params![id_bytes, alias],
+        )?;
+        tx.commit()
+    }
+
+    /// Create a cell-less person entity with a freshly allocated id and
+    /// `primary_cell_id = NULL`. Used by the People page's "Add person…"
+    /// affordance. Caller must subsequently `refresh_entities` so the
+    /// in-memory caches see the new row.
+    pub fn create_cell_less_person_entity(
+        &mut self,
+        display_name: &str,
+    ) -> rusqlite::Result<Uuid> {
+        let id = Uuid::now_v7();
+        let id_bytes = id.as_bytes().to_vec();
+        let now = chrono::Utc::now().timestamp_millis();
+        let alias = normalize_alias(display_name);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO entities \
+                (id, kind, display_name, primary_cell_id, created_at, updated_at) \
+             VALUES (?1, 'person', ?2, NULL, ?3, ?3)",
+            params![id_bytes, display_name, now],
+        )?;
+        tx.execute(
+            "INSERT INTO entity_aliases (entity_id, alias) VALUES (?1, ?2)",
+            params![id_bytes, alias],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Rename an existing entity. Updates `display_name`, replaces alias
+    /// rows with a fresh normalization. The caller is responsible for
+    /// rewriting the backing cell's title (in-memory + dirty flag) when
+    /// `primary_cell_id` is set — this method touches only the entity
+    /// tables.
+    pub fn rename_person_entity(
+        &mut self,
+        entity_id: Uuid,
+        new_display_name: &str,
+    ) -> rusqlite::Result<()> {
+        let id_bytes = entity_id.as_bytes().to_vec();
+        let now = chrono::Utc::now().timestamp_millis();
+        let alias = normalize_alias(new_display_name);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE entities SET display_name = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id_bytes, new_display_name, now],
+        )?;
+        tx.execute(
+            "DELETE FROM entity_aliases WHERE entity_id = ?1",
+            params![id_bytes],
+        )?;
+        tx.execute(
+            "INSERT INTO entity_aliases (entity_id, alias) VALUES (?1, ?2)",
+            params![id_bytes, alias],
+        )?;
+        tx.commit()
+    }
+
+    /// Drop an entity row + its alias rows. Caller must ensure the
+    /// entity has no incoming `kept://<id>` mentions and no backing cell
+    /// (otherwise existing links go stale and cell saves will reinsert
+    /// it). Used by the People page's right-click → Delete person flow,
+    /// gated on those preconditions in the UI layer.
+    pub fn delete_entity(&mut self, entity_id: Uuid) -> rusqlite::Result<()> {
+        let id_bytes = entity_id.as_bytes().to_vec();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM entity_aliases WHERE entity_id = ?1",
+            params![id_bytes],
+        )?;
+        tx.execute(
+            "DELETE FROM entities WHERE id = ?1",
+            params![id_bytes],
         )?;
         tx.commit()
     }
