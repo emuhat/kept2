@@ -261,6 +261,15 @@ struct PeopleRenameState {
     input: TextBox,
 }
 
+/// Right-click menu anchored on a cell in the doc area. Replaces the
+/// old kebab affordance: timestamps render as muted info rows, and a
+/// "Delete cell" row is the only action.
+struct CellContextMenu {
+    cell_id: Uuid,
+    anchor_x: f32,
+    anchor_y: f32,
+}
+
 /// Right-click menu over a People-page row. `deletable` and `ref_count`
 /// are precomputed at open time so the menu render doesn't have to walk
 /// every cell's links each frame; if the user creates a new mention
@@ -592,16 +601,12 @@ const SEARCH_DATE_FONT_SIZE: f32 = 12.0;
 const SEARCH_MAX_VISIBLE: usize = 8;
 const SEARCH_SNIPPET_LEN: usize = 80;
 
-const KEBAB_SIZE: f32 = 22.0;
-const KEBAB_INSET_X: f32 = 4.0;
-const KEBAB_INSET_Y: f32 = 2.0;
-const KEBAB_DOT_RADIUS: f32 = 1.6;
-/// Width reserved on the right of each cell so the kebab sits *outside* the
-/// focused-cell card. Must accommodate `FOCUS_PAD` (card outset) + gap +
-/// `KEBAB_SIZE` + `KEBAB_INSET_X`.
-const KEBAB_RESERVE: f32 = FOCUS_PAD + 4.0 + KEBAB_SIZE + KEBAB_INSET_X;
-const CELL_MENU_WIDTH: f32 = 280.0;
-const CELL_MENU_HEIGHT: f32 = 64.0;
+/// Cell context menu (right-click). Two muted timestamp lines + a
+/// "Delete cell" action separated by a hairline.
+const CELL_MENU_WIDTH: f32 = 220.0;
+const CELL_MENU_INFO_H: f32 = 22.0;
+const CELL_MENU_ACTION_H: f32 = 26.0;
+const CELL_MENU_PAD: f32 = 6.0;
 
 pub struct KeptApp {
     typeface: Typeface,
@@ -640,8 +645,13 @@ pub struct KeptApp {
     pending_deletes: HashSet<Uuid>,
     dirty_contexts: HashSet<Uuid>,
     pending_context_deletes: HashSet<Uuid>,
-    cell_menu_open: Option<Uuid>,
-    last_kebab_rects: Vec<(Uuid, Rect)>,
+    /// Right-click context menu over a cell. While `Some`, render a
+    /// floating card at the anchor; clicks inside dispatch the action,
+    /// clicks elsewhere dismiss.
+    cell_context_menu: Option<CellContextMenu>,
+    /// "Delete cell" row rect on the cell context menu, captured each
+    /// render for hit-testing.
+    last_cell_menu_delete_rect: Option<Rect>,
     /// Sidebar context-row rects (window coords) from last frame, for hit-testing.
     last_sidebar_rects: Vec<(Uuid, Rect)>,
     /// Sidebar date-header rects from last frame, for hit-testing.
@@ -917,8 +927,8 @@ impl KeptApp {
             pending_deletes: HashSet::new(),
             dirty_contexts: HashSet::new(),
             pending_context_deletes: HashSet::new(),
-            cell_menu_open: None,
-            last_kebab_rects: Vec::new(),
+            cell_context_menu: None,
+            last_cell_menu_delete_rect: None,
             last_sidebar_rects: Vec::new(),
             last_sidebar_date_rects: Vec::new(),
             last_sidebar_tag_rects: Vec::new(),
@@ -1231,7 +1241,7 @@ impl KeptApp {
         self.focused = None;
         self.editing = false;
         self.dragging_cell = None;
-        self.cell_menu_open = None;
+        self.cell_context_menu = None;
         self.scroll_y = 0.0;
     }
 
@@ -1257,7 +1267,7 @@ impl KeptApp {
         self.focused = pre_focused;
         self.editing = false;
         self.dragging_cell = None;
-        self.cell_menu_open = None;
+        self.cell_context_menu = None;
         self.scroll_y = pre_scroll_y;
     }
 
@@ -1366,7 +1376,7 @@ impl KeptApp {
         self.focused = self.visible_cell_ids().first().copied();
         self.editing = false;
         self.dragging_cell = None;
-        self.cell_menu_open = None;
+        self.cell_context_menu = None;
         self.scroll_y = 0.0;
         self.coalesce_break = true;
         self.pending_caret_scroll = true;
@@ -1383,7 +1393,7 @@ impl KeptApp {
         self.focused = self.visible_cell_ids().first().copied();
         self.editing = false;
         self.dragging_cell = None;
-        self.cell_menu_open = None;
+        self.cell_context_menu = None;
         self.scroll_y = 0.0;
         self.coalesce_break = true;
         self.pending_caret_scroll = true;
@@ -1401,7 +1411,7 @@ impl KeptApp {
         self.focused = self.visible_cell_ids().first().copied();
         self.editing = false;
         self.dragging_cell = None;
-        self.cell_menu_open = None;
+        self.cell_context_menu = None;
         self.scroll_y = 0.0;
         self.coalesce_break = true;
         self.pending_caret_scroll = true;
@@ -1432,7 +1442,7 @@ impl KeptApp {
         self.focused = self.visible_cell_ids().first().copied();
         self.editing = false;
         self.dragging_cell = None;
-        self.cell_menu_open = None;
+        self.cell_context_menu = None;
         self.scroll_y = 0.0;
         self.coalesce_break = true;
         self.pending_caret_scroll = true;
@@ -1479,7 +1489,7 @@ impl KeptApp {
         self.scroll_y = e.scroll_y;
         self.editing = false;
         self.dragging_cell = None;
-        self.cell_menu_open = None;
+        self.cell_context_menu = None;
         self.coalesce_break = true;
         self.pending_caret_scroll = true;
         // Drop focus mode — the new view's focused cell may not be the
@@ -1614,7 +1624,7 @@ impl KeptApp {
         self.last_scroll_time = Some(Instant::now());
         // Scrolling dismisses the per-cell menu (anchored in doc coords; would
         // visually decouple from its kebab if left open during a scroll).
-        self.cell_menu_open = None;
+        self.cell_context_menu = None;
         true
     }
 
@@ -1645,7 +1655,7 @@ impl KeptApp {
             let outer = (width - left - MARGIN_X).max(80.0);
             (left, outer)
         };
-        let content_width = (outer_cell_width - KEBAB_RESERVE).max(60.0);
+        let content_width = outer_cell_width.max(60.0);
 
         // Capture focused-cell geometry up front. The card backdrop (drawn
         // *before* cell content) and the focus ring (drawn after) both use
@@ -1655,7 +1665,6 @@ impl KeptApp {
         // layout (otherwise the card would draw at last frame's normal-mode
         // size); the ring is suppressed since there's nothing to compare to.
         let mut y = MARGIN_TOP;
-        self.last_kebab_rects.clear();
         let mouse_doc_x = self.mouse_pos.0;
         let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
         let focused_id = self.focused;
@@ -1875,19 +1884,6 @@ impl KeptApp {
                         canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
                     }
 
-                    let kebab_right = cell_x + outer_cell_width - KEBAB_INSET_X;
-                    let kebab_left = kebab_right - KEBAB_SIZE;
-                    let kebab_top = cell_y + KEBAB_INSET_Y;
-                    let kebab_bot = kebab_top + KEBAB_SIZE;
-                    let kebab_rect =
-                        Rect::new(kebab_left, kebab_top, kebab_right, kebab_bot);
-                    let hovered = mouse_doc_x >= kebab_rect.left
-                        && mouse_doc_x <= kebab_rect.right
-                        && mouse_doc_y >= kebab_rect.top
-                        && mouse_doc_y <= kebab_rect.bottom;
-                    draw_kebab(canvas, kebab_rect, hovered);
-                    self.last_kebab_rects.push((cell.id, kebab_rect));
-
                     y += h + CELL_GAP;
                 }
             }
@@ -1939,10 +1935,6 @@ impl KeptApp {
                 cy + ch + FOCUS_PAD,
             );
             canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &focus_paint);
-        }
-
-        if let Some(id) = self.cell_menu_open {
-            self.render_cell_menu(canvas, id);
         }
 
         canvas.restore();
@@ -2016,15 +2008,16 @@ impl KeptApp {
         // Tag right-click menu (window space).
         self.render_tag_context_menu(canvas);
         self.render_people_context_menu(canvas);
+        self.render_cell_context_menu(canvas);
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
-        // Esc closes the cell menu first if it's open.
+        // Esc closes the cell context menu first if it's open.
         if event.state == ElementState::Pressed
-            && self.cell_menu_open.is_some()
+            && self.cell_context_menu.is_some()
             && matches!(event.logical_key, Key::Named(NamedKey::Escape))
         {
-            self.cell_menu_open = None;
+            self.cell_context_menu = None;
             return true;
         }
 
@@ -2215,9 +2208,6 @@ impl KeptApp {
                 }
                 Key::Character(s) if s.as_str() == "]" => {
                     return self.nav_forward();
-                }
-                Key::Named(NamedKey::Delete) => {
-                    return self.delete_focused_cell();
                 }
                 Key::Named(NamedKey::ArrowUp) => {
                     if modifiers.state().shift_key() {
@@ -2442,9 +2432,6 @@ impl KeptApp {
                             }
                         }
                         return false;
-                    }
-                    Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => {
-                        return self.delete_focused_cell();
                     }
                     _ => {}
                 }
@@ -2762,75 +2749,124 @@ impl KeptApp {
         true
     }
 
-    fn render_cell_menu(&self, canvas: &Canvas, cell_id: Uuid) {
-        let Some((_, anchor)) = self
-            .last_kebab_rects
-            .iter()
-            .find(|(i, _)| *i == cell_id)
-            .copied()
-        else {
+    /// Right-click context menu over a cell. Two muted info lines
+    /// (Created / Last edited timestamps) followed by a hairline and a
+    /// red "Delete cell" action row. Anchored at the cursor position
+    /// recorded when the menu opened.
+    fn render_cell_context_menu(&mut self, canvas: &Canvas) {
+        let Some(menu) = self.cell_context_menu.as_ref() else {
+            self.last_cell_menu_delete_rect = None;
             return;
         };
-        let Some(cell) = self.cell(cell_id) else {
+        let Some(cell) = self.cell(menu.cell_id) else {
+            self.last_cell_menu_delete_rect = None;
             return;
         };
         let scale = self.font_scale;
+        let pad = CELL_MENU_PAD * scale;
+        let info_h = CELL_MENU_INFO_H * scale;
+        let action_h = CELL_MENU_ACTION_H * scale;
         let menu_w = CELL_MENU_WIDTH * scale;
-        let menu_h = CELL_MENU_HEIGHT * scale;
-        let menu_x = anchor.right - menu_w;
-        let menu_y = anchor.bottom + 4.0 * scale;
+        let menu_h = pad + info_h * 2.0 + 1.0 + action_h + pad;
         let radius = 6.0 * scale;
-        let rect = Rect::new(menu_x, menu_y, menu_x + menu_w, menu_y + menu_h);
+        let rect = Rect::new(
+            menu.anchor_x,
+            menu.anchor_y,
+            menu.anchor_x + menu_w,
+            menu.anchor_y + menu_h,
+        );
 
         // Drop shadow.
-        let mut shadow_paint = Paint::default();
-        shadow_paint.set_anti_alias(true);
-        shadow_paint.set_color(Color::from_argb(0x30, 0, 0, 0));
-        shadow_paint.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
+        let mut shadow = Paint::default();
+        shadow.set_anti_alias(true);
+        shadow.set_color(Color::from_argb(0x40, 0, 0, 0));
+        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
         canvas.draw_round_rect(
             Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
             radius,
             radius,
-            &shadow_paint,
+            &shadow,
         );
 
-        // Background.
-        let mut bg_paint = Paint::default();
-        bg_paint.set_anti_alias(true);
-        bg_paint.set_color(Color::WHITE);
-        canvas.draw_round_rect(rect, radius, radius, &bg_paint);
+        // Background + border.
+        let mut bg = Paint::default();
+        bg.set_anti_alias(true);
+        bg.set_color(Color::WHITE);
+        canvas.draw_round_rect(rect, radius, radius, &bg);
+        let mut border = Paint::default();
+        border.set_anti_alias(true);
+        border.set_style(PaintStyle::Stroke);
+        border.set_stroke_width(1.0);
+        border.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        canvas.draw_round_rect(rect, radius, radius, &border);
 
-        // Border.
-        let mut border_paint = Paint::default();
-        border_paint.set_anti_alias(true);
-        border_paint.set_style(PaintStyle::Stroke);
-        border_paint.set_stroke_width(1.0);
-        border_paint.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
-        canvas.draw_round_rect(rect, radius, radius, &border_paint);
-
-        // Two non-selectable timestamp lines.
-        let font = Font::from_typeface(&self.typeface, 13.0 * scale);
-        let mut text_paint = Paint::default();
-        text_paint.set_anti_alias(true);
-        text_paint.set_color(Color::from_rgb(0x70, 0x70, 0x70));
-        let (_, m) = font.metrics();
-        let line_step = -m.ascent + m.descent + m.leading;
-        let pad_y = 10.0 * scale;
-        let line1_baseline = rect.top + pad_y + (-m.ascent);
-        let line2_baseline = line1_baseline + line_step;
-        let pad_x = 12.0 * scale;
+        // Two muted info lines.
+        let info_font = Font::from_typeface(&self.typeface, 12.0 * scale);
+        let mut info_paint = Paint::default();
+        info_paint.set_anti_alias(true);
+        info_paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+        let (_, im) = info_font.metrics();
+        let line1_baseline =
+            rect.top + pad + (info_h + (-im.ascent) - im.descent) * 0.5;
+        let line2_baseline = line1_baseline + info_h;
         canvas.draw_str(
             format!("Created {}", format_timestamp(cell.timestamp)),
-            Point::new(rect.left + pad_x, line1_baseline),
-            &font,
-            &text_paint,
+            Point::new(rect.left + pad * 2.0, line1_baseline),
+            &info_font,
+            &info_paint,
         );
         canvas.draw_str(
             format!("Last edited {}", format_timestamp(cell.edited_at)),
-            Point::new(rect.left + pad_x, line2_baseline),
-            &font,
-            &text_paint,
+            Point::new(rect.left + pad * 2.0, line2_baseline),
+            &info_font,
+            &info_paint,
         );
+
+        // Hairline divider above the action row.
+        let divider_y = rect.top + pad + info_h * 2.0 + 0.5;
+        let mut divider = Paint::default();
+        divider.set_anti_alias(false);
+        divider.set_color(Color::from_argb(0x28, 0x1c, 0x1c, 0x1c));
+        canvas.draw_line(
+            Point::new(rect.left + pad, divider_y),
+            Point::new(rect.right - pad, divider_y),
+            &divider,
+        );
+
+        // Delete row.
+        let delete_top = rect.top + pad + info_h * 2.0 + 1.0;
+        let delete_rect = Rect::new(
+            rect.left + pad * 0.5,
+            delete_top,
+            rect.right - pad * 0.5,
+            delete_top + action_h,
+        );
+        let mouse_x = self.mouse_pos.0;
+        let mouse_y = self.mouse_pos.1;
+        let delete_hovered = mouse_x >= delete_rect.left
+            && mouse_x <= delete_rect.right
+            && mouse_y >= delete_rect.top
+            && mouse_y <= delete_rect.bottom;
+        if delete_hovered {
+            let mut hp = Paint::default();
+            hp.set_anti_alias(true);
+            hp.set_color(Color::from_argb(0x20, 0xc0, 0x30, 0x30));
+            canvas.draw_round_rect(delete_rect, 4.0 * scale, 4.0 * scale, &hp);
+        }
+        let action_font = Font::from_typeface(&self.typeface, 13.0 * scale);
+        let (_, am) = action_font.metrics();
+        let mut delete_paint = Paint::default();
+        delete_paint.set_anti_alias(true);
+        delete_paint.set_color(Color::from_rgb(0xc0, 0x30, 0x30));
+        let baseline =
+            delete_rect.top + (action_h + (-am.ascent) - am.descent) * 0.5;
+        canvas.draw_str(
+            "Delete cell",
+            Point::new(delete_rect.left + pad * 2.0, baseline),
+            &action_font,
+            &delete_paint,
+        );
+        self.last_cell_menu_delete_rect = Some(delete_rect);
     }
 
     /// Render the entity page for `entity_id` into the doc area. Returns
@@ -4377,7 +4413,7 @@ impl KeptApp {
         });
         // Drop other transient overlays so they don't compete for input.
         self.mention_popup = None;
-        self.cell_menu_open = None;
+        self.cell_context_menu = None;
     }
 
     fn close_search_cancel(&mut self) {
@@ -4810,8 +4846,10 @@ impl KeptApp {
         true
     }
 
-    fn delete_focused_cell(&mut self) -> bool {
-        let Some(id) = self.focused else { return false };
+    /// Delete a cell by id. Used by the right-click "Delete cell" menu.
+    /// The cell does not need to be focused — focus is repicked from the
+    /// visible neighbors as part of the operation.
+    fn delete_cell_by_id(&mut self, id: Uuid) -> bool {
         let cell_ref = match self.cell(id) {
             Some(c) => c,
             None => return false,
@@ -5098,7 +5136,8 @@ impl KeptApp {
     pub fn right_click(&mut self, x: f32, y: f32) -> bool {
         // Right-clicking anywhere first closes any open menu.
         let was_open = self.tag_context_menu.take().is_some()
-            | self.people_context_menu.take().is_some();
+            | self.people_context_menu.take().is_some()
+            | self.cell_context_menu.take().is_some();
         // Sidebar: tag rows offer a context menu (delete-tag for empty
         // tags). Everything else in the sidebar dismisses an open menu.
         if x < SIDEBAR_WIDTH * self.font_scale {
@@ -5123,8 +5162,9 @@ impl KeptApp {
             }
             return was_open;
         }
-        // Doc-area right-clicks: People-page rows open the rename/delete
-        // context menu. Other doc-area clicks dismiss any open menu.
+        // Doc-area right-clicks. People-page rows → rename/delete menu.
+        // AST/Context cell-loop → per-cell context menu (timestamps +
+        // Delete cell).
         if matches!(self.view.view_kind, ViewKind::People) {
             let doc_y = y + self.scroll_y;
             for (entity_id, rect) in self.last_people_row_rects.clone() {
@@ -5132,6 +5172,21 @@ impl KeptApp {
                     self.open_people_context_menu(entity_id, x, y);
                     return true;
                 }
+            }
+            return was_open;
+        }
+        if matches!(
+            self.view.view_kind,
+            ViewKind::Ast | ViewKind::Context(_) | ViewKind::Entity(_)
+        ) {
+            let doc_y = y + self.scroll_y;
+            if let Some(cell_id) = self.find_cell_at(x, doc_y) {
+                self.cell_context_menu = Some(CellContextMenu {
+                    cell_id,
+                    anchor_x: x,
+                    anchor_y: y,
+                });
+                return true;
             }
         }
         was_open
@@ -5217,7 +5272,7 @@ impl KeptApp {
             // PAGES section first (top of the sidebar).
             for (kind, rect) in self.last_sidebar_pages_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    self.cell_menu_open = None;
+                    self.cell_context_menu = None;
                     return match kind {
                         PageKind::People => self.push_view(Query::people()),
                     };
@@ -5227,46 +5282,42 @@ impl KeptApp {
             // overlaps date row gaps in some edge cases — context wins).
             for (id, rect) in self.last_sidebar_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    self.cell_menu_open = None;
+                    self.cell_context_menu = None;
                     return self.push_view(Query::context(id));
                 }
             }
             for (date, rect) in self.last_sidebar_date_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    self.cell_menu_open = None;
+                    self.cell_context_menu = None;
                     return self.push_view(Query::date(date));
                 }
             }
             for (name, rect) in self.last_sidebar_tag_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    self.cell_menu_open = None;
+                    self.cell_context_menu = None;
                     return self.push_view(Query::tag(name));
                 }
             }
-            self.cell_menu_open = None;
+            self.cell_context_menu = None;
             return false;
         }
 
         let doc_y = y + self.scroll_y;
 
-        // Per-cell kebab toggle wins over normal cell click routing.
-        for (id, kebab) in &self.last_kebab_rects {
-            if x >= kebab.left
-                && x <= kebab.right
-                && doc_y >= kebab.top
-                && doc_y <= kebab.bottom
-            {
-                self.cell_menu_open = if self.cell_menu_open == Some(*id) {
-                    None
-                } else {
-                    Some(*id)
-                };
-                return true;
+        // Cell context menu dispatch: click on Delete row deletes;
+        // click anywhere else dismisses and falls through to normal
+        // cell routing.
+        if self.cell_context_menu.is_some() {
+            if let Some(rect) = self.last_cell_menu_delete_rect {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        self.delete_cell_by_id(menu.cell_id);
+                    }
+                    return true;
+                }
             }
+            self.cell_context_menu = None;
         }
-        // Any other click closes the cell menu before falling through to
-        // normal cell routing.
-        self.cell_menu_open = None;
 
         // Entity-page active/inactive toggle (always present in entity
         // view; rect is None outside it).
@@ -5545,28 +5596,6 @@ fn draw_runs_with_matches(
         x += font.measure_str(segment, Some(paint)).0;
         i = j;
     }
-}
-
-fn draw_kebab(canvas: &Canvas, rect: Rect, hovered: bool) {
-    let cx = (rect.left + rect.right) * 0.5;
-    let cy = (rect.top + rect.bottom) * 0.5;
-    if hovered {
-        let mut hover_paint = Paint::default();
-        hover_paint.set_anti_alias(true);
-        hover_paint.set_color(Color::from_argb(0x22, 0, 0, 0));
-        let r = rect.width().min(rect.height()) * 0.5;
-        canvas.draw_circle((cx, cy), r, &hover_paint);
-    }
-    let mut paint = Paint::default();
-    paint.set_anti_alias(true);
-    paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
-    let h = rect.height();
-    let cy0 = rect.top + h * 0.28;
-    let cy1 = rect.top + h * 0.50;
-    let cy2 = rect.top + h * 0.72;
-    canvas.draw_circle((cx, cy0), KEBAB_DOT_RADIUS, &paint);
-    canvas.draw_circle((cx, cy1), KEBAB_DOT_RADIUS, &paint);
-    canvas.draw_circle((cx, cy2), KEBAB_DOT_RADIUS, &paint);
 }
 
 /// Pill-shaped on/off switch. `on=true` paints the track in the
