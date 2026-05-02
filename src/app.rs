@@ -429,6 +429,39 @@ enum UndoOp {
         prev_view: Query,
         new_view: Query,
     },
+    /// People-page rename: swap `display_name` (entity row + alias rows)
+    /// and, when the entity has a backing cell, swap the cell's title
+    /// text. Captures both halves so undo / redo flip atomically; the
+    /// backing cell is also marked dirty so the next flush persists the
+    /// title change to disk.
+    RenamePersonEntity {
+        entity_id: Uuid,
+        prev_name: String,
+        new_name: String,
+        /// `(cell_id, prev_title_text, new_title_text)` when a backing
+        /// cell's title was rewritten as part of the rename. None for
+        /// cell-less entities.
+        cell_title_change: Option<(Uuid, String, String)>,
+    },
+    /// People-page "Add person" (cell-less entity creation). Undo drops
+    /// the row by id; redo re-inserts with the same id + name +
+    /// created_at so any `kept://<id>` mentions written between create
+    /// and undo stay valid through the round-trip.
+    CreateCelllessEntity {
+        entity_id: Uuid,
+        name: String,
+        created_at: i64,
+    },
+    /// People-page "Delete person." Captures the row's identity so undo
+    /// re-inserts it; redo deletes again. Pre-condition (enforced at
+    /// menu open time) is no backing cell + zero `kept://` mentions —
+    /// without that, a deleted-then-undone entity would still leave
+    /// dangling references in the live DB.
+    DeleteCelllessEntity {
+        entity_id: Uuid,
+        name: String,
+        created_at: i64,
+    },
 }
 
 const SEED_TEXTS: &[&str] = &[
@@ -2056,35 +2089,28 @@ impl KeptApp {
             return true;
         }
 
-        // People-page rename input: while active, Enter commits, Esc
-        // cancels, every other key flows into the embedded TextBox.
+        // People-page rename input: Enter and Esc both commit (Esc is a
+        // "blur" that keeps the typed text live, matching the cell
+        // edit-vs-view modal elsewhere). Everything else flows into the
+        // embedded TextBox.
         if event.state == ElementState::Pressed && self.people_rename.is_some() {
             match &event.logical_key {
-                Key::Named(NamedKey::Escape) => {
-                    self.cancel_people_rename();
-                    return true;
-                }
-                Key::Named(NamedKey::Enter) => {
+                Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
                     self.commit_people_rename();
                     return true;
                 }
                 _ => {}
             }
-            // Everything else: route to the input so caret / arrows /
-            // selection / typing / clipboard work like a normal TextBox.
             if let Some(rs) = self.people_rename.as_mut() {
                 return rs.input.handle_key(event, modifiers);
             }
         }
 
-        // People-page Add input: same shape as rename.
+        // People-page Add input: same shape as rename. Esc / Enter both
+        // commit; trimmed-empty input is still a no-op (no row created).
         if event.state == ElementState::Pressed && self.people_add.is_some() {
             match &event.logical_key {
-                Key::Named(NamedKey::Escape) => {
-                    self.cancel_people_add();
-                    return true;
-                }
-                Key::Named(NamedKey::Enter) => {
+                Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
                     self.commit_people_add();
                     return true;
                 }
@@ -2252,6 +2278,14 @@ impl KeptApp {
                         self.mark_cell_dirty(id);
                     }
                     return changed;
+                }
+                Key::Character(s)
+                    if s.as_str().eq_ignore_ascii_case("d")
+                        && modifiers.state().shift_key() =>
+                {
+                    // Ctrl/Cmd+Shift+D: jump to today's date view.
+                    let today = local_date_for_ms(now_epoch_ms());
+                    return self.push_view(Query::date(today));
                 }
                 _ => {}
             }
@@ -3112,16 +3146,12 @@ impl KeptApp {
         self.people_rename = Some(PeopleRenameState { entity_id, input });
     }
 
-    /// Drop any in-progress rename without persisting changes.
-    fn cancel_people_rename(&mut self) {
-        self.people_rename = None;
-    }
-
     /// Commit the in-progress rename. Writes the new display_name to the
     /// entity row and replaces alias rows. If the entity has a backing
     /// cell, the cell's title text is rewritten (preserving trailing tags)
     /// and the cell is marked dirty so `flush_persistence` saves it on
-    /// the next idle window.
+    /// the next idle window. The whole operation lands as a single
+    /// `UndoOp::RenamePersonEntity` on the undo stack.
     fn commit_people_rename(&mut self) {
         let Some(rs) = self.people_rename.take() else { return };
         let new_text = rs.input.text().trim().to_string();
@@ -3130,11 +3160,15 @@ impl KeptApp {
         }
         let entity_id = rs.entity_id;
 
-        let primary_cell_id = self
-            .entities
-            .iter()
-            .find(|e| e.id == entity_id)
-            .and_then(|e| e.primary_cell_id);
+        // Snapshot pre-rename state for undo.
+        let entity_pre = self.entities.iter().find(|e| e.id == entity_id).cloned();
+        let Some(entity_pre) = entity_pre else { return };
+        let prev_name = entity_pre.display_name.clone();
+        if prev_name == new_text {
+            // No-op rename — don't pollute the undo stack.
+            return;
+        }
+        let primary_cell_id = entity_pre.primary_cell_id;
 
         if let Some(db) = self.db.as_mut() {
             if let Err(e) = db.rename_person_entity(entity_id, &new_text) {
@@ -3143,23 +3177,32 @@ impl KeptApp {
             }
         }
 
+        let mut cell_title_change: Option<(Uuid, String, String)> = None;
         if let Some(cell_id) = primary_cell_id {
             if let Some(cell) = self.cell_mut(cell_id) {
                 if let Some(title) = cell.title.as_mut() {
-                    let cur = title.text().to_string();
-                    let (_, tags) = split_title_name_and_tags(&cur);
+                    let prev_title = title.text().to_string();
+                    let (_, tags) = split_title_name_and_tags(&prev_title);
                     let new_title = if tags.is_empty() {
                         new_text.clone()
                     } else {
                         format!("{} {}", new_text, tags)
                     };
-                    title.replace_text(new_title);
+                    title.replace_text(new_title.clone());
+                    cell_title_change = Some((cell_id, prev_title, new_title));
                 }
             }
             self.mark_cell_dirty(cell_id);
         }
 
         self.refresh_entities();
+        self.undo_stack.push(UndoOp::RenamePersonEntity {
+            entity_id,
+            prev_name,
+            new_name: new_text,
+            cell_title_change,
+        });
+        self.redo_stack.clear();
         self.coalesce_break = true;
     }
 
@@ -3204,9 +3247,16 @@ impl KeptApp {
 
     /// Hard-delete an entity that has no backing cell and no references.
     /// Caller must have verified those conditions (the menu does that at
-    /// open time). Refreshes entity caches so the People list reflects
-    /// the removal on the next frame.
+    /// open time). Refreshes entity caches and pushes a
+    /// `DeleteCelllessEntity` undo entry that captures the row's
+    /// identity (id + name + created_at) so undo can recreate it
+    /// faithfully.
     fn delete_person_entity(&mut self, entity_id: Uuid) {
+        let snapshot = self
+            .entities
+            .iter()
+            .find(|e| e.id == entity_id)
+            .cloned();
         if let Some(db) = self.db.as_mut() {
             if let Err(e) = db.delete_entity(entity_id) {
                 eprintln!("kept: delete_entity failed: {e}");
@@ -3214,6 +3264,14 @@ impl KeptApp {
             }
         }
         self.refresh_entities();
+        if let Some(e) = snapshot {
+            self.undo_stack.push(UndoOp::DeleteCelllessEntity {
+                entity_id: e.id,
+                name: e.display_name,
+                created_at: e.created_at,
+            });
+            self.redo_stack.clear();
+        }
         self.coalesce_break = true;
     }
 
@@ -3230,25 +3288,40 @@ impl KeptApp {
 
     /// Commit the inline Add-person input. Trimmed-empty input cancels
     /// silently (no entity created); otherwise inserts a cell-less
-    /// person entity with the typed name.
+    /// person entity with the typed name and pushes a
+    /// `CreateCelllessEntity` undo entry.
     fn commit_people_add(&mut self) {
         let Some(input) = self.people_add.take() else { return };
         let name = input.text().trim().to_string();
         if name.is_empty() {
             return;
         }
-        if let Some(db) = self.db.as_mut() {
-            if let Err(e) = db.create_cell_less_person_entity(&name) {
-                eprintln!("kept: create_cell_less_person_entity failed: {e}");
-                return;
-            }
-        }
+        let new_id = match self.db.as_mut() {
+            Some(db) => match db.create_cell_less_person_entity(&name) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("kept: create_cell_less_person_entity failed: {e}");
+                    return;
+                }
+            },
+            None => return,
+        };
         self.refresh_entities();
+        // Pull the just-inserted row's `created_at` so undo→redo
+        // round-trips preserve the stable timestamp.
+        let created_at = self
+            .entities
+            .iter()
+            .find(|e| e.id == new_id)
+            .map(|e| e.created_at)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        self.undo_stack.push(UndoOp::CreateCelllessEntity {
+            entity_id: new_id,
+            name,
+            created_at,
+        });
+        self.redo_stack.clear();
         self.coalesce_break = true;
-    }
-
-    fn cancel_people_add(&mut self) {
-        self.people_add = None;
     }
 
     fn render_sidebar(&mut self, canvas: &Canvas, height: f32) {
@@ -4353,6 +4426,52 @@ impl KeptApp {
                 self.view = prev_view.clone();
                 bump_focused_edited = false;
             }
+            UndoOp::RenamePersonEntity {
+                entity_id,
+                prev_name,
+                cell_title_change,
+                ..
+            } => {
+                if let Some(db) = self.db.as_mut() {
+                    if let Err(e) = db.rename_person_entity(*entity_id, prev_name) {
+                        eprintln!("kept: undo rename_person_entity failed: {e}");
+                    }
+                }
+                if let Some((cell_id, prev_title, _)) = cell_title_change {
+                    if let Some(cell) = self.cell_mut(*cell_id) {
+                        if let Some(title) = cell.title.as_mut() {
+                            title.replace_text(prev_title.clone());
+                        }
+                    }
+                    self.mark_cell_dirty(*cell_id);
+                }
+                self.refresh_entities();
+                bump_focused_edited = false;
+            }
+            UndoOp::CreateCelllessEntity { entity_id, .. } => {
+                if let Some(db) = self.db.as_mut() {
+                    if let Err(e) = db.delete_entity(*entity_id) {
+                        eprintln!("kept: undo create-entity (delete) failed: {e}");
+                    }
+                }
+                self.refresh_entities();
+                bump_focused_edited = false;
+            }
+            UndoOp::DeleteCelllessEntity {
+                entity_id,
+                name,
+                created_at,
+            } => {
+                if let Some(db) = self.db.as_mut() {
+                    if let Err(e) =
+                        db.insert_person_entity_with_id(*entity_id, name, *created_at)
+                    {
+                        eprintln!("kept: undo delete-entity (insert) failed: {e}");
+                    }
+                }
+                self.refresh_entities();
+                bump_focused_edited = false;
+            }
         }
         self.redo_stack.push(op);
         self.dragging_cell = None;
@@ -4426,6 +4545,52 @@ impl KeptApp {
                 }
                 self.dirty_contexts.insert(*context_id);
                 self.view = new_view.clone();
+                bump_focused_edited = false;
+            }
+            UndoOp::RenamePersonEntity {
+                entity_id,
+                new_name,
+                cell_title_change,
+                ..
+            } => {
+                if let Some(db) = self.db.as_mut() {
+                    if let Err(e) = db.rename_person_entity(*entity_id, new_name) {
+                        eprintln!("kept: redo rename_person_entity failed: {e}");
+                    }
+                }
+                if let Some((cell_id, _, new_title)) = cell_title_change {
+                    if let Some(cell) = self.cell_mut(*cell_id) {
+                        if let Some(title) = cell.title.as_mut() {
+                            title.replace_text(new_title.clone());
+                        }
+                    }
+                    self.mark_cell_dirty(*cell_id);
+                }
+                self.refresh_entities();
+                bump_focused_edited = false;
+            }
+            UndoOp::CreateCelllessEntity {
+                entity_id,
+                name,
+                created_at,
+            } => {
+                if let Some(db) = self.db.as_mut() {
+                    if let Err(e) =
+                        db.insert_person_entity_with_id(*entity_id, name, *created_at)
+                    {
+                        eprintln!("kept: redo create-entity failed: {e}");
+                    }
+                }
+                self.refresh_entities();
+                bump_focused_edited = false;
+            }
+            UndoOp::DeleteCelllessEntity { entity_id, .. } => {
+                if let Some(db) = self.db.as_mut() {
+                    if let Err(e) = db.delete_entity(*entity_id) {
+                        eprintln!("kept: redo delete-entity failed: {e}");
+                    }
+                }
+                self.refresh_entities();
                 bump_focused_edited = false;
             }
         }

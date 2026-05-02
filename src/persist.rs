@@ -663,6 +663,38 @@ impl Db {
         tx.commit()
     }
 
+    /// Insert a person entity row at a specific id + created_at, with
+    /// alias rebuilt from `display_name`. Used to reverse Add (redo) and
+    /// Delete (undo) on cell-less entities — preserving the original
+    /// id keeps any pre-existing `kept://` mentions valid through the
+    /// undo round-trip.
+    pub fn insert_person_entity_with_id(
+        &mut self,
+        entity_id: Uuid,
+        display_name: &str,
+        created_at: i64,
+    ) -> rusqlite::Result<()> {
+        let id_bytes = entity_id.as_bytes().to_vec();
+        let now = chrono::Utc::now().timestamp_millis();
+        let alias = normalize_alias(display_name);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO entities \
+                (id, kind, display_name, primary_cell_id, created_at, updated_at) \
+             VALUES (?1, 'person', ?2, NULL, ?3, ?4)",
+            params![id_bytes, display_name, created_at, now],
+        )?;
+        tx.execute(
+            "DELETE FROM entity_aliases WHERE entity_id = ?1",
+            params![id_bytes],
+        )?;
+        tx.execute(
+            "INSERT INTO entity_aliases (entity_id, alias) VALUES (?1, ?2)",
+            params![id_bytes, alias],
+        )?;
+        tx.commit()
+    }
+
     /// Drop an entity row + its alias rows. Caller must ensure the
     /// entity has no incoming `kept://<id>` mentions and no backing cell
     /// (otherwise existing links go stale and cell saves will reinsert
