@@ -89,7 +89,9 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
             if i == 0 {
                 score += 8;
             } else if !c[i - 1].is_ascii_alphanumeric() {
-                score += 4;
+                // Post-separator (whitespace, punctuation): `Carr` after
+                // a space in "Peter Carr".
+                score += 6;
             } else if camel_aligned
                 && orig[i].is_ascii_uppercase()
                 && orig[i - 1].is_ascii_lowercase()
@@ -97,8 +99,13 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
                 // CamelCase boundary inside an otherwise unbroken run —
                 // e.g. the `C` in `PeterCarr` starts a new name component
                 // even though there's no separator character.
-                score += 4;
+                score += 6;
             }
+            // Word-boundary bonuses (6) are intentionally larger than
+            // contiguous (5) so initials-style matches like `th` →
+            // `TrevorHickey` (T + camelCase H) outrank an inside-word
+            // contiguous run like `th` → `ThomasOttaway` (T + adjacent
+            // h inside "Thomas").
             if let Some(prev) = prev_match {
                 if i == prev + 1 {
                     score += 5;
@@ -5733,6 +5740,23 @@ mod tests {
         ];
         let ranked = filter_mentions(&cands, "pc");
         assert_eq!(ranked[0].0, "PeterCarr");
+    }
+
+    #[test]
+    fn fuzzy_initials_beat_inside_word_contiguous() {
+        // "th" against "TrevorHickey" (T + camelCase H) should outrank
+        // "ThomasOttaway" (T + adjacent h inside "Thomas") even though
+        // the latter has a contiguous-match bonus and the former does
+        // not. Word-boundary bonus must dominate inside-word contiguity
+        // for initials-style queries to feel right.
+        let trevor = fuzzy_score("th", "TrevorHickey").expect("matches");
+        let thomas = fuzzy_score("th", "ThomasOttaway").expect("matches");
+        assert!(
+            trevor.0 > thomas.0,
+            "TrevorHickey ({}) must outrank ThomasOttaway ({})",
+            trevor.0,
+            thomas.0,
+        );
     }
 
     #[test]
