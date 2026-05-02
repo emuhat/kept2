@@ -154,13 +154,34 @@ fn split_title_name_and_tags(text: &str) -> (String, String) {
     (text[..name_end].to_string(), text[tags_start..].to_string())
 }
 
-fn filter_mentions(names: &[String], query: &str) -> Vec<(String, Vec<usize>)> {
+/// Heavy penalty applied to inactive candidates in the @-mention popup.
+/// Typical short-query fuzzy scores are in roughly `[0, 30]`, so an
+/// inactive match always ranks below any active match — but the user can
+/// still find an inactive person by typing enough of the name.
+const INACTIVE_FUZZY_PENALTY: i32 = 50;
+
+fn filter_mentions(
+    candidates: &[(String, bool)],
+    query: &str,
+) -> Vec<(String, Vec<usize>)> {
     if query.is_empty() {
-        return names.iter().map(|n| (n.clone(), Vec::new())).collect();
+        return candidates
+            .iter()
+            .map(|(n, _)| (n.clone(), Vec::new()))
+            .collect();
     }
-    let mut scored: Vec<(i32, String, Vec<usize>)> = names
+    let mut scored: Vec<(i32, String, Vec<usize>)> = candidates
         .iter()
-        .filter_map(|name| fuzzy_score(query, name).map(|(s, m)| (s, name.clone(), m)))
+        .filter_map(|(name, is_active)| {
+            fuzzy_score(query, name).map(|(s, m)| {
+                let s = if *is_active {
+                    s
+                } else {
+                    s - INACTIVE_FUZZY_PENALTY
+                };
+                (s, name.clone(), m)
+            })
+        })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     scored.into_iter().map(|(_, n, m)| (n, m)).collect()
@@ -456,11 +477,20 @@ enum UndoOp {
     /// re-inserts it; redo deletes again. Pre-condition (enforced at
     /// menu open time) is no backing cell + zero `kept://` mentions —
     /// without that, a deleted-then-undone entity would still leave
-    /// dangling references in the live DB.
+    /// dangling references in the live DB. Also captures `is_active` so
+    /// an inactive person comes back inactive on undo.
     DeleteCelllessEntity {
         entity_id: Uuid,
         name: String,
+        is_active: bool,
         created_at: i64,
+    },
+    /// Entity-page active/inactive toggle. Undo flips `is_active` to
+    /// `prev`; redo flips to `new`. No focus side-effects.
+    SetEntityActive {
+        entity_id: Uuid,
+        prev: bool,
+        new: bool,
     },
 }
 
@@ -644,6 +674,16 @@ pub struct KeptApp {
     /// trimmed text becomes a new cell-less entity; Esc cancels with no
     /// row created. Mutually exclusive with `people_rename`.
     people_add: Option<TextBox>,
+    /// People-page "Show inactive" view filter. Default false: inactive
+    /// entities are hidden from the list. Always-show in the @-mention
+    /// popup (with downweight). Session-only — no persistence in v1.
+    show_inactive: bool,
+    /// Active/inactive toggle rect on the entity page from last frame.
+    /// `Some` only while in `ViewKind::Entity(_)`.
+    last_entity_active_toggle_rect: Option<Rect>,
+    /// "Show inactive" toggle rect on the People page from last frame.
+    /// `Some` only while in `ViewKind::People`.
+    last_people_show_inactive_toggle_rect: Option<Rect>,
     /// Active right-click menu over a People-page row.
     people_context_menu: Option<PeopleContextMenu>,
     /// "Rename" row rect on the People context menu, captured each
@@ -884,6 +924,9 @@ impl KeptApp {
             last_people_add_rect: None,
             people_rename: None,
             people_add: None,
+            show_inactive: false,
+            last_entity_active_toggle_rect: None,
+            last_people_show_inactive_toggle_rect: None,
             people_context_menu: None,
             last_people_menu_rename_rect: None,
             last_people_menu_delete_rect: None,
@@ -955,6 +998,20 @@ impl KeptApp {
         out
     }
 
+    /// `(display_name, is_active)` for every person entity, in the same
+    /// alphabetical order as `person_entries`. Fed to `filter_mentions`
+    /// so the popup can downweight inactive matches without losing them.
+    fn person_mention_candidates(&self) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = self
+            .entities
+            .iter()
+            .filter(|e| e.kind == "person")
+            .map(|e| (e.display_name.clone(), e.is_active))
+            .collect();
+        out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        out
+    }
+
     /// Reload the entity caches from the DB. Called after every
     /// `save_cell` / `delete_cell` so the in-memory state stays in lockstep
     /// with the persistence layer's authoritative entity table.
@@ -978,10 +1035,6 @@ impl KeptApp {
             .filter(|e| e.primary_cell_id.is_some())
             .map(|e| (e.id, normalize_title_for_fallback(&e.display_name)))
             .collect();
-    }
-
-    fn person_names(&self) -> Vec<String> {
-        self.person_entries().into_iter().map(|(n, _)| n).collect()
     }
 
     fn writable_context_id(&self) -> Option<Uuid> {
@@ -2617,9 +2670,11 @@ impl KeptApp {
             return;
         }
         let query = q.to_string();
-        let names = self.person_names();
+        let candidates = self.person_mention_candidates();
         if let Some(p) = self.mention_popup.as_mut() {
-            let count = filter_mentions(&names, &query).len().min(MENTION_POPUP_MAX_VISIBLE);
+            let count = filter_mentions(&candidates, &query)
+                .len()
+                .min(MENTION_POPUP_MAX_VISIBLE);
             p.query = query;
             if count == 0 {
                 p.selected = 0;
@@ -2841,12 +2896,47 @@ impl KeptApp {
         meta_paint.set_anti_alias(true);
         meta_paint.set_color(Color::from_rgb(0x70, 0x68, 0x58));
         y += 4.0 * scale;
+        let meta_baseline = y + (-mm.ascent);
         canvas.draw_str(
             &meta,
-            Point::new(cells_left, y + (-mm.ascent)),
+            Point::new(cells_left, meta_baseline),
             &meta_font,
             &meta_paint,
         );
+        // Active/inactive toggle, right-aligned with the meta baseline.
+        // Label sits to the left of the pill in the same font/color as
+        // the meta text; mouse_down hit-tests the pill rect alone.
+        let toggle_w = 34.0 * scale;
+        let toggle_h = 18.0 * scale;
+        let label = if entity.is_active { "active" } else { "inactive" };
+        let label_w = meta_font.measure_str(label, Some(&meta_paint)).0;
+        let toggle_right = cells_left + content_width;
+        let toggle_left = toggle_right - toggle_w;
+        let label_right = toggle_left - 8.0 * scale;
+        let label_x = label_right - label_w;
+        canvas.draw_str(
+            label,
+            Point::new(label_x, meta_baseline),
+            &meta_font,
+            &meta_paint,
+        );
+        // Vertically center the pill on the meta-text band (ascent..descent).
+        let band_top = meta_baseline + mm.ascent;
+        let band_bot = meta_baseline + mm.descent;
+        let band_mid = (band_top + band_bot) * 0.5;
+        let toggle_rect = Rect::new(
+            toggle_left,
+            band_mid - toggle_h * 0.5,
+            toggle_left + toggle_w,
+            band_mid + toggle_h * 0.5,
+        );
+        let toggle_hovered = mouse_doc_x >= toggle_rect.left
+            && mouse_doc_x <= toggle_rect.right
+            && mouse_doc_y >= toggle_rect.top
+            && mouse_doc_y <= toggle_rect.bottom;
+        draw_toggle(canvas, toggle_rect, entity.is_active, toggle_hovered);
+        self.last_entity_active_toggle_rect = Some(toggle_rect);
+
         y += -mm.ascent + mm.descent;
         y += ENTITY_SECTION_GAP * scale;
 
@@ -2981,30 +3071,75 @@ impl KeptApp {
     ) -> f32 {
         self.last_people_row_rects.clear();
         self.last_people_add_rect = None;
+        self.last_people_show_inactive_toggle_rect = None;
 
         let mut y = MARGIN_TOP;
 
-        // Title
+        // Title + "Show inactive" toggle, sharing a baseline.
         let title_font =
             Font::from_typeface(&self.typeface, ENTITY_TITLE_FONT_SIZE * scale);
         let (_, tm) = title_font.metrics();
         let mut title_paint = Paint::default();
         title_paint.set_anti_alias(true);
         title_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        let title_baseline = y + (-tm.ascent);
         canvas.draw_str(
             "People",
-            Point::new(cells_left, y + (-tm.ascent)),
+            Point::new(cells_left, title_baseline),
             &title_font,
             &title_paint,
         );
+        // Toggle: right-aligned, vertically centered on the title's
+        // text band. Label "Show inactive" sits to its left in the
+        // muted meta-text style.
+        let toggle_w = 34.0 * scale;
+        let toggle_h = 18.0 * scale;
+        let label_font = Font::from_typeface(&self.typeface, ENTITY_META_FONT_SIZE * scale);
+        let (_, lm) = label_font.metrics();
+        let mut label_paint = Paint::default();
+        label_paint.set_anti_alias(true);
+        label_paint.set_color(Color::from_rgb(0x70, 0x68, 0x58));
+        let label = "Show inactive";
+        let label_w = label_font.measure_str(label, Some(&label_paint)).0;
+        let toggle_right = cells_left + content_width;
+        let toggle_left = toggle_right - toggle_w;
+        let label_x = toggle_left - 8.0 * scale - label_w;
+        // Vertically center toggle + label on the title's text band.
+        let title_band_top = title_baseline + tm.ascent;
+        let title_band_bot = title_baseline + tm.descent;
+        let title_band_mid = (title_band_top + title_band_bot) * 0.5;
+        let label_baseline = title_band_mid + (-lm.ascent + lm.descent) * 0.5 - lm.descent;
+        canvas.draw_str(
+            label,
+            Point::new(label_x, label_baseline),
+            &label_font,
+            &label_paint,
+        );
+        let toggle_rect = Rect::new(
+            toggle_left,
+            title_band_mid - toggle_h * 0.5,
+            toggle_left + toggle_w,
+            title_band_mid + toggle_h * 0.5,
+        );
+        let toggle_hovered = mouse_doc_x >= toggle_rect.left
+            && mouse_doc_x <= toggle_rect.right
+            && mouse_doc_y >= toggle_rect.top
+            && mouse_doc_y <= toggle_rect.bottom;
+        draw_toggle(canvas, toggle_rect, self.show_inactive, toggle_hovered);
+        self.last_people_show_inactive_toggle_rect = Some(toggle_rect);
+
         y += -tm.ascent + tm.descent + 24.0 * scale;
 
-        // Sorted snapshot — case-insensitive by display_name.
-        let mut people: Vec<(String, Uuid)> = self
+        // Sorted snapshot — case-insensitive by display_name. When
+        // `show_inactive` is off, hide inactive rows entirely; when on,
+        // they stay in alphabetical order but render in muted color.
+        let show_inactive = self.show_inactive;
+        let mut people: Vec<(String, Uuid, bool)> = self
             .entities
             .iter()
             .filter(|e| e.kind == PERSON_TAG)
-            .map(|e| (e.display_name.clone(), e.id))
+            .filter(|e| show_inactive || e.is_active)
+            .map(|e| (e.display_name.clone(), e.id, e.is_active))
             .collect();
         people.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
 
@@ -3027,6 +3162,9 @@ impl KeptApp {
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
         text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        let mut inactive_paint = Paint::default();
+        inactive_paint.set_anti_alias(true);
+        inactive_paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
         let mut divider_paint = Paint::default();
         divider_paint.set_anti_alias(true);
         divider_paint.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
@@ -3035,7 +3173,7 @@ impl KeptApp {
         hover_paint.set_anti_alias(true);
         hover_paint.set_color(Color::from_argb(0x14, 0x1c, 0x1c, 0x1c));
 
-        for (display_name, entity_id) in &people {
+        for (display_name, entity_id, is_active) in &people {
             let row_rect = Rect::new(cells_left, y, cells_left + row_w, y + row_h);
             let hovered = mouse_doc_x >= row_rect.left
                 && mouse_doc_x <= row_rect.right
@@ -3063,6 +3201,11 @@ impl KeptApp {
                     );
                 }
             } else {
+                let row_text_paint = if *is_active {
+                    &text_paint
+                } else {
+                    &inactive_paint
+                };
                 canvas.draw_str(
                     display_name,
                     Point::new(
@@ -3070,7 +3213,7 @@ impl KeptApp {
                         row_rect.top + text_baseline_offset,
                     ),
                     &row_font,
-                    &text_paint,
+                    row_text_paint,
                 );
             }
 
@@ -3245,6 +3388,33 @@ impl KeptApp {
         });
     }
 
+    /// Flip an entity's `is_active` flag. Recorded as a single
+    /// `UndoOp::SetEntityActive` so Ctrl+Z reverses it. No-ops cleanly
+    /// when the entity is missing.
+    fn toggle_entity_active(&mut self, entity_id: Uuid) {
+        let prev = self
+            .entities
+            .iter()
+            .find(|e| e.id == entity_id)
+            .map(|e| e.is_active);
+        let Some(prev) = prev else { return };
+        let new = !prev;
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.set_entity_active(entity_id, new) {
+                eprintln!("kept: set_entity_active failed: {e}");
+                return;
+            }
+        }
+        self.refresh_entities();
+        self.undo_stack.push(UndoOp::SetEntityActive {
+            entity_id,
+            prev,
+            new,
+        });
+        self.redo_stack.clear();
+        self.coalesce_break = true;
+    }
+
     /// Hard-delete an entity that has no backing cell and no references.
     /// Caller must have verified those conditions (the menu does that at
     /// open time). Refreshes entity caches and pushes a
@@ -3268,6 +3438,7 @@ impl KeptApp {
             self.undo_stack.push(UndoOp::DeleteCelllessEntity {
                 entity_id: e.id,
                 name: e.display_name,
+                is_active: e.is_active,
                 created_at: e.created_at,
             });
             self.redo_stack.clear();
@@ -3981,8 +4152,8 @@ impl KeptApp {
         let pad = MENTION_POPUP_PAD * scale;
         let radius = MENTION_POPUP_RADIUS * scale;
 
-        let names = self.person_names();
-        let items = filter_mentions(&names, &popup.query);
+        let candidates = self.person_mention_candidates();
+        let items = filter_mentions(&candidates, &popup.query);
         let visible = items.len().min(MENTION_POPUP_MAX_VISIBLE);
         let popup_h = if visible == 0 {
             row_h + pad * 2.0
@@ -4095,11 +4266,11 @@ impl KeptApp {
     }
 
     fn mention_popup_move(&mut self, delta: i32) {
-        let names = self.person_names();
+        let candidates = self.person_mention_candidates();
         let Some(p) = self.mention_popup.as_mut() else {
             return;
         };
-        let count = filter_mentions(&names, &p.query)
+        let count = filter_mentions(&candidates, &p.query)
             .len()
             .min(MENTION_POPUP_MAX_VISIBLE);
         if count == 0 {
@@ -4118,8 +4289,8 @@ impl KeptApp {
             return false;
         };
         let entries = self.person_entries();
-        let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
-        let filtered = filter_mentions(&names, &popup.query);
+        let candidates = self.person_mention_candidates();
+        let filtered = filter_mentions(&candidates, &popup.query);
         let Some(selected) = filtered.get(popup.selected) else {
             return true;
         };
@@ -4460,14 +4631,25 @@ impl KeptApp {
             UndoOp::DeleteCelllessEntity {
                 entity_id,
                 name,
+                is_active,
                 created_at,
             } => {
                 if let Some(db) = self.db.as_mut() {
-                    if let Err(e) =
-                        db.insert_person_entity_with_id(*entity_id, name, *created_at)
-                    {
+                    if let Err(e) = db.insert_person_entity_with_id(
+                        *entity_id,
+                        name,
+                        *is_active,
+                        *created_at,
+                    ) {
                         eprintln!("kept: undo delete-entity (insert) failed: {e}");
                     }
+                }
+                self.refresh_entities();
+                bump_focused_edited = false;
+            }
+            UndoOp::SetEntityActive { entity_id, prev, .. } => {
+                if let Some(db) = self.db.as_mut() {
+                    let _ = db.set_entity_active(*entity_id, *prev);
                 }
                 self.refresh_entities();
                 bump_focused_edited = false;
@@ -4575,9 +4757,17 @@ impl KeptApp {
                 created_at,
             } => {
                 if let Some(db) = self.db.as_mut() {
-                    if let Err(e) =
-                        db.insert_person_entity_with_id(*entity_id, name, *created_at)
-                    {
+                    // Add Person always creates an active entity, so a
+                    // redo restores it active. (If the user toggled it
+                    // inactive between create and undo, that's a separate
+                    // SetEntityActive op on the stack and stays around
+                    // for its own redo.)
+                    if let Err(e) = db.insert_person_entity_with_id(
+                        *entity_id,
+                        name,
+                        true,
+                        *created_at,
+                    ) {
                         eprintln!("kept: redo create-entity failed: {e}");
                     }
                 }
@@ -4589,6 +4779,13 @@ impl KeptApp {
                     if let Err(e) = db.delete_entity(*entity_id) {
                         eprintln!("kept: redo delete-entity failed: {e}");
                     }
+                }
+                self.refresh_entities();
+                bump_focused_edited = false;
+            }
+            UndoOp::SetEntityActive { entity_id, new, .. } => {
+                if let Some(db) = self.db.as_mut() {
+                    let _ = db.set_entity_active(*entity_id, *new);
                 }
                 self.refresh_entities();
                 bump_focused_edited = false;
@@ -5064,6 +5261,17 @@ impl KeptApp {
         // normal cell routing.
         self.cell_menu_open = None;
 
+        // Entity-page active/inactive toggle (always present in entity
+        // view; rect is None outside it).
+        if let ViewKind::Entity(eid) = self.view.view_kind {
+            if let Some(rect) = self.last_entity_active_toggle_rect {
+                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
+                    self.toggle_entity_active(eid);
+                    return true;
+                }
+            }
+        }
+
         // Entity-page "+ Create backing cell" button (only present when
         // viewing a cell-less entity). Wire-up of the actual create flow
         // is deferred to Chunk 2; for now, swallow the click so it doesn't
@@ -5081,6 +5289,26 @@ impl KeptApp {
         // "Add person" footer (when no input is active) starts an Add.
         // Plain row click navigates to that entity's page.
         if matches!(self.view.view_kind, ViewKind::People) {
+            // "Show inactive" header toggle wins over everything else
+            // on the People page, including any in-progress rename
+            // / add input — toggling the filter shouldn't lose typed
+            // text but shouldn't get masked by the input rects either.
+            if let Some(rect) = self.last_people_show_inactive_toggle_rect {
+                if x >= rect.left
+                    && x <= rect.right
+                    && doc_y >= rect.top
+                    && doc_y <= rect.bottom
+                {
+                    if self.people_rename.is_some() {
+                        self.commit_people_rename();
+                    }
+                    if self.people_add.is_some() {
+                        self.commit_people_add();
+                    }
+                    self.show_inactive = !self.show_inactive;
+                    return true;
+                }
+            }
             // Forward-into-input checks come first so caret moves work
             // when the user clicks within their own input.
             let renaming_id = self.people_rename.as_ref().map(|s| s.entity_id);
@@ -5334,6 +5562,44 @@ fn draw_kebab(canvas: &Canvas, rect: Rect, hovered: bool) {
     canvas.draw_circle((cx, cy2), KEBAB_DOT_RADIUS, &paint);
 }
 
+/// Pill-shaped on/off switch. `on=true` paints the track in the
+/// active-blue used elsewhere with the knob on the right; `on=false` is
+/// muted gray with the knob on the left. `hovered=true` adds a subtle
+/// dark overlay so the affordance reads as clickable. Caller records
+/// `rect` for hit-testing.
+fn draw_toggle(canvas: &Canvas, rect: Rect, on: bool, hovered: bool) {
+    let h = rect.height();
+    let radius = h * 0.5;
+    // Track.
+    let mut track = Paint::default();
+    track.set_anti_alias(true);
+    if on {
+        track.set_color(Color::from_argb(0xff, 0x4a, 0x90, 0xe2));
+    } else {
+        track.set_color(Color::from_argb(0x60, 0x90, 0x88, 0x7a));
+    }
+    canvas.draw_round_rect(rect, radius, radius, &track);
+    if hovered {
+        let mut overlay = Paint::default();
+        overlay.set_anti_alias(true);
+        overlay.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+        canvas.draw_round_rect(rect, radius, radius, &overlay);
+    }
+    // Knob.
+    let inset = 2.0_f32.max(h * 0.1);
+    let knob_r = h * 0.5 - inset;
+    let cy = (rect.top + rect.bottom) * 0.5;
+    let cx = if on {
+        rect.right - inset - knob_r
+    } else {
+        rect.left + inset + knob_r
+    };
+    let mut knob = Paint::default();
+    knob.set_anti_alias(true);
+    knob.set_color(Color::WHITE);
+    canvas.draw_circle((cx, cy), knob_r, &knob);
+}
+
 fn format_timestamp(epoch_ms: i64) -> String {
     use chrono::{Local, TimeZone};
     let dt = Local
@@ -5461,9 +5727,26 @@ mod tests {
 
     #[test]
     fn filter_mentions_orders_camelcase_correctly() {
-        let names = vec!["PatrickFoy".to_string(), "PeterCarr".to_string()];
-        let ranked = filter_mentions(&names, "pc");
+        let cands = vec![
+            ("PatrickFoy".to_string(), true),
+            ("PeterCarr".to_string(), true),
+        ];
+        let ranked = filter_mentions(&cands, "pc");
         assert_eq!(ranked[0].0, "PeterCarr");
+    }
+
+    #[test]
+    fn fuzzy_inactive_is_downweighted() {
+        // Active candidate beats inactive on a single-char query even
+        // though the alphabetical tiebreak alone would put PatrickFoy
+        // first. Inactive still appears in the result list — just last.
+        let cands = vec![
+            ("PatrickFoy".to_string(), false), // inactive
+            ("PeterCarr".to_string(), true),   // active
+        ];
+        let ranked = filter_mentions(&cands, "p");
+        assert_eq!(ranked[0].0, "PeterCarr");
+        assert_eq!(ranked[1].0, "PatrickFoy");
     }
 
     #[test]

@@ -47,6 +47,10 @@ pub struct Entity {
     pub kind: String,
     pub display_name: String,
     pub primary_cell_id: Option<Uuid>,
+    /// People-page UI shows / hides inactive rows; the @-mention popup
+    /// downweights them heavily but still surfaces them on a literal
+    /// query. Default true; flipped via the entity-page toggle.
+    pub is_active: bool,
     #[allow(dead_code)]
     pub created_at: i64,
     #[allow(dead_code)]
@@ -151,6 +155,16 @@ impl Db {
                  COMMIT;",
             )?;
             self.backfill_entities_from_persons()?;
+        }
+        if version < 6 {
+            // v5 → v6: per-entity active flag. Existing rows default to
+            // active (1). New writes pick up explicit values.
+            self.conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE entities ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1;
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )?;
         }
         Ok(())
     }
@@ -473,7 +487,8 @@ impl Db {
     /// in-memory entity caches after save/delete.
     pub fn all_entities(&self) -> rusqlite::Result<Vec<Entity>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, display_name, primary_cell_id, created_at, updated_at \
+            "SELECT id, kind, display_name, primary_cell_id, is_active, \
+                    created_at, updated_at \
              FROM entities ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -482,14 +497,16 @@ impl Db {
                 let kind: String = row.get(1)?;
                 let display_name: String = row.get(2)?;
                 let primary_bytes: Option<Vec<u8>> = row.get(3)?;
-                let created_at: i64 = row.get(4)?;
-                let updated_at: i64 = row.get(5)?;
+                let is_active_int: i64 = row.get(4)?;
+                let created_at: i64 = row.get(5)?;
+                let updated_at: i64 = row.get(6)?;
                 Ok(Entity {
                     id: Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::nil()),
                     kind,
                     display_name,
                     primary_cell_id: primary_bytes
                         .and_then(|b| Uuid::from_slice(&b).ok()),
+                    is_active: is_active_int != 0,
                     created_at,
                     updated_at,
                 })
@@ -505,7 +522,8 @@ impl Db {
     #[allow(dead_code)]
     pub fn find_entity(&self, id: Uuid) -> rusqlite::Result<Option<Entity>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, display_name, primary_cell_id, created_at, updated_at \
+            "SELECT id, kind, display_name, primary_cell_id, is_active, \
+                    created_at, updated_at \
              FROM entities WHERE id = ?1",
         )?;
         let row = stmt
@@ -514,14 +532,16 @@ impl Db {
                 let kind: String = row.get(1)?;
                 let display_name: String = row.get(2)?;
                 let primary_bytes: Option<Vec<u8>> = row.get(3)?;
-                let created_at: i64 = row.get(4)?;
-                let updated_at: i64 = row.get(5)?;
+                let is_active_int: i64 = row.get(4)?;
+                let created_at: i64 = row.get(5)?;
+                let updated_at: i64 = row.get(6)?;
                 Ok(Entity {
                     id: Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::nil()),
                     kind,
                     display_name,
                     primary_cell_id: primary_bytes
                         .and_then(|b| Uuid::from_slice(&b).ok()),
+                    is_active: is_active_int != 0,
                     created_at,
                     updated_at,
                 })
@@ -587,11 +607,17 @@ impl Db {
         let now = chrono::Utc::now().timestamp_millis();
         let alias = normalize_alias(display_name);
         let tx = self.conn.transaction()?;
-        // Preserve created_at on update; bump updated_at.
+        // Preserve created_at + is_active on update; bump updated_at.
+        // The COALESCE on is_active is critical — every save_cell call
+        // re-runs this upsert, and clobbering is_active would mean a
+        // single edit on the cell flips a manually-deactivated person
+        // back to active.
         tx.execute(
             "INSERT OR REPLACE INTO entities \
-                (id, kind, display_name, primary_cell_id, created_at, updated_at) \
+                (id, kind, display_name, primary_cell_id, is_active, \
+                 created_at, updated_at) \
              VALUES (?1, 'person', ?2, ?1, \
+                     COALESCE((SELECT is_active FROM entities WHERE id = ?1), 1), \
                      COALESCE((SELECT created_at FROM entities WHERE id = ?1), ?3), \
                      ?3)",
             params![id_bytes, display_name, now],
@@ -622,8 +648,9 @@ impl Db {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO entities \
-                (id, kind, display_name, primary_cell_id, created_at, updated_at) \
-             VALUES (?1, 'person', ?2, NULL, ?3, ?3)",
+                (id, kind, display_name, primary_cell_id, is_active, \
+                 created_at, updated_at) \
+             VALUES (?1, 'person', ?2, NULL, 1, ?3, ?3)",
             params![id_bytes, display_name, now],
         )?;
         tx.execute(
@@ -663,26 +690,31 @@ impl Db {
         tx.commit()
     }
 
-    /// Insert a person entity row at a specific id + created_at, with
-    /// alias rebuilt from `display_name`. Used to reverse Add (redo) and
-    /// Delete (undo) on cell-less entities — preserving the original
-    /// id keeps any pre-existing `kept://` mentions valid through the
-    /// undo round-trip.
+    /// Insert a person entity row at a specific id + created_at +
+    /// is_active state, with alias rebuilt from `display_name`. Used to
+    /// reverse Add (redo) and Delete (undo) on cell-less entities —
+    /// preserving the original id keeps any pre-existing `kept://`
+    /// mentions valid through the undo round-trip, and preserving
+    /// is_active means an inactive entity that gets deleted comes back
+    /// inactive on undo.
     pub fn insert_person_entity_with_id(
         &mut self,
         entity_id: Uuid,
         display_name: &str,
+        is_active: bool,
         created_at: i64,
     ) -> rusqlite::Result<()> {
         let id_bytes = entity_id.as_bytes().to_vec();
         let now = chrono::Utc::now().timestamp_millis();
         let alias = normalize_alias(display_name);
+        let active_int: i64 = if is_active { 1 } else { 0 };
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO entities \
-                (id, kind, display_name, primary_cell_id, created_at, updated_at) \
-             VALUES (?1, 'person', ?2, NULL, ?3, ?4)",
-            params![id_bytes, display_name, created_at, now],
+                (id, kind, display_name, primary_cell_id, is_active, \
+                 created_at, updated_at) \
+             VALUES (?1, 'person', ?2, NULL, ?3, ?4, ?5)",
+            params![id_bytes, display_name, active_int, created_at, now],
         )?;
         tx.execute(
             "DELETE FROM entity_aliases WHERE entity_id = ?1",
@@ -693,6 +725,23 @@ impl Db {
             params![id_bytes, alias],
         )?;
         tx.commit()
+    }
+
+    /// Toggle the `is_active` flag on a single entity. Bumps `updated_at`
+    /// so observers (sync, conflict resolution if any) see the change.
+    pub fn set_entity_active(
+        &mut self,
+        entity_id: Uuid,
+        is_active: bool,
+    ) -> rusqlite::Result<()> {
+        let id_bytes = entity_id.as_bytes().to_vec();
+        let now = chrono::Utc::now().timestamp_millis();
+        let active_int: i64 = if is_active { 1 } else { 0 };
+        self.conn.execute(
+            "UPDATE entities SET is_active = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id_bytes, active_int, now],
+        )?;
+        Ok(())
     }
 
     /// Drop an entity row + its alias rows. Caller must ensure the
