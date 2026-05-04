@@ -608,6 +608,86 @@ const CELL_MENU_INFO_H: f32 = 22.0;
 const CELL_MENU_ACTION_H: f32 = 26.0;
 const CELL_MENU_PAD: f32 = 6.0;
 
+/// Pane divider (gutter between left and right panes). 6 px wide, painted
+/// in the same separator tone as the sidebar's right edge. Hover within
+/// ±DIVIDER_HIT_SLOP px in x grabs it for drag.
+const DIVIDER_THICKNESS: f32 = 6.0;
+const DIVIDER_HIT_SLOP: f32 = 4.0;
+/// Active-pane indicator border thickness.
+const PANE_BORDER_STROKE: f32 = 2.0;
+/// Min/max for `split_ratio` so a pane can't shrink below ~15% of width.
+const SPLIT_MIN: f32 = 0.15;
+const SPLIT_MAX: f32 = 0.85;
+
+/// Forward-compat: the orientation of the (eventual) split. Always `Horiz`
+/// in v1 (left/right). When vertical splits land, this enum gains meaning
+/// without renaming.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitDir {
+    Horiz,
+    Vert,
+}
+
+/// A viewport into the shared cell stream with its own focus, scroll,
+/// edit, and navigation state. v1 has one Pane (Stage 1) → two (Stage 2);
+/// future i3-style nesting replaces `Vec<Pane>` with a Layout tree but
+/// leaves Pane internals untouched.
+pub struct Pane {
+    /// What this pane is showing (date / context / entity / people).
+    view: Query,
+    /// Focused cell within this pane's view (None if empty).
+    focused: Option<Uuid>,
+    /// Edit mode for the focused cell (false = view mode).
+    editing: bool,
+    /// In-pane mouse drag binding — drags belong to their origin pane.
+    dragging_cell: Option<Uuid>,
+    /// Vertical scroll within this pane's content (doc coords).
+    scroll_y: f32,
+    max_scroll: f32,
+    doc_height: f32,
+    viewport_height: f32,
+    /// Drives this pane's scrollbar fade.
+    last_scroll_time: Option<Instant>,
+    /// "Request scroll caret into view next frame" — honored at end of
+    /// this pane's tick.
+    pending_caret_scroll: bool,
+    /// Undo coalesce-break for this pane's edit stream. Cross-pane edits
+    /// or focus changes set this so the next edit begins a new undo entry.
+    coalesce_break: bool,
+    /// Ctrl+F enlarges the focused cell to fill this pane only.
+    focus_mode: bool,
+    /// Per-pane back/forward navigation history.
+    nav_back: Vec<HistoryEntry>,
+    nav_forward: Vec<HistoryEntry>,
+    /// Window-coord rect this pane occupies, populated by `tick`. Used by
+    /// input dispatch (which pane was clicked) and overlay anchoring.
+    #[allow(dead_code)]
+    last_rect: Rect,
+}
+
+impl Pane {
+    fn new(view: Query, focused: Option<Uuid>) -> Self {
+        Self {
+            view,
+            focused,
+            editing: false,
+            dragging_cell: None,
+            scroll_y: 0.0,
+            max_scroll: 0.0,
+            doc_height: 0.0,
+            viewport_height: 0.0,
+            last_scroll_time: None,
+            pending_caret_scroll: false,
+            coalesce_break: false,
+            focus_mode: false,
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
+            last_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+        }
+    }
+}
+
 pub struct KeptApp {
     typeface: Typeface,
     /// Global, append-only stream of cells. Source of truth.
@@ -615,28 +695,26 @@ pub struct KeptApp {
     cells: Vec<Cell>,
     /// Time-window overlays. Membership is derived (timestamp-based), not stored.
     contexts: Vec<Context>,
-    /// What the user is currently viewing (single context or a whole date).
-    /// The "writable target" is always the most recent open context, derived
-    /// on demand via `writable_context_id` — independent of this field.
-    view: Query,
-    focused: Option<Uuid>,
-    /// Modal state. `false` = view (cell is selected but not accepting text);
-    /// `true` = edit (caret visible, text input forwarded). Toggled by Enter
-    /// (view → edit) and Esc (edit → view). Any focus change drops to view
-    /// mode except creation (Ctrl+Enter) and clicks, which enter edit mode.
-    editing: bool,
-    dragging_cell: Option<Uuid>,
-    scroll_y: f32,
-    max_scroll: f32,
-    doc_height: f32,
-    viewport_height: f32,
-    last_scroll_time: Option<Instant>,
+    /// Viewports. Length 1 in Stage 1; length 2 starting Stage 2. Future
+    /// i3-style nesting replaces this with a Layout tree.
+    panes: Vec<Pane>,
+    /// Index into `panes` for the pane that owns keyboard input.
+    active_pane: usize,
+    /// Fractional split position (0.0..1.0) for the divider between panes.
+    /// Lives on KeptApp (not Pane) because the divider sits *between* panes.
+    /// Default 0.5; clamped to [0.15, 0.85] when dragged.
+    #[allow(dead_code)]
+    split_ratio: f32,
+    /// True while the user is mouse-dragging the divider.
+    #[allow(dead_code)]
+    dragging_divider: bool,
+    /// Reserved for future vertical splits — always `Horiz` in v1.
+    #[allow(dead_code)]
+    split_dir: SplitDir,
     font_scale: f32,
-    pending_caret_scroll: bool,
     undo_stack: Vec<UndoOp>,
     redo_stack: Vec<UndoOp>,
     last_edit_time: Option<Instant>,
-    coalesce_break: bool,
     mention_popup: Option<MentionPopup>,
     search: Option<SearchState>,
     clipboard: Option<Clipboard>,
@@ -713,16 +791,6 @@ pub struct KeptApp {
     /// True while the user is mouse-dragging inside the search input
     /// (selecting text). Drives `mouse_drag_to` / `mouse_up` routing.
     search_dragging: bool,
-    /// "Focus mode" — Ctrl+F. When true, the doc area renders only the
-    /// focused cell at full width (everything except the sidebar). Esc and
-    /// any sidebar interaction exit it.
-    focus_mode: bool,
-    /// View-history back stack. Pushed on deliberate user nav (sidebar
-    /// click, search commit). Pop = "go back". Top = most-recent past.
-    nav_back: Vec<HistoryEntry>,
-    /// View-history forward stack. Populated when the user goes back; any
-    /// new `push_view` clears it (the abandoned future is gone).
-    nav_forward: Vec<HistoryEntry>,
     // ---- Entity caches (invariants #1–#7) ----
     /// All entity rows from the DB. Source of identity (kind, display_name).
     entities: Vec<Entity>,
@@ -750,6 +818,22 @@ struct HistoryEntry {
 }
 
 const NAV_HISTORY_CAP: usize = 100;
+
+/// `KeptApp` derefs to its active `Pane` so existing call sites — which
+/// say `self.view`, `self.focused`, `self.scroll_y`, etc. — keep working
+/// without rewriting every one. New per-pane access (Stage 2+) goes
+/// through `self.panes[i].field` directly.
+impl std::ops::Deref for KeptApp {
+    type Target = Pane;
+    fn deref(&self) -> &Pane {
+        &self.panes[self.active_pane]
+    }
+}
+impl std::ops::DerefMut for KeptApp {
+    fn deref_mut(&mut self) -> &mut Pane {
+        &mut self.panes[self.active_pane]
+    }
+}
 
 impl KeptApp {
     pub fn new() -> Self {
@@ -904,21 +988,15 @@ impl KeptApp {
             typeface,
             cells,
             contexts,
-            view,
-            focused,
-            editing: false,
-            dragging_cell: None,
-            scroll_y: 0.0,
-            max_scroll: 0.0,
-            doc_height: 0.0,
-            viewport_height: 0.0,
-            last_scroll_time: None,
+            panes: vec![Pane::new(view.clone(), focused), Pane::new(view, focused)],
+            active_pane: 0,
+            split_ratio: 0.5,
+            dragging_divider: false,
+            split_dir: SplitDir::Horiz,
             font_scale: 1.0,
-            pending_caret_scroll: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_time: None,
-            coalesce_break: false,
             mention_popup: None,
             search: None,
             clipboard: Clipboard::new().ok(),
@@ -948,9 +1026,6 @@ impl KeptApp {
             last_people_menu_rename_rect: None,
             last_people_menu_delete_rect: None,
             search_dragging: false,
-            focus_mode: false,
-            nav_back: Vec::new(),
-            nav_forward: Vec::new(),
             entities,
             entity_alias_index,
             cell_to_entity,
@@ -961,6 +1036,135 @@ impl KeptApp {
 
     pub fn cursor_moved(&mut self, x: f32, y: f32) {
         self.mouse_pos = (x, y);
+    }
+
+    // ----- pane helpers -----
+
+    /// Index of the pane whose `last_rect` contains `(x, y)`. None when
+    /// the point is in the sidebar, on the divider, or out of bounds.
+    fn pane_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.panes.iter().position(|p| {
+            x >= p.last_rect.left
+                && x < p.last_rect.right
+                && y >= p.last_rect.top
+                && y < p.last_rect.bottom
+        })
+    }
+
+    /// True if `x` falls inside the divider's hit slop. Only meaningful
+    /// when there are 2+ panes.
+    fn is_on_divider(&self, x: f32) -> bool {
+        if self.panes.len() < 2 {
+            return false;
+        }
+        // Divider sits between pane[0].right and pane[1].left.
+        let div_x = (self.panes[0].last_rect.right + self.panes[1].last_rect.left) * 0.5;
+        (x - div_x).abs() <= DIVIDER_HIT_SLOP
+    }
+
+    /// Switch the active pane. Closes transient overlays that were
+    /// anchored to the previously-active pane (mention popup, cell menu).
+    /// Returns true if the active pane changed.
+    fn set_active_pane(&mut self, i: usize) -> bool {
+        if i >= self.panes.len() || self.active_pane == i {
+            return false;
+        }
+        self.cell_context_menu = None;
+        self.mention_popup = None;
+        self.active_pane = i;
+        true
+    }
+
+    /// Compute window-coord rects for each pane and write them into
+    /// `pane.last_rect`. Sidebar occupies the leftmost `SIDEBAR_WIDTH *
+    /// scale` pixels; remaining width is split among panes per
+    /// `split_ratio`. Single-pane mode (panes.len() == 1) gives the lone
+    /// pane the full content area.
+    fn layout_panes(&mut self, width: f32, height: f32) {
+        let scale = self.font_scale;
+        let sb_w = SIDEBAR_WIDTH * scale;
+        let pane_area_left = sb_w;
+        let pane_area_w = (width - sb_w).max(120.0);
+        match self.panes.len() {
+            1 => {
+                self.panes[0].last_rect =
+                    Rect::new(pane_area_left, 0.0, pane_area_left + pane_area_w, height);
+            }
+            _ => {
+                let div_x =
+                    pane_area_left + pane_area_w * self.split_ratio.clamp(SPLIT_MIN, SPLIT_MAX);
+                let half_t = DIVIDER_THICKNESS * 0.5;
+                self.panes[0].last_rect =
+                    Rect::new(pane_area_left, 0.0, (div_x - half_t).max(pane_area_left), height);
+                self.panes[1].last_rect = Rect::new(
+                    (div_x + half_t).min(pane_area_left + pane_area_w),
+                    0.0,
+                    pane_area_left + pane_area_w,
+                    height,
+                );
+            }
+        }
+    }
+
+    /// Paint the divider gutter between panes. No-op for single-pane.
+    fn render_divider(&self, canvas: &Canvas, height: f32) {
+        if self.panes.len() < 2 {
+            return;
+        }
+        let div_x = (self.panes[0].last_rect.right + self.panes[1].last_rect.left) * 0.5;
+        let half_t = DIVIDER_THICKNESS * 0.5;
+        let hovered = (self.mouse_pos.0 - div_x).abs() <= DIVIDER_HIT_SLOP;
+        let color = if hovered || self.dragging_divider {
+            Color::from_rgb(0xc8, 0xbf, 0xb0)
+        } else {
+            Color::from_rgb(0xdc, 0xd4, 0xc6)
+        };
+        let mut p = Paint::default();
+        p.set_anti_alias(true);
+        p.set_color(color);
+        canvas.draw_rect(
+            Rect::new(div_x - half_t, 0.0, div_x + half_t, height),
+            &p,
+        );
+    }
+
+    /// Stroke a 2 px accent border around the active pane. No-op for
+    /// single-pane.
+    fn render_active_pane_indicator(&self, canvas: &Canvas) {
+        if self.panes.len() < 2 {
+            return;
+        }
+        let r = self.panes[self.active_pane].last_rect;
+        // Inset by half the stroke so the border sits inside the rect.
+        let s = PANE_BORDER_STROKE * 0.5;
+        let mut p = Paint::default();
+        p.set_anti_alias(true);
+        p.set_style(PaintStyle::Stroke);
+        p.set_stroke_width(PANE_BORDER_STROKE);
+        p.set_color(Color::from_argb(0x80, 0x4a, 0x90, 0xe2));
+        canvas.draw_rect(
+            Rect::new(r.left + s, r.top + s, r.right - s, r.bottom - s),
+            &p,
+        );
+    }
+
+    /// Debounced persistence flush. Called once per frame from `tick`,
+    /// outside the per-pane loop (dirty cells are global, not per-pane).
+    fn maybe_flush_persistence(&mut self) {
+        let any_dirty = !self.dirty_cells.is_empty()
+            || !self.pending_deletes.is_empty()
+            || !self.dirty_contexts.is_empty()
+            || !self.pending_context_deletes.is_empty();
+        if !any_dirty {
+            return;
+        }
+        let idle = self
+            .last_edit_time
+            .map(|t| t.elapsed() >= SAVE_DEBOUNCE)
+            .unwrap_or(true);
+        if idle {
+            self.flush_persistence();
+        }
     }
 
     /// True if the mouse is currently over a link in any visible cell. Used
@@ -1429,11 +1633,12 @@ impl KeptApp {
         if self.view == new {
             return false;
         }
-        self.nav_back.push(HistoryEntry {
+        let entry = HistoryEntry {
             query: self.view.clone(),
             focused: self.focused,
             scroll_y: self.scroll_y,
-        });
+        };
+        self.nav_back.push(entry);
         if self.nav_back.len() > NAV_HISTORY_CAP {
             self.nav_back.remove(0);
         }
@@ -1454,11 +1659,12 @@ impl KeptApp {
     /// stack is empty.
     fn nav_back(&mut self) -> bool {
         let Some(prev) = self.nav_back.pop() else { return false };
-        self.nav_forward.push(HistoryEntry {
+        let entry = HistoryEntry {
             query: self.view.clone(),
             focused: self.focused,
             scroll_y: self.scroll_y,
-        });
+        };
+        self.nav_forward.push(entry);
         if self.nav_forward.len() > NAV_HISTORY_CAP {
             self.nav_forward.remove(0);
         }
@@ -1471,11 +1677,12 @@ impl KeptApp {
     /// once and not yet pushed a new view).
     fn nav_forward(&mut self) -> bool {
         let Some(next) = self.nav_forward.pop() else { return false };
-        self.nav_back.push(HistoryEntry {
+        let entry = HistoryEntry {
             query: self.view.clone(),
             focused: self.focused,
             scroll_y: self.scroll_y,
-        });
+        };
+        self.nav_back.push(entry);
         if self.nav_back.len() > NAV_HISTORY_CAP {
             self.nav_back.remove(0);
         }
@@ -1615,44 +1822,111 @@ impl KeptApp {
         self.set_font_scale(self.font_scale / ZOOM_STEP)
     }
 
+    /// Mouse-wheel scroll. Routes to the pane under the cursor (per the
+    /// multi-pane spec), not the active pane — letting the user scroll one
+    /// pane while keyboard input goes to another. Falls back to the active
+    /// pane when the cursor isn't over any pane.
     pub fn scroll_by(&mut self, dy: f32) -> bool {
-        let new_y = (self.scroll_y + dy).clamp(0.0, self.max_scroll);
-        if new_y == self.scroll_y {
+        let target = self
+            .pane_at(self.mouse_pos.0, self.mouse_pos.1)
+            .unwrap_or(self.active_pane);
+        let pane = &mut self.panes[target];
+        let new_y = (pane.scroll_y + dy).clamp(0.0, pane.max_scroll);
+        if new_y == pane.scroll_y {
             return false;
         }
-        self.scroll_y = new_y;
-        self.last_scroll_time = Some(Instant::now());
-        // Scrolling dismisses the per-cell menu (anchored in doc coords; would
-        // visually decouple from its kebab if left open during a scroll).
+        pane.scroll_y = new_y;
+        pane.last_scroll_time = Some(Instant::now());
+        // Scrolling dismisses the per-cell menu (anchored in doc coords).
         self.cell_context_menu = None;
         true
     }
 
     pub fn tick(&mut self, canvas: &Canvas, width: f32, height: f32) {
         canvas.clear(Color::from_rgb(0xfa, 0xf7, 0xf2));
+        self.layout_panes(width, height);
 
+        // Render each pane. We swap `active_pane` for the duration of each
+        // pane's tick so Deref-based field access (self.scroll_y, self.view,
+        // etc.) resolves to the pane currently being rendered. The truly
+        // active pane (saved_active) is restored before global UI is drawn
+        // so sidebar highlight / overlays anchor correctly.
+        //
+        // Render order: inactive panes first, active pane LAST. Cell
+        // positions (cell.x_origin/y_origin) are stored on the Cell itself,
+        // so whichever pane renders last "wins" them. Putting the active
+        // pane last means in-pane hit-testing (find_cell_at) reads the
+        // correct positions. Clicks on an inactive pane just activate it —
+        // a second click is needed to focus a specific cell, since cell
+        // positions for that pane don't update until the next frame.
+        let saved_active = self.active_pane;
+        let n = self.panes.len();
+        for i in 0..n {
+            if i == saved_active {
+                continue;
+            }
+            self.active_pane = i;
+            self.tick_pane(canvas, i, height);
+        }
+        if n > 0 {
+            self.active_pane = saved_active;
+            self.tick_pane(canvas, saved_active, height);
+        }
+
+        // Pane chrome (between and around).
+        self.render_divider(canvas, height);
+        self.render_active_pane_indicator(canvas);
+
+        // Sidebar (window space, single global instance).
+        self.render_sidebar(canvas, height);
+
+        // Overlays (window space, drawn last so they layer on top).
+        self.render_search_popup(canvas, width);
+        self.render_mention_popup(canvas);
+        self.render_tag_context_menu(canvas);
+        self.render_people_context_menu(canvas);
+        self.render_cell_context_menu(canvas);
+
+        // Persistence flush is global (dirty cells aren't per-pane), so it
+        // runs once per frame, after all panes have rendered.
+        self.maybe_flush_persistence();
+    }
+
+    /// Render a single pane. With `active_pane` swapped to `pane_idx` by
+    /// the caller, all `self.X` field accesses (Deref) resolve to this
+    /// pane. Pane geometry comes from `self.panes[pane_idx].last_rect`,
+    /// populated by `layout_panes`.
+    fn tick_pane(&mut self, canvas: &Canvas, pane_idx: usize, _height: f32) {
         // Clamp scroll using last frame's max_scroll before drawing this frame.
         self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll);
+
+        let pane_rect = self.panes[pane_idx].last_rect;
+        let pane_left = pane_rect.left;
+        let pane_right = pane_rect.right;
+        let pane_h = pane_rect.height();
 
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
         text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
 
-        // Document space — translate so doc y=0 lands at window y = -scroll_y.
+        // Clip to this pane's rect so over-wide content / focus shadows
+        // can't bleed across the divider into the other pane.
         canvas.save();
+        canvas.clip_rect(pane_rect, None, true);
+        // Document space — translate so doc y=0 lands at window y = -scroll_y.
         canvas.translate((0.0, -self.scroll_y));
 
         let scale = self.font_scale;
-        // Focus mode pulls the cell out near the sidebar with smaller pad so
-        // it visually expands to fill the available area; normal mode uses
-        // MARGIN_X on both sides for the multi-cell layout.
+        // Focus mode pulls the cell out near the pane's left edge with
+        // smaller pad so it visually expands to fill the pane; normal mode
+        // uses MARGIN_X on both sides.
         let (cells_left, outer_cell_width) = if self.focus_mode {
-            let left = SIDEBAR_WIDTH * scale + FOCUS_MODE_PAD * scale;
-            let outer = (width - left - FOCUS_MODE_PAD * scale).max(80.0);
+            let left = pane_left + FOCUS_MODE_PAD * scale;
+            let outer = (pane_right - left - FOCUS_MODE_PAD * scale).max(80.0);
             (left, outer)
         } else {
-            let left = SIDEBAR_WIDTH * scale + MARGIN_X;
-            let outer = (width - left - MARGIN_X).max(80.0);
+            let left = pane_left + MARGIN_X;
+            let outer = (pane_right - left - MARGIN_X).max(80.0);
             (left, outer)
         };
         let content_width = outer_cell_width.max(60.0);
@@ -1668,6 +1942,7 @@ impl KeptApp {
         let mouse_doc_x = self.mouse_pos.0;
         let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
         let focused_id = self.focused;
+        let editing_local = self.editing;
 
         // Cell-loop views (Ast / Context) draw the cell stream with the
         // focused-cell card backdrop + ring. Entity / People views draw
@@ -1677,6 +1952,11 @@ impl KeptApp {
             self.last_entity_create_button_rect = None;
         }
 
+        // Card backdrop and focus ring use this. We pull `cells_left` and
+        // `content_width` from this frame's pane geometry (so they're always
+        // correct for the pane being rendered, not stale from another pane's
+        // last render). y/height come from the cell's last-rendered values
+        // — at most one frame stale when content size changes.
         let focused_geom = if matches!(view_kind_local, ViewKind::Ast | ViewKind::Context(_)) {
             self.focused
                 .and_then(|id| self.cell(id))
@@ -1685,7 +1965,7 @@ impl KeptApp {
                     if self.focus_mode {
                         (cells_left, MARGIN_TOP, content_width, c.height())
                     } else {
-                        (c.x_origin(), c.y_origin(), c.width(), c.height())
+                        (cells_left, c.y_origin(), content_width, c.height())
                     }
                 })
         } else {
@@ -1851,7 +2131,7 @@ impl KeptApp {
                     // (so view-mode users can drag-select). Caret only renders in
                     // edit mode.
                     let render_focused = cell_is_focused;
-                    let show_caret = cell_is_focused && self.editing;
+                    let show_caret = cell_is_focused && editing_local;
                     let h = cell.tick(
                         canvas,
                         cell_x,
@@ -1941,7 +2221,7 @@ impl KeptApp {
 
         // Update bookkeeping for scroll math + clamp again in case content shrank.
         self.doc_height = y - CELL_GAP + DOC_BOTTOM_PAD;
-        self.viewport_height = height.max(0.0);
+        self.viewport_height = pane_h.max(0.0);
         self.max_scroll = (self.doc_height - self.viewport_height).max(0.0);
         self.scroll_y = self.scroll_y.min(self.max_scroll);
 
@@ -1951,23 +2231,7 @@ impl KeptApp {
             self.scroll_caret_into_view();
         }
 
-        // Debounced persistence: if anything dirty and user has been idle
-        // for SAVE_DEBOUNCE, flush.
-        let any_dirty = !self.dirty_cells.is_empty()
-            || !self.pending_deletes.is_empty()
-            || !self.dirty_contexts.is_empty()
-            || !self.pending_context_deletes.is_empty();
-        if any_dirty {
-            let idle = self
-                .last_edit_time
-                .map(|t| t.elapsed() >= SAVE_DEBOUNCE)
-                .unwrap_or(true);
-            if idle {
-                self.flush_persistence();
-            }
-        }
-
-        // Scrollbar lives in window coords (no translate), so it doesn't scroll.
+        // Per-pane scrollbar in window coords, anchored at the pane's right edge.
         if self.max_scroll > 0.0 {
             let alpha = scrollbar_alpha(self.last_scroll_time);
             if alpha > 0.0 {
@@ -1979,7 +2243,7 @@ impl KeptApp {
                 let thumb_top = track_top
                     + (self.scroll_y / self.max_scroll) * (track_len - thumb_h);
                 let thumb_bot = thumb_top + thumb_h;
-                let bar_x = width - SCROLLBAR_INSET - SCROLLBAR_WIDTH;
+                let bar_x = pane_right - SCROLLBAR_INSET - SCROLLBAR_WIDTH;
 
                 let mut sb_paint = Paint::default();
                 sb_paint.set_anti_alias(true);
@@ -1994,21 +2258,6 @@ impl KeptApp {
                 );
             }
         }
-
-        // Sidebar (window space — does not scroll with content).
-        self.render_sidebar(canvas, height);
-
-        // Search popup (window space, drawn last so it's on top of everything).
-        self.render_search_popup(canvas, width);
-
-        // Mention popup also in window space; for cell-anchored mentions
-        // we subtract scroll_y to convert doc-y into window-y.
-        self.render_mention_popup(canvas);
-
-        // Tag right-click menu (window space).
-        self.render_tag_context_menu(canvas);
-        self.render_people_context_menu(canvas);
-        self.render_cell_context_menu(canvas);
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
@@ -2200,6 +2449,36 @@ impl KeptApp {
         }
 
         if event.state == ElementState::Pressed && primary_mod(modifiers.state()) {
+            // Pane chord: Ctrl+Alt+Arrow switches active pane (or reserved
+            // for future vertical splits). Matched first so the bare
+            // Cmd+Arrow handlers below don't fire on the chord. Works in
+            // both view and edit mode (Alt isn't used as a top-level
+            // text-edit modifier in app.rs — cell.rs uses Alt for
+            // multi-cursor click and word-nav, but neither responds to
+            // Ctrl+Alt+Arrow).
+            if modifiers.state().alt_key() {
+                match &event.logical_key {
+                    Key::Named(NamedKey::ArrowLeft) => {
+                        if self.panes.len() > 1 && self.active_pane > 0 {
+                            return self.set_active_pane(self.active_pane - 1);
+                        }
+                        return false;
+                    }
+                    Key::Named(NamedKey::ArrowRight) => {
+                        if self.panes.len() > 1
+                            && self.active_pane + 1 < self.panes.len()
+                        {
+                            return self.set_active_pane(self.active_pane + 1);
+                        }
+                        return false;
+                    }
+                    // Reserved for future vertical splits.
+                    Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowDown) => {
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
             match &event.logical_key {
                 // View history: Cmd/Ctrl+[ = back, Cmd/Ctrl+] = forward.
                 // No-op when the corresponding stack is empty.
@@ -2208,6 +2487,14 @@ impl KeptApp {
                 }
                 Key::Character(s) if s.as_str() == "]" => {
                     return self.nav_forward();
+                }
+                // Ctrl+0: reset divider to 50/50.
+                Key::Character(s) if s.as_str() == "0" => {
+                    if self.panes.len() > 1 {
+                        self.split_ratio = 0.5;
+                        return true;
+                    }
+                    return false;
                 }
                 Key::Named(NamedKey::ArrowUp) => {
                     if modifiers.state().shift_key() {
@@ -5164,7 +5451,11 @@ impl KeptApp {
         }
         // Doc-area right-clicks. People-page rows → rename/delete menu.
         // AST/Context cell-loop → per-cell context menu (timestamps +
-        // Delete cell).
+        // Delete cell). First, make the clicked pane active so the menu
+        // anchors correctly and operates on that pane's view.
+        if let Some(idx) = self.pane_at(x, y) {
+            self.set_active_pane(idx);
+        }
         if matches!(self.view.view_kind, ViewKind::People) {
             let doc_y = y + self.scroll_y;
             for (entity_id, rect) in self.last_people_row_rects.clone() {
@@ -5255,6 +5546,14 @@ impl KeptApp {
             return true;
         }
 
+        // Divider drag: a click within ±DIVIDER_HIT_SLOP of the divider
+        // starts a drag. Tracks until mouse_up. Doesn't change active pane
+        // or fire any other action.
+        if self.is_on_divider(x) {
+            self.dragging_divider = true;
+            return true;
+        }
+
         // Sidebar clicks switch the view. Sidebar lives in window (logical)
         // space, so use raw (x, y) — not doc_y. Any sidebar interaction
         // also exits focus mode so the new selection lands in the normal
@@ -5300,6 +5599,12 @@ impl KeptApp {
             }
             self.cell_context_menu = None;
             return false;
+        }
+
+        // Click is in the pane area — make the clicked pane active before
+        // computing doc-space coords. (doc_y depends on the pane's scroll.)
+        if let Some(idx) = self.pane_at(x, y) {
+            self.set_active_pane(idx);
         }
 
         let doc_y = y + self.scroll_y;
@@ -5483,6 +5788,15 @@ impl KeptApp {
     }
 
     pub fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool {
+        // Divider drag wins — recompute split_ratio relative to the pane
+        // area (sidebar's right edge → window's right edge).
+        if self.dragging_divider && self.panes.len() >= 2 {
+            let pane_area_left = self.panes[0].last_rect.left;
+            let pane_area_right = self.panes[self.panes.len() - 1].last_rect.right;
+            let pane_area_w = (pane_area_right - pane_area_left).max(1.0);
+            self.split_ratio = ((x - pane_area_left) / pane_area_w).clamp(SPLIT_MIN, SPLIT_MAX);
+            return true;
+        }
         if self.search_dragging {
             if let Some(state) = self.search.as_mut() {
                 return state.input.mouse_drag_to(x, y);
@@ -5500,6 +5814,10 @@ impl KeptApp {
     }
 
     pub fn mouse_up(&mut self) -> bool {
+        if self.dragging_divider {
+            self.dragging_divider = false;
+            return true;
+        }
         if self.search_dragging {
             self.search_dragging = false;
             if let Some(state) = self.search.as_mut() {
@@ -5514,6 +5832,12 @@ impl KeptApp {
         } else {
             false
         }
+    }
+
+    /// True when the mouse is currently over the pane divider — main.rs
+    /// uses this to swap to a column-resize cursor.
+    pub fn is_hovering_divider(&self) -> bool {
+        self.is_on_divider(self.mouse_pos.0)
     }
 
     /// Pick the visible cell that contains `(x, doc_y)` — `doc_y` must already

@@ -121,7 +121,9 @@ impl ApplicationHandler for Application {
                 if self.kept_app.mouse_drag_to(x, y) {
                     self.env.window.request_redraw();
                 }
-                let icon = if self.kept_app.is_hovering_link() {
+                let icon = if self.kept_app.is_hovering_divider() {
+                    CursorIcon::ColResize
+                } else if self.kept_app.is_hovering_link() {
                     CursorIcon::Pointer
                 } else {
                     CursorIcon::Default
