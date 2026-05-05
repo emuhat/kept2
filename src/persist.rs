@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use skia_safe::Typeface;
 use uuid::Uuid;
 
-use crate::cell::{Bullet, Cell, CellKind, OutlineCell, PopPopCell, TableCell, TextBox};
+use crate::cell::{
+    Bullet, Cell, CellKind, OutlineCell, PopPopCell, ReferenceCell, ReferenceTarget, TableCell,
+    TextBox,
+};
 
 /// Resolved database path: env override → OS data dir → CWD fallback.
 pub fn db_path() -> PathBuf {
@@ -844,6 +847,40 @@ enum CellBody {
         cols: usize,
         cells: Vec<Vec<TableEntryRecord>>,
     },
+    Reference {
+        target: ReferenceTargetRecord,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum ReferenceTargetRecord {
+    /// Whole-cell embed.
+    Cell { cell_id: Uuid },
+    /// Sub-tree of an outline (root bullet + descendants).
+    Subtree { cell_id: Uuid, bullet_id: Uuid },
+}
+
+impl From<ReferenceTarget> for ReferenceTargetRecord {
+    fn from(t: ReferenceTarget) -> Self {
+        match t {
+            ReferenceTarget::WholeCell(cell_id) => ReferenceTargetRecord::Cell { cell_id },
+            ReferenceTarget::Subtree { cell_id, bullet_id } => {
+                ReferenceTargetRecord::Subtree { cell_id, bullet_id }
+            }
+        }
+    }
+}
+
+impl From<ReferenceTargetRecord> for ReferenceTarget {
+    fn from(r: ReferenceTargetRecord) -> Self {
+        match r {
+            ReferenceTargetRecord::Cell { cell_id } => ReferenceTarget::WholeCell(cell_id),
+            ReferenceTargetRecord::Subtree { cell_id, bullet_id } => {
+                ReferenceTarget::Subtree { cell_id, bullet_id }
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -969,6 +1006,9 @@ fn cell_to_body(cell: &Cell) -> CellBody {
                 cells,
             }
         }
+        CellKind::Reference(rc) => CellBody::Reference {
+            target: rc.target().into(),
+        },
     }
 }
 
@@ -986,6 +1026,8 @@ fn extract_title_from_body_json(body_json: &str) -> Option<String> {
         CellBody::PopPop { text, links } => take_heading_from_inline(text, links),
         CellBody::Outline { blocks } => take_heading_from_outline(blocks),
         CellBody::Table { cells, .. } => take_heading_from_table(cells),
+        // Reference cells never had inline headings to migrate from.
+        CellBody::Reference { .. } => None,
     };
     let title = extracted?;
     pc.title = Some(title);
@@ -1190,6 +1232,9 @@ fn tag_names_from_body(body: &CellBody) -> Vec<String> {
                 push_from(&first.text);
             }
         }
+        // Reference cells contribute no tags directly; the source cell's
+        // tags are already indexed at its real location.
+        CellBody::Reference { .. } => {}
     }
     out
 }
@@ -1288,12 +1333,52 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
                 .collect();
             CellKind::Table(TableCell::from_records(typeface.clone(), triples))
         }
+        CellBody::Reference { target } => {
+            CellKind::Reference(ReferenceCell::new(typeface.clone(), target.into()))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_cell_round_trips_through_json() {
+        // Whole-cell embed.
+        let cid = Uuid::now_v7();
+        let body = CellBody::Reference {
+            target: ReferenceTargetRecord::Cell { cell_id: cid },
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let parsed: CellBody = serde_json::from_str(&json).unwrap();
+        match parsed {
+            CellBody::Reference {
+                target: ReferenceTargetRecord::Cell { cell_id },
+            } => assert_eq!(cell_id, cid),
+            _ => panic!("whole-cell reference must round-trip"),
+        }
+
+        // Sub-tree embed.
+        let bid = Uuid::now_v7();
+        let body = CellBody::Reference {
+            target: ReferenceTargetRecord::Subtree {
+                cell_id: cid,
+                bullet_id: bid,
+            },
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let parsed: CellBody = serde_json::from_str(&json).unwrap();
+        match parsed {
+            CellBody::Reference {
+                target: ReferenceTargetRecord::Subtree { cell_id, bullet_id },
+            } => {
+                assert_eq!(cell_id, cid);
+                assert_eq!(bullet_id, bid);
+            }
+            _ => panic!("subtree reference must round-trip"),
+        }
+    }
 
     #[test]
     fn migration_extracts_plain_heading_into_title() {

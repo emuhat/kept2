@@ -4,14 +4,17 @@ use std::time::{Duration, Instant};
 use arboard::Clipboard;
 use uuid::{Uuid, uuid};
 use skia_safe::{
-    BlurStyle, Canvas, Color, Font, FontMgr, MaskFilter, Paint, PaintStyle, Point, Rect, Typeface,
+    BlurStyle, Canvas, Color, Font, FontMgr, MaskFilter, Paint, PaintStyle, PathEffect, Point,
+    Rect, Typeface,
 };
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
     keyboard::{Key, NamedKey},
 };
 
-use crate::cell::{self, Cell, CellSnapshot, TextBox, now_epoch_ms, primary_mod};
+use crate::cell::{
+    self, Cell, CellKind, CellSnapshot, ReferenceTarget, TextBox, now_epoch_ms, primary_mod,
+};
 use crate::persist::{ContextRef, Db, Entity, db_path};
 use crate::query;
 
@@ -268,6 +271,12 @@ struct CellContextMenu {
     cell_id: Uuid,
     anchor_x: f32,
     anchor_y: f32,
+    /// When the right-click hit-tested onto a specific bullet inside an
+    /// outline cell, the bullet's id + a short snippet of its text. Drives
+    /// the "Copy '<snippet>' bullet sub-tree as embed" menu row. None for
+    /// non-outline cells or right-clicks landing in outline whitespace.
+    bullet_id: Option<Uuid>,
+    bullet_snippet: Option<String>,
 }
 
 /// Right-click menu over a People-page row. `deletable` and `ref_count`
@@ -608,6 +617,14 @@ const CELL_MENU_INFO_H: f32 = 22.0;
 const CELL_MENU_ACTION_H: f32 = 26.0;
 const CELL_MENU_PAD: f32 = 6.0;
 
+/// Reference-cell embed wrapper. Warm-tan dashed border with a faint warm
+/// background tint, plus a muted footer line ("↗ originally <date>") so the
+/// embed reads as "not the original; click for the source."
+const EMBED_INSET: f32 = 8.0;
+const EMBED_PAD: f32 = 6.0;
+const EMBED_FOOTER_H: f32 = 18.0;
+const EMBED_FOOTER_FONT_SIZE: f32 = 12.0;
+
 /// Pane divider (gutter between left and right panes). 6 px wide, painted
 /// in the same separator tone as the sidebar's right edge. Hover within
 /// ±DIVIDER_HIT_SLOP px in x grabs it for drag.
@@ -738,6 +755,12 @@ pub struct KeptApp {
     /// "Delete cell" row rect on the cell context menu, captured each
     /// render for hit-testing.
     last_cell_menu_delete_rect: Option<Rect>,
+    /// "Surface as reference" row rect (always present when the menu is open).
+    last_cell_menu_surface_rect: Option<Rect>,
+    /// "Surface '<snippet>' as reference" (sub-tree) row rect. None when
+    /// the right-click didn't hit a bullet (non-outline cell, or outline
+    /// whitespace).
+    last_cell_menu_surface_subtree_rect: Option<Rect>,
     /// Sidebar context-row rects (window coords) from last frame, for hit-testing.
     last_sidebar_rects: Vec<(Uuid, Rect)>,
     /// Sidebar date-header rects from last frame, for hit-testing.
@@ -1016,6 +1039,8 @@ impl KeptApp {
             pending_context_deletes: HashSet::new(),
             cell_context_menu: None,
             last_cell_menu_delete_rect: None,
+            last_cell_menu_surface_rect: None,
+            last_cell_menu_surface_subtree_rect: None,
             last_sidebar_rects: Vec::new(),
             last_sidebar_date_rects: Vec::new(),
             last_sidebar_tag_rects: Vec::new(),
@@ -1263,6 +1288,253 @@ impl KeptApp {
             Rect::new(r.left + s, r.top + s, r.right - s, r.bottom - s),
             &p,
         );
+    }
+
+    /// Render a reference cell at `(x, y)` with `width`. Returns the height
+    /// drawn. Looks up the target out of `self.cells`, dispatches to the
+    /// appropriate body's `render_view`, and wraps it in the embed visual
+    /// (warm-tan dashed border + faint background tint + footer line).
+    /// Handles dangling references and chained references via placeholder
+    /// text. Records geometry on the reference cell so click-tests work.
+    fn render_reference_cell(
+        &mut self,
+        canvas: &Canvas,
+        ref_idx: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+    ) -> f32 {
+        let target = match &self.cells[ref_idx].kind {
+            CellKind::Reference(rc) => rc.target,
+            _ => return 0.0,
+        };
+        let scale = self.font_scale;
+        let inset = EMBED_INSET * scale;
+        let pad = EMBED_PAD * scale;
+        let footer_h = EMBED_FOOTER_H * scale;
+        let body_x = x + inset;
+        let body_y = y + pad;
+        let body_w = (width - 2.0 * inset).max(40.0);
+
+        let target_idx = self.cells.iter().position(|c| c.id == target.cell_id());
+
+        // Decide what kind of preview to render and refresh the cache on
+        // the reference cell if the source's edited_at has changed.
+        enum PreviewKind {
+            Cached,
+            Placeholder(&'static str),
+        }
+        let preview = match target_idx {
+            None => {
+                // Target gone — clear any stale cache and show placeholder.
+                if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
+                    rc.install_cache(None, None);
+                }
+                PreviewKind::Placeholder("↗ [referenced cell deleted]")
+            }
+            Some(tidx) if matches!(self.cells[tidx].kind, CellKind::Reference(_)) => {
+                if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
+                    rc.install_cache(None, None);
+                }
+                PreviewKind::Placeholder("↗ [chained reference]")
+            }
+            Some(tidx) => {
+                let source_edited_at = self.cells[tidx].edited_at;
+                let is_stale = match &self.cells[ref_idx].kind {
+                    CellKind::Reference(rc) => rc.cache_is_stale_for(Some(source_edited_at)),
+                    _ => false,
+                };
+                if is_stale {
+                    let new_cache = self.build_reference_cache(tidx, target);
+                    if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
+                        rc.install_cache(new_cache, Some(source_edited_at));
+                    }
+                }
+                // If the build returned None (e.g., subtree's bullet missing),
+                // surface a placeholder. Otherwise tick the cache.
+                let has_cache = matches!(
+                    &self.cells[ref_idx].kind,
+                    CellKind::Reference(rc) if rc.cache_ref().is_some()
+                );
+                if has_cache {
+                    PreviewKind::Cached
+                } else if matches!(target, ReferenceTarget::Subtree { .. }) {
+                    PreviewKind::Placeholder("↗ [referenced bullet deleted]")
+                } else {
+                    PreviewKind::Placeholder("↗ [reference target unrenderable]")
+                }
+            }
+        };
+
+        let body_h = match preview {
+            PreviewKind::Placeholder(msg) => self.render_embed_placeholder(
+                canvas, msg, body_x, body_y, body_w, scale,
+            ),
+            PreviewKind::Cached => {
+                if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
+                    if let Some(cache) = rc.cache_mut() {
+                        // Tick the cache: focused mirrors the outer cell's
+                        // focus state (so selection highlights show only
+                        // when this reference is the focused cell). Caret
+                        // is always suppressed — references are read-only.
+                        cache.tick(canvas, body_x, body_y, body_w, focused, false)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
+            }
+        };
+
+        let total_h = pad + body_h + 4.0 * scale + footer_h;
+        let wrapper = Rect::new(x, y, x + width, y + total_h);
+
+        // Background tint.
+        let mut bg = Paint::default();
+        bg.set_anti_alias(true);
+        bg.set_color(Color::from_argb(0x0c, 0xb3, 0x92, 0x60));
+        canvas.draw_round_rect(wrapper, FOCUS_RADIUS, FOCUS_RADIUS, &bg);
+
+        // Dashed warm-tan border.
+        let mut stroke = Paint::default();
+        stroke.set_anti_alias(true);
+        stroke.set_style(PaintStyle::Stroke);
+        stroke.set_stroke_width(1.0);
+        stroke.set_color(Color::from_rgb(0xb3, 0x92, 0x60));
+        if let Some(eff) = PathEffect::dash(&[4.0, 2.0], 0.0) {
+            stroke.set_path_effect(eff);
+        }
+        canvas.draw_round_rect(wrapper, FOCUS_RADIUS, FOCUS_RADIUS, &stroke);
+
+        // Footer: "↗ originally <date>" or "↗ original deleted".
+        let footer_text = match target_idx {
+            Some(tidx) => {
+                let ts = self.cells[tidx].timestamp;
+                format!("↗ originally {}", format_date_label(local_date_for_ms(ts)))
+            }
+            None => "↗ original deleted".to_string(),
+        };
+        let footer_font = Font::from_typeface(&self.typeface, EMBED_FOOTER_FONT_SIZE * scale);
+        let (_, fm) = footer_font.metrics();
+        let footer_baseline = y + total_h - pad - (-fm.ascent);
+        let mut footer_paint = Paint::default();
+        footer_paint.set_anti_alias(true);
+        footer_paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+        canvas.draw_str(
+            &footer_text,
+            Point::new(body_x, footer_baseline),
+            &footer_font,
+            &footer_paint,
+        );
+
+        // Record geometry on the embed: both on the inner ReferenceCell
+        // (for symmetry / future use) and on the outer Cell (which is what
+        // `find_cell_at` reads via Cell::x_origin/width/height).
+        if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
+            rc.set_view_geometry(x, y, width, total_h);
+        }
+        self.cells[ref_idx].set_view_geometry(x, y, width, total_h);
+
+        total_h
+    }
+
+    /// Build a fresh cache `Cell` mirroring the source's content. Returns
+    /// None when the target isn't renderable (e.g., Subtree whose bullet
+    /// is gone, Subtree pointing at a non-Outline cell). The cache is a
+    /// real `Cell` so it owns selection state across frames and dispatches
+    /// mouse events through the standard machinery.
+    fn build_reference_cache(
+        &self,
+        target_idx: usize,
+        target: ReferenceTarget,
+    ) -> Option<Cell> {
+        let source = &self.cells[target_idx];
+        let scale = self.font_scale;
+        let typeface = &self.typeface;
+        match target {
+            ReferenceTarget::WholeCell(_) => {
+                let kind = clone_cell_kind_for_cache(&source.kind, typeface, scale)?;
+                let title = source.title.as_ref().map(|t| {
+                    let mut new_t = TextBox::new(typeface.clone(), t.text().to_string());
+                    new_t.set_force_heading(true);
+                    new_t.set_font_scale(scale);
+                    for l in t.links() {
+                        new_t.add_link(l.range.clone(), l.url.clone());
+                    }
+                    new_t
+                });
+                let mut cache = Cell::from_parts(
+                    Uuid::now_v7(),
+                    kind,
+                    title,
+                    source.timestamp,
+                    source.edited_at,
+                    source.context_hint_id,
+                );
+                cache.set_font_scale(scale);
+                Some(cache)
+            }
+            ReferenceTarget::Subtree { bullet_id, .. } => {
+                let oc = match &source.kind {
+                    CellKind::Outline(oc) => oc,
+                    _ => return None,
+                };
+                let range = oc.subtree_range(bullet_id)?;
+                let root_depth = oc.bullets()[range.start].depth();
+                let bullets: Vec<cell::Bullet> = oc.bullets()[range]
+                    .iter()
+                    .map(|b| {
+                        let mut tb = TextBox::new(
+                            typeface.clone(),
+                            b.textbox().text().to_string(),
+                        );
+                        tb.set_font_scale(scale);
+                        for l in b.textbox().links() {
+                            tb.add_link(l.range.clone(), l.url.clone());
+                        }
+                        let new_depth = b.depth().saturating_sub(root_depth);
+                        cell::Bullet::new(b.id(), tb, new_depth)
+                    })
+                    .collect();
+                let mut new_oc = cell::OutlineCell::from_bullets(typeface.clone(), bullets);
+                new_oc.set_font_scale(scale);
+                let mut cache = Cell::from_parts(
+                    Uuid::now_v7(),
+                    CellKind::Outline(new_oc),
+                    None,
+                    source.timestamp,
+                    source.edited_at,
+                    source.context_hint_id,
+                );
+                cache.set_font_scale(scale);
+                Some(cache)
+            }
+        }
+    }
+
+    /// One-line muted placeholder for dangling / chained / wrong-kind
+    /// references. Returns the rendered height.
+    fn render_embed_placeholder(
+        &self,
+        canvas: &Canvas,
+        text: &str,
+        x: f32,
+        y: f32,
+        _width: f32,
+        scale: f32,
+    ) -> f32 {
+        // Slightly smaller than body text — placeholder is a notice, not
+        // actual content.
+        let font = Font::from_typeface(&self.typeface, 14.0 * scale);
+        let (_, m) = font.metrics();
+        let baseline = y + (-m.ascent);
+        let mut paint = Paint::default();
+        paint.set_anti_alias(true);
+        paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+        canvas.draw_str(text, Point::new(x, baseline), &font, &paint);
+        -m.ascent + m.descent
     }
 
     /// Debounced persistence flush. Called once per frame from `tick`,
@@ -2210,7 +2482,6 @@ impl KeptApp {
                 // self.cells (asc) iterates from end to start.
                 let total_cells = self.cells.len();
                 for i in (0..total_cells).rev() {
-                    let cell = &mut self.cells[i];
                     if !visible[i] {
                         continue;
                     }
@@ -2241,27 +2512,45 @@ impl KeptApp {
                     }
                     let cell_x = cells_left;
                     let cell_y = y;
+                    let cell_id = self.cells[i].id;
+                    let is_reference = matches!(self.cells[i].kind, CellKind::Reference(_));
                     let cell_is_focused =
-                        focused_id.map(|f| f == cell.id).unwrap_or(false);
+                        focused_id.map(|f| f == cell_id).unwrap_or(false);
 
                     // Selection highlights are visible whenever the cell is focused
                     // (so view-mode users can drag-select). Caret only renders in
                     // edit mode.
                     let render_focused = cell_is_focused;
                     let show_caret = cell_is_focused && editing_local;
-                    let h = cell.tick(
-                        canvas,
-                        cell_x,
-                        cell_y,
-                        content_width,
-                        render_focused,
-                        show_caret,
-                    );
+                    let h = if is_reference {
+                        // Reference cells render via the app layer (which can
+                        // see the full cell list to look up the target).
+                        self.render_reference_cell(
+                            canvas,
+                            i,
+                            cell_x,
+                            cell_y,
+                            content_width,
+                            render_focused,
+                        )
+                    } else {
+                        let cell = &mut self.cells[i];
+                        cell.tick(
+                            canvas,
+                            cell_x,
+                            cell_y,
+                            content_width,
+                            render_focused,
+                            show_caret,
+                        )
+                    };
 
                     // Faint outline around non-focused cells so each one reads as a
                     // distinct unit. Drawn in the same position the focus ring would
                     // occupy so cells don't visually shift when focus moves.
-                    if !cell_is_focused {
+                    // Reference cells have their own dashed warm-tan border —
+                    // skip the standard outline so the two don't compete.
+                    if !cell_is_focused && !is_reference {
                         let mut outline = Paint::default();
                         outline.set_anti_alias(true);
                         outline.set_style(PaintStyle::Stroke);
@@ -2783,6 +3072,22 @@ impl KeptApp {
                         && !modifiers.state().shift_key()
                         && self.focused.is_some() =>
                 {
+                    // Reference cells are read-only — Enter on a focused
+                    // reference navigates to the original instead of
+                    // entering edit mode.
+                    if let Some(id) = self.focused {
+                        let target = match self.cell(id) {
+                            Some(c) => match &c.kind {
+                                CellKind::Reference(rc) => Some(rc.target),
+                                _ => None,
+                            },
+                            None => None,
+                        };
+                        if let Some(t) = target {
+                            self.navigate_to_reference(t);
+                            return true;
+                        }
+                    }
                     self.editing = true;
                     // Position caret at the end so typing appends to the cell.
                     if let Some(id) = self.focused {
@@ -3163,10 +3468,14 @@ impl KeptApp {
     fn render_cell_context_menu(&mut self, canvas: &Canvas) {
         let Some(menu) = self.cell_context_menu.as_ref() else {
             self.last_cell_menu_delete_rect = None;
+            self.last_cell_menu_surface_rect = None;
+            self.last_cell_menu_surface_subtree_rect = None;
             return;
         };
         let Some(cell) = self.cell(menu.cell_id) else {
             self.last_cell_menu_delete_rect = None;
+            self.last_cell_menu_surface_rect = None;
+            self.last_cell_menu_surface_subtree_rect = None;
             return;
         };
         let scale = self.font_scale;
@@ -3174,7 +3483,16 @@ impl KeptApp {
         let info_h = CELL_MENU_INFO_H * scale;
         let action_h = CELL_MENU_ACTION_H * scale;
         let menu_w = CELL_MENU_WIDTH * scale;
-        let menu_h = pad + info_h * 2.0 + 1.0 + action_h + pad;
+
+        // Compute action rows. Order matches the visual stack.
+        let has_subtree = menu.bullet_id.is_some();
+        let mut action_count: usize = 1; // Delete cell
+        action_count += 1; // Surface as reference (always)
+        if has_subtree {
+            action_count += 1;
+        }
+        let menu_h =
+            pad + info_h * 2.0 + 1.0 + action_h * action_count as f32 + pad;
         let radius = 6.0 * scale;
         let rect = Rect::new(
             menu.anchor_x,
@@ -3229,7 +3547,7 @@ impl KeptApp {
             &info_paint,
         );
 
-        // Hairline divider above the action row.
+        // Hairline divider above the action rows.
         let divider_y = rect.top + pad + info_h * 2.0 + 0.5;
         let mut divider = Paint::default();
         divider.set_anti_alias(false);
@@ -3240,40 +3558,81 @@ impl KeptApp {
             &divider,
         );
 
-        // Delete row.
-        let delete_top = rect.top + pad + info_h * 2.0 + 1.0;
-        let delete_rect = Rect::new(
-            rect.left + pad * 0.5,
-            delete_top,
-            rect.right - pad * 0.5,
-            delete_top + action_h,
-        );
-        let mouse_x = self.mouse_pos.0;
-        let mouse_y = self.mouse_pos.1;
-        let delete_hovered = mouse_x >= delete_rect.left
-            && mouse_x <= delete_rect.right
-            && mouse_y >= delete_rect.top
-            && mouse_y <= delete_rect.bottom;
-        if delete_hovered {
-            let mut hp = Paint::default();
-            hp.set_anti_alias(true);
-            hp.set_color(Color::from_argb(0x20, 0xc0, 0x30, 0x30));
-            canvas.draw_round_rect(delete_rect, 4.0 * scale, 4.0 * scale, &hp);
-        }
         let action_font = Font::from_typeface(&self.typeface, 13.0 * scale);
         let (_, am) = action_font.metrics();
-        let mut delete_paint = Paint::default();
-        delete_paint.set_anti_alias(true);
-        delete_paint.set_color(Color::from_rgb(0xc0, 0x30, 0x30));
-        let baseline =
-            delete_rect.top + (action_h + (-am.ascent) - am.descent) * 0.5;
-        canvas.draw_str(
+        let mouse_x = self.mouse_pos.0;
+        let mouse_y = self.mouse_pos.1;
+        let mut row_top = rect.top + pad + info_h * 2.0 + 1.0;
+        let mut draw_row = |label: &str,
+                            color: Color,
+                            hover_argb: (u8, u8, u8, u8)|
+         -> Rect {
+            let r = Rect::new(
+                rect.left + pad * 0.5,
+                row_top,
+                rect.right - pad * 0.5,
+                row_top + action_h,
+            );
+            let hovered = mouse_x >= r.left
+                && mouse_x <= r.right
+                && mouse_y >= r.top
+                && mouse_y <= r.bottom;
+            if hovered {
+                let mut hp = Paint::default();
+                hp.set_anti_alias(true);
+                hp.set_color(Color::from_argb(
+                    hover_argb.0, hover_argb.1, hover_argb.2, hover_argb.3,
+                ));
+                canvas.draw_round_rect(r, 4.0 * scale, 4.0 * scale, &hp);
+            }
+            let mut paint = Paint::default();
+            paint.set_anti_alias(true);
+            paint.set_color(color);
+            let baseline =
+                r.top + (action_h + (-am.ascent) - am.descent) * 0.5;
+            canvas.draw_str(
+                label,
+                Point::new(r.left + pad * 2.0, baseline),
+                &action_font,
+                &paint,
+            );
+            row_top += action_h;
+            r
+        };
+
+        // Delete row (red, hover red-tinted).
+        let delete_rect = draw_row(
             "Delete cell",
-            Point::new(delete_rect.left + pad * 2.0, baseline),
-            &action_font,
-            &delete_paint,
+            Color::from_rgb(0xc0, 0x30, 0x30),
+            (0x20, 0xc0, 0x30, 0x30),
         );
+
+        // Surface as reference — always present. Creates a new reference
+        // cell at "now" pointing to this cell. Lands wherever a fresh
+        // Ctrl+N cell would land. Hover uses the warm-tan tint.
+        let surface_rect = draw_row(
+            "Surface as reference",
+            Color::from_rgb(0x40, 0x40, 0x40),
+            (0x20, 0xb3, 0x92, 0x60),
+        );
+
+        // Surface bullet sub-tree as reference — only when right-click hit
+        // a bullet inside an outline.
+        let surface_subtree_rect = if has_subtree {
+            let snip = menu.bullet_snippet.as_deref().unwrap_or("[empty]");
+            let label = format!("Surface '{}' as reference", snip);
+            Some(draw_row(
+                &label,
+                Color::from_rgb(0x40, 0x40, 0x40),
+                (0x20, 0xb3, 0x92, 0x60),
+            ))
+        } else {
+            None
+        };
+
         self.last_cell_menu_delete_rect = Some(delete_rect);
+        self.last_cell_menu_surface_rect = Some(surface_rect);
+        self.last_cell_menu_surface_subtree_rect = surface_subtree_rect;
     }
 
     /// Render the entity page for `entity_id` into the doc area. Returns
@@ -5494,6 +5853,53 @@ impl KeptApp {
         true
     }
 
+    /// "Surface as reference" — create a new Reference cell pointing at
+    /// `target` and insert it where any new cell would land: at "now," in
+    /// the current writable context (auto-rotating to a fresh context when
+    /// the user has been idle, just like `insert_cell_after_focused`).
+    /// Focuses the new reference. Returns true on insert.
+    fn surface_as_reference(&mut self, target: ReferenceTarget) -> bool {
+        // If the user is viewing a closed context, jump to the current open
+        // one before inserting — surfacing belongs in "today," not history.
+        let _auto_switched = self.ensure_writable_context();
+        // Idle rotation: same baseline logic as insert_cell_after_focused.
+        let now = now_epoch_ms();
+        let idle_ms = IDLE_CONTEXT_THRESHOLD.as_millis() as i64;
+        let writable_start = self
+            .writable_context_id()
+            .and_then(|id| self.contexts.iter().find(|c| c.id == id))
+            .map(|c| c.start_time)
+            .unwrap_or(i64::MIN);
+        let baseline = self
+            .last_cell_create_ms()
+            .map(|t| t.max(writable_start))
+            .unwrap_or(writable_start);
+        if baseline > i64::MIN && now - baseline >= idle_ms {
+            self.rotate_context_now();
+        }
+        let pre_focused = self.focused;
+        let mut new_cell = Cell::new_reference(self.typeface.clone(), target);
+        new_cell.set_font_scale(self.font_scale);
+        new_cell.context_hint_id = self.writable_context_id();
+        let new_id = new_cell.id;
+        let snapshot = new_cell.snapshot();
+        self.insert_cell_sorted(new_cell);
+        self.focused = Some(new_id);
+        // References never enter edit mode; just focus.
+        self.editing = false;
+        self.dragging_cell = None;
+        self.pending_caret_scroll = true;
+        self.undo_stack.push(UndoOp::InsertCell {
+            cell_id: new_id,
+            snapshot,
+            pre_focused,
+        });
+        self.redo_stack.clear();
+        self.coalesce_break = true;
+        self.touch_cell(new_id);
+        true
+    }
+
     /// Bring the primary caret of the focused cell into view if it's outside
     /// the viewport. Used after edits, caret movement, and zoom changes.
     fn scroll_caret_into_view(&mut self) {
@@ -5598,10 +6004,24 @@ impl KeptApp {
         ) {
             let doc_y = y + self.scroll_y;
             if let Some(cell_id) = self.find_cell_at(x, doc_y) {
+                // If the right-click landed on a specific bullet inside an
+                // outline cell, capture (bullet_id, snippet) so the menu
+                // can offer "Copy bullet sub-tree as embed."
+                let (bullet_id, bullet_snippet) = self
+                    .cell(cell_id)
+                    .and_then(|c| match &c.kind {
+                        CellKind::Outline(oc) => oc
+                            .bullet_at_doc_y(doc_y)
+                            .map(|(id, text)| (Some(id), Some(snippet(&text)))),
+                        _ => None,
+                    })
+                    .unwrap_or((None, None));
                 self.cell_context_menu = Some(CellContextMenu {
                     cell_id,
                     anchor_x: x,
                     anchor_y: y,
+                    bullet_id,
+                    bullet_snippet,
                 });
                 return true;
             }
@@ -5758,6 +6178,31 @@ impl KeptApp {
                     return true;
                 }
             }
+            // "Surface as reference" — create a new reference cell at "now"
+            // pointing to the right-clicked cell.
+            if let Some(rect) = self.last_cell_menu_surface_rect {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        self.surface_as_reference(ReferenceTarget::WholeCell(menu.cell_id));
+                    }
+                    return true;
+                }
+            }
+            // "Surface '<snippet>' as reference" — sub-tree target. Only
+            // present when the menu was opened over a specific bullet.
+            if let Some(rect) = self.last_cell_menu_surface_subtree_rect {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        if let Some(bid) = menu.bullet_id {
+                            self.surface_as_reference(ReferenceTarget::Subtree {
+                                cell_id: menu.cell_id,
+                                bullet_id: bid,
+                            });
+                        }
+                    }
+                    return true;
+                }
+            }
             self.cell_context_menu = None;
         }
 
@@ -5896,6 +6341,33 @@ impl KeptApp {
             self.handle_link_click(&url);
         }
         result
+    }
+
+    /// Click-on-embed → land on the original. Mirrors `close_search_commit`
+    /// (app.rs:close_search_commit) for the cell-level case, plus an extra
+    /// step for `Subtree` targets that focuses the specific bullet inside
+    /// the target outline. No-op when the target cell is gone (the embed
+    /// already showed a "[deleted]" placeholder).
+    fn navigate_to_reference(&mut self, target: ReferenceTarget) {
+        let cell_id = target.cell_id();
+        let target_date = match self.cell(cell_id) {
+            Some(c) => local_date_for_ms(c.timestamp),
+            None => return,
+        };
+        self.push_view(Query::date(target_date));
+        self.focused = Some(cell_id);
+        self.editing = false;
+        self.pending_caret_scroll = true;
+        // Subtree target: drill into the outline cell and focus the
+        // specific bullet. Cell-level focus alone is the fallback if the
+        // bullet is missing or the cell isn't an outline anymore.
+        if let ReferenceTarget::Subtree { bullet_id, .. } = target {
+            if let Some(c) = self.cell_mut(cell_id) {
+                if let CellKind::Outline(oc) = &mut c.kind {
+                    let _ = oc.set_focused_bullet(bullet_id);
+                }
+            }
+        }
     }
 
     /// Resolve a clicked link URL. `kept://<uuid>` routes by uuid kind:
@@ -6190,6 +6662,90 @@ fn context_ref<'a>(c: &'a Context) -> ContextRef<'a> {
         end_time: c.end_time,
         title: c.title.as_deref(),
     }
+}
+
+/// Build a `CellKind` clone for a reference cache. Returns None when the
+/// source kind is itself a Reference (chained refs are short-circuited
+/// upstream and shouldn't reach this path). Mirrors text + links + per-row
+/// flags; uses the supplied typeface so the new widgets render in the
+/// same font as everything else in the app.
+fn clone_cell_kind_for_cache(
+    kind: &CellKind,
+    typeface: &Typeface,
+    scale: f32,
+) -> Option<CellKind> {
+    match kind {
+        CellKind::Plain(tb) => {
+            let mut new_tb = TextBox::new(typeface.clone(), tb.text().to_string());
+            new_tb.set_font_scale(scale);
+            for l in tb.links() {
+                new_tb.add_link(l.range.clone(), l.url.clone());
+            }
+            Some(CellKind::Plain(new_tb))
+        }
+        CellKind::Outline(oc) => {
+            let bullets: Vec<cell::Bullet> = oc
+                .bullets()
+                .iter()
+                .map(|b| {
+                    let mut tb = TextBox::new(typeface.clone(), b.textbox().text().to_string());
+                    tb.set_font_scale(scale);
+                    for l in b.textbox().links() {
+                        tb.add_link(l.range.clone(), l.url.clone());
+                    }
+                    cell::Bullet::new(b.id(), tb, b.depth())
+                })
+                .collect();
+            let mut new_oc = cell::OutlineCell::from_bullets(typeface.clone(), bullets);
+            new_oc.set_font_scale(scale);
+            Some(CellKind::Outline(new_oc))
+        }
+        CellKind::PopPop(pc) => {
+            let mut new_pc = cell::PopPopCell::new(typeface.clone());
+            new_pc.set_font_scale(scale);
+            new_pc.restore(pc.snapshot());
+            Some(CellKind::PopPop(new_pc))
+        }
+        CellKind::Table(tc) => {
+            let triples: Vec<Vec<(String, Vec<(std::ops::Range<usize>, String)>, bool)>> = tc
+                .rows_view()
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| {
+                            let text = e.textbox.text().to_string();
+                            let links: Vec<(std::ops::Range<usize>, String)> = e
+                                .textbox
+                                .links()
+                                .iter()
+                                .map(|l| (l.range.clone(), l.url.clone()))
+                                .collect();
+                            (text, links, e.readonly)
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut new_tc = cell::TableCell::from_records(typeface.clone(), triples);
+            new_tc.set_font_scale(scale);
+            Some(CellKind::Table(new_tc))
+        }
+        CellKind::Reference(_) => None,
+    }
+}
+
+/// Trim arbitrary text to a single-line preview suitable for menu labels.
+/// Collapses internal whitespace, truncates with ellipsis past 30 chars,
+/// returns "[empty]" for blank input so the menu row reads sensibly.
+fn snippet(text: &str) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "[empty]".to_string();
+    }
+    if collapsed.chars().count() <= 30 {
+        return collapsed;
+    }
+    let truncated: String = collapsed.chars().take(29).collect();
+    format!("{}…", truncated)
 }
 
 #[cfg(test)]

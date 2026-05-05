@@ -1676,6 +1676,7 @@ impl TextBox {
         self.line_is_comment = comments;
         self.recompute_line_tag_layout();
     }
+
 }
 
 /// Draw the visible portion of `line` from `text` at `(text_x, baseline)`,
@@ -2310,6 +2311,22 @@ impl OutlineCell {
         self.bullets.iter().position(|b| b.id == id)
     }
 
+    /// Bullet under doc-space y (id + text). Strict: returns None when the
+    /// y isn't inside any bullet's render band (e.g., the click landed
+    /// above the first bullet's top edge or below the last bullet's bottom
+    /// edge of the outline). Used by the right-click context menu to
+    /// surface "Copy bullet sub-tree as embed."
+    pub fn bullet_at_doc_y(&self, abs_y: f32) -> Option<(Uuid, String)> {
+        for b in &self.bullets {
+            let top = b.textbox.y_origin();
+            let bot = top + b.textbox.height();
+            if abs_y >= top && abs_y < bot {
+                return Some((b.id, b.textbox.text().to_string()));
+            }
+        }
+        None
+    }
+
     fn focused_index(&self) -> Option<usize> {
         self.bullets.iter().position(|b| b.id == self.focused_bullet)
     }
@@ -2712,6 +2729,36 @@ impl OutlineCell {
 
     pub fn focused_bullet_id(&self) -> Uuid {
         self.focused_bullet
+    }
+
+    /// Move focus to the bullet with `id` if present. Returns true if the
+    /// bullet was found (and focus changed); false otherwise. Used by
+    /// reference-embed click navigation to land on a specific bullet.
+    pub fn set_focused_bullet(&mut self, id: Uuid) -> bool {
+        if self.bullet_idx_by_id(id).is_none() {
+            return false;
+        }
+        if self.focused_bullet == id {
+            return true;
+        }
+        self.focused_bullet = id;
+        self.bullet_selection = None;
+        true
+    }
+
+    /// Range of indices for the sub-tree rooted at `bullet_id`: the bullet
+    /// itself plus all immediately-following bullets with strictly greater
+    /// depth, until depth drops back to <= the root. Single bullet with no
+    /// children → range of length 1. Used by reference-embed rendering and
+    /// (eventually) Stage 2's bullet-as-reference work.
+    pub fn subtree_range(&self, bullet_id: Uuid) -> Option<std::ops::Range<usize>> {
+        let i = self.bullet_idx_by_id(bullet_id)?;
+        let root_depth = self.bullets[i].depth;
+        let mut k = i + 1;
+        while k < self.bullets.len() && self.bullets[k].depth > root_depth {
+            k += 1;
+        }
+        Some(i..k)
     }
 
     /// Select all text inside the focused bullet's textbox.
@@ -3160,6 +3207,7 @@ impl OutlineCell {
         self.focused_bullet = next_id;
         true
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -3187,6 +3235,9 @@ pub enum CellSnapshotKind {
     /// re-attach to a PopPop cell rather than collapsing it back to Plain.
     PopPop(TextBoxSnapshot),
     Table(TableSnapshot),
+    /// Reference cells store only the target pointer. Restore recreates the
+    /// pointer; live-vs-dangling state is determined fresh at render time.
+    Reference(ReferenceTarget),
 }
 
 impl CellSnapshot {
@@ -3623,6 +3674,7 @@ impl PopPopCell {
         self.textbox.set_font_scale(scale);
         self.output.set_font_scale(scale);
     }
+
 }
 
 // ============================================================================
@@ -4230,6 +4282,155 @@ impl TableCell {
         }
         None
     }
+
+}
+
+/// What a reference cell points at — either a whole cell, or a specific
+/// bullet sub-tree within an outline (root bullet + its contiguous deeper-
+/// depth followers). Cheap to copy; passed by value through navigation /
+/// snapshot paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferenceTarget {
+    WholeCell(Uuid),
+    Subtree { cell_id: Uuid, bullet_id: Uuid },
+}
+
+impl ReferenceTarget {
+    /// The cell id (whether or not we further narrow to a bullet). Used by
+    /// navigation and dangling-ref lookups.
+    pub fn cell_id(self) -> Uuid {
+        match self {
+            ReferenceTarget::WholeCell(id) => id,
+            ReferenceTarget::Subtree { cell_id, .. } => cell_id,
+        }
+    }
+}
+
+/// A read-only window onto another cell (or sub-tree). Renders the target's
+/// content in place; click navigates to the original. Stores only the
+/// pointer + its own layout box — never caches target content. Lookup
+/// happens on the shared `Vec<Cell>` at render time.
+pub struct ReferenceCell {
+    pub target: ReferenceTarget,
+    /// Carried so the cache can reconstitute body widgets. The reference
+    /// itself doesn't render text directly.
+    typeface: Typeface,
+    /// Layout box for the embed itself, written by the app layer's render
+    /// dispatch. Distinct from the target's own `(x_origin, y_origin)` —
+    /// those belong to the target's render at its real timeline location.
+    x_origin: f32,
+    y_origin: f32,
+    width: f32,
+    height: f32,
+    font_scale: f32,
+    /// Persistent cached preview of the target's content. Owns its own
+    /// selection state across frames so drag-select inside the embed
+    /// works exactly like in any other cell. Rebuilt whenever
+    /// `cache_source_edited_at` doesn't match the source's `edited_at`,
+    /// so edits at the original propagate. None when the target is
+    /// missing or chained (a placeholder is drawn instead).
+    /// Boxed because `Cell` contains `CellKind` which contains
+    /// `ReferenceCell` — without indirection the type would be infinitely
+    /// sized.
+    cache: Option<Box<Cell>>,
+    /// Source's `edited_at` when `cache` was last rebuilt.
+    cache_source_edited_at: Option<i64>,
+}
+
+impl ReferenceCell {
+    pub fn new(typeface: Typeface, target: ReferenceTarget) -> Self {
+        Self {
+            target,
+            typeface,
+            x_origin: 0.0,
+            y_origin: 0.0,
+            width: 0.0,
+            height: 0.0,
+            font_scale: 1.0,
+            cache: None,
+            cache_source_edited_at: None,
+        }
+    }
+
+    /// True if the cache needs rebuilding for `source_edited_at` (None
+    /// means the target is gone — invalidate the cache).
+    pub fn cache_is_stale_for(&self, source_edited_at: Option<i64>) -> bool {
+        match (source_edited_at, self.cache_source_edited_at, &self.cache) {
+            // Target gone. Cache should be cleared if it isn't already.
+            (None, _, Some(_)) => true,
+            (None, _, None) => false,
+            // Target present, cache missing.
+            (Some(_), _, None) => true,
+            // Target present, cache stale.
+            (Some(src), Some(cached), Some(_)) => src != cached,
+            // Target present, cache built but no edited_at recorded.
+            (Some(_), None, Some(_)) => true,
+        }
+    }
+
+    /// Replace the cache with `new_cache` (built by the caller from the
+    /// resolved source data). Updates the staleness key. Pass `None` for
+    /// `new_cache` when the target is missing / chained.
+    pub fn install_cache(&mut self, new_cache: Option<Cell>, source_edited_at: Option<i64>) {
+        self.cache = new_cache.map(Box::new);
+        self.cache_source_edited_at = source_edited_at;
+    }
+
+    pub fn cache_mut(&mut self) -> Option<&mut Cell> {
+        self.cache.as_deref_mut()
+    }
+
+    pub fn cache_ref(&self) -> Option<&Cell> {
+        self.cache.as_deref()
+    }
+
+    #[allow(dead_code)]
+    pub fn typeface(&self) -> &Typeface {
+        &self.typeface
+    }
+
+    pub fn target(&self) -> ReferenceTarget {
+        self.target
+    }
+
+    #[allow(dead_code)]
+    pub fn font_scale(&self) -> f32 {
+        self.font_scale
+    }
+
+    pub fn set_font_scale(&mut self, scale: f32) {
+        self.font_scale = scale;
+    }
+
+    #[allow(dead_code)]
+    pub fn x_origin(&self) -> f32 {
+        self.x_origin
+    }
+
+    #[allow(dead_code)]
+    pub fn y_origin(&self) -> f32 {
+        self.y_origin
+    }
+
+    #[allow(dead_code)]
+    pub fn width(&self) -> f32 {
+        self.width
+    }
+
+    #[allow(dead_code)]
+    pub fn height(&self) -> f32 {
+        self.height
+    }
+
+    /// Called by the app's render layer (which has access to the full cell
+    /// list) after computing the embed's height. The reference cell itself
+    /// can't render — it doesn't have access to its target.
+    pub fn set_view_geometry(&mut self, x: f32, y: f32, width: f32, height: f32) {
+        self.x_origin = x;
+        self.y_origin = y;
+        self.width = width;
+        self.height = height;
+    }
 }
 
 pub struct Cell {
@@ -4265,6 +4466,9 @@ pub enum CellKind {
     Outline(OutlineCell),
     PopPop(PopPopCell),
     Table(TableCell),
+    /// Read-only embed of another cell or bullet sub-tree. Has no editable
+    /// content of its own; click navigates to the target.
+    Reference(ReferenceCell),
 }
 
 impl Cell {
@@ -4336,6 +4540,27 @@ impl Cell {
         }
     }
 
+    /// Create a reference (read-only embed) cell. Title slot is left None —
+    /// references inherit identity from their target, not their own title.
+    /// Typeface is unused at construction; included for symmetry with the
+    /// other constructors and for any future per-reference rendering needs.
+    pub fn new_reference(typeface: Typeface, target: ReferenceTarget) -> Self {
+        let now = now_epoch_ms();
+        Self {
+            id: Uuid::now_v7(),
+            kind: CellKind::Reference(ReferenceCell::new(typeface, target)),
+            title: None,
+            title_focused: false,
+            cell_x: 0.0,
+            cell_y: 0.0,
+            cell_w: 0.0,
+            cell_h: 0.0,
+            timestamp: now,
+            edited_at: now,
+            context_hint_id: None,
+        }
+    }
+
     /// Reconstruct from raw parts (used by the persistence layer).
     pub fn from_parts(
         id: Uuid,
@@ -4380,6 +4605,10 @@ impl Cell {
     /// existing title or its content. Returns true if focus moved or a
     /// title was created.
     pub fn toggle_title_focus(&mut self) -> bool {
+        // Reference cells are read-only — no title slot.
+        if matches!(self.kind, CellKind::Reference(_)) {
+            return false;
+        }
         let created = self.title.is_none();
         self.ensure_title();
         if !self.title_focused || created {
@@ -4397,6 +4626,7 @@ impl Cell {
             CellKind::Outline(oc) => oc.typeface.clone(),
             CellKind::PopPop(pc) => pc.textbox.typeface.clone(),
             CellKind::Table(tc) => tc.typeface.clone(),
+            CellKind::Reference(rc) => rc.typeface.clone(),
         }
     }
 
@@ -4408,6 +4638,7 @@ impl Cell {
             CellKind::Outline(oc) => oc.font_scale,
             CellKind::PopPop(pc) => pc.textbox.font_scale(),
             CellKind::Table(tc) => tc.font_scale,
+            CellKind::Reference(rc) => rc.font_scale,
         }
     }
 
@@ -4436,6 +4667,9 @@ impl Cell {
                 tc.restore(ts);
                 CellKind::Table(tc)
             }
+            CellSnapshotKind::Reference(target) => {
+                CellKind::Reference(ReferenceCell::new(typeface.clone(), target))
+            }
         };
         let title = snap.title.map(|tbs| {
             let mut tb = TextBox::new(typeface.clone(), String::new());
@@ -4459,6 +4693,8 @@ impl Cell {
                     entry.textbox.add_link(range, url);
                 }
             }
+            // No body text to attach a link to.
+            CellKind::Reference(_) => {}
         }
     }
 
@@ -4475,6 +4711,14 @@ impl Cell {
             CellKind::Outline(oc) => oc.link_at_doc_pos(abs_x, abs_y),
             CellKind::PopPop(pc) => pc.link_at_doc_pos(abs_x, abs_y),
             CellKind::Table(tc) => tc.link_at_doc_pos(abs_x, abs_y),
+            // Forward to the cache: links inside an embed body get the
+            // hand cursor on hover, just like inline links anywhere else.
+            // The reference *body itself* (outside any link span) stays
+            // default — clicking blank space focuses, doesn't navigate.
+            CellKind::Reference(rc) => match rc.cache_ref() {
+                Some(cache) => cache.link_at_doc_pos(abs_x, abs_y),
+                None => false,
+            },
         }
     }
 
@@ -4510,6 +4754,8 @@ impl Cell {
                     }
                 }
             }
+            // Reference cells have no editable text to attach a link to.
+            CellKind::Reference(_) => {}
         }
     }
 
@@ -4527,6 +4773,12 @@ impl Cell {
             CellKind::Outline(oc) => oc.copy_text(),
             CellKind::PopPop(pc) => pc.copy_selection(),
             CellKind::Table(tc) => tc.copy_selection(),
+            // Forward to the cached preview so Cmd+C grabs the selection
+            // the user dragged inside the embed body.
+            CellKind::Reference(rc) => match rc.cache_ref() {
+                Some(cache) => cache.copy_text(),
+                None => String::new(),
+            },
         }
     }
 
@@ -4581,6 +4833,10 @@ impl Cell {
             }
             CellKind::PopPop(pc) => pc.textbox().text().to_string(),
             CellKind::Table(tc) => tc.full_text(),
+            // Reference cells contribute nothing to search-indexable text;
+            // search would otherwise return the same content twice (once
+            // for the original cell, once for each embed).
+            CellKind::Reference(_) => String::new(),
         };
         match self.title.as_ref() {
             Some(t) if !t.text().is_empty() => {
@@ -4609,8 +4865,15 @@ impl Cell {
             CellKind::Outline(oc) => oc.take_pending_link_url(),
             CellKind::PopPop(pc) => pc.take_pending_link_url(),
             CellKind::Table(tc) => tc.take_pending_link_url(),
+            // Forward to the cache so links inside an embed body are
+            // clickable just like inline links anywhere else.
+            CellKind::Reference(rc) => match rc.cache_mut() {
+                Some(cache) => cache.take_pending_link_url(),
+                None => None,
+            },
         }
     }
+
 
     /// Every link URL in the cell — title (if any), body, all inner
     /// elements. Used by the query executor to resolve `kept://<uuid>`
@@ -4649,6 +4912,8 @@ impl Cell {
                     }
                 }
             }
+            // No links inside a reference embed.
+            CellKind::Reference(_) => {}
         }
         out
     }
@@ -4664,6 +4929,7 @@ impl Cell {
             CellKind::Outline(oc) => oc.cut_text(),
             CellKind::PopPop(pc) => pc.textbox_mut().cut_primary_selection(),
             CellKind::Table(tc) => tc.cut_focused(),
+            CellKind::Reference(_) => String::new(),
         }
     }
 
@@ -4679,6 +4945,8 @@ impl Cell {
             CellKind::Outline(oc) => oc.paste_text(s),
             CellKind::PopPop(pc) => pc.textbox_mut().paste(s),
             CellKind::Table(tc) => tc.paste_focused(s),
+            // Pasting into a reference is a no-op (read-only).
+            CellKind::Reference(_) => {}
         }
     }
 
@@ -4730,6 +4998,11 @@ impl Cell {
             CellKind::Outline(oc) => oc.tick(canvas, x, body_y, width, body_focused, body_caret),
             CellKind::PopPop(pc) => pc.tick(canvas, x, body_y, width, body_focused, body_caret),
             CellKind::Table(tc) => tc.tick(canvas, x, body_y, width, body_focused, body_caret),
+            // Reference cells render via the app layer (which can see the
+            // full cell list to look up the target). `Cell::tick` is never
+            // called for them — see the dispatch in app.rs's cell-render
+            // loop. Returning 0 here would corrupt geometry if it ever did.
+            CellKind::Reference(_) => 0.0,
         };
         let total_h = consumed + body_h;
         // Record cell-level geometry so focus ring, hit-test, kebab placement,
@@ -4792,6 +5065,9 @@ impl Cell {
             CellKind::Outline(oc) => oc.handle_key(event, modifiers),
             CellKind::PopPop(pc) => pc.handle_key(event, modifiers),
             CellKind::Table(tc) => tc.handle_key(event, modifiers),
+            // Reference cells consume nothing — keys bubble back up so the
+            // app's cell-level arrow nav can step past them.
+            CellKind::Reference(_) => false,
         }
     }
 
@@ -4819,6 +5095,18 @@ impl Cell {
             CellKind::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers, editing),
             CellKind::PopPop(pc) => pc.mouse_down(abs_x, abs_y, modifiers, editing),
             CellKind::Table(tc) => tc.mouse_down(abs_x, abs_y, modifiers, editing),
+            // Reference cells: forward into the cached preview so
+            // drag-select inside the embed works the same as in any
+            // normal cell. `editing=false` regardless of the outer cell's
+            // edit state — the cache is read-only by design (no caret,
+            // selection only). Navigation to the source still fires on
+            // Enter (handled in app.rs::handle_key).
+            CellKind::Reference(rc) => {
+                if let Some(cache) = rc.cache_mut() {
+                    cache.mouse_down(abs_x, abs_y, modifiers, false);
+                }
+                true
+            }
         }
     }
 
@@ -4835,6 +5123,11 @@ impl Cell {
             CellKind::Outline(oc) => oc.mouse_drag_to(abs_x, abs_y),
             CellKind::PopPop(pc) => pc.mouse_drag_to(abs_x, abs_y),
             CellKind::Table(tc) => tc.mouse_drag_to(abs_x, abs_y),
+            // Forward into the cached preview so drag-extend-select works.
+            CellKind::Reference(rc) => match rc.cache_mut() {
+                Some(cache) => cache.mouse_drag_to(abs_x, abs_y),
+                None => false,
+            },
         };
         any || body
     }
@@ -4851,6 +5144,10 @@ impl Cell {
             CellKind::Outline(oc) => oc.mouse_up(),
             CellKind::PopPop(pc) => pc.mouse_up(),
             CellKind::Table(tc) => tc.mouse_up(),
+            CellKind::Reference(rc) => match rc.cache_mut() {
+                Some(cache) => cache.mouse_up(),
+                None => false,
+            },
         };
         any || body
     }
@@ -4872,6 +5169,9 @@ impl Cell {
                         .map(|e| e.textbox.at_top_visual_line())
                         .unwrap_or(true)
             }
+            // Reference cells have no caret, so "at top edge" is always
+            // true — arrow-up over a Reference cell jumps to the cell above.
+            CellKind::Reference(_) => true,
         }
     }
 
@@ -4901,6 +5201,8 @@ impl Cell {
                     entry.textbox.set_caret_at(0);
                 }
             }
+            // No caret to place.
+            CellKind::Reference(_) => {}
         }
     }
 
@@ -4920,6 +5222,18 @@ impl Cell {
         self.cell_h
     }
 
+    /// Record the cell-level geometry from outside `tick`. Used by the
+    /// app's render-reference-cell path: reference cells don't go through
+    /// `Cell::tick` (which is the only other writer), so without this
+    /// `find_cell_at` would still see zero width/height and clicks would
+    /// fall through.
+    pub fn set_view_geometry(&mut self, x: f32, y: f32, width: f32, height: f32) {
+        self.cell_x = x;
+        self.cell_y = y;
+        self.cell_w = width;
+        self.cell_h = height;
+    }
+
     pub fn is_empty(&self) -> bool {
         let title_empty = self.title.as_ref().map(|t| t.is_empty()).unwrap_or(true);
         let body_empty = match &self.kind {
@@ -4927,6 +5241,9 @@ impl Cell {
             CellKind::Outline(oc) => oc.is_empty(),
             CellKind::PopPop(pc) => pc.textbox().is_empty(),
             CellKind::Table(tc) => tc.is_empty(),
+            // Reference cells are never "empty" — they're a pointer, which
+            // is content even when its target is gone.
+            CellKind::Reference(_) => false,
         };
         title_empty && body_empty
     }
@@ -4940,6 +5257,7 @@ impl Cell {
             CellKind::Outline(oc) => oc.set_font_scale(scale),
             CellKind::PopPop(pc) => pc.set_font_scale(scale),
             CellKind::Table(tc) => tc.set_font_scale(scale),
+            CellKind::Reference(rc) => rc.set_font_scale(scale),
         }
     }
 
@@ -4954,6 +5272,7 @@ impl Cell {
             CellKind::Outline(oc) => oc.caret_doc_y_band(),
             CellKind::PopPop(pc) => pc.textbox().caret_doc_y_band(),
             CellKind::Table(tc) => tc.caret_doc_y_band(),
+            CellKind::Reference(_) => None,
         }
     }
 
@@ -4984,6 +5303,9 @@ impl Cell {
                         .map(|e| e.textbox.at_top_visual_line())
                         .unwrap_or(true)
             }
+            // Reference cells are always at both edges — there's no caret
+            // to hold the focus, so arrow keys should immediately cross out.
+            CellKind::Reference(_) => true,
         }
     }
 
@@ -5004,6 +5326,7 @@ impl Cell {
                         .map(|e| e.textbox.at_bottom_visual_line())
                         .unwrap_or(true)
             }
+            CellKind::Reference(_) => true,
         }
     }
 
@@ -5023,6 +5346,7 @@ impl Cell {
                     entry.textbox.set_caret_at(0);
                 }
             }
+            CellKind::Reference(_) => {}
         }
     }
 
@@ -5051,6 +5375,7 @@ impl Cell {
                     entry.textbox.set_caret_at(end);
                 }
             }
+            CellKind::Reference(_) => {}
         }
     }
 
@@ -5071,6 +5396,11 @@ impl Cell {
                 let (r, c) = tc.focused_index();
                 if let Some(entry) = tc.cell_at_mut(r, c) {
                     entry.textbox.select_all();
+                }
+            }
+            CellKind::Reference(rc) => {
+                if let Some(cache) = rc.cache_mut() {
+                    cache.select_all_focused();
                 }
             }
         }
@@ -5097,6 +5427,7 @@ impl Cell {
                 let entry = tc.cell_at(r, c)?;
                 entry.textbox.primary_caret().map(|(_, h)| (entry.textbox.text(), h))
             }
+            CellKind::Reference(_) => None,
         }
     }
 
@@ -5111,6 +5442,7 @@ impl Cell {
             CellKind::Outline(oc) => Some(oc.focused_bullet_id()),
             CellKind::PopPop(_) => None,
             CellKind::Table(_) => None,
+            CellKind::Reference(_) => None,
         }
     }
 
@@ -5163,6 +5495,7 @@ impl Cell {
                 CellKind::Outline(oc) => CellSnapshotKind::Outline(oc.snapshot()),
                 CellKind::PopPop(pc) => CellSnapshotKind::PopPop(pc.snapshot()),
                 CellKind::Table(tc) => CellSnapshotKind::Table(tc.snapshot()),
+                CellKind::Reference(rc) => CellSnapshotKind::Reference(rc.target),
             },
         }
     }
@@ -5191,6 +5524,9 @@ impl Cell {
             (CellKind::Outline(oc), CellSnapshotKind::Outline(os)) => oc.restore(os),
             (CellKind::PopPop(pc), CellSnapshotKind::PopPop(tbs)) => pc.restore(tbs),
             (CellKind::Table(tc), CellSnapshotKind::Table(ts)) => tc.restore(ts),
+            (CellKind::Reference(rc), CellSnapshotKind::Reference(target)) => {
+                rc.target = target;
+            }
             _ => {}
         }
     }
