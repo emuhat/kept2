@@ -619,6 +619,11 @@ const PANE_BORDER_STROKE: f32 = 2.0;
 const SPLIT_MIN: f32 = 0.15;
 const SPLIT_MAX: f32 = 0.85;
 
+/// How long the Ctrl+W pane chord stays armed waiting for a follow-up key
+/// before auto-cancelling. Long enough to be forgiving of stray presses,
+/// short enough not to swallow real keystrokes much later.
+const PANE_CHORD_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Forward-compat: the orientation of the (eventual) split. Always `Horiz`
 /// in v1 (left/right). When vertical splits land, this enum gains meaning
 /// without renaming.
@@ -711,6 +716,9 @@ pub struct KeptApp {
     /// Reserved for future vertical splits — always `Horiz` in v1.
     #[allow(dead_code)]
     split_dir: SplitDir,
+    /// `Some(armed_at)` while the pane chord (Ctrl+W) is awaiting a
+    /// follow-up key. Cleared by the follow-up, by Esc, or by timeout.
+    pane_chord_armed: Option<Instant>,
     font_scale: f32,
     undo_stack: Vec<UndoOp>,
     redo_stack: Vec<UndoOp>,
@@ -988,11 +996,12 @@ impl KeptApp {
             typeface,
             cells,
             contexts,
-            panes: vec![Pane::new(view.clone(), focused), Pane::new(view, focused)],
+            panes: vec![Pane::new(view, focused)],
             active_pane: 0,
             split_ratio: 0.5,
             dragging_divider: false,
             split_dir: SplitDir::Horiz,
+            pane_chord_armed: None,
             font_scale: 1.0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -1060,6 +1069,114 @@ impl KeptApp {
         // Divider sits between pane[0].right and pane[1].left.
         let div_x = (self.panes[0].last_rect.right + self.panes[1].last_rect.left) * 0.5;
         (x - div_x).abs() <= DIVIDER_HIT_SLOP
+    }
+
+    /// Dispatch the follow-up key in a Ctrl+W pane chord. Returns whether
+    /// the action consumed the key. Unrecognized follow-ups consume the
+    /// key (return true) so a stray keystroke after the leader doesn't
+    /// also fire a normal app shortcut.
+    fn dispatch_pane_chord(&mut self, event: &KeyEvent) -> bool {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => true,
+            Key::Character(s) => {
+                let c = s.as_str();
+                if c.eq_ignore_ascii_case("h") {
+                    if self.active_pane > 0 {
+                        return self.set_active_pane(self.active_pane - 1);
+                    }
+                    return true;
+                }
+                if c.eq_ignore_ascii_case("l") {
+                    if self.active_pane + 1 < self.panes.len() {
+                        return self.set_active_pane(self.active_pane + 1);
+                    }
+                    return true;
+                }
+                if c == "=" {
+                    self.split_ratio = 0.5;
+                    return true;
+                }
+                if c.eq_ignore_ascii_case("v") {
+                    return self.split_pane();
+                }
+                if c.eq_ignore_ascii_case("q") {
+                    return self.close_active_pane();
+                }
+                // j / k reserved for future vertical splits; s for future
+                // horizontal-split-of-existing. Consume so they don't fire
+                // normal app shortcuts.
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Ctrl+W v — duplicate the active pane to its right and make the new
+    /// pane active. The new pane mirrors the active pane's view (same
+    /// query, same focus, same scroll) so a "split" feels like cloning the
+    /// current context, then the user navigates the new pane elsewhere.
+    /// No-op when already at the 2-pane cap (nested splits are future work).
+    fn split_pane(&mut self) -> bool {
+        if self.panes.len() >= 2 {
+            return true;
+        }
+        let src = &self.panes[self.active_pane];
+        let new_pane = Pane {
+            view: src.view.clone(),
+            focused: src.focused,
+            editing: false,
+            dragging_cell: None,
+            scroll_y: src.scroll_y,
+            max_scroll: src.max_scroll,
+            doc_height: src.doc_height,
+            viewport_height: src.viewport_height,
+            last_scroll_time: None,
+            pending_caret_scroll: false,
+            coalesce_break: true,
+            focus_mode: false,
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
+            last_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+        };
+        // Insert to the right of the active pane and activate it. With v1
+        // capped at 2 panes, this just means push + active = 1.
+        self.panes.push(new_pane);
+        self.split_ratio = 0.5;
+        self.active_pane = self.panes.len() - 1;
+        true
+    }
+
+    /// Open `q` in the *other* pane, splitting first if needed. The
+    /// "other" pane becomes active, so subsequent keystrokes go there.
+    /// Used by Alt+click on sidebar entries — the low-friction path for
+    /// "I've got this open here, give me that over there."
+    fn open_in_other_pane(&mut self, q: Query) -> bool {
+        if self.panes.len() < 2 {
+            self.split_pane();
+        } else {
+            let other = (self.active_pane + 1) % self.panes.len();
+            self.set_active_pane(other);
+        }
+        self.push_view(q)
+    }
+
+    /// Ctrl+W q — close the active pane. No-op when only one pane remains
+    /// (refuse to leave the user with zero panes).
+    fn close_active_pane(&mut self) -> bool {
+        if self.panes.len() <= 1 {
+            return true;
+        }
+        self.panes.remove(self.active_pane);
+        // active_pane points at the (now-)next pane in array order; clamp
+        // to the last index so closing the rightmost pane lands on what's
+        // now the rightmost.
+        if self.active_pane >= self.panes.len() {
+            self.active_pane = self.panes.len() - 1;
+        }
+        // Reset transient overlays anchored to the closed pane.
+        self.cell_context_menu = None;
+        self.mention_popup = None;
+        true
     }
 
     /// Switch the active pane. Closes transient overlays that were
@@ -2261,6 +2378,32 @@ impl KeptApp {
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        // Pane chord follow-up: when armed (by Ctrl+W), intercept the very
+        // next "real" key press as a pane command. Modifier-only press
+        // events (Shift/Ctrl/Alt by themselves) and key releases are
+        // ignored so holding Shift while picking a follow-up doesn't break
+        // the chord. Auto-cancels after PANE_CHORD_TIMEOUT.
+        if let Some(armed_at) = self.pane_chord_armed {
+            if armed_at.elapsed() > PANE_CHORD_TIMEOUT {
+                self.pane_chord_armed = None;
+            } else if event.state == ElementState::Pressed {
+                let is_mod_only = matches!(
+                    event.logical_key,
+                    Key::Named(
+                        NamedKey::Shift
+                            | NamedKey::Control
+                            | NamedKey::Alt
+                            | NamedKey::Super
+                            | NamedKey::Meta
+                    )
+                );
+                if !is_mod_only {
+                    self.pane_chord_armed = None;
+                    return self.dispatch_pane_chord(event);
+                }
+            }
+        }
+
         // Esc closes the cell context menu first if it's open.
         if event.state == ElementState::Pressed
             && self.cell_context_menu.is_some()
@@ -2315,7 +2458,11 @@ impl KeptApp {
                     return true;
                 }
                 Key::Named(NamedKey::Enter) => {
-                    self.close_search_commit();
+                    // Alt+Enter routes the result into the *other* pane
+                    // (splitting if needed). Plain Enter lands it in the
+                    // active pane.
+                    let other = mods.alt_key();
+                    self.close_search_commit(other);
                     return true;
                 }
                 Key::Named(NamedKey::ArrowUp) if !mods.shift_key() => {
@@ -2449,34 +2596,15 @@ impl KeptApp {
         }
 
         if event.state == ElementState::Pressed && primary_mod(modifiers.state()) {
-            // Pane chord: Ctrl+Alt+Arrow switches active pane (or reserved
-            // for future vertical splits). Matched first so the bare
-            // Cmd+Arrow handlers below don't fire on the chord. Works in
-            // both view and edit mode (Alt isn't used as a top-level
-            // text-edit modifier in app.rs — cell.rs uses Alt for
-            // multi-cursor click and word-nav, but neither responds to
-            // Ctrl+Alt+Arrow).
-            if modifiers.state().alt_key() {
-                match &event.logical_key {
-                    Key::Named(NamedKey::ArrowLeft) => {
-                        if self.panes.len() > 1 && self.active_pane > 0 {
-                            return self.set_active_pane(self.active_pane - 1);
-                        }
-                        return false;
+            // Pane chord leader: Ctrl+W arms the chord. The next key (handled
+            // by the intercept at the top of `handle_key`) is interpreted as
+            // a pane command — switch active, split, close, reset divider.
+            if !modifiers.state().shift_key() && !modifiers.state().alt_key() {
+                if let Key::Character(s) = &event.logical_key {
+                    if s.as_str().eq_ignore_ascii_case("w") {
+                        self.pane_chord_armed = Some(Instant::now());
+                        return true;
                     }
-                    Key::Named(NamedKey::ArrowRight) => {
-                        if self.panes.len() > 1
-                            && self.active_pane + 1 < self.panes.len()
-                        {
-                            return self.set_active_pane(self.active_pane + 1);
-                        }
-                        return false;
-                    }
-                    // Reserved for future vertical splits.
-                    Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowDown) => {
-                        return false;
-                    }
-                    _ => {}
                 }
             }
             match &event.logical_key {
@@ -2487,14 +2615,6 @@ impl KeptApp {
                 }
                 Key::Character(s) if s.as_str() == "]" => {
                     return self.nav_forward();
-                }
-                // Ctrl+0: reset divider to 50/50.
-                Key::Character(s) if s.as_str() == "0" => {
-                    if self.panes.len() > 1 {
-                        self.split_ratio = 0.5;
-                        return true;
-                    }
-                    return false;
                 }
                 Key::Named(NamedKey::ArrowUp) => {
                     if modifiers.state().shift_key() {
@@ -4713,7 +4833,7 @@ impl KeptApp {
     /// Enter on the search popup: jump to the highlighted result. View
     /// becomes that cell's date and the cell is focused. Empty / no-match
     /// input just closes the popup.
-    fn close_search_commit(&mut self) {
+    fn close_search_commit(&mut self, in_other_pane: bool) {
         let Some(state) = self.search.take() else { return };
         let query = state.input.text().to_string();
         let results = self.search_results(&query);
@@ -4723,10 +4843,16 @@ impl KeptApp {
         };
         if let Some(cell) = self.cell(id) {
             let target_date = local_date_for_ms(cell.timestamp);
-            // Deliberate nav: push the pre-search view onto history so
-            // Cmd+[ returns to where the user was before searching.
-            // No-op when target view equals the current one.
-            self.push_view(Query::date(target_date));
+            if in_other_pane {
+                // Alt+Enter: split-or-swap to the other pane, then nav there.
+                self.open_in_other_pane(Query::date(target_date));
+            } else {
+                // Plain Enter: deliberate nav in active pane. Push the
+                // pre-search view onto history so Cmd+[ returns to where
+                // the user was before searching. No-op when target equals
+                // current.
+                self.push_view(Query::date(target_date));
+            }
         }
         self.focused = Some(id);
         self.editing = false;
@@ -5305,8 +5431,8 @@ impl KeptApp {
         // If the user is viewing a closed context, jump to the current open
         // one before inserting. The note belongs in "today," not in history.
         let auto_switched = self.ensure_writable_context();
-        // No-op if the focused cell is empty — Ctrl+Enter shouldn't pile up
-        // empties. Skip when we just auto-switched: the destination's focused
+        // No-op if the focused cell is empty — the new-cell shortcut shouldn't
+        // pile up empties. Skip when we just auto-switched: the destination's focused
         // cell is incidental, the user's intent was clearly to write.
         if !auto_switched {
             if let Some(id) = self.focused {
@@ -5568,12 +5694,23 @@ impl KeptApp {
             if self.people_add.is_some() {
                 self.commit_people_add();
             }
+            // Alt+click on a sidebar entry opens the target in the *other*
+            // pane (splitting if there's only one). Plain click replaces the
+            // active pane's view as before.
+            let alt = modifiers.state().alt_key();
+            let open = |app: &mut Self, q: Query| -> bool {
+                if alt {
+                    app.open_in_other_pane(q)
+                } else {
+                    app.push_view(q)
+                }
+            };
             // PAGES section first (top of the sidebar).
             for (kind, rect) in self.last_sidebar_pages_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_context_menu = None;
                     return match kind {
-                        PageKind::People => self.push_view(Query::people()),
+                        PageKind::People => open(self, Query::people()),
                     };
                 }
             }
@@ -5582,19 +5719,19 @@ impl KeptApp {
             for (id, rect) in self.last_sidebar_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_context_menu = None;
-                    return self.push_view(Query::context(id));
+                    return open(self, Query::context(id));
                 }
             }
             for (date, rect) in self.last_sidebar_date_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_context_menu = None;
-                    return self.push_view(Query::date(date));
+                    return open(self, Query::date(date));
                 }
             }
             for (name, rect) in self.last_sidebar_tag_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_context_menu = None;
-                    return self.push_view(Query::tag(name));
+                    return open(self, Query::tag(name));
                 }
             }
             self.cell_context_menu = None;
