@@ -6965,7 +6965,10 @@ fn format_date_label(d: chrono::NaiveDate) -> String {
     } else if d.succ_opt() == Some(now) {
         format!("Yesterday — {}", d.format("%b %-d"))
     } else {
-        d.format("%B %-d, %Y").to_string()
+        // Explicit dates get a short weekday up front (Mon / Tue / …) so
+        // a glance at the sidebar conveys "what day of the week" without
+        // doing the math from the calendar date.
+        d.format("%a %B %-d, %Y").to_string()
     }
 }
 
