@@ -7029,11 +7029,15 @@ impl KeptApp {
         // The cell's mouse_down may have stashed a `kept://...` (or other)
         // URL because the click landed on a link. Drain it here and route
         // through the navigation policy that lives on `KeptApp`.
+        // Alt+click on a kept:// link or `#tag` opens the destination in
+        // the other pane (matches the sidebar alt-click semantics) —
+        // external URLs always shell out via `open_url` regardless.
+        let alt = modifiers.state().alt_key();
         let pending = self
             .cell_mut(target)
             .and_then(|c| c.take_pending_link_url());
         if let Some(url) = pending {
-            self.handle_link_click(&url);
+            self.handle_link_click(&url, alt);
         }
         // Same shape for inline `#tag` clicks: the textbox stashed the
         // tag name; drain and navigate to the tag's filter view (same
@@ -7042,7 +7046,12 @@ impl KeptApp {
             .cell_mut(target)
             .and_then(|c| c.take_pending_tag_name());
         if let Some(name) = pending_tag {
-            self.push_view(Query::tag(name));
+            let q = Query::tag(name);
+            if alt {
+                self.open_in_other_pane(q);
+            } else {
+                self.push_view(q);
+            }
         }
         result
     }
@@ -7082,22 +7091,33 @@ impl KeptApp {
     /// entity match → entity page; cell match → date view + focus the
     /// cell; neither → drop (don't shell out, that produces a useless
     /// OS error). Other URLs hand off to `cell::open_url` (xdg-open).
-    fn handle_link_click(&mut self, url: &str) {
+    fn handle_link_click(&mut self, url: &str, alt: bool) {
         if let Some(rest) = url.strip_prefix("kept://") {
             if let Ok(uuid) = Uuid::parse_str(rest) {
-                if self.entities.iter().any(|e| e.id == uuid) {
-                    self.push_view(Query::entity(uuid));
+                let q = if self.entities.iter().any(|e| e.id == uuid) {
+                    Some((Query::entity(uuid), None))
+                } else if let Some(cell) = self.cell(uuid) {
+                    Some((Query::date(local_date_for_ms(cell.timestamp)), Some(uuid)))
+                } else {
+                    eprintln!("kept: dangling kept:// link: {url}");
                     return;
+                };
+                if let Some((q, focus_cell)) = q {
+                    if alt {
+                        self.open_in_other_pane(q);
+                    } else {
+                        self.push_view(q);
+                    }
+                    if let Some(cell_id) = focus_cell {
+                        // Cell-target link: also focus the cell + drop
+                        // edit mode + scroll it into view. Applies to
+                        // whichever pane just opened the view (the
+                        // active pane post-`open_in_other_pane`).
+                        self.focused = Some(cell_id);
+                        self.editing = false;
+                        self.pending_caret_scroll = true;
+                    }
                 }
-                if let Some(cell) = self.cell(uuid) {
-                    let target_date = local_date_for_ms(cell.timestamp);
-                    self.push_view(Query::date(target_date));
-                    self.focused = Some(uuid);
-                    self.editing = false;
-                    self.pending_caret_scroll = true;
-                    return;
-                }
-                eprintln!("kept: dangling kept:// link: {url}");
                 return;
             }
         }

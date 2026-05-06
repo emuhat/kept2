@@ -1079,10 +1079,17 @@ impl TextBox {
         // caret). The primary modifier is Cmd on Mac, Ctrl elsewhere. Same
         // semantics apply to inline `#tag` substrings — click navigates to
         // that tag's filter view.
+        //
+        // Alt+click (without other mods) ALSO opens — the app routes it
+        // to `open_in_other_pane` so the link/tag opens in the second
+        // pane (matches sidebar alt-click). Without this branch the
+        // click would fall through to the multi-cursor handler below
+        // and the click would visibly do nothing.
         let plain_in_view = !editing && !mods.shift_key() && !mods.alt_key();
         let modified_in_edit =
             editing && primary_mod(mods) && !mods.shift_key() && !mods.alt_key();
-        if plain_in_view || modified_in_edit {
+        let alt_open = mods.alt_key() && !mods.shift_key() && !primary_mod(mods);
+        if plain_in_view || modified_in_edit || alt_open {
             if let Some(name) = self.tag_at(idx) {
                 self.pending_tag_name = Some(name);
                 return true;
