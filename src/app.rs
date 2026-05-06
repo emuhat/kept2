@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
@@ -641,6 +641,39 @@ const SPLIT_MAX: f32 = 0.85;
 /// short enough not to swallow real keystrokes much later.
 const PANE_CHORD_TIMEOUT: Duration = Duration::from_secs(2);
 
+// ----- Kinetic scrolling -----
+//
+// Wheel events apply their dy directly (instant feedback) AND blend
+// into a running velocity. Each frame we additionally integrate
+// `velocity * dt_since_last_scroll_apply` — when a wheel event just
+// fired, dt is ~0 so no double-apply; when the wheel goes quiet, dt
+// climbs to a frame's worth and the page coasts on its accumulated
+// velocity. No engage window, no visible pause.
+
+/// Constant deceleration applied each frame: velocity_magnitude -=
+/// KINETIC_FRICTION * dt. Linear stopping (vs. exponential decay) gives
+/// a predictable, finite coast time: a 2000 px/s coast stops in ~0.7 s,
+/// a 1000 px/s coast in ~0.3 s. Important on platforms where
+/// finger-rest-without-motion isn't an observable event (most Linux
+/// libinput configs) — the user can't manually interrupt, so the coast
+/// just needs to be short enough that they don't want to.
+const KINETIC_FRICTION: f32 = 3000.0;
+/// Stop the kinetic decay when speed drops below this (logical px/sec).
+const KINETIC_MIN_VELOCITY: f32 = 8.0;
+/// Cap on velocity in either direction. Trackpad bursts can produce
+/// pathological dy/dt readings (two events 10 µs apart with 30 px →
+/// huge velocities); clamping here keeps a single bad sample from
+/// teleporting the page.
+const KINETIC_MAX_VELOCITY: f32 = 2500.0;
+/// Window over which recent wheel events are averaged to estimate
+/// velocity. Smooths out trackpad event jitter — short enough to track
+/// finger motion, long enough to not be dominated by one noisy sample.
+const KINETIC_VELOCITY_WINDOW: Duration = Duration::from_millis(80);
+/// Largest gap between consecutive wheel events that still counts as the
+/// same gesture. Beyond this, a new event is treated as a fresh gesture
+/// — and if a coast is in progress, that fresh gesture interrupts it.
+const KINETIC_BURST_GAP: Duration = Duration::from_millis(100);
+
 /// Forward-compat: the orientation of the (eventual) split. Always `Horiz`
 /// in v1 (left/right). When vertical splits land, this enum gains meaning
 /// without renaming.
@@ -686,6 +719,22 @@ pub struct Pane {
     /// input dispatch (which pane was clicked) and overlay anchoring.
     #[allow(dead_code)]
     last_rect: Rect,
+    /// Kinetic scroll velocity in document px/sec. Estimated as the
+    /// recent-window average of wheel `dy / dt`. Decays exponentially
+    /// each frame in `step_kinetic`. Cleared on any non-wheel input.
+    /// Sign: positive = scrolling toward higher scroll_y (visually
+    /// downward).
+    scroll_velocity_y: f32,
+    /// Recent wheel samples within `KINETIC_VELOCITY_WINDOW`, used to
+    /// smooth velocity estimation against trackpad jitter (events with
+    /// microsecond-scale gaps would otherwise yield absurd dy/dt). Pruned
+    /// at the head every wheel event.
+    recent_wheel: VecDeque<(Instant, f32)>,
+    /// Wall-clock time the most recent scroll change was applied —
+    /// either by a wheel event or by `step_kinetic`. Drives the dt for
+    /// kinetic integration so a frame triggered by a wheel event doesn't
+    /// double-apply velocity.
+    last_scroll_apply_at: Option<Instant>,
 }
 
 impl Pane {
@@ -706,7 +755,18 @@ impl Pane {
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             last_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+            scroll_velocity_y: 0.0,
+            recent_wheel: VecDeque::new(),
+            last_scroll_apply_at: None,
         }
+    }
+
+    /// Halt any in-flight kinetic decay on this pane. Called from input
+    /// handlers (mouse_down, key press) so user input always wins.
+    fn kill_kinetic(&mut self) {
+        self.scroll_velocity_y = 0.0;
+        self.recent_wheel.clear();
+        self.last_scroll_apply_at = None;
     }
 }
 
@@ -1168,6 +1228,9 @@ impl KeptApp {
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             last_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+            scroll_velocity_y: 0.0,
+            recent_wheel: VecDeque::new(),
+            last_scroll_apply_at: None,
         };
         // Insert to the right of the active pane and activate it. With v1
         // capped at 2 panes, this just means push + active = 1.
@@ -2242,20 +2305,151 @@ impl KeptApp {
     /// multi-pane spec), not the active pane — letting the user scroll one
     /// pane while keyboard input goes to another. Falls back to the active
     /// pane when the cursor isn't over any pane.
-    pub fn scroll_by(&mut self, dy: f32) -> bool {
+    pub fn scroll_by(&mut self, dy: f32, phase: winit::event::TouchPhase) -> bool {
+        use winit::event::TouchPhase;
         let target = self
             .pane_at(self.mouse_pos.0, self.mouse_pos.1)
             .unwrap_or(self.active_pane);
         let pane = &mut self.panes[target];
+        let now = Instant::now();
+
+        // Interrupt detection. Two signals, in priority order:
+        //
+        // 1) `phase == Started`: trackpad fingers just touched. On
+        //    Linux libinput this fires with dy=0 the moment the user
+        //    rests fingers on the trackpad — the canonical "tap to
+        //    stop" gesture. Kill the coast immediately.
+        //
+        // 2) Fallback for wheel mice (which don't carry meaningful
+        //    phase): a wheel event after a >KINETIC_BURST_GAP idle
+        //    counts as a fresh gesture and interrupts.
+        let last_sample_at = pane.recent_wheel.back().map(|&(t, _)| t);
+        let burst_gap_elapsed = match last_sample_at {
+            Some(t) => now.duration_since(t) > KINETIC_BURST_GAP,
+            None => true,
+        };
+        let interrupt = phase == TouchPhase::Started
+            || (burst_gap_elapsed && pane.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY);
+        if interrupt && pane.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY {
+            pane.scroll_velocity_y = 0.0;
+            pane.recent_wheel.clear();
+        }
+        // A `Started` event with dy=0 (pure touch, no scroll motion) is
+        // ONLY for interruption — don't let it pollute the velocity
+        // window or attempt a no-op scroll.
+        if phase == TouchPhase::Started && dy == 0.0 {
+            return interrupt;
+        }
+
+        // Append this sample and prune anything older than the window.
+        // dy=0 is also pushed — libinput sends a dy=0 sentinel on
+        // touchpad lift, and counting it correctly drops velocity to
+        // zero if the user paused before releasing.
+        pane.recent_wheel.push_back((now, dy));
+        let cutoff = now - KINETIC_VELOCITY_WINDOW;
+        while pane
+            .recent_wheel
+            .front()
+            .map_or(false, |&(t, _)| t < cutoff)
+        {
+            pane.recent_wheel.pop_front();
+        }
+        // Velocity = sum(dy) / window_span. Span is from the oldest
+        // sample to now (not the full window), so the very first event
+        // in a burst gets a meaningful estimate based on its own dy and
+        // a sub-millisecond dt — clamped below.
+        let total_dy: f32 = pane.recent_wheel.iter().map(|&(_, d)| d).sum();
+        let span = pane
+            .recent_wheel
+            .front()
+            .map(|&(t, _)| now.duration_since(t).as_secs_f32())
+            .unwrap_or(0.0)
+            // Floor the span so a single fresh sample doesn't divide by
+            // ~0 and produce a runaway velocity.
+            .max(0.016);
+        let raw_v = total_dy / span;
+        pane.scroll_velocity_y = raw_v.clamp(-KINETIC_MAX_VELOCITY, KINETIC_MAX_VELOCITY);
+
+        // Direct apply. Kinetic integration in `step_kinetic` uses dt
+        // since the last scroll application — when the wheel just fired
+        // (this very moment), that dt is ~0 so kinetic doesn't
+        // double-apply.
         let new_y = (pane.scroll_y + dy).clamp(0.0, pane.max_scroll);
-        if new_y == pane.scroll_y {
+        if dy != 0.0 && new_y == pane.scroll_y {
+            // True bound hit (we asked to move and couldn't). Kill
+            // velocity so kinetic doesn't spin against the wall after
+            // the user releases. dy==0 events (libinput stop sentinels)
+            // never reach this branch.
+            pane.scroll_velocity_y = 0.0;
             return false;
         }
-        pane.scroll_y = new_y;
-        pane.last_scroll_time = Some(Instant::now());
-        // Scrolling dismisses the per-cell menu (anchored in doc coords).
-        self.cell_context_menu = None;
+        if new_y != pane.scroll_y {
+            pane.scroll_y = new_y;
+            pane.last_scroll_time = Some(now);
+            pane.last_scroll_apply_at = Some(now);
+            // Scrolling dismisses the per-cell menu (doc-anchored).
+            self.cell_context_menu = None;
+        }
         true
+    }
+
+    /// Advance kinetic decay for `pane_idx`. Called from `tick_pane` at
+    /// the top of each frame. Integrates `velocity * dt` since the last
+    /// scroll application (wheel or prior kinetic step), decays the
+    /// velocity exponentially, and stops when speed drops below the
+    /// threshold or a bound is hit. When invoked on a frame that was
+    /// triggered by a wheel event, dt is essentially zero, so this is
+    /// a no-op for that frame — the wheel's direct-apply already moved
+    /// the page.
+    fn step_kinetic(&mut self, pane_idx: usize) {
+        let pane = &mut self.panes[pane_idx];
+        if pane.scroll_velocity_y.abs() < KINETIC_MIN_VELOCITY {
+            // Below the floor — clear velocity so is_animating() returns
+            // false. Don't touch recent_wheel; that's wheel-history,
+            // managed by scroll_by / kill_kinetic only.
+            pane.scroll_velocity_y = 0.0;
+            return;
+        }
+        let now = Instant::now();
+        let dt = match pane.last_scroll_apply_at {
+            Some(prev) => now.duration_since(prev).as_secs_f32(),
+            None => 1.0 / 60.0,
+        };
+        let dt = dt.clamp(0.0, 0.05);
+        let displacement = pane.scroll_velocity_y * dt;
+        let new_y = (pane.scroll_y + displacement).clamp(0.0, pane.max_scroll);
+        if new_y == pane.scroll_y {
+            // Hit a bound. Stop coasting.
+            pane.scroll_velocity_y = 0.0;
+            return;
+        }
+        pane.scroll_y = new_y;
+        pane.last_scroll_time = Some(now);
+        pane.last_scroll_apply_at = Some(now);
+        // Constant friction: bleed off `KINETIC_FRICTION * dt` each
+        // frame. Stop crisply when we'd cross zero rather than oscillate.
+        let drop = KINETIC_FRICTION * dt;
+        pane.scroll_velocity_y = if pane.scroll_velocity_y.abs() <= drop {
+            0.0
+        } else {
+            pane.scroll_velocity_y - drop * pane.scroll_velocity_y.signum()
+        };
+    }
+
+    /// True iff any pane has enough velocity to need another frame.
+    /// main.rs checks this after `tick` to schedule a redraw.
+    pub fn is_animating(&self) -> bool {
+        self.panes
+            .iter()
+            .any(|p| p.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY)
+    }
+
+    /// Halt kinetic coast on every pane. Called from any user input
+    /// other than the wheel itself — clicks and key presses always win.
+    fn kill_all_kinetic(&mut self) {
+        for p in &mut self.panes {
+            p.kill_kinetic();
+        }
     }
 
     pub fn tick(&mut self, canvas: &Canvas, width: f32, height: f32) {
@@ -2313,6 +2507,10 @@ impl KeptApp {
     /// pane. Pane geometry comes from `self.panes[pane_idx].last_rect`,
     /// populated by `layout_panes`.
     fn tick_pane(&mut self, canvas: &Canvas, pane_idx: usize, _height: f32) {
+        // Kinetic decay step (no-op when wheel is still active or
+        // velocity is below the floor).
+        self.step_kinetic(pane_idx);
+
         // Clamp scroll using last frame's max_scroll before drawing this frame.
         self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll);
 
@@ -2694,6 +2892,13 @@ impl KeptApp {
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        // Any pressed key cancels in-flight kinetic coast on every pane.
+        // Releases don't (so a kinetic scroll doesn't get killed by the
+        // user releasing a modifier they were holding while wheeling).
+        if event.state == ElementState::Pressed {
+            self.kill_all_kinetic();
+        }
+
         // Pane chord follow-up: when armed (by Ctrl+W), intercept the very
         // next "real" key press as a pane command. Modifier-only press
         // events (Shift/Ctrl/Alt by themselves) and key releases are
@@ -6139,6 +6344,9 @@ impl KeptApp {
     }
 
     pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
+        // Any click cancels in-flight kinetic coast on every pane.
+        self.kill_all_kinetic();
+
         // Tag context menu intercepts left-clicks: clicking the "Delete
         // tag" row deletes; clicking anywhere else closes the menu and
         // falls through to normal click routing.

@@ -146,12 +146,12 @@ impl ApplicationHandler for Application {
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y * 30.0,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / self.dpi,
                 };
-                if self.kept_app.scroll_by(-dy) {
+                if self.kept_app.scroll_by(-dy, phase) {
                     self.env.window.request_redraw();
                 }
             }
@@ -186,6 +186,14 @@ impl ApplicationHandler for Application {
                     .gl_surface
                     .swap_buffers(&self.env.gl_context)
                     .unwrap();
+
+                // Drive the kinetic-scroll animation: if any pane is still
+                // coasting after this frame, queue another. The event
+                // loop's WaitUntil(60Hz) cap below means we tick at most
+                // ~60fps regardless of how fast we ask.
+                if self.kept_app.is_animating() {
+                    self.env.window.request_redraw();
+                }
             }
             _ => {}
         }
