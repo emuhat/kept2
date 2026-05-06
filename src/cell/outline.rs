@@ -777,6 +777,26 @@ impl OutlineCell {
         Some(i..k)
     }
 
+    /// Select the sub-tree rooted at `bullet_id` — the bullet itself
+    /// plus all of its descendants. Drives the same highlight + bullet-
+    /// selection key handling as a multi-bullet drag-select, so any
+    /// existing op (delete, indent / outdent, copy) works on the
+    /// resulting range. Also moves the focused bullet to the root so
+    /// keyboard nav stays inside the selection. Returns false if
+    /// `bullet_id` isn't in the cell.
+    pub fn select_subtree(&mut self, bullet_id: Uuid) -> bool {
+        let Some(range) = self.subtree_range(bullet_id) else {
+            return false;
+        };
+        let head_id = self.bullets[range.end - 1].id;
+        self.bullet_selection = Some(BulletSelection {
+            anchor_id: bullet_id,
+            head_id,
+        });
+        self.focused_bullet = bullet_id;
+        true
+    }
+
     /// Select all text inside the focused bullet's textbox.
     pub fn select_all_in_focused(&mut self) {
         if let Some(idx) = self.focused_index() {

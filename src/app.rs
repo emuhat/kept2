@@ -6537,6 +6537,19 @@ impl KeptApp {
                         _ => None,
                     })
                     .unwrap_or((None, None));
+                // Right-click on an outline bullet selects its subtree
+                // (bullet + descendants). Visualized as the standard
+                // bullet-range highlight; any later op (delete, copy,
+                // indent…) operates on the same range. Focus the cell
+                // so keyboard ops reach it without an extra click.
+                if let Some(bid) = bullet_id {
+                    self.focused = Some(cell_id);
+                    if let Some(c) = self.cell_mut(cell_id) {
+                        if let CellKind::Outline(oc) = &mut c.kind {
+                            oc.select_subtree(bid);
+                        }
+                    }
+                }
                 self.cell_context_menu = Some(CellContextMenu {
                     cell_id,
                     anchor_x: x,
@@ -6913,13 +6926,17 @@ impl KeptApp {
         self.focused = Some(cell_id);
         self.editing = false;
         self.pending_caret_scroll = true;
-        // Subtree target: drill into the outline cell and focus the
-        // specific bullet. Cell-level focus alone is the fallback if the
+        // Subtree target: drill into the outline cell, focus the
+        // specific bullet, AND select its subtree (bullet + descendants)
+        // so the original chunk the embed pointed at is visually
+        // highlighted on arrival — matches the right-click selection
+        // behavior. Cell-level focus alone is the fallback if the
         // bullet is missing or the cell isn't an outline anymore.
         if let ReferenceTarget::Subtree { bullet_id, .. } = target {
             if let Some(c) = self.cell_mut(cell_id) {
                 if let CellKind::Outline(oc) = &mut c.kind {
                     let _ = oc.set_focused_bullet(bullet_id);
+                    oc.select_subtree(bullet_id);
                 }
             }
         }
@@ -7227,9 +7244,9 @@ fn compute_outline_bullet_filter(
 fn format_date_label(d: chrono::NaiveDate) -> String {
     let now = chrono::Local::now().date_naive();
     if d == now {
-        format!("Today — {}", d.format("%b %-d"))
+        format!("Today – {}", d.format("%b %-d"))
     } else if d.succ_opt() == Some(now) {
-        format!("Yesterday — {}", d.format("%b %-d"))
+        format!("Yesterday – {}", d.format("%b %-d"))
     } else {
         // Explicit dates get a short weekday up front (Mon / Tue / …) so
         // a glance at the sidebar conveys "what day of the week" without
