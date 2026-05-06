@@ -21,7 +21,7 @@ use crate::query;
 const FONT_BYTES: &[u8] = include_bytes!("../resources/fonts/Figtree.ttf");
 
 const MARGIN_X: f32 = 40.0;
-const MARGIN_TOP: f32 = 60.0;
+const MARGIN_TOP: f32 = 20.0;
 const CELL_GAP: f32 = 32.0;
 /// Outer padding around the focused cell in focus mode (Ctrl+F). Smaller
 /// than `MARGIN_X` so the cell really feels "kinda fullscreen."
