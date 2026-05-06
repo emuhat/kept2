@@ -1430,8 +1430,8 @@ impl KeptApp {
         let typeface = &self.typeface;
         match target {
             ReferenceTarget::WholeCell(_) => {
-                let kind = clone_cell_kind_for_cache(&source.kind, typeface, scale)?;
-                let title = source.title.as_ref().map(|t| {
+                let kind = source.kind.clone_for_scale(typeface, scale)?;
+                let title = source.title().map(|t| {
                     let mut new_t = TextBox::new(typeface.clone(), t.text().to_string());
                     new_t.set_force_heading(true);
                     new_t.set_font_scale(scale);
@@ -4241,7 +4241,7 @@ impl KeptApp {
         let mut cell_title_change: Option<(Uuid, String, String)> = None;
         if let Some(cell_id) = primary_cell_id {
             if let Some(cell) = self.cell_mut(cell_id) {
-                if let Some(title) = cell.title.as_mut() {
+                if let Some(title) = cell.title_mut() {
                     let prev_title = title.text().to_string();
                     let (_, tags) = split_title_name_and_tags(&prev_title);
                     let new_title = if tags.is_empty() {
@@ -5534,7 +5534,7 @@ impl KeptApp {
                 }
                 if let Some((cell_id, prev_title, _)) = cell_title_change {
                     if let Some(cell) = self.cell_mut(*cell_id) {
-                        if let Some(title) = cell.title.as_mut() {
+                        if let Some(title) = cell.title_mut() {
                             title.replace_text(prev_title.clone());
                         }
                     }
@@ -5666,7 +5666,7 @@ impl KeptApp {
                 }
                 if let Some((cell_id, _, new_title)) = cell_title_change {
                     if let Some(cell) = self.cell_mut(*cell_id) {
-                        if let Some(title) = cell.title.as_mut() {
+                        if let Some(title) = cell.title_mut() {
                             title.replace_text(new_title.clone());
                         }
                     }
@@ -6800,70 +6800,6 @@ fn context_ref<'a>(c: &'a Context) -> ContextRef<'a> {
 /// upstream and shouldn't reach this path). Mirrors text + links + per-row
 /// flags; uses the supplied typeface so the new widgets render in the
 /// same font as everything else in the app.
-fn clone_cell_kind_for_cache(
-    kind: &CellKind,
-    typeface: &Typeface,
-    scale: f32,
-) -> Option<CellKind> {
-    match kind {
-        CellKind::Plain(tb) => {
-            let mut new_tb = TextBox::new(typeface.clone(), tb.text().to_string());
-            new_tb.set_font_scale(scale);
-            for l in tb.links() {
-                new_tb.add_link(l.range.clone(), l.url.clone());
-            }
-            Some(CellKind::Plain(new_tb))
-        }
-        CellKind::Outline(oc) => {
-            let bullets: Vec<cell::Bullet> = oc
-                .bullets()
-                .iter()
-                .map(|b| {
-                    let mut tb = TextBox::new(typeface.clone(), b.textbox().text().to_string());
-                    tb.set_font_scale(scale);
-                    for l in b.textbox().links() {
-                        tb.add_link(l.range.clone(), l.url.clone());
-                    }
-                    cell::Bullet::new(b.id(), tb, b.depth())
-                })
-                .collect();
-            let mut new_oc = cell::OutlineCell::from_bullets(typeface.clone(), bullets);
-            new_oc.set_font_scale(scale);
-            Some(CellKind::Outline(new_oc))
-        }
-        CellKind::PopPop(pc) => {
-            let mut new_pc = cell::PopPopCell::new(typeface.clone());
-            new_pc.set_font_scale(scale);
-            new_pc.restore(pc.snapshot());
-            Some(CellKind::PopPop(new_pc))
-        }
-        CellKind::Table(tc) => {
-            let triples: Vec<Vec<(String, Vec<(std::ops::Range<usize>, String)>, bool)>> = tc
-                .rows_view()
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|e| {
-                            let text = e.textbox.text().to_string();
-                            let links: Vec<(std::ops::Range<usize>, String)> = e
-                                .textbox
-                                .links()
-                                .iter()
-                                .map(|l| (l.range.clone(), l.url.clone()))
-                                .collect();
-                            (text, links, e.readonly)
-                        })
-                        .collect()
-                })
-                .collect();
-            let mut new_tc = cell::TableCell::from_records(typeface.clone(), triples);
-            new_tc.set_font_scale(scale);
-            Some(CellKind::Table(new_tc))
-        }
-        CellKind::Reference(_) => None,
-    }
-}
-
 /// Trim arbitrary text to a single-line preview suitable for menu labels.
 /// Collapses internal whitespace, truncates with ellipsis past 30 chars,
 /// returns "[empty]" for blank input so the menu row reads sensibly.

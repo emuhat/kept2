@@ -911,7 +911,7 @@ struct TableEntryRecord {
 /// Build the wrapped persisted form from a live Cell. Captures the title
 /// slot (if any) and the kind-tagged body.
 fn persisted_cell_from(cell: &Cell) -> PersistedCell {
-    let title = cell.title.as_ref().map(|tb| TitleRecord {
+    let title = cell.title().map(|tb| TitleRecord {
         text: tb.text().to_string(),
         links: tb
             .links()
@@ -1542,15 +1542,15 @@ mod tests {
         // verifies tags continue to be parsed correctly.
         let tf = typeface();
         let mut cell = Cell::new(tf.clone(), "body".to_string());
-        cell.title = Some({
+        cell.set_title(Some({
             let mut tb = TextBox::new(tf.clone(), "Project Notes #urgent #planning".to_string());
             tb.set_force_heading(true);
             tb.add_link(0..7, "https://example.com/h".to_string());
             tb
-        });
+        }));
         let back = round_trip(&cell, &tf);
-        let orig_title = cell.title.as_ref().expect("orig has title");
-        let reborn_title = back.title.as_ref().expect("title survives round-trip");
+        let orig_title = cell.title().expect("orig has title");
+        let reborn_title = back.title().expect("title survives round-trip");
         assert_eq!(orig_title.text(), reborn_title.text());
         assert_eq!(orig_title.links().len(), reborn_title.links().len());
         let (o, r) = (&orig_title.links()[0], &reborn_title.links()[0]);

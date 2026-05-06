@@ -736,7 +736,7 @@ mod tests {
         if let Some(t) = title {
             let mut tb = TextBox::new(tf, t.to_string());
             tb.set_force_heading(true);
-            cell.title = Some(tb);
+            cell.set_title(Some(tb));
         }
         cell
     }
