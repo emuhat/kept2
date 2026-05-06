@@ -706,6 +706,241 @@ enum SplitDir {
     Vert,
 }
 
+/// One scrollable region's complete state: position, bounds, kinetic
+/// coast, and the fade timer that drives its scrollbar. Owned by panes
+/// (one per pane) and by the app (one for the sidebar). All scrolling
+/// surfaces use this — keeps wheel handling, kinetic decay, scrollbar
+/// rendering, and interrupt rules identical everywhere.
+pub struct Scroller {
+    /// Vertical scroll offset in logical px.
+    scroll_y: f32,
+    /// Upper bound for `scroll_y`. Caller updates each frame via
+    /// `set_max_scroll(content_h - viewport_h)`.
+    max_scroll: f32,
+    /// Last time `scroll_y` changed — drives the scrollbar fade
+    /// (`scrollbar_alpha`).
+    last_scroll_time: Option<Instant>,
+    /// Kinetic velocity in px/sec. Estimated from the recent wheel
+    /// burst; bled off by `step_kinetic`. Sign: positive = scrolling
+    /// toward higher `scroll_y` (visually downward).
+    scroll_velocity_y: f32,
+    /// Recent wheel samples within `KINETIC_VELOCITY_WINDOW`. Smooths
+    /// the velocity estimate against trackpad jitter (microsecond-gap
+    /// events would otherwise produce runaway dy/dt). Pruned at the
+    /// head every wheel event.
+    recent_wheel: VecDeque<(Instant, f32)>,
+    /// Wall-clock time the most recent scroll change was applied —
+    /// either by `apply_wheel` or by `step_kinetic`. Anchors the dt
+    /// for kinetic integration so a frame triggered by the wheel
+    /// itself doesn't double-apply velocity.
+    last_scroll_apply_at: Option<Instant>,
+}
+
+impl Scroller {
+    fn new() -> Self {
+        Self {
+            scroll_y: 0.0,
+            max_scroll: 0.0,
+            last_scroll_time: None,
+            scroll_velocity_y: 0.0,
+            recent_wheel: VecDeque::new(),
+            last_scroll_apply_at: None,
+        }
+    }
+
+    /// Update the scroll bound and clamp the current position. If the
+    /// content shrank below the prior scroll, this snaps back into
+    /// range and zeroes any in-flight velocity (no point coasting
+    /// against a wall).
+    fn set_max_scroll(&mut self, max: f32) {
+        let max = max.max(0.0);
+        self.max_scroll = max;
+        if self.scroll_y > max {
+            self.scroll_y = max;
+            self.scroll_velocity_y = 0.0;
+        }
+    }
+
+    /// Apply a wheel event. Direct-applies `dy` to `scroll_y` and
+    /// updates the kinetic state from the sample window. Returns true
+    /// if anything redraw-relevant happened (scroll moved OR a coast
+    /// was interrupted by a fresh gesture).
+    fn apply_wheel(&mut self, dy: f32, phase: winit::event::TouchPhase) -> bool {
+        use winit::event::TouchPhase;
+        let now = Instant::now();
+
+        // Interrupt detection. Two signals, in priority order:
+        //
+        // 1) `phase == Started`: trackpad fingers just touched. On
+        //    Linux libinput this fires with dy=0 the moment the user
+        //    rests fingers on the trackpad — the canonical "tap to
+        //    stop" gesture. Kill the coast immediately.
+        //
+        // 2) Fallback for wheel mice (which don't carry meaningful
+        //    phase): a wheel event after a >KINETIC_BURST_GAP idle
+        //    counts as a fresh gesture and interrupts.
+        let last_sample_at = self.recent_wheel.back().map(|&(t, _)| t);
+        let burst_gap_elapsed = match last_sample_at {
+            Some(t) => now.duration_since(t) > KINETIC_BURST_GAP,
+            None => true,
+        };
+        let interrupt = phase == TouchPhase::Started
+            || (burst_gap_elapsed && self.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY);
+        if interrupt && self.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY {
+            self.scroll_velocity_y = 0.0;
+            self.recent_wheel.clear();
+        }
+        // A `Started` event with dy=0 (pure touch, no scroll motion) is
+        // ONLY for interruption — don't pollute the velocity window or
+        // attempt a no-op scroll.
+        if phase == TouchPhase::Started && dy == 0.0 {
+            return interrupt;
+        }
+
+        // Append this sample and prune anything older than the window.
+        // dy=0 is also pushed — libinput sends a dy=0 sentinel on
+        // touchpad lift, and counting it correctly drops velocity to
+        // zero if the user paused before releasing.
+        self.recent_wheel.push_back((now, dy));
+        let cutoff = now - KINETIC_VELOCITY_WINDOW;
+        while self
+            .recent_wheel
+            .front()
+            .map_or(false, |&(t, _)| t < cutoff)
+        {
+            self.recent_wheel.pop_front();
+        }
+        // Velocity = sum(dy) / window_span. Span is from the oldest
+        // sample to now (not the full window), so the very first event
+        // in a burst gets a meaningful estimate based on its own dy and
+        // a sub-millisecond dt — clamped below.
+        let total_dy: f32 = self.recent_wheel.iter().map(|&(_, d)| d).sum();
+        let span = self
+            .recent_wheel
+            .front()
+            .map(|&(t, _)| now.duration_since(t).as_secs_f32())
+            .unwrap_or(0.0)
+            // Floor the span so a single fresh sample doesn't divide by
+            // ~0 and produce a runaway velocity.
+            .max(0.016);
+        let raw_v = total_dy / span;
+        self.scroll_velocity_y = raw_v.clamp(-KINETIC_MAX_VELOCITY, KINETIC_MAX_VELOCITY);
+
+        // Direct apply. Kinetic integration in `step_kinetic` uses dt
+        // since the last scroll application — when the wheel just fired
+        // (this very moment), that dt is ~0 so kinetic doesn't
+        // double-apply.
+        let new_y = (self.scroll_y + dy).clamp(0.0, self.max_scroll);
+        if dy != 0.0 && new_y == self.scroll_y {
+            // True bound hit (we asked to move and couldn't). Kill
+            // velocity so kinetic doesn't spin against the wall after
+            // the user releases. dy==0 events (libinput stop sentinels)
+            // never reach this branch.
+            self.scroll_velocity_y = 0.0;
+            return false;
+        }
+        if new_y != self.scroll_y {
+            self.scroll_y = new_y;
+            self.last_scroll_time = Some(now);
+            self.last_scroll_apply_at = Some(now);
+            return true;
+        }
+        // dy=0 sentinel that didn't move us — still counts as activity
+        // for the interrupt return path above.
+        interrupt
+    }
+
+    /// Advance kinetic decay one frame. Integrates `velocity * dt`
+    /// since the last scroll application, decays velocity by constant
+    /// friction, and stops when speed drops below the floor or a
+    /// bound is hit. Returns true if `scroll_y` moved.
+    fn step_kinetic(&mut self) -> bool {
+        if self.scroll_velocity_y.abs() < KINETIC_MIN_VELOCITY {
+            self.scroll_velocity_y = 0.0;
+            return false;
+        }
+        let now = Instant::now();
+        let dt = match self.last_scroll_apply_at {
+            Some(prev) => now.duration_since(prev).as_secs_f32(),
+            None => 1.0 / 60.0,
+        };
+        let dt = dt.clamp(0.0, 0.05);
+        let displacement = self.scroll_velocity_y * dt;
+        let new_y = (self.scroll_y + displacement).clamp(0.0, self.max_scroll);
+        if new_y == self.scroll_y {
+            // Hit a bound. Stop coasting.
+            self.scroll_velocity_y = 0.0;
+            return false;
+        }
+        self.scroll_y = new_y;
+        self.last_scroll_time = Some(now);
+        self.last_scroll_apply_at = Some(now);
+        // Constant friction: bleed off `KINETIC_FRICTION * dt` each
+        // frame. Stop crisply when we'd cross zero rather than oscillate.
+        let drop = KINETIC_FRICTION * dt;
+        self.scroll_velocity_y = if self.scroll_velocity_y.abs() <= drop {
+            0.0
+        } else {
+            self.scroll_velocity_y - drop * self.scroll_velocity_y.signum()
+        };
+        true
+    }
+
+    /// Halt any in-flight kinetic decay. Called from input handlers
+    /// (mouse_down, key press) so user input always wins over coast.
+    fn kill_kinetic(&mut self) {
+        self.scroll_velocity_y = 0.0;
+        self.recent_wheel.clear();
+        self.last_scroll_apply_at = None;
+    }
+
+    /// True iff the kinetic coast still has enough velocity to need
+    /// another frame. `is_animating` aggregates this across panes.
+    fn has_velocity(&self) -> bool {
+        self.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY
+    }
+
+    /// Draw the right-edge thumb-only scrollbar. Tucks `SCROLLBAR_INSET`
+    /// inside `right_edge_x`, vertical inset top & bottom. No-op when
+    /// content fits or fade has decayed.
+    fn draw_bar(
+        &self,
+        canvas: &Canvas,
+        right_edge_x: f32,
+        viewport_h: f32,
+        content_h: f32,
+    ) {
+        if self.max_scroll <= 0.0 || content_h <= 0.0 {
+            return;
+        }
+        let alpha = scrollbar_alpha(self.last_scroll_time);
+        if alpha <= 0.0 {
+            return;
+        }
+        let track_top = 6.0_f32;
+        let track_bot = viewport_h - 6.0;
+        let track_len = (track_bot - track_top).max(1.0);
+        let raw_thumb = (viewport_h / content_h) * track_len;
+        let thumb_h = raw_thumb.max(SCROLLBAR_MIN_THUMB).min(track_len);
+        let thumb_top =
+            track_top + (self.scroll_y / self.max_scroll) * (track_len - thumb_h);
+        let thumb_bot = thumb_top + thumb_h;
+        let bar_x = right_edge_x - SCROLLBAR_INSET - SCROLLBAR_WIDTH;
+
+        let mut sb_paint = Paint::default();
+        sb_paint.set_anti_alias(true);
+        let alpha_byte = (alpha * 0xb0 as f32).round() as u8;
+        sb_paint.set_color(crate::color::dark_alpha(alpha_byte));
+        let r = SCROLLBAR_WIDTH * 0.5;
+        canvas.draw_round_rect(
+            Rect::new(bar_x, thumb_top, bar_x + SCROLLBAR_WIDTH, thumb_bot),
+            r,
+            r,
+            &sb_paint,
+        );
+    }
+}
+
 /// A viewport into the shared cell stream with its own focus, scroll,
 /// edit, and navigation state. v1 has one Pane (Stage 1) → two (Stage 2);
 /// future i3-style nesting replaces `Vec<Pane>` with a Layout tree but
@@ -719,13 +954,12 @@ pub struct Pane {
     editing: bool,
     /// In-pane mouse drag binding — drags belong to their origin pane.
     dragging_cell: Option<Uuid>,
-    /// Vertical scroll within this pane's content (doc coords).
-    scroll_y: f32,
-    max_scroll: f32,
+    /// Pane's scroll state: position, bounds, kinetic, fade timer.
+    /// `Pane` derefs to this so existing `pane.scroll_y`,
+    /// `pane.max_scroll`, etc. accesses keep working unchanged.
+    scroller: Scroller,
     doc_height: f32,
     viewport_height: f32,
-    /// Drives this pane's scrollbar fade.
-    last_scroll_time: Option<Instant>,
     /// "Request scroll caret into view next frame" — honored at end of
     /// this pane's tick.
     pending_caret_scroll: bool,
@@ -741,22 +975,18 @@ pub struct Pane {
     /// input dispatch (which pane was clicked) and overlay anchoring.
     #[allow(dead_code)]
     last_rect: Rect,
-    /// Kinetic scroll velocity in document px/sec. Estimated as the
-    /// recent-window average of wheel `dy / dt`. Decays exponentially
-    /// each frame in `step_kinetic`. Cleared on any non-wheel input.
-    /// Sign: positive = scrolling toward higher scroll_y (visually
-    /// downward).
-    scroll_velocity_y: f32,
-    /// Recent wheel samples within `KINETIC_VELOCITY_WINDOW`, used to
-    /// smooth velocity estimation against trackpad jitter (events with
-    /// microsecond-scale gaps would otherwise yield absurd dy/dt). Pruned
-    /// at the head every wheel event.
-    recent_wheel: VecDeque<(Instant, f32)>,
-    /// Wall-clock time the most recent scroll change was applied —
-    /// either by a wheel event or by `step_kinetic`. Drives the dt for
-    /// kinetic integration so a frame triggered by a wheel event doesn't
-    /// double-apply velocity.
-    last_scroll_apply_at: Option<Instant>,
+}
+
+impl std::ops::Deref for Pane {
+    type Target = Scroller;
+    fn deref(&self) -> &Scroller {
+        &self.scroller
+    }
+}
+impl std::ops::DerefMut for Pane {
+    fn deref_mut(&mut self) -> &mut Scroller {
+        &mut self.scroller
+    }
 }
 
 impl Pane {
@@ -766,29 +996,16 @@ impl Pane {
             focused,
             editing: false,
             dragging_cell: None,
-            scroll_y: 0.0,
-            max_scroll: 0.0,
+            scroller: Scroller::new(),
             doc_height: 0.0,
             viewport_height: 0.0,
-            last_scroll_time: None,
             pending_caret_scroll: false,
             coalesce_break: false,
             focus_mode: false,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             last_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
-            scroll_velocity_y: 0.0,
-            recent_wheel: VecDeque::new(),
-            last_scroll_apply_at: None,
         }
-    }
-
-    /// Halt any in-flight kinetic decay on this pane. Called from input
-    /// handlers (mouse_down, key press) so user input always wins.
-    fn kill_kinetic(&mut self) {
-        self.scroll_velocity_y = 0.0;
-        self.recent_wheel.clear();
-        self.last_scroll_apply_at = None;
     }
 }
 
@@ -873,6 +1090,11 @@ pub struct KeptApp {
     /// Sidebar PAGES section row rects (window coords) from last frame.
     /// Hit-tested by `mouse_down` to dispatch to `push_view(Query::people())`.
     last_sidebar_pages_rects: Vec<(PageKind, Rect)>,
+    /// Sidebar's scroll state. Same `Scroller` that backs each pane —
+    /// kinetic decay, scrollbar fade, interrupt rules all match. Wheel
+    /// events whose mouse position falls in the sidebar column route
+    /// here instead of to any pane's scroller.
+    sidebar_scroll: Scroller,
     /// People-page row rects (entity_id, doc-space rect) from last frame.
     /// Used by `mouse_down` to route clicks into entity nav or rename.
     last_people_row_rects: Vec<(Uuid, Rect)>,
@@ -1137,6 +1359,7 @@ impl KeptApp {
             last_entity_create_button_rect: None,
             last_entity_page_ref_rects: Vec::new(),
             last_sidebar_pages_rects: Vec::new(),
+            sidebar_scroll: Scroller::new(),
             last_people_row_rects: Vec::new(),
             last_people_add_rect: None,
             people_rename: None,
@@ -1234,25 +1457,27 @@ impl KeptApp {
             return true;
         }
         let src = &self.panes[self.active_pane];
+        let mut new_scroller = Scroller::new();
+        // Carry scroll position + bound from the source pane so the
+        // split lands at the same place visually. Velocity, fade
+        // timer, and wheel-history don't carry — those belong to the
+        // gesture, not the view.
+        new_scroller.scroll_y = src.scroll_y;
+        new_scroller.max_scroll = src.max_scroll;
         let new_pane = Pane {
             view: src.view.clone(),
             focused: src.focused,
             editing: false,
             dragging_cell: None,
-            scroll_y: src.scroll_y,
-            max_scroll: src.max_scroll,
+            scroller: new_scroller,
             doc_height: src.doc_height,
             viewport_height: src.viewport_height,
-            last_scroll_time: None,
             pending_caret_scroll: false,
             coalesce_break: true,
             focus_mode: false,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             last_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
-            scroll_velocity_y: 0.0,
-            recent_wheel: VecDeque::new(),
-            last_scroll_apply_at: None,
         };
         // Insert to the right of the active pane and activate it. With v1
         // capped at 2 panes, this just means push + active = 1.
@@ -2389,150 +2614,45 @@ impl KeptApp {
     /// pane while keyboard input goes to another. Falls back to the active
     /// pane when the cursor isn't over any pane.
     pub fn scroll_by(&mut self, dy: f32, phase: winit::event::TouchPhase) -> bool {
-        use winit::event::TouchPhase;
+        // Wheel-over-sidebar scrolls the sidebar; otherwise the pane
+        // under the mouse, falling back to the active pane. Both go
+        // through the same `Scroller::apply_wheel` so kinetic decay,
+        // fade timing, and interrupt rules behave identically.
+        if self.mouse_pos.0 < SIDEBAR_WIDTH * self.font_scale {
+            return self.sidebar_scroll.apply_wheel(dy, phase);
+        }
         let target = self
             .pane_at(self.mouse_pos.0, self.mouse_pos.1)
             .unwrap_or(self.active_pane);
-        let pane = &mut self.panes[target];
-        let now = Instant::now();
-
-        // Interrupt detection. Two signals, in priority order:
-        //
-        // 1) `phase == Started`: trackpad fingers just touched. On
-        //    Linux libinput this fires with dy=0 the moment the user
-        //    rests fingers on the trackpad — the canonical "tap to
-        //    stop" gesture. Kill the coast immediately.
-        //
-        // 2) Fallback for wheel mice (which don't carry meaningful
-        //    phase): a wheel event after a >KINETIC_BURST_GAP idle
-        //    counts as a fresh gesture and interrupts.
-        let last_sample_at = pane.recent_wheel.back().map(|&(t, _)| t);
-        let burst_gap_elapsed = match last_sample_at {
-            Some(t) => now.duration_since(t) > KINETIC_BURST_GAP,
-            None => true,
-        };
-        let interrupt = phase == TouchPhase::Started
-            || (burst_gap_elapsed && pane.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY);
-        if interrupt && pane.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY {
-            pane.scroll_velocity_y = 0.0;
-            pane.recent_wheel.clear();
-        }
-        // A `Started` event with dy=0 (pure touch, no scroll motion) is
-        // ONLY for interruption — don't let it pollute the velocity
-        // window or attempt a no-op scroll.
-        if phase == TouchPhase::Started && dy == 0.0 {
-            return interrupt;
-        }
-
-        // Append this sample and prune anything older than the window.
-        // dy=0 is also pushed — libinput sends a dy=0 sentinel on
-        // touchpad lift, and counting it correctly drops velocity to
-        // zero if the user paused before releasing.
-        pane.recent_wheel.push_back((now, dy));
-        let cutoff = now - KINETIC_VELOCITY_WINDOW;
-        while pane
-            .recent_wheel
-            .front()
-            .map_or(false, |&(t, _)| t < cutoff)
-        {
-            pane.recent_wheel.pop_front();
-        }
-        // Velocity = sum(dy) / window_span. Span is from the oldest
-        // sample to now (not the full window), so the very first event
-        // in a burst gets a meaningful estimate based on its own dy and
-        // a sub-millisecond dt — clamped below.
-        let total_dy: f32 = pane.recent_wheel.iter().map(|&(_, d)| d).sum();
-        let span = pane
-            .recent_wheel
-            .front()
-            .map(|&(t, _)| now.duration_since(t).as_secs_f32())
-            .unwrap_or(0.0)
-            // Floor the span so a single fresh sample doesn't divide by
-            // ~0 and produce a runaway velocity.
-            .max(0.016);
-        let raw_v = total_dy / span;
-        pane.scroll_velocity_y = raw_v.clamp(-KINETIC_MAX_VELOCITY, KINETIC_MAX_VELOCITY);
-
-        // Direct apply. Kinetic integration in `step_kinetic` uses dt
-        // since the last scroll application — when the wheel just fired
-        // (this very moment), that dt is ~0 so kinetic doesn't
-        // double-apply.
-        let new_y = (pane.scroll_y + dy).clamp(0.0, pane.max_scroll);
-        if dy != 0.0 && new_y == pane.scroll_y {
-            // True bound hit (we asked to move and couldn't). Kill
-            // velocity so kinetic doesn't spin against the wall after
-            // the user releases. dy==0 events (libinput stop sentinels)
-            // never reach this branch.
-            pane.scroll_velocity_y = 0.0;
-            return false;
-        }
-        if new_y != pane.scroll_y {
-            pane.scroll_y = new_y;
-            pane.last_scroll_time = Some(now);
-            pane.last_scroll_apply_at = Some(now);
-            // Scrolling dismisses the per-cell menu (doc-anchored).
+        let moved = self.panes[target].apply_wheel(dy, phase);
+        if moved {
+            // Doc-anchored menu loses its anchor on any pane scroll.
             self.cell_context_menu = None;
         }
-        true
+        moved
     }
 
-    /// Advance kinetic decay for `pane_idx`. Called from `tick_pane` at
-    /// the top of each frame. Integrates `velocity * dt` since the last
-    /// scroll application (wheel or prior kinetic step), decays the
-    /// velocity exponentially, and stops when speed drops below the
-    /// threshold or a bound is hit. When invoked on a frame that was
-    /// triggered by a wheel event, dt is essentially zero, so this is
-    /// a no-op for that frame — the wheel's direct-apply already moved
-    /// the page.
+    /// Advance kinetic decay for `pane_idx`. Thin wrapper that
+    /// delegates to the pane's `Scroller::step_kinetic`.
     fn step_kinetic(&mut self, pane_idx: usize) {
-        let pane = &mut self.panes[pane_idx];
-        if pane.scroll_velocity_y.abs() < KINETIC_MIN_VELOCITY {
-            // Below the floor — clear velocity so is_animating() returns
-            // false. Don't touch recent_wheel; that's wheel-history,
-            // managed by scroll_by / kill_kinetic only.
-            pane.scroll_velocity_y = 0.0;
-            return;
-        }
-        let now = Instant::now();
-        let dt = match pane.last_scroll_apply_at {
-            Some(prev) => now.duration_since(prev).as_secs_f32(),
-            None => 1.0 / 60.0,
-        };
-        let dt = dt.clamp(0.0, 0.05);
-        let displacement = pane.scroll_velocity_y * dt;
-        let new_y = (pane.scroll_y + displacement).clamp(0.0, pane.max_scroll);
-        if new_y == pane.scroll_y {
-            // Hit a bound. Stop coasting.
-            pane.scroll_velocity_y = 0.0;
-            return;
-        }
-        pane.scroll_y = new_y;
-        pane.last_scroll_time = Some(now);
-        pane.last_scroll_apply_at = Some(now);
-        // Constant friction: bleed off `KINETIC_FRICTION * dt` each
-        // frame. Stop crisply when we'd cross zero rather than oscillate.
-        let drop = KINETIC_FRICTION * dt;
-        pane.scroll_velocity_y = if pane.scroll_velocity_y.abs() <= drop {
-            0.0
-        } else {
-            pane.scroll_velocity_y - drop * pane.scroll_velocity_y.signum()
-        };
+        let _ = self.panes[pane_idx].step_kinetic();
     }
 
-    /// True iff any pane has enough velocity to need another frame.
-    /// main.rs checks this after `tick` to schedule a redraw.
+    /// True iff any scrollable surface has enough velocity to need
+    /// another frame. main.rs checks this after `tick` to schedule a
+    /// redraw. Sidebar coast counts too — it shares the kinetic path.
     pub fn is_animating(&self) -> bool {
-        self.panes
-            .iter()
-            .any(|p| p.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY)
+        self.panes.iter().any(|p| p.has_velocity()) || self.sidebar_scroll.has_velocity()
     }
 
-    /// Halt kinetic coast on every pane. Called from any user input
-    /// other than the wheel itself — clicks and key presses always win.
+    /// Halt kinetic coast on every scrollable surface. Called from any
+    /// user input other than the wheel itself — clicks and key presses
+    /// always win.
     fn kill_all_kinetic(&mut self) {
         for p in &mut self.panes {
             p.kill_kinetic();
         }
+        self.sidebar_scroll.kill_kinetic();
     }
 
     pub fn tick(&mut self, canvas: &Canvas, width: f32, height: f32) {
@@ -2570,7 +2690,10 @@ impl KeptApp {
         self.render_divider(canvas, height);
         self.render_active_pane_indicator(canvas);
 
-        // Sidebar (window space, single global instance).
+        // Sidebar (window space, single global instance). Step its
+        // kinetic decay before render so a coast advances each frame
+        // — matches the per-pane `step_kinetic` call in `tick_pane`.
+        let _ = self.sidebar_scroll.step_kinetic();
         self.render_sidebar(canvas, height);
 
         // Overlays (window space, drawn last so they layer on top).
@@ -2969,32 +3092,12 @@ impl KeptApp {
         }
 
         // Per-pane scrollbar in window coords, anchored at the pane's right edge.
-        if self.max_scroll > 0.0 {
-            let alpha = scrollbar_alpha(self.last_scroll_time);
-            if alpha > 0.0 {
-                let track_top = 6.0_f32;
-                let track_bot = self.viewport_height - 6.0;
-                let track_len = (track_bot - track_top).max(1.0);
-                let raw_thumb = (self.viewport_height / self.doc_height) * track_len;
-                let thumb_h = raw_thumb.max(SCROLLBAR_MIN_THUMB).min(track_len);
-                let thumb_top = track_top
-                    + (self.scroll_y / self.max_scroll) * (track_len - thumb_h);
-                let thumb_bot = thumb_top + thumb_h;
-                let bar_x = pane_right - SCROLLBAR_INSET - SCROLLBAR_WIDTH;
-
-                let mut sb_paint = Paint::default();
-                sb_paint.set_anti_alias(true);
-                let alpha_byte = (alpha * 0xb0 as f32).round() as u8;
-                sb_paint.set_color(crate::color::dark_alpha(alpha_byte));
-                let r = SCROLLBAR_WIDTH * 0.5;
-                canvas.draw_round_rect(
-                    Rect::new(bar_x, thumb_top, bar_x + SCROLLBAR_WIDTH, thumb_bot),
-                    r,
-                    r,
-                    &sb_paint,
-                );
-            }
-        }
+        self.scroller.draw_bar(
+            canvas,
+            pane_right,
+            self.viewport_height,
+            self.doc_height,
+        );
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
@@ -4768,6 +4871,17 @@ impl KeptApp {
             &sep,
         );
 
+        // Everything below the bg + edge separator scrolls together
+        // under `sidebar_scroll.scroll_y`. Clip so off-screen rows
+        // don't leak into the doc area, then translate so y values
+        // inside this block stay in natural content coordinates (rects
+        // are recorded in content-space; hover tests below add
+        // scroll_y to mouse_y before comparing).
+        let scroll_y = self.sidebar_scroll.scroll_y;
+        canvas.save();
+        canvas.clip_rect(Rect::new(0.0, 0.0, sb_w, height.max(0.0)), None, true);
+        canvas.translate((0.0, -scroll_y));
+
         let header_font =
             Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
         let mut header_paint = Paint::default();
@@ -4788,7 +4902,8 @@ impl KeptApp {
             Font::from_typeface(&self.typeface, SIDEBAR_DATE_FONT_SIZE * scale);
         let (_, dm_pages) = date_font_for_pages.metrics();
         let mouse_x_pages = self.mouse_pos.0;
-        let mouse_y_pages = self.mouse_pos.1;
+        // mouse_y in CONTENT coords (rects stored in content coords).
+        let mouse_y_pages = self.mouse_pos.1 + scroll_y;
 
         // ---- PAGES section ----
         let pages_header_baseline = pad_top + (-hm.ascent);
@@ -4888,14 +5003,17 @@ impl KeptApp {
         let date_font = Font::from_typeface(&self.typeface, SIDEBAR_DATE_FONT_SIZE * scale);
         let (_, dm) = date_font.metrics();
         let mouse_x = self.mouse_pos.0;
-        let mouse_y = self.mouse_pos.1;
+        // Content-coords mouse_y so hover tests match content-space rects.
+        let mouse_y = self.mouse_pos.1 + scroll_y;
 
         let mut y = sidebar_y;
         for d in dates {
             let date_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
-            if date_rect.top > height {
-                break;
-            }
+            // No early break: with sidebar scrolling enabled, every row
+            // contributes to the total content height (used for
+            // `sidebar_max_scroll`). The clip rect handles off-screen
+            // suppression, and the date list is already capped at
+            // `SIDEBAR_DATE_LIMIT` rows so iteration cost is minimal.
             let date_active = self.view == Query::date(d);
             let date_hovered = mouse_x >= date_rect.left
                 && mouse_x <= date_rect.right
@@ -4950,9 +5068,8 @@ impl KeptApp {
 
             for name in tags {
                 let row_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
-                if row_rect.top > height {
-                    break;
-                }
+                // No early break — scrolling lets the user reach all
+                // tags; the clip rect handles off-screen suppression.
                 let row_active = self.view.is_solo_tag(&name);
                 let row_hovered = mouse_x >= row_rect.left
                     && mouse_x <= row_rect.right
@@ -4983,6 +5100,20 @@ impl KeptApp {
                 y += date_h + item_gap;
             }
         }
+
+        canvas.restore();
+
+        // Update scroll bounds. `y` is the bottom of the rendered
+        // content in content-space; the gap between content and the
+        // visible viewport (`height`) is the legal scroll range.
+        let total_h = y;
+        self.sidebar_scroll
+            .set_max_scroll((total_h - height).max(0.0));
+
+        // Sidebar scrollbar — anchored just inside the right-edge
+        // separator (`sb_w - 1.0` is the separator itself).
+        self.sidebar_scroll
+            .draw_bar(canvas, sb_w - 1.0, height, total_h);
     }
 
     fn render_search_popup(&mut self, canvas: &Canvas, width: f32) {
@@ -6481,6 +6612,8 @@ impl KeptApp {
         // Sidebar: tag rows offer a context menu (delete-tag for empty
         // tags). Everything else in the sidebar dismisses an open menu.
         if x < SIDEBAR_WIDTH * self.font_scale {
+            // Sidebar rects are in content-space; map mouse to match.
+            let y = y + self.sidebar_scroll.scroll_y;
             for (name, rect) in self.last_sidebar_tag_rects.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     let count = self
@@ -6643,6 +6776,9 @@ impl KeptApp {
         // multi-cell layout.
         if x < SIDEBAR_WIDTH * self.font_scale {
             self.focus_mode = false;
+            // Sidebar rects are stored in content-space; map mouse to
+            // match (sidebar can scroll independently of the doc area).
+            let y = y + self.sidebar_scroll.scroll_y;
             // Any sidebar interaction commits an in-progress People
             // rename or add (don't lose typed input on nav).
             if self.people_rename.is_some() {
@@ -7072,6 +7208,7 @@ fn scrollbar_alpha(last: Option<Instant>) -> f32 {
         1.0 - (into_fade.as_secs_f32() / SCROLLBAR_FADE.as_secs_f32())
     }
 }
+
 
 /// Draw `name` starting at `origin`, painting bytes in `match_indices` with
 /// `match_paint` and the rest with `dim_paint`. Matches are byte indices; the
