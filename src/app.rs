@@ -783,6 +783,11 @@ pub struct KeptApp {
     /// `Entity(eid)` and the entity has no `primary_cell_id`. Used by
     /// `mouse_down` to route a click into the create flow (Chunk 2).
     last_entity_create_button_rect: Option<Rect>,
+    /// Doc-space rects of the entity page's "REFERENCED IN" embed cards
+    /// from the last render, paired with the source cell ids they point
+    /// at. Cleared on every entity-page render and repopulated; clicks
+    /// that land in any rect navigate to that source cell.
+    last_entity_page_ref_rects: Vec<(Uuid, Rect)>,
     /// Sidebar PAGES section row rects (window coords) from last frame.
     /// Hit-tested by `mouse_down` to dispatch to `push_view(Query::people())`.
     last_sidebar_pages_rects: Vec<(PageKind, Rect)>,
@@ -1048,6 +1053,7 @@ impl KeptApp {
             last_tag_menu_delete_rect: None,
             last_search_input_rect: None,
             last_entity_create_button_rect: None,
+            last_entity_page_ref_rects: Vec::new(),
             last_sidebar_pages_rects: Vec::new(),
             last_people_row_rects: Vec::new(),
             last_people_add_rect: None,
@@ -1312,7 +1318,6 @@ impl KeptApp {
         let scale = self.font_scale;
         let inset = EMBED_INSET * scale;
         let pad = EMBED_PAD * scale;
-        let footer_h = EMBED_FOOTER_H * scale;
         let body_x = x + inset;
         let body_y = y + pad;
         let body_w = (width - 2.0 * inset).max(40.0);
@@ -1388,27 +1393,6 @@ impl KeptApp {
             }
         };
 
-        let total_h = pad + body_h + 4.0 * scale + footer_h;
-        let wrapper = Rect::new(x, y, x + width, y + total_h);
-
-        // Background tint.
-        let mut bg = Paint::default();
-        bg.set_anti_alias(true);
-        bg.set_color(Color::from_argb(0x0c, 0xb3, 0x92, 0x60));
-        canvas.draw_round_rect(wrapper, FOCUS_RADIUS, FOCUS_RADIUS, &bg);
-
-        // Dashed warm-tan border.
-        let mut stroke = Paint::default();
-        stroke.set_anti_alias(true);
-        stroke.set_style(PaintStyle::Stroke);
-        stroke.set_stroke_width(1.0);
-        stroke.set_color(Color::from_rgb(0xb3, 0x92, 0x60));
-        if let Some(eff) = PathEffect::dash(&[4.0, 2.0], 0.0) {
-            stroke.set_path_effect(eff);
-        }
-        canvas.draw_round_rect(wrapper, FOCUS_RADIUS, FOCUS_RADIUS, &stroke);
-
-        // Footer: "↗ originally <date>" or "↗ original deleted".
         let footer_text = match target_idx {
             Some(tidx) => {
                 let ts = self.cells[tidx].timestamp;
@@ -1416,17 +1400,8 @@ impl KeptApp {
             }
             None => "↗ original deleted".to_string(),
         };
-        let footer_font = Font::from_typeface(&self.typeface, EMBED_FOOTER_FONT_SIZE * scale);
-        let (_, fm) = footer_font.metrics();
-        let footer_baseline = y + total_h - pad - (-fm.ascent);
-        let mut footer_paint = Paint::default();
-        footer_paint.set_anti_alias(true);
-        footer_paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
-        canvas.draw_str(
-            &footer_text,
-            Point::new(body_x, footer_baseline),
-            &footer_font,
-            &footer_paint,
+        let total_h = self.draw_embed_wrapper(
+            canvas, x, y, width, body_x, body_h, &footer_text, scale,
         );
 
         // Record geometry on the embed: both on the inner ReferenceCell
@@ -1516,6 +1491,58 @@ impl KeptApp {
 
     /// One-line muted placeholder for dangling / chained / wrong-kind
     /// references. Returns the rendered height.
+    /// Paint the embed's wrapper chrome: faint warm-tan background tint,
+    /// dashed warm-tan border, muted footer line. Used by both the
+    /// timeline reference cell render and the entity-page references
+    /// list — the visual is identical because the meaning is identical.
+    /// Returns the total height (body + footer + paddings).
+    fn draw_embed_wrapper(
+        &self,
+        canvas: &Canvas,
+        x: f32,
+        y: f32,
+        width: f32,
+        body_x: f32,
+        body_h: f32,
+        footer_text: &str,
+        scale: f32,
+    ) -> f32 {
+        let pad = EMBED_PAD * scale;
+        let footer_h = EMBED_FOOTER_H * scale;
+        let total_h = pad + body_h + 4.0 * scale + footer_h;
+        let wrapper = Rect::new(x, y, x + width, y + total_h);
+
+        let mut bg = Paint::default();
+        bg.set_anti_alias(true);
+        bg.set_color(Color::from_argb(0x0c, 0xb3, 0x92, 0x60));
+        canvas.draw_round_rect(wrapper, FOCUS_RADIUS, FOCUS_RADIUS, &bg);
+
+        let mut stroke = Paint::default();
+        stroke.set_anti_alias(true);
+        stroke.set_style(PaintStyle::Stroke);
+        stroke.set_stroke_width(1.0);
+        stroke.set_color(Color::from_rgb(0xb3, 0x92, 0x60));
+        if let Some(eff) = PathEffect::dash(&[4.0, 2.0], 0.0) {
+            stroke.set_path_effect(eff);
+        }
+        canvas.draw_round_rect(wrapper, FOCUS_RADIUS, FOCUS_RADIUS, &stroke);
+
+        let footer_font = Font::from_typeface(&self.typeface, EMBED_FOOTER_FONT_SIZE * scale);
+        let (_, fm) = footer_font.metrics();
+        let footer_baseline = y + total_h - pad - (-fm.ascent);
+        let mut footer_paint = Paint::default();
+        footer_paint.set_anti_alias(true);
+        footer_paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+        canvas.draw_str(
+            footer_text,
+            Point::new(body_x, footer_baseline),
+            &footer_font,
+            &footer_paint,
+        );
+
+        total_h
+    }
+
     fn render_embed_placeholder(
         &self,
         canvas: &Canvas,
@@ -3859,6 +3886,88 @@ impl KeptApp {
             );
             self.last_entity_create_button_rect = Some(btn_rect);
             y += btn_h;
+        }
+
+        // REFERENCED IN — list of cells that link to this entity. Rendered
+        // as embed previews (warm-tan dashed wrapper + cached body), sorted
+        // newest-first by `edited_at`. The previews aren't real cells —
+        // they live only as long as this page render. Click an embed →
+        // navigate to the source cell; rect-tracked in
+        // `last_entity_page_ref_rects` for hit-test in `mouse_down`.
+        self.last_entity_page_ref_rects.clear();
+        let kept_url = format!("kept://{}", entity_id);
+        let primary = entity.primary_cell_id;
+        let mut mentions: Vec<(usize, i64)> = self
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| Some(c.id) != primary)
+            .filter(|(_, c)| c.all_link_urls().iter().any(|u| u == &kept_url))
+            .map(|(idx, c)| (idx, c.edited_at))
+            .collect();
+        mentions.sort_by_key(|&(_, t)| std::cmp::Reverse(t));
+
+        if !mentions.is_empty() {
+            y += ENTITY_SECTION_GAP * scale;
+            let mut ref_header_paint = Paint::default();
+            ref_header_paint.set_anti_alias(true);
+            ref_header_paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+            canvas.draw_str(
+                "REFERENCED IN",
+                Point::new(cells_left, y + (-hm.ascent)),
+                &header_font,
+                &ref_header_paint,
+            );
+            y += -hm.ascent + hm.descent + ENTITY_SECTION_HEADER_GAP * scale;
+
+            let inset = EMBED_INSET * scale;
+            let pad = EMBED_PAD * scale;
+            let body_x = cells_left + inset;
+            let body_w = (content_width - 2.0 * inset).max(40.0);
+
+            for (target_idx, _) in mentions {
+                let target_cell_id = self.cells[target_idx].id;
+                let target_ts = self.cells[target_idx].timestamp;
+                // Fresh cache per frame — no selection persistence on the
+                // entity page (acceptable for v1; click-to-navigate covers
+                // the main interaction).
+                let mut maybe_cache = self.build_reference_cache(
+                    target_idx,
+                    ReferenceTarget::WholeCell(target_cell_id),
+                );
+                let body_h = match &mut maybe_cache {
+                    Some(cache) => {
+                        cache.tick(canvas, body_x, y + pad, body_w, false, false)
+                    }
+                    None => self.render_embed_placeholder(
+                        canvas,
+                        "↗ [unrenderable]",
+                        body_x,
+                        y + pad,
+                        body_w,
+                        scale,
+                    ),
+                };
+                let footer_text = format!(
+                    "↗ originally {}",
+                    format_date_label(local_date_for_ms(target_ts))
+                );
+                let total_h = self.draw_embed_wrapper(
+                    canvas,
+                    cells_left,
+                    y,
+                    content_width,
+                    body_x,
+                    body_h,
+                    &footer_text,
+                    scale,
+                );
+                self.last_entity_page_ref_rects.push((
+                    target_cell_id,
+                    Rect::new(cells_left, y, cells_left + content_width, y + total_h),
+                ));
+                y += total_h + CELL_GAP;
+            }
         }
 
         y - MARGIN_TOP
@@ -6224,6 +6333,28 @@ impl KeptApp {
         if let Some(rect) = self.last_entity_create_button_rect {
             if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                 // TODO(chunk-2): trigger create_backing_cell_for_entity.
+                return true;
+            }
+        }
+
+        // Entity-page "REFERENCED IN" embed cards: clicking any of them
+        // navigates to the source cell at its real timeline location.
+        // Snapshotted into a local first to avoid the &self borrow on
+        // `last_entity_page_ref_rects` outliving the &mut self call to
+        // `navigate_to_reference`.
+        if matches!(self.view.view_kind, ViewKind::Entity(_)) {
+            let hit = self
+                .last_entity_page_ref_rects
+                .iter()
+                .find(|(_, rect)| {
+                    x >= rect.left
+                        && x <= rect.right
+                        && doc_y >= rect.top
+                        && doc_y <= rect.bottom
+                })
+                .map(|(id, _)| *id);
+            if let Some(target_cell_id) = hit {
+                self.navigate_to_reference(ReferenceTarget::WholeCell(target_cell_id));
                 return true;
             }
         }
