@@ -493,6 +493,42 @@ impl Cell {
         }
     }
 
+    /// Plain-text variant of `replace_focused_with_link` — replaces
+    /// `range` in the focused slot (title, plain body, focused outline
+    /// bullet, etc.) with `text`, with no link span attached. Used by
+    /// `#`-tag autocomplete commit.
+    pub fn replace_focused_with_text(
+        &mut self,
+        bullet_id: Option<Uuid>,
+        range: Range<usize>,
+        text: String,
+    ) {
+        if self.title_focused {
+            if let Some(title) = self.title.as_mut() {
+                title.replace_with_text(range, text);
+            }
+            return;
+        }
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.replace_with_text(range, text),
+            CellKind::Outline(oc) => {
+                if let Some(bid) = bullet_id {
+                    oc.replace_in_bullet_with_text(bid, range, text);
+                }
+            }
+            CellKind::PopPop(pc) => pc.textbox_mut().replace_with_text(range, text),
+            CellKind::Table(tc) => {
+                let (r, c) = tc.focused_index();
+                if let Some(entry) = tc.cell_at_mut(r, c) {
+                    if !entry.readonly {
+                        entry.textbox.replace_with_text(range, text);
+                    }
+                }
+            }
+            CellKind::Reference(_) => {}
+        }
+    }
+
     pub fn copy_text(&self) -> String {
         if self.title_focused {
             if let Some(title) = self.title.as_ref() {
@@ -543,6 +579,35 @@ impl Cell {
             Some(tb) => tb.heading_tag_names(),
             None => Vec::new(),
         }
+    }
+
+    /// True iff the title slot is focused and the caret currently sits
+    /// inside (or right at the end of) one of the trailing `#tag` tokens.
+    /// Used by the persistence flush to defer saving the cell while a
+    /// tag is mid-edit — without this gate, every keystroke commits a
+    /// new partial-name tag to the DB, which yanks the cell out of any
+    /// tag-filtered sidebar view as the spelling shifts.
+    ///
+    /// Edge: caret == r.start (right before the `#`) is *not* considered
+    /// in-progress — the user is positioned to type chars before the
+    /// tag, which doesn't change the tag itself. caret == r.end (just
+    /// after the last char) IS in-progress — the next keystroke would
+    /// extend the tag.
+    pub fn caret_in_in_progress_title_tag(&self) -> bool {
+        if !self.title_focused {
+            return false;
+        }
+        let Some(title) = self.title.as_ref() else {
+            return false;
+        };
+        let Some((_, caret)) = title.primary_caret() else {
+            return false;
+        };
+        let text = title.text();
+        let title_end = text.find('\n').unwrap_or(text.len());
+        parse_heading_tags(text, title_end)
+            .iter()
+            .any(|r| caret > r.start && caret <= r.end)
     }
 
     /// Full text of the cell, ignoring selection state. Title (if any) is

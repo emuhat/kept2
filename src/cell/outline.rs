@@ -541,6 +541,19 @@ impl OutlineCell {
         }
     }
 
+    /// Plain-text replacement variant of `replace_in_bullet_with_link`,
+    /// used by `#`-tag autocomplete (no URL attached).
+    pub fn replace_in_bullet_with_text(
+        &mut self,
+        bullet_id: Uuid,
+        range: Range<usize>,
+        text: String,
+    ) {
+        if let Some(b) = self.bullets.iter_mut().find(|b| b.id == bullet_id) {
+            b.textbox.replace_with_text(range, text);
+        }
+    }
+
     /// Plain-text representation of the current selection — joined bullet text
     /// (one bullet per line, indented with 4 spaces per depth) when a multi-
     /// bullet selection is active, otherwise the focused bullet's textbox

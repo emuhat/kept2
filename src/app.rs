@@ -207,12 +207,34 @@ struct MentionPopup {
     /// What the popup is anchored to: a focused cell's text or the search
     /// bar's input. Drives sync, render-anchor, and commit behavior.
     source: MentionSource,
-    /// Byte position of the '@' in the source's text.
+    /// Whether this popup is for `@`-person mentions or `#`-tag tags.
+    /// Determines candidate source (`person_mention_candidates` vs
+    /// `tag_mention_candidates`), trigger character, prefix glyph in
+    /// the rendered list, and commit semantics.
+    kind: MentionKind,
+    /// Byte position of the trigger character (`@` or `#`) in the
+    /// source's text.
     anchor_byte: usize,
-    /// Currently typed query (text after the '@', no whitespace).
+    /// Currently typed query (text after the trigger, no whitespace).
     query: String,
     /// Index of the highlighted item in the filtered list.
     selected: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MentionKind {
+    Person,
+    Tag,
+}
+
+impl MentionKind {
+    /// The trigger character that opens this popup kind.
+    fn trigger(self) -> &'static str {
+        match self {
+            MentionKind::Person => "@",
+            MentionKind::Tag => "#",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1715,6 +1737,26 @@ impl KeptApp {
         out
     }
 
+    /// Tag candidates for the `#`-autocomplete popup. Sourced from the DB
+    /// tags table (the same set the sidebar's TAGS section lists). All
+    /// tags are treated as "active" — there's no inactive-tag concept.
+    fn tag_mention_candidates(&self) -> Vec<(String, bool)> {
+        let names: Vec<String> = self
+            .db
+            .as_ref()
+            .and_then(|db| db.all_tags().ok())
+            .unwrap_or_default();
+        names.into_iter().map(|n| (n, true)).collect()
+    }
+
+    /// Pick the candidate set for the popup's current kind.
+    fn mention_candidates_for(&self, kind: MentionKind) -> Vec<(String, bool)> {
+        match kind {
+            MentionKind::Person => self.person_mention_candidates(),
+            MentionKind::Tag => self.tag_mention_candidates(),
+        }
+    }
+
     /// Reload the entity caches from the DB. Called after every
     /// `save_cell` / `delete_cell` so the in-memory state stays in lockstep
     /// with the persistence layer's authoritative entity table.
@@ -1759,6 +1801,16 @@ impl KeptApp {
     /// - `People` → no cells visible (the page is bespoke).
     /// - `Ast` → delegate to `query::matches` against `view.ast`.
     fn is_visible_for_view(&self, cell: &Cell, ctx: &query::MatchContext) -> bool {
+        // A focused cell whose caret is mid-edit inside a `#tag` token in
+        // the title stays visible regardless of filter match. Otherwise
+        // the in-memory `heading_tag_names()` shifts on every keystroke
+        // and the cell yanks out from under the user the instant they
+        // edit the tag they're filtering by. Once the caret moves out
+        // (whitespace, focus loss, navigating away from the title), the
+        // filter re-evaluates with the finalized spelling.
+        if self.focused == Some(cell.id) && cell.caret_in_in_progress_title_tag() {
+            return true;
+        }
         match self.view.view_kind {
             ViewKind::Context(id) => {
                 let cell_ts = cell.timestamp;
@@ -2259,7 +2311,18 @@ impl KeptApp {
         }
         let dirty: Vec<Uuid> = self.dirty_cells.drain().collect();
         for id in dirty {
+            // Defer this cell's save while a title `#tag` is mid-edit
+            // (popup-driven typing OR plain in-place rename). Otherwise
+            // each keystroke would persist a new partial-name tag and
+            // pop the cell out of any tag-filtered view in real time.
+            // The dirty mark is re-asserted so the next flush — once
+            // the caret leaves the tag (whitespace, focus loss, or
+            // moving outside the title) — saves the finalized name.
             if let Some(cell) = self.cells.iter().find(|c| c.id == id) {
+                if cell.caret_in_in_progress_title_tag() {
+                    self.dirty_cells.insert(id);
+                    continue;
+                }
                 if let Err(e) = db.save_cell(cell) {
                     eprintln!("kept: save_cell failed for {id}: {e}");
                 }
@@ -2574,10 +2637,18 @@ impl KeptApp {
         // correct for the pane being rendered, not stale from another pane's
         // last render). y/height come from the cell's last-rendered values
         // — at most one frame stale when content size changes.
+        //
+        // Also gate on the focused cell still passing the current view's
+        // visibility filter. Without this, a cell that just dropped out of
+        // a tag-filtered view (because the user finished renaming its
+        // `#tag` and it no longer matches) would leave its focus card
+        // behind as a ghost rectangle since `self.focused` still points
+        // at the now-hidden cell.
+        let match_ctx = self.match_context();
         let focused_geom = if matches!(view_kind_local, ViewKind::Ast | ViewKind::Context(_)) {
             self.focused
                 .and_then(|id| self.cell(id))
-                .filter(|c| c.height() > 0.0)
+                .filter(|c| c.height() > 0.0 && self.is_visible_for_view(c, &match_ctx))
                 .map(|c| {
                     if self.focus_mode {
                         (cells_left, MARGIN_TOP, content_width, c.height())
@@ -3047,11 +3118,16 @@ impl KeptApp {
                     state.selected = 0;
                 }
             }
-            // @-mention popup hooks: maybe open if the user just typed '@';
-            // sync against the new caret/text otherwise so a shrinking
-            // query backs out the popup or updates its filter.
-            if !popup_was_open && event.text.as_deref() == Some("@") {
-                self.try_open_mention_popup();
+            // Mention popup hooks: maybe open if the user just typed a
+            // trigger character (`@` for persons, `#` for tags); sync
+            // against the new caret/text otherwise so a shrinking query
+            // backs out the popup or updates its filter.
+            if !popup_was_open {
+                match event.text.as_deref() {
+                    Some("@") => self.try_open_mention_popup(MentionKind::Person),
+                    Some("#") => self.try_open_mention_popup(MentionKind::Tag),
+                    _ => {}
+                }
             }
             self.sync_mention_popup();
             return true;
@@ -3493,17 +3569,23 @@ impl KeptApp {
             }
             self.pending_caret_scroll = true;
 
-            // Maybe open the @-mention popup (if user just typed '@'), then
-            // sync against the current text+caret state.
-            if !popup_was_open && event.text.as_deref() == Some("@") {
-                self.try_open_mention_popup();
+            // Maybe open the mention popup (if user just typed a trigger
+            // character: `@` for persons, `#` for tags), then sync against
+            // the current text+caret state.
+            if !popup_was_open {
+                match event.text.as_deref() {
+                    Some("@") => self.try_open_mention_popup(MentionKind::Person),
+                    Some("#") => self.try_open_mention_popup(MentionKind::Tag),
+                    _ => {}
+                }
             }
             self.sync_mention_popup();
         }
         handled
     }
 
-    fn try_open_mention_popup(&mut self) {
+    fn try_open_mention_popup(&mut self, kind: MentionKind) {
+        let trigger = kind.trigger();
         // Prefer the search bar when it has the keyboard focus — typing in
         // the popup never goes through cell.handle_key, so the cell-source
         // path would be a no-op here.
@@ -3517,11 +3599,12 @@ impl KeptApp {
             if caret == 0 {
                 return;
             }
-            if text.get(caret - 1..caret) != Some("@") {
+            if text.get(caret - 1..caret) != Some(trigger) {
                 return;
             }
             self.mention_popup = Some(MentionPopup {
                 source: MentionSource::SearchBar,
+                kind,
                 anchor_byte: caret - 1,
                 query: String::new(),
                 selected: 0,
@@ -3534,14 +3617,20 @@ impl KeptApp {
         let Some(cell) = self.cell(focused_id) else {
             return;
         };
+        // Tag autocomplete only applies in the title slot — `#tag` only
+        // has structural meaning in headings. Body `#` (including the
+        // PopPop comment marker) shouldn't trigger the popup.
+        if kind == MentionKind::Tag && !cell.title_focused {
+            return;
+        }
         let Some((text, caret)) = cell.focused_text_and_caret() else {
             return;
         };
         if caret == 0 {
             return;
         }
-        // Caret should be just past the '@'.
-        if text.get(caret - 1..caret) != Some("@") {
+        // Caret should be just past the trigger character.
+        if text.get(caret - 1..caret) != Some(trigger) {
             return;
         }
         self.mention_popup = Some(MentionPopup {
@@ -3549,6 +3638,7 @@ impl KeptApp {
                 cell_id: focused_id,
                 bullet_id: cell.focused_bullet_id(),
             },
+            kind,
             anchor_byte: caret - 1,
             query: String::new(),
             selected: 0,
@@ -3586,17 +3676,22 @@ impl KeptApp {
             self.mention_popup = None;
             return;
         };
-        // The '@' must still be at anchor_byte.
-        if text.get(anchor_byte..).map_or(true, |s| !s.starts_with('@')) {
+        // The trigger character must still be at anchor_byte.
+        let trigger = popup.kind.trigger();
+        if text
+            .get(anchor_byte..)
+            .map_or(true, |s| !s.starts_with(trigger))
+        {
             self.mention_popup = None;
             return;
         }
-        // Caret must be at or past the '@' itself.
+        // Caret must be at or past the trigger itself.
         if caret < anchor_byte + 1 {
             self.mention_popup = None;
             return;
         }
-        // Query is everything between the '@' and the caret. Whitespace breaks it.
+        // Query is everything between the trigger and the caret. Whitespace
+        // breaks it.
         let Some(q) = text.get(anchor_byte + 1..caret) else {
             self.mention_popup = None;
             return;
@@ -3606,7 +3701,8 @@ impl KeptApp {
             return;
         }
         let query = q.to_string();
-        let candidates = self.person_mention_candidates();
+        let kind = popup.kind;
+        let candidates = self.mention_candidates_for(kind);
         if let Some(p) = self.mention_popup.as_mut() {
             let count = filter_mentions(&candidates, &query)
                 .len()
@@ -5263,7 +5359,7 @@ impl KeptApp {
         let pad = MENTION_POPUP_PAD * scale;
         let radius = MENTION_POPUP_RADIUS * scale;
 
-        let candidates = self.person_mention_candidates();
+        let candidates = self.mention_candidates_for(popup.kind);
         let items = filter_mentions(&candidates, &popup.query);
         let visible = items.len().min(MENTION_POPUP_MAX_VISIBLE);
         let popup_h = if visible == 0 {
@@ -5360,14 +5456,16 @@ impl KeptApp {
             }
             let baseline = row_y + text_offset_in_row;
             let text_x = popup_x + 12.0 * scale;
-            // Render '@' in dim, then alternate dim / match-paint runs.
-            let at_w = body_font.measure_str("@", Some(&dim_paint)).0;
-            canvas.draw_str("@", Point::new(text_x, baseline), &body_font, &dim_paint);
+            // Render the trigger in dim, then alternate dim / match-paint
+            // runs across the suggestion's letters.
+            let trigger = popup.kind.trigger();
+            let trigger_w = body_font.measure_str(trigger, Some(&dim_paint)).0;
+            canvas.draw_str(trigger, Point::new(text_x, baseline), &body_font, &dim_paint);
             draw_runs_with_matches(
                 canvas,
                 item,
                 matches,
-                Point::new(text_x + at_w, baseline),
+                Point::new(text_x + trigger_w, baseline),
                 &body_font,
                 &match_paint,
                 &dim_paint,
@@ -5377,7 +5475,10 @@ impl KeptApp {
     }
 
     fn mention_popup_move(&mut self, delta: i32) {
-        let candidates = self.person_mention_candidates();
+        let Some(kind) = self.mention_popup.as_ref().map(|p| p.kind) else {
+            return;
+        };
+        let candidates = self.mention_candidates_for(kind);
         let Some(p) = self.mention_popup.as_mut() else {
             return;
         };
@@ -5392,33 +5493,60 @@ impl KeptApp {
         p.selected = new;
     }
 
-    /// Commit the highlighted person from the `@`-mention popup: replace
-    /// the `@query` typeahead text with the person's title and attach a
-    /// `kept://<source-cell-id>` link spanning it. Recorded as one undo.
+    /// Commit the highlighted item from the mention popup. For person
+    /// (`@`) mentions, replaces `@query` with the person's title and
+    /// attaches a `kept://<source-cell-id>` link span. For tag (`#`)
+    /// mentions, replaces `#query` with the literal `#tagname` as plain
+    /// text — the title's tag-extraction pass picks it up. Both record
+    /// one undo entry.
     fn commit_mention(&mut self) -> bool {
         let Some(popup) = self.mention_popup.take() else {
             return false;
         };
-        let entries = self.person_entries();
-        let candidates = self.person_mention_candidates();
+        let candidates = self.mention_candidates_for(popup.kind);
         let filtered = filter_mentions(&candidates, &popup.query);
         let Some(selected) = filtered.get(popup.selected) else {
             return true;
         };
         let chosen_name = selected.0.clone();
-        let Some((_, source_id)) = entries.iter().find(|(n, _)| n == &chosen_name) else {
-            return true;
-        };
-        let source_id = *source_id;
 
         let start = popup.anchor_byte;
         let end = start + 1 + popup.query.len();
 
-        match popup.source {
+        match popup.kind {
+            MentionKind::Person => {
+                let entries = self.person_entries();
+                let Some((_, source_id)) =
+                    entries.iter().find(|(n, _)| n == &chosen_name)
+                else {
+                    return true;
+                };
+                let source_id = *source_id;
+                self.commit_person_mention(popup.source, start, end, chosen_name, source_id);
+            }
+            MentionKind::Tag => {
+                self.commit_tag_mention(popup.source, start, end, chosen_name);
+            }
+        }
+        self.coalesce_break = true;
+        true
+    }
+
+    /// Insert a person mention: a clickable `kept://<entity_id>` link
+    /// (cell context) or a `@Slug_Underscored` token (search context).
+    fn commit_person_mention(
+        &mut self,
+        source: MentionSource,
+        start: usize,
+        end: usize,
+        chosen_name: String,
+        source_id: Uuid,
+    ) {
+        match source {
             MentionSource::Cell { cell_id, bullet_id } => {
                 let pre = match self.cell(cell_id) {
                     Some(c) => c.snapshot(),
-                    None => return true,
+                    None => return,
                 };
                 let url = format!("kept://{}", source_id);
                 if let Some(c) = self.cell_mut(cell_id) {
@@ -5435,21 +5563,75 @@ impl KeptApp {
                 }
             }
             MentionSource::SearchBar => {
-                // Replace `@<query>` with `@<Title_Cased_With_Underscores>` so
-                // the resulting query string is readable and parses cleanly
-                // (entity tokens can't contain whitespace). The executor's
-                // resolver normalizes both sides — strips whitespace and
-                // underscores, lowercases — so `@Patrick_Foy` matches the
-                // person cell titled "Patrick Foy".
+                // Replace `@<query>` with `@<Title_Cased_With_Underscores>`
+                // so the resulting query string is readable and parses
+                // cleanly (entity tokens can't contain whitespace). The
+                // executor's resolver normalizes both sides — strips
+                // whitespace and underscores, lowercases — so
+                // `@Patrick_Foy` matches the person cell titled
+                // "Patrick Foy".
                 let slug = chosen_name
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join("_");
-                let replacement = format!("@{slug}");
+                self.replace_search_or_cell_text(
+                    source,
+                    start,
+                    end,
+                    format!("@{slug}"),
+                );
+            }
+        }
+    }
+
+    /// Insert a tag mention: replace `#<query>` with the literal
+    /// `#<chosen>` (no link, no underline). Tags only carry meaning in
+    /// the title, where the existing tag-rendering pass styles trailing
+    /// `#tokens` automatically.
+    fn commit_tag_mention(
+        &mut self,
+        source: MentionSource,
+        start: usize,
+        end: usize,
+        chosen_name: String,
+    ) {
+        let replacement = format!("#{chosen_name}");
+        self.replace_search_or_cell_text(source, start, end, replacement);
+    }
+
+    /// Plain-text replacement of `[start..end]` with `replacement` in
+    /// whichever source the popup was anchored on. Records an undo edit
+    /// for cell sources; mutates the search input directly otherwise.
+    fn replace_search_or_cell_text(
+        &mut self,
+        source: MentionSource,
+        start: usize,
+        end: usize,
+        replacement: String,
+    ) {
+        match source {
+            MentionSource::Cell { cell_id, bullet_id } => {
+                let pre = match self.cell(cell_id) {
+                    Some(c) => c.snapshot(),
+                    None => return,
+                };
+                if let Some(c) = self.cell_mut(cell_id) {
+                    c.replace_focused_with_text(bullet_id, start..end, replacement);
+                }
+                if let Some(c) = self.cell(cell_id) {
+                    let post = c.snapshot();
+                    if !pre.doc_eq(&post) {
+                        let saved_focused = self.focused;
+                        self.focused = Some(cell_id);
+                        self.record_edit(pre, post);
+                        self.focused = saved_focused.or(Some(cell_id));
+                    }
+                }
+            }
+            MentionSource::SearchBar => {
                 if let Some(state) = self.search.as_mut() {
                     let txt = state.input.text();
                     if start <= txt.len() && end <= txt.len() {
-                        // Build new text: prefix + replacement + suffix.
                         let prefix = &txt[..start];
                         let suffix = &txt[end..];
                         let new_text = format!("{prefix}{replacement}{suffix}");
@@ -5462,8 +5644,6 @@ impl KeptApp {
                 }
             }
         }
-        self.coalesce_break = true;
-        true
     }
 
     // ----- Search popup (Ctrl/Cmd+K) -----

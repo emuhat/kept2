@@ -1418,6 +1418,19 @@ impl TextBox {
         self.apply_edits_right_to_left(edits);
     }
 
+    /// Replace `range` with `text` as plain (un-linked) characters.
+    /// Caret lands at the end of the inserted text. Used by the tag
+    /// `#`-autocomplete commit, where the inserted token has no URL.
+    pub fn replace_with_text(&mut self, range: Range<usize>, text: String) {
+        let start = range.start;
+        let inserted_len = text.len();
+        self.apply_edit(&Edit {
+            range,
+            replacement: text,
+        });
+        self.set_caret_at(start + inserted_len);
+    }
+
     /// Replace `range` with `text` and add a link covering the inserted text.
     /// Used to insert mentions like a person's title with a `kept://…` URL.
     /// Caret lands at the end of the inserted text.
