@@ -1,5 +1,6 @@
 mod app;
 mod cell;
+mod color;
 mod persist;
 mod query;
 

@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use skia_safe::{Canvas, Color, Font, Paint, Rect, Typeface};
+use skia_safe::{Canvas, Font, Paint, Rect, Typeface};
 use uuid::Uuid;
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
@@ -252,7 +252,7 @@ impl OutlineCell {
 
         let mut bullet_paint = Paint::default();
         bullet_paint.set_anti_alias(true);
-        bullet_paint.set_color(Color::from_rgb(0x60, 0x60, 0x60));
+        bullet_paint.set_color(crate::color::BULLET_MARKER);
 
         let mut bullet_y_bands: Vec<(f32, f32)> = Vec::with_capacity(self.bullets.len());
         let suppress_caret = active_indices.is_some();
@@ -283,7 +283,7 @@ impl OutlineCell {
             if let Some((lo, hi)) = active_indices {
                 let mut hl_paint = Paint::default();
                 hl_paint.set_anti_alias(true);
-                hl_paint.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+                hl_paint.set_color(crate::color::ACCENT_BLUE_SELECTION);
                 for i in lo..=hi {
                     if let Some(&(top, bot)) = bullet_y_bands.get(i) {
                         canvas.draw_rect(Rect::new(x, top, x + width, bot), &hl_paint);

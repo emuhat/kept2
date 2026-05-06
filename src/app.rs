@@ -1326,9 +1326,9 @@ impl KeptApp {
         let half_t = DIVIDER_THICKNESS * 0.5;
         let hovered = (self.mouse_pos.0 - div_x).abs() <= DIVIDER_HIT_SLOP;
         let color = if hovered || self.dragging_divider {
-            Color::from_rgb(0xc8, 0xbf, 0xb0)
+            crate::color::DIVIDER_PANE_HOVER
         } else {
-            Color::from_rgb(0xdc, 0xd4, 0xc6)
+            crate::color::DIVIDER_PANE
         };
         let mut p = Paint::default();
         p.set_anti_alias(true);
@@ -1352,7 +1352,7 @@ impl KeptApp {
         p.set_anti_alias(true);
         p.set_style(PaintStyle::Stroke);
         p.set_stroke_width(PANE_BORDER_STROKE);
-        p.set_color(Color::from_argb(0x80, 0x4a, 0x90, 0xe2));
+        p.set_color(crate::color::ACCENT_BLUE_PANE_BORDER);
         canvas.draw_rect(
             Rect::new(r.left + s, r.top + s, r.right - s, r.bottom - s),
             &p,
@@ -1577,14 +1577,14 @@ impl KeptApp {
 
         let mut bg = Paint::default();
         bg.set_anti_alias(true);
-        bg.set_color(Color::from_argb(0x0c, 0xb3, 0x92, 0x60));
+        bg.set_color(crate::color::EMBED_TINT);
         canvas.draw_round_rect(wrapper, FOCUS_RADIUS, FOCUS_RADIUS, &bg);
 
         let mut stroke = Paint::default();
         stroke.set_anti_alias(true);
         stroke.set_style(PaintStyle::Stroke);
         stroke.set_stroke_width(1.0);
-        stroke.set_color(Color::from_rgb(0xb3, 0x92, 0x60));
+        stroke.set_color(crate::color::EMBED_BORDER);
         if let Some(eff) = PathEffect::dash(&[4.0, 2.0], 0.0) {
             stroke.set_path_effect(eff);
         }
@@ -1595,7 +1595,7 @@ impl KeptApp {
         let footer_baseline = y + total_h - pad - (-fm.ascent);
         let mut footer_paint = Paint::default();
         footer_paint.set_anti_alias(true);
-        footer_paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+        footer_paint.set_color(crate::color::TEXT_MUTED_GREY);
         canvas.draw_str(
             footer_text,
             Point::new(body_x, footer_baseline),
@@ -1622,7 +1622,7 @@ impl KeptApp {
         let baseline = y + (-m.ascent);
         let mut paint = Paint::default();
         paint.set_anti_alias(true);
-        paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+        paint.set_color(crate::color::TEXT_MUTED_GREY);
         canvas.draw_str(text, Point::new(x, baseline), &font, &paint);
         -m.ascent + m.descent
     }
@@ -2453,7 +2453,7 @@ impl KeptApp {
     }
 
     pub fn tick(&mut self, canvas: &Canvas, width: f32, height: f32) {
-        canvas.clear(Color::from_rgb(0xfa, 0xf7, 0xf2));
+        canvas.clear(crate::color::BG_PAGE);
         self.layout_panes(width, height);
 
         // Render each pane. We swap `active_pane` for the duration of each
@@ -2521,7 +2521,7 @@ impl KeptApp {
 
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
-        text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        text_paint.set_color(crate::color::TEXT_PRIMARY);
 
         // Clip to this pane's rect so over-wide content / focus shadows
         // can't bleed across the divider into the other pane.
@@ -2596,7 +2596,7 @@ impl KeptApp {
             // Drop shadow: blurred dark rect, offset down a few px.
             let mut shadow_paint = Paint::default();
             shadow_paint.set_anti_alias(true);
-            shadow_paint.set_color(Color::from_argb(FOCUS_SHADOW_ALPHA, 0, 0, 0));
+            shadow_paint.set_color(crate::color::black_alpha(FOCUS_SHADOW_ALPHA));
             shadow_paint.set_mask_filter(MaskFilter::blur(
                 BlurStyle::Normal,
                 FOCUS_SHADOW_BLUR,
@@ -2612,7 +2612,7 @@ impl KeptApp {
             // White card fill.
             let mut fill_paint = Paint::default();
             fill_paint.set_anti_alias(true);
-            fill_paint.set_color(Color::WHITE);
+            fill_paint.set_color(crate::color::BG_CARD);
             canvas.draw_round_rect(card_rect, FOCUS_RADIUS, FOCUS_RADIUS, &fill_paint);
         }
 
@@ -2715,7 +2715,7 @@ impl KeptApp {
                         let baseline = header_y + (-hm.ascent);
                         let mut hp = Paint::default();
                         hp.set_anti_alias(true);
-                        hp.set_color(Color::from_rgb(0x70, 0x68, 0x58));
+                        hp.set_color(crate::color::TEXT_MUTED_WARM);
                         canvas.draw_str(
                             label,
                             Point::new(cells_left, baseline),
@@ -2726,7 +2726,7 @@ impl KeptApp {
                         let line_y = baseline - hm.ascent / 3.0;
                         let mut lp = Paint::default();
                         lp.set_anti_alias(true);
-                        lp.set_color(Color::from_argb(0x80, 0x70, 0x68, 0x58));
+                        lp.set_color(crate::color::HEADING_RULE);
                         lp.set_stroke_width(1.5);
                         canvas.draw_line(
                             Point::new(cells_left + label_w + 8.0 * scale, line_y),
@@ -2780,12 +2780,7 @@ impl KeptApp {
                         outline.set_anti_alias(true);
                         outline.set_style(PaintStyle::Stroke);
                         outline.set_stroke_width(CELL_OUTLINE_STROKE);
-                        outline.set_color(Color::from_argb(
-                            CELL_OUTLINE_ALPHA,
-                            0x1c,
-                            0x1c,
-                            0x1c,
-                        ));
+                        outline.set_color(crate::color::dark_alpha(CELL_OUTLINE_ALPHA));
                         let rect = Rect::new(
                             cell_x - FOCUS_PAD,
                             cell_y - FOCUS_PAD,
@@ -2838,7 +2833,7 @@ impl KeptApp {
             focus_paint.set_anti_alias(true);
             focus_paint.set_style(PaintStyle::Stroke);
             focus_paint.set_stroke_width(stroke);
-            focus_paint.set_color(Color::from_argb(alpha, 0x4a, 0x90, 0xe2));
+            focus_paint.set_color(crate::color::accent_blue_alpha(alpha));
             let rect = Rect::new(
                 cx - FOCUS_PAD,
                 cy - FOCUS_PAD,
@@ -2879,7 +2874,7 @@ impl KeptApp {
                 let mut sb_paint = Paint::default();
                 sb_paint.set_anti_alias(true);
                 let alpha_byte = (alpha * 0xb0 as f32).round() as u8;
-                sb_paint.set_color(Color::from_argb(alpha_byte, 0x1c, 0x1c, 0x1c));
+                sb_paint.set_color(crate::color::dark_alpha(alpha_byte));
                 let r = SCROLLBAR_WIDTH * 0.5;
                 canvas.draw_round_rect(
                     Rect::new(bar_x, thumb_top, bar_x + SCROLLBAR_WIDTH, thumb_bot),
@@ -3736,7 +3731,7 @@ impl KeptApp {
         // Drop shadow.
         let mut shadow = Paint::default();
         shadow.set_anti_alias(true);
-        shadow.set_color(Color::from_argb(0x40, 0, 0, 0));
+        shadow.set_color(crate::color::SHADOW_MENU);
         shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
         canvas.draw_round_rect(
             Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
@@ -3748,20 +3743,20 @@ impl KeptApp {
         // Background + border.
         let mut bg = Paint::default();
         bg.set_anti_alias(true);
-        bg.set_color(Color::WHITE);
+        bg.set_color(crate::color::BG_CARD);
         canvas.draw_round_rect(rect, radius, radius, &bg);
         let mut border = Paint::default();
         border.set_anti_alias(true);
         border.set_style(PaintStyle::Stroke);
         border.set_stroke_width(1.0);
-        border.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        border.set_color(crate::color::MENU_BORDER);
         canvas.draw_round_rect(rect, radius, radius, &border);
 
         // Two muted info lines.
         let info_font = Font::from_typeface(&self.typeface, 12.0 * scale);
         let mut info_paint = Paint::default();
         info_paint.set_anti_alias(true);
-        info_paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+        info_paint.set_color(crate::color::TEXT_MUTED_GREY);
         let (_, im) = info_font.metrics();
         let line1_baseline =
             rect.top + pad + (info_h + (-im.ascent) - im.descent) * 0.5;
@@ -3783,7 +3778,7 @@ impl KeptApp {
         let divider_y = rect.top + pad + info_h * 2.0 + 0.5;
         let mut divider = Paint::default();
         divider.set_anti_alias(false);
-        divider.set_color(Color::from_argb(0x28, 0x1c, 0x1c, 0x1c));
+        divider.set_color(crate::color::HAIRLINE_DIVIDER);
         canvas.draw_line(
             Point::new(rect.left + pad, divider_y),
             Point::new(rect.right - pad, divider_y),
@@ -3795,10 +3790,7 @@ impl KeptApp {
         let mouse_x = self.mouse_pos.0;
         let mouse_y = self.mouse_pos.1;
         let mut row_top = rect.top + pad + info_h * 2.0 + 1.0;
-        let mut draw_row = |label: &str,
-                            color: Color,
-                            hover_argb: (u8, u8, u8, u8)|
-         -> Rect {
+        let mut draw_row = |label: &str, color: Color, hover_bg: Color| -> Rect {
             let r = Rect::new(
                 rect.left + pad * 0.5,
                 row_top,
@@ -3812,9 +3804,7 @@ impl KeptApp {
             if hovered {
                 let mut hp = Paint::default();
                 hp.set_anti_alias(true);
-                hp.set_color(Color::from_argb(
-                    hover_argb.0, hover_argb.1, hover_argb.2, hover_argb.3,
-                ));
+                hp.set_color(hover_bg);
                 canvas.draw_round_rect(r, 4.0 * scale, 4.0 * scale, &hp);
             }
             let mut paint = Paint::default();
@@ -3835,8 +3825,8 @@ impl KeptApp {
         // Delete row (red, hover red-tinted).
         let delete_rect = draw_row(
             "Delete cell",
-            Color::from_rgb(0xc0, 0x30, 0x30),
-            (0x20, 0xc0, 0x30, 0x30),
+            crate::color::DELETE_TEXT,
+            crate::color::DELETE_HOVER_BG,
         );
 
         // Surface as reference — always present. Creates a new reference
@@ -3844,8 +3834,8 @@ impl KeptApp {
         // Ctrl+N cell would land. Hover uses the warm-tan tint.
         let surface_rect = draw_row(
             "Surface as reference",
-            Color::from_rgb(0x40, 0x40, 0x40),
-            (0x20, 0xb3, 0x92, 0x60),
+            crate::color::TEXT_MENU_ROW,
+            crate::color::EMBED_HOVER,
         );
 
         // Surface bullet sub-tree as reference — only when right-click hit
@@ -3855,8 +3845,8 @@ impl KeptApp {
             let label = format!("Surface '{}' as reference", snip);
             Some(draw_row(
                 &label,
-                Color::from_rgb(0x40, 0x40, 0x40),
-                (0x20, 0xb3, 0x92, 0x60),
+                crate::color::TEXT_MENU_ROW,
+                crate::color::EMBED_HOVER,
             ))
         } else {
             None
@@ -3893,7 +3883,7 @@ impl KeptApp {
                 let (_, fm) = font.metrics();
                 let mut paint = Paint::default();
                 paint.set_anti_alias(true);
-                paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+                paint.set_color(crate::color::TEXT_SECTION_HEADER);
                 canvas.draw_str(
                     "Entity not found",
                     Point::new(cells_left, MARGIN_TOP + (-fm.ascent)),
@@ -3911,7 +3901,7 @@ impl KeptApp {
         let (_, tm) = title_font.metrics();
         let mut title_paint = Paint::default();
         title_paint.set_anti_alias(true);
-        title_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        title_paint.set_color(crate::color::TEXT_PRIMARY);
         canvas.draw_str(
             &entity.display_name,
             Point::new(cells_left, y + (-tm.ascent)),
@@ -3935,7 +3925,7 @@ impl KeptApp {
         let (_, mm) = meta_font.metrics();
         let mut meta_paint = Paint::default();
         meta_paint.set_anti_alias(true);
-        meta_paint.set_color(Color::from_rgb(0x70, 0x68, 0x58));
+        meta_paint.set_color(crate::color::TEXT_MUTED_WARM);
         y += 4.0 * scale;
         let meta_baseline = y + (-mm.ascent);
         canvas.draw_str(
@@ -3987,7 +3977,7 @@ impl KeptApp {
         let (_, hm) = header_font.metrics();
         let mut header_paint = Paint::default();
         header_paint.set_anti_alias(true);
-        header_paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+        header_paint.set_color(crate::color::TEXT_SECTION_HEADER);
         canvas.draw_str(
             "BACKING CELL",
             Point::new(cells_left, y + (-hm.ascent)),
@@ -4018,12 +4008,7 @@ impl KeptApp {
                     outline.set_anti_alias(true);
                     outline.set_style(PaintStyle::Stroke);
                     outline.set_stroke_width(CELL_OUTLINE_STROKE);
-                    outline.set_color(Color::from_argb(
-                        CELL_OUTLINE_ALPHA,
-                        0x1c,
-                        0x1c,
-                        0x1c,
-                    ));
+                    outline.set_color(crate::color::dark_alpha(CELL_OUTLINE_ALPHA));
                     let rect = Rect::new(
                         cells_left - FOCUS_PAD,
                         y - FOCUS_PAD,
@@ -4039,7 +4024,7 @@ impl KeptApp {
                 // panicking.
                 let mut paint = Paint::default();
                 paint.set_anti_alias(true);
-                paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+                paint.set_color(crate::color::TEXT_SECTION_HEADER);
                 canvas.draw_str(
                     "Backing cell missing",
                     Point::new(cells_left, y + (-mm.ascent)),
@@ -4067,18 +4052,18 @@ impl KeptApp {
             let bg_alpha: u8 = if hovered { 0x18 } else { 0x08 };
             let mut bg = Paint::default();
             bg.set_anti_alias(true);
-            bg.set_color(Color::from_argb(bg_alpha, 0x1c, 0x1c, 0x1c));
+            bg.set_color(crate::color::dark_alpha(bg_alpha));
             canvas.draw_round_rect(btn_rect, 6.0 * scale, 6.0 * scale, &bg);
             let mut border = Paint::default();
             border.set_anti_alias(true);
             border.set_style(PaintStyle::Stroke);
             border.set_stroke_width(1.0);
-            border.set_color(Color::from_argb(0x40, 0x1c, 0x1c, 0x1c));
+            border.set_color(crate::color::BUTTON_BORDER_FAINT);
             canvas.draw_round_rect(btn_rect, 6.0 * scale, 6.0 * scale, &border);
 
             let mut lp = Paint::default();
             lp.set_anti_alias(true);
-            lp.set_color(Color::from_rgb(0x60, 0x58, 0x48));
+            lp.set_color(crate::color::TEXT_MUTED_WARM_DEEP);
             let label = "+ Create backing cell";
             let lw = meta_font.measure_str(label, Some(&lp)).0;
             let label_baseline =
@@ -4116,7 +4101,7 @@ impl KeptApp {
             y += ENTITY_SECTION_GAP * scale;
             let mut ref_header_paint = Paint::default();
             ref_header_paint.set_anti_alias(true);
-            ref_header_paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+            ref_header_paint.set_color(crate::color::TEXT_SECTION_HEADER);
             canvas.draw_str(
                 "REFERENCED IN",
                 Point::new(cells_left, y + (-hm.ascent)),
@@ -4204,7 +4189,7 @@ impl KeptApp {
         let (_, tm) = title_font.metrics();
         let mut title_paint = Paint::default();
         title_paint.set_anti_alias(true);
-        title_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        title_paint.set_color(crate::color::TEXT_PRIMARY);
         let title_baseline = y + (-tm.ascent);
         canvas.draw_str(
             "People",
@@ -4221,7 +4206,7 @@ impl KeptApp {
         let (_, lm) = label_font.metrics();
         let mut label_paint = Paint::default();
         label_paint.set_anti_alias(true);
-        label_paint.set_color(Color::from_rgb(0x70, 0x68, 0x58));
+        label_paint.set_color(crate::color::TEXT_MUTED_WARM);
         let label = "Show inactive";
         let label_w = label_font.measure_str(label, Some(&label_paint)).0;
         let toggle_right = cells_left + content_width;
@@ -4284,17 +4269,17 @@ impl KeptApp {
 
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
-        text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        text_paint.set_color(crate::color::TEXT_PRIMARY);
         let mut inactive_paint = Paint::default();
         inactive_paint.set_anti_alias(true);
-        inactive_paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+        inactive_paint.set_color(crate::color::TEXT_SECTION_HEADER);
         let mut divider_paint = Paint::default();
         divider_paint.set_anti_alias(true);
-        divider_paint.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+        divider_paint.set_color(crate::color::HOVER_FAINT);
         divider_paint.set_stroke_width(1.0);
         let mut hover_paint = Paint::default();
         hover_paint.set_anti_alias(true);
-        hover_paint.set_color(Color::from_argb(0x14, 0x1c, 0x1c, 0x1c));
+        hover_paint.set_color(crate::color::dark_alpha(0x14));
 
         for (display_name, entity_id, is_active) in &people {
             let row_rect = Rect::new(cells_left, y, cells_left + row_w, y + row_h);
@@ -4378,7 +4363,7 @@ impl KeptApp {
         } else {
             let mut muted = Paint::default();
             muted.set_anti_alias(true);
-            muted.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+            muted.set_color(crate::color::TEXT_SECTION_HEADER);
             canvas.draw_str(
                 "+ Add person…",
                 Point::new(
@@ -4634,12 +4619,12 @@ impl KeptApp {
         // Background panel.
         let mut bg_paint = Paint::default();
         bg_paint.set_anti_alias(true);
-        bg_paint.set_color(Color::from_rgb(0xf2, 0xee, 0xe6));
+        bg_paint.set_color(crate::color::BG_PANEL);
         canvas.draw_rect(Rect::new(0.0, 0.0, sb_w, height.max(0.0)), &bg_paint);
         // Right-edge separator.
         let mut sep = Paint::default();
         sep.set_anti_alias(false);
-        sep.set_color(Color::from_rgb(0xdc, 0xd4, 0xc6));
+        sep.set_color(crate::color::DIVIDER_PANE);
         canvas.draw_rect(
             Rect::new(sb_w - 1.0, 0.0, sb_w, height.max(0.0)),
             &sep,
@@ -4649,7 +4634,7 @@ impl KeptApp {
             Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
         let mut header_paint = Paint::default();
         header_paint.set_anti_alias(true);
-        header_paint.set_color(Color::from_rgb(0x90, 0x88, 0x7a));
+        header_paint.set_color(crate::color::TEXT_SECTION_HEADER);
         let (_, hm) = header_font.metrics();
 
         // Sidebar shows one row per local date that has any contexts.
@@ -4691,17 +4676,17 @@ impl KeptApp {
         if people_active {
             let mut p = Paint::default();
             p.set_anti_alias(true);
-            p.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+            p.set_color(crate::color::ACCENT_BLUE_SELECTION);
             canvas.draw_round_rect(people_rect, radius, radius, &p);
         } else if people_hovered {
             let mut p = Paint::default();
             p.set_anti_alias(true);
-            p.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+            p.set_color(crate::color::HOVER_FAINT);
             canvas.draw_round_rect(people_rect, radius, radius, &p);
         }
         let mut row_paint = Paint::default();
         row_paint.set_anti_alias(true);
-        row_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        row_paint.set_color(crate::color::TEXT_PRIMARY);
         let people_baseline =
             sidebar_y + (date_h + (-dm_pages.ascent) - dm_pages.descent) * 0.5;
         canvas.draw_str(
@@ -4782,17 +4767,17 @@ impl KeptApp {
             if date_active {
                 let mut p = Paint::default();
                 p.set_anti_alias(true);
-                p.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+                p.set_color(crate::color::ACCENT_BLUE_SELECTION);
                 canvas.draw_round_rect(date_rect, radius, radius, &p);
             } else if date_hovered {
                 let mut p = Paint::default();
                 p.set_anti_alias(true);
-                p.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+                p.set_color(crate::color::HOVER_FAINT);
                 canvas.draw_round_rect(date_rect, radius, radius, &p);
             }
             let mut date_paint = Paint::default();
             date_paint.set_anti_alias(true);
-            date_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+            date_paint.set_color(crate::color::TEXT_PRIMARY);
             let date_baseline = y + (date_h + (-dm.ascent) - dm.descent) * 0.5;
             canvas.draw_str(
                 format_date_label(d),
@@ -4838,17 +4823,17 @@ impl KeptApp {
                 if row_active {
                     let mut p = Paint::default();
                     p.set_anti_alias(true);
-                    p.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+                    p.set_color(crate::color::ACCENT_BLUE_SELECTION);
                     canvas.draw_round_rect(row_rect, radius, radius, &p);
                 } else if row_hovered {
                     let mut p = Paint::default();
                     p.set_anti_alias(true);
-                    p.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+                    p.set_color(crate::color::HOVER_FAINT);
                     canvas.draw_round_rect(row_rect, radius, radius, &p);
                 }
                 let mut tp = Paint::default();
                 tp.set_anti_alias(true);
-                tp.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+                tp.set_color(crate::color::TEXT_PRIMARY);
                 let baseline = y + (date_h + (-dm.ascent) - dm.descent) * 0.5;
                 canvas.draw_str(
                     format!("#{name}"),
@@ -4904,7 +4889,7 @@ impl KeptApp {
         // Drop shadow.
         let mut shadow = Paint::default();
         shadow.set_anti_alias(true);
-        shadow.set_color(Color::from_argb(0x40, 0, 0, 0));
+        shadow.set_color(crate::color::SHADOW_MENU);
         shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 14.0, false));
         canvas.draw_round_rect(
             Rect::new(popup_x, popup_y + 4.0, popup_x + popup_w, popup_y + popup_h + 4.0),
@@ -4916,7 +4901,7 @@ impl KeptApp {
         // Background card.
         let mut bg = Paint::default();
         bg.set_anti_alias(true);
-        bg.set_color(Color::WHITE);
+        bg.set_color(crate::color::BG_CARD);
         let card = Rect::new(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h);
         canvas.draw_round_rect(card, radius, radius, &bg);
 
@@ -4924,7 +4909,7 @@ impl KeptApp {
         border.set_anti_alias(true);
         border.set_style(PaintStyle::Stroke);
         border.set_stroke_width(1.0);
-        border.set_color(Color::from_rgb(0xc8, 0xc0, 0xb0));
+        border.set_color(crate::color::PANEL_BORDER_WARM);
         canvas.draw_round_rect(card, radius, radius, &border);
 
         // Input row: drive the TextBox directly so caret, selection, arrow
@@ -4950,7 +4935,7 @@ impl KeptApp {
             let baseline = input_y + (-im.ascent);
             let mut hint = Paint::default();
             hint.set_anti_alias(true);
-            hint.set_color(Color::from_rgb(0xa8, 0xa0, 0x90));
+            hint.set_color(crate::color::TEXT_GHOST_WARM);
             canvas.draw_str(
                 "Search…",
                 Point::new(input_x, baseline),
@@ -4963,7 +4948,7 @@ impl KeptApp {
         let div_y = popup_y + pad + input_h - 4.0 * scale;
         let mut div = Paint::default();
         div.set_anti_alias(false);
-        div.set_color(Color::from_argb(0x30, 0x40, 0x40, 0x40));
+        div.set_color(crate::color::TOGGLE_INACTIVE_BG);
         canvas.draw_line(
             (popup_x + pad, div_y),
             (popup_x + popup_w - pad, div_y),
@@ -4978,10 +4963,10 @@ impl KeptApp {
         let (_, rm) = result_font.metrics();
         let mut date_paint = Paint::default();
         date_paint.set_anti_alias(true);
-        date_paint.set_color(Color::from_rgb(0x80, 0x78, 0x68));
+        date_paint.set_color(crate::color::TEXT_MUTED_WARM_SOFT);
         let mut row_paint = Paint::default();
         row_paint.set_anti_alias(true);
-        row_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        row_paint.set_color(crate::color::TEXT_PRIMARY);
 
         let selected = self.search.as_ref().map(|s| s.selected).unwrap_or(0);
         let mut row_y = popup_y + pad + input_h;
@@ -4990,7 +4975,7 @@ impl KeptApp {
             if is_selected {
                 let mut sel = Paint::default();
                 sel.set_anti_alias(true);
-                sel.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+                sel.set_color(crate::color::ACCENT_BLUE_SELECTION);
                 canvas.draw_rect(
                     Rect::new(
                         popup_x + pad * 0.5,
@@ -5029,7 +5014,7 @@ impl KeptApp {
             let baseline = popup_y + pad + input_h + (result_h + (-rm.ascent) - rm.descent) * 0.5;
             let mut empty_paint = Paint::default();
             empty_paint.set_anti_alias(true);
-            empty_paint.set_color(Color::from_rgb(0x90, 0x88, 0x78));
+            empty_paint.set_color(crate::color::TEXT_SECTION_HEADER);
             canvas.draw_str(
                 "no matches",
                 Point::new(popup_x + pad, baseline),
@@ -5058,7 +5043,7 @@ impl KeptApp {
         // Drop shadow.
         let mut shadow = Paint::default();
         shadow.set_anti_alias(true);
-        shadow.set_color(Color::from_argb(0x40, 0, 0, 0));
+        shadow.set_color(crate::color::SHADOW_MENU);
         shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
         canvas.draw_round_rect(
             Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
@@ -5069,13 +5054,13 @@ impl KeptApp {
         // Background card.
         let mut bg = Paint::default();
         bg.set_anti_alias(true);
-        bg.set_color(Color::WHITE);
+        bg.set_color(crate::color::BG_CARD);
         canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &bg);
         let mut border = Paint::default();
         border.set_anti_alias(true);
         border.set_style(PaintStyle::Stroke);
         border.set_stroke_width(1.0);
-        border.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        border.set_color(crate::color::MENU_BORDER);
         canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &border);
         // "Delete tag" row.
         let row_rect = Rect::new(
@@ -5093,7 +5078,7 @@ impl KeptApp {
         if hovered {
             let mut hp = Paint::default();
             hp.set_anti_alias(true);
-            hp.set_color(Color::from_argb(0x20, 0xc0, 0x30, 0x30));
+            hp.set_color(crate::color::DELETE_HOVER_BG);
             canvas.draw_round_rect(row_rect, 4.0 * scale, 4.0 * scale, &hp);
         }
         let font = Font::from_typeface(&self.typeface, 13.0 * scale);
@@ -5101,7 +5086,7 @@ impl KeptApp {
         let baseline = row_rect.top + (row_h + (-m.ascent) - m.descent) * 0.5;
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
-        text_paint.set_color(Color::from_rgb(0xc0, 0x30, 0x30));
+        text_paint.set_color(crate::color::DELETE_TEXT);
         canvas.draw_str(
             format!("Delete tag #{}", menu.name),
             Point::new(row_rect.left + pad, baseline),
@@ -5135,7 +5120,7 @@ impl KeptApp {
         // Drop shadow.
         let mut shadow = Paint::default();
         shadow.set_anti_alias(true);
-        shadow.set_color(Color::from_argb(0x40, 0, 0, 0));
+        shadow.set_color(crate::color::SHADOW_MENU);
         shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
         canvas.draw_round_rect(
             Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
@@ -5146,13 +5131,13 @@ impl KeptApp {
         // Background.
         let mut bg = Paint::default();
         bg.set_anti_alias(true);
-        bg.set_color(Color::WHITE);
+        bg.set_color(crate::color::BG_CARD);
         canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &bg);
         let mut border = Paint::default();
         border.set_anti_alias(true);
         border.set_style(PaintStyle::Stroke);
         border.set_stroke_width(1.0);
-        border.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        border.set_color(crate::color::MENU_BORDER);
         canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &border);
 
         let font = Font::from_typeface(&self.typeface, 13.0 * scale);
@@ -5161,13 +5146,13 @@ impl KeptApp {
         let mouse_y = self.mouse_pos.1;
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
-        text_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        text_paint.set_color(crate::color::TEXT_PRIMARY);
         let mut dim_paint = Paint::default();
         dim_paint.set_anti_alias(true);
-        dim_paint.set_color(Color::from_rgb(0xa0, 0x9a, 0x90));
+        dim_paint.set_color(crate::color::TEXT_DISABLED);
         let mut delete_paint = Paint::default();
         delete_paint.set_anti_alias(true);
-        delete_paint.set_color(Color::from_rgb(0xc0, 0x30, 0x30));
+        delete_paint.set_color(crate::color::DELETE_TEXT);
 
         // Rename row.
         let rename_rect = Rect::new(
@@ -5183,7 +5168,7 @@ impl KeptApp {
         if rename_hovered {
             let mut hp = Paint::default();
             hp.set_anti_alias(true);
-            hp.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+            hp.set_color(crate::color::HOVER_FAINT);
             canvas.draw_round_rect(rename_rect, 4.0 * scale, 4.0 * scale, &hp);
         }
         let rename_baseline =
@@ -5211,7 +5196,7 @@ impl KeptApp {
         if delete_hovered {
             let mut hp = Paint::default();
             hp.set_anti_alias(true);
-            hp.set_color(Color::from_argb(0x20, 0xc0, 0x30, 0x30));
+            hp.set_color(crate::color::DELETE_HOVER_BG);
             canvas.draw_round_rect(delete_rect, 4.0 * scale, 4.0 * scale, &hp);
         }
         let delete_baseline =
@@ -5290,7 +5275,7 @@ impl KeptApp {
         // Drop shadow (drawn first, slightly offset).
         let mut shadow_paint = Paint::default();
         shadow_paint.set_anti_alias(true);
-        shadow_paint.set_color(Color::from_argb(0x30, 0, 0, 0));
+        shadow_paint.set_color(crate::color::SHADOW_SOFT);
         canvas.draw_round_rect(
             Rect::new(
                 popup_x + 1.0,
@@ -5306,7 +5291,7 @@ impl KeptApp {
         // Background.
         let mut bg_paint = Paint::default();
         bg_paint.set_anti_alias(true);
-        bg_paint.set_color(Color::WHITE);
+        bg_paint.set_color(crate::color::BG_CARD);
         let popup_rect = Rect::new(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h);
         canvas.draw_round_rect(popup_rect, radius, radius, &bg_paint);
 
@@ -5315,7 +5300,7 @@ impl KeptApp {
         border_paint.set_anti_alias(true);
         border_paint.set_style(PaintStyle::Stroke);
         border_paint.set_stroke_width(1.0);
-        border_paint.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        border_paint.set_color(crate::color::MENU_BORDER);
         canvas.draw_round_rect(popup_rect, radius, radius, &border_paint);
 
         let body_font = Font::from_typeface(&self.typeface, MENTION_BODY_FONT_SIZE * scale);
@@ -5326,7 +5311,7 @@ impl KeptApp {
         if items.is_empty() {
             let mut hint_paint = Paint::default();
             hint_paint.set_anti_alias(true);
-            hint_paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+            hint_paint.set_color(crate::color::TEXT_MUTED_GREY);
             let baseline = popup_y + pad + text_offset_in_row;
             let label = if popup.query.is_empty() {
                 "Type to search…".to_string()
@@ -5344,15 +5329,15 @@ impl KeptApp {
 
         let mut dim_paint = Paint::default();
         dim_paint.set_anti_alias(true);
-        dim_paint.set_color(Color::from_rgb(0x80, 0x80, 0x80));
+        dim_paint.set_color(crate::color::TEXT_MUTED_GREY);
 
         let mut match_paint = Paint::default();
         match_paint.set_anti_alias(true);
-        match_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+        match_paint.set_color(crate::color::TEXT_PRIMARY);
 
         let mut hl_paint = Paint::default();
         hl_paint.set_anti_alias(true);
-        hl_paint.set_color(Color::from_argb(0x40, 0x4a, 0x90, 0xe2));
+        hl_paint.set_color(crate::color::ACCENT_BLUE_SELECTION);
 
         let selected = popup.selected.min(visible - 1);
         let mut row_y = popup_y + pad;
@@ -6882,15 +6867,15 @@ fn draw_toggle(canvas: &Canvas, rect: Rect, on: bool, hovered: bool) {
     let mut track = Paint::default();
     track.set_anti_alias(true);
     if on {
-        track.set_color(Color::from_argb(0xff, 0x4a, 0x90, 0xe2));
+        track.set_color(crate::color::ACCENT_BLUE_FOCUS_EDIT);
     } else {
-        track.set_color(Color::from_argb(0x60, 0x90, 0x88, 0x7a));
+        track.set_color(crate::color::TOGGLE_OFF_BG);
     }
     canvas.draw_round_rect(rect, radius, radius, &track);
     if hovered {
         let mut overlay = Paint::default();
         overlay.set_anti_alias(true);
-        overlay.set_color(Color::from_argb(0x18, 0x1c, 0x1c, 0x1c));
+        overlay.set_color(crate::color::HOVER_FAINT);
         canvas.draw_round_rect(rect, radius, radius, &overlay);
     }
     // Knob.
@@ -6904,7 +6889,7 @@ fn draw_toggle(canvas: &Canvas, rect: Rect, on: bool, hovered: bool) {
     };
     let mut knob = Paint::default();
     knob.set_anti_alias(true);
-    knob.set_color(Color::WHITE);
+    knob.set_color(crate::color::BG_CARD);
     canvas.draw_circle((cx, cy), knob_r, &knob);
 }
 

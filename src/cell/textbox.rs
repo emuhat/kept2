@@ -123,7 +123,7 @@ impl TextBox {
             click_count: 0,
             font_scale: 1.0,
             links: Vec::new(),
-            text_color: Color::from_rgb(0x1c, 0x1c, 0x1c),
+            text_color: crate::color::TEXT_PRIMARY,
             force_heading: false,
             enable_comment_coloring: false,
             pending_link_url: None,
@@ -686,7 +686,7 @@ impl TextBox {
         text_paint.set_color(self.text_color);
         let mut tag_paint = Paint::default();
         tag_paint.set_anti_alias(true);
-        tag_paint.set_color(Color::from_rgb(0x90, 0x90, 0x90));
+        tag_paint.set_color(crate::color::TEXT_GHOST);
 
         let (_, body_metrics) = body_font.metrics();
         let (_, heading_metrics) = heading_font.metrics();
@@ -710,7 +710,7 @@ impl TextBox {
         if focused {
             let mut hl_paint = Paint::default();
             hl_paint.set_anti_alias(true);
-            hl_paint.set_color(Color::from_argb(0x60, 0x4a, 0x90, 0xe2));
+            hl_paint.set_color(crate::color::accent_blue_alpha(0x60));
             for sel in &self.sels.items {
                 if sel.is_collapsed() {
                     continue;
@@ -763,16 +763,16 @@ impl TextBox {
         // between plain and linked styling.
         let mut link_paint = Paint::default();
         link_paint.set_anti_alias(true);
-        link_paint.set_color(Color::from_rgb(0x1a, 0x66, 0xc4));
+        link_paint.set_color(crate::color::LINK_TEXT);
         let mut underline_paint = Paint::default();
         underline_paint.set_anti_alias(true);
-        underline_paint.set_color(Color::from_rgb(0x1a, 0x66, 0xc4));
+        underline_paint.set_color(crate::color::LINK_TEXT);
         underline_paint.set_stroke_width(1.0);
         // Dark-green paint used for `#`-comment lines when comment coloring
         // is enabled (PopPop input cells). Built once per tick.
         let mut comment_paint = Paint::default();
         comment_paint.set_anti_alias(true);
-        comment_paint.set_color(Color::from_rgb(0x1f, 0x6b, 0x2a));
+        comment_paint.set_color(crate::color::POPPOP_COMMENT);
         for (li, line) in self.body_lines.iter().enumerate() {
             let baseline = baselines_local[li] + y;
             // Trailing '\n' is part of the line range but not drawn.
@@ -858,7 +858,7 @@ impl TextBox {
         if show_caret {
             let mut caret_paint = Paint::default();
             caret_paint.set_anti_alias(false);
-            caret_paint.set_color(Color::from_rgb(0x1c, 0x1c, 0x1c));
+            caret_paint.set_color(crate::color::TEXT_PRIMARY);
             for sel in &self.sels.items {
                 let (li, offset) = locate_caret(&self.body_lines, sel.head, sel.affinity);
                 let baseline = baselines_local[li] + y;

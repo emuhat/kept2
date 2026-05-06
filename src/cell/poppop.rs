@@ -3,7 +3,7 @@
 //! (read-only). Each `\n`-separated input source line gets one output
 //! line. Errors render in red beneath their failing input row.
 
-use skia_safe::{Canvas, Color, Font, Paint, Point, Typeface};
+use skia_safe::{Canvas, Font, Paint, Point, Typeface};
 use winit::event::{KeyEvent, Modifiers};
 
 use super::TextBox;
@@ -23,8 +23,6 @@ const POPPOP_ERROR_INDENT: f32 = 14.0;
 /// row begins. Keeps the error from kissing the divider above the row
 /// underneath.
 const POPPOP_ERROR_BOTTOM_PAD: f32 = 4.0;
-/// Dark red used for PopPop error text.
-const POPPOP_ERROR_RGB: (u8, u8, u8) = (0x9a, 0x1e, 0x1e);
 
 /// Calculator-style "REPL" cell. Single TextBox for input on the left;
 /// each `\n`-separated source line gets a sentinel `42` rendered on the
@@ -118,7 +116,7 @@ pub(crate) fn compute_poppop_output(
 impl PopPopCell {
     pub fn new(typeface: Typeface) -> Self {
         let mut output = TextBox::new(typeface.clone(), String::new());
-        output.set_text_color(Color::from_rgb(0x18, 0x3a, 0x9c));
+        output.set_text_color(crate::color::POPPOP_OUTPUT);
         let mut input = TextBox::new(typeface.clone(), String::new());
         // PopPop is the only cell type that wants `#`-prefixed lines
         // colored as comments (and skipped by the evaluator).
@@ -275,8 +273,7 @@ impl PopPopCell {
         if !self.errors.is_empty() {
             let mut err_paint = Paint::default();
             err_paint.set_anti_alias(true);
-            let (er, eg, eb) = POPPOP_ERROR_RGB;
-            err_paint.set_color(Color::from_rgb(er, eg, eb));
+            err_paint.set_color(crate::color::POPPOP_ERROR);
             for (paragraph_idx, msg) in &self.errors {
                 let Some(&(_, bot_abs, _)) = bands.get(*paragraph_idx) else {
                     continue;
