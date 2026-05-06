@@ -1583,9 +1583,12 @@ impl KeptApp {
         let mut stroke = Paint::default();
         stroke.set_anti_alias(true);
         stroke.set_style(PaintStyle::Stroke);
-        stroke.set_stroke_width(1.0);
+        stroke.set_stroke_width(1.5);
+        stroke.set_stroke_cap(skia_safe::PaintCap::Round);
         stroke.set_color(crate::color::EMBED_BORDER);
-        if let Some(eff) = PathEffect::dash(&[4.0, 2.0], 0.0) {
+        // Tight dots: a near-zero "on" segment with round caps draws as a
+        // single round dot at each interval; "off" sets the spacing.
+        if let Some(eff) = PathEffect::dash(&[0.0, 4.0], 0.0) {
             stroke.set_path_effect(eff);
         }
         canvas.draw_round_rect(wrapper, FOCUS_RADIUS, FOCUS_RADIUS, &stroke);
