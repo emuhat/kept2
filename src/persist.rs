@@ -1342,6 +1342,226 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cell::{Bullet, Cell, OutlineCell, ReferenceTarget, TableCell, now_epoch_ms};
+    use skia_safe::FontMgr;
+
+    fn typeface() -> Typeface {
+        FontMgr::new()
+            .new_from_data(
+                include_bytes!("../resources/fonts/Figtree.ttf"),
+                None,
+            )
+            .expect("font loads")
+    }
+
+    /// Send a `Cell` through the persistence pipeline (build PersistedCell,
+    /// serialize to JSON, deserialize, reconstruct Cell) and return the
+    /// reborn cell. Mirrors what `Db::load_cells` does in production.
+    fn round_trip(cell: &Cell, typeface: &Typeface) -> Cell {
+        let pc = persisted_cell_from(cell);
+        let json = serde_json::to_string(&pc).expect("serialize");
+        let pc: PersistedCell = serde_json::from_str(&json).expect("deserialize");
+        let title = pc.title.map(|t| {
+            let mut tb = TextBox::new(typeface.clone(), t.text);
+            tb.set_force_heading(true);
+            for l in t.links {
+                tb.add_link(l.start..l.end, l.url);
+            }
+            tb
+        });
+        let kind = body_to_kind(pc.body, typeface);
+        Cell::from_parts(
+            cell.id,
+            kind,
+            title,
+            cell.timestamp,
+            cell.edited_at,
+            cell.context_hint_id,
+        )
+    }
+
+    #[test]
+    fn round_trip_plain_cell_preserves_text_and_links() {
+        let tf = typeface();
+        let mut cell = Cell::new(tf.clone(), "hello LINK world".to_string());
+        cell.add_link_to_first(6..10, "https://example.com/a".to_string());
+        let back = round_trip(&cell, &tf);
+        match (&cell.kind, &back.kind) {
+            (CellKind::Plain(orig), CellKind::Plain(reborn)) => {
+                assert_eq!(orig.text(), reborn.text());
+                assert_eq!(orig.links().len(), reborn.links().len(), "link count");
+                let (o, r) = (&orig.links()[0], &reborn.links()[0]);
+                assert_eq!(o.range, r.range);
+                assert_eq!(o.url, r.url);
+            }
+            _ => panic!("variant must round-trip as Plain"),
+        }
+        assert_eq!(cell.id, back.id);
+        assert_eq!(cell.timestamp, back.timestamp);
+    }
+
+    #[test]
+    fn round_trip_outline_preserves_bullets_depths_and_links() {
+        let tf = typeface();
+        let mut cell = Cell::new_outline(tf.clone());
+        // Mutate the lone seed bullet via OutlineCell directly to set up a
+        // known shape: text + a link.
+        if let CellKind::Outline(oc) = &mut cell.kind {
+            // Grab the seed bullet's id, then build a richer set replacing it.
+            let seed_id = oc.bullets()[0].id();
+            let mut tb1 = TextBox::new(tf.clone(), "root LINK here".to_string());
+            tb1.add_link(5..9, "https://example.com/r".to_string());
+            let b1 = Bullet::new(seed_id, tb1, 0);
+            let b2 = Bullet::new(
+                Uuid::now_v7(),
+                TextBox::new(tf.clone(), "child".to_string()),
+                1,
+            );
+            let b3 = Bullet::new(
+                Uuid::now_v7(),
+                TextBox::new(tf.clone(), "grandchild".to_string()),
+                2,
+            );
+            *oc = OutlineCell::from_bullets(tf.clone(), vec![b1, b2, b3]);
+        }
+        let back = round_trip(&cell, &tf);
+        match (&cell.kind, &back.kind) {
+            (CellKind::Outline(orig), CellKind::Outline(reborn)) => {
+                assert_eq!(orig.bullets().len(), reborn.bullets().len());
+                for (o, r) in orig.bullets().iter().zip(reborn.bullets().iter()) {
+                    assert_eq!(o.id(), r.id());
+                    assert_eq!(o.depth(), r.depth());
+                    assert_eq!(o.textbox().text(), r.textbox().text());
+                    assert_eq!(o.textbox().links().len(), r.textbox().links().len());
+                }
+                // Specifically: the link on bullet 0 survived.
+                let r_links = reborn.bullets()[0].textbox().links();
+                assert_eq!(r_links.len(), 1);
+                assert_eq!(r_links[0].range, 5..9);
+                assert_eq!(r_links[0].url, "https://example.com/r");
+            }
+            _ => panic!("variant must round-trip as Outline"),
+        }
+    }
+
+    #[test]
+    fn round_trip_poppop_preserves_input_and_links() {
+        let tf = typeface();
+        let mut cell = Cell::new_poppop(tf.clone());
+        if let CellKind::PopPop(pc) = &mut cell.kind {
+            pc.textbox_mut().replace_text("2 + 3\nx LINK".to_string());
+            pc.textbox_mut().add_link(8..12, "https://example.com/p".to_string());
+        }
+        let back = round_trip(&cell, &tf);
+        match (&cell.kind, &back.kind) {
+            (CellKind::PopPop(orig), CellKind::PopPop(reborn)) => {
+                assert_eq!(orig.textbox().text(), reborn.textbox().text());
+                assert_eq!(orig.textbox().links().len(), reborn.textbox().links().len());
+                let (o, r) = (&orig.textbox().links()[0], &reborn.textbox().links()[0]);
+                assert_eq!(o.range, r.range);
+                assert_eq!(o.url, r.url);
+            }
+            _ => panic!("variant must round-trip as PopPop"),
+        }
+    }
+
+    #[test]
+    fn round_trip_table_preserves_grid_and_readonly_flags() {
+        let tf = typeface();
+        // Build a 2×3 table with mixed text + a readonly cell + a link.
+        let triples: Vec<Vec<(String, Vec<(std::ops::Range<usize>, String)>, bool)>> = vec![
+            vec![
+                ("h1".to_string(), Vec::new(), true),
+                ("h2".to_string(), Vec::new(), true),
+                ("h3".to_string(), Vec::new(), true),
+            ],
+            vec![
+                (
+                    "a LINK".to_string(),
+                    vec![(2..6, "https://example.com/t".to_string())],
+                    false,
+                ),
+                ("b".to_string(), Vec::new(), false),
+                ("c".to_string(), Vec::new(), false),
+            ],
+        ];
+        let table = TableCell::from_records(tf.clone(), triples);
+        let cell = Cell::from_parts(
+            Uuid::now_v7(),
+            CellKind::Table(table),
+            None,
+            now_epoch_ms(),
+            now_epoch_ms(),
+            None,
+        );
+        let back = round_trip(&cell, &tf);
+        match (&cell.kind, &back.kind) {
+            (CellKind::Table(orig), CellKind::Table(reborn)) => {
+                assert_eq!(orig.rows(), reborn.rows());
+                assert_eq!(orig.cols(), reborn.cols());
+                let orig_rows = orig.rows_view();
+                let reborn_rows = reborn.rows_view();
+                for (o_row, r_row) in orig_rows.iter().zip(reborn_rows.iter()) {
+                    for (o, r) in o_row.iter().zip(r_row.iter()) {
+                        assert_eq!(o.textbox.text(), r.textbox.text());
+                        assert_eq!(o.readonly, r.readonly);
+                        assert_eq!(o.textbox.links().len(), r.textbox.links().len());
+                    }
+                }
+                // Link on (1,0) survived.
+                let r_links = reborn_rows[1][0].textbox.links();
+                assert_eq!(r_links.len(), 1);
+                assert_eq!(r_links[0].range, 2..6);
+                assert_eq!(r_links[0].url, "https://example.com/t");
+            }
+            _ => panic!("variant must round-trip as Table"),
+        }
+    }
+
+    #[test]
+    fn round_trip_reference_cell_preserves_target() {
+        let tf = typeface();
+        let target_id = Uuid::now_v7();
+        let cell = Cell::new_reference(tf.clone(), ReferenceTarget::WholeCell(target_id));
+        let back = round_trip(&cell, &tf);
+        match &back.kind {
+            CellKind::Reference(rc) => match rc.target() {
+                ReferenceTarget::WholeCell(id) => assert_eq!(id, target_id),
+                _ => panic!("WholeCell target lost"),
+            },
+            _ => panic!("variant must round-trip as Reference"),
+        }
+    }
+
+    #[test]
+    fn round_trip_title_preserves_text_and_tags() {
+        // Title round-trip with trailing tags. The title TextBox is rebuilt
+        // with force_heading=true on load; both the text and any inline
+        // links survive the cycle. Tag detection happens off the title's
+        // text via heading_tag_names, so verifying text equality also
+        // verifies tags continue to be parsed correctly.
+        let tf = typeface();
+        let mut cell = Cell::new(tf.clone(), "body".to_string());
+        cell.title = Some({
+            let mut tb = TextBox::new(tf.clone(), "Project Notes #urgent #planning".to_string());
+            tb.set_force_heading(true);
+            tb.add_link(0..7, "https://example.com/h".to_string());
+            tb
+        });
+        let back = round_trip(&cell, &tf);
+        let orig_title = cell.title.as_ref().expect("orig has title");
+        let reborn_title = back.title.as_ref().expect("title survives round-trip");
+        assert_eq!(orig_title.text(), reborn_title.text());
+        assert_eq!(orig_title.links().len(), reborn_title.links().len());
+        let (o, r) = (&orig_title.links()[0], &reborn_title.links()[0]);
+        assert_eq!(o.range, r.range);
+        assert_eq!(o.url, r.url);
+        // Tags are parsed off the title text by heading_tag_names.
+        assert_eq!(
+            back.heading_tag_names(),
+            vec!["urgent".to_string(), "planning".to_string()]
+        );
+    }
 
     #[test]
     fn reference_cell_round_trips_through_json() {

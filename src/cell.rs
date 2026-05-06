@@ -5912,6 +5912,56 @@ mod tests {
     }
 
     #[test]
+    fn reference_cache_is_stale_when_no_cache_yet() {
+        // Fresh ReferenceCell: cache is None. Any present target → stale
+        // (caller must build cache).
+        let target_id = Uuid::now_v7();
+        let rc = ReferenceCell::new(typeface(), ReferenceTarget::WholeCell(target_id));
+        assert!(rc.cache_is_stale_for(Some(123)));
+        // Target gone AND cache empty → not stale (nothing to do).
+        assert!(!rc.cache_is_stale_for(None));
+    }
+
+    #[test]
+    fn reference_cache_is_stale_when_source_edited_at_changes() {
+        // Cache built at time A; source's edited_at bumped to B → stale.
+        let target_id = Uuid::now_v7();
+        let mut rc = ReferenceCell::new(typeface(), ReferenceTarget::WholeCell(target_id));
+        // Install a fake cache (a Plain cell stand-in; the staleness check
+        // doesn't inspect contents — only the edited_at key).
+        let dummy = Cell::new(typeface(), String::new());
+        rc.install_cache(Some(dummy), Some(100));
+        assert!(!rc.cache_is_stale_for(Some(100)), "same edited_at → fresh");
+        assert!(rc.cache_is_stale_for(Some(101)), "bumped edited_at → stale");
+    }
+
+    #[test]
+    fn reference_cache_is_stale_when_target_disappears() {
+        // Cache exists but the target was deleted (None edited_at) →
+        // stale, so the render path will clear the cache.
+        let target_id = Uuid::now_v7();
+        let mut rc = ReferenceCell::new(typeface(), ReferenceTarget::WholeCell(target_id));
+        let dummy = Cell::new(typeface(), String::new());
+        rc.install_cache(Some(dummy), Some(100));
+        assert!(rc.cache_is_stale_for(None));
+    }
+
+    #[test]
+    fn reference_cache_install_clears_when_passed_none() {
+        // install_cache(None, None) is the "drop the cache" path used when
+        // the target goes missing or chains.
+        let target_id = Uuid::now_v7();
+        let mut rc = ReferenceCell::new(typeface(), ReferenceTarget::WholeCell(target_id));
+        let dummy = Cell::new(typeface(), String::new());
+        rc.install_cache(Some(dummy), Some(100));
+        assert!(rc.cache_ref().is_some());
+        rc.install_cache(None, None);
+        assert!(rc.cache_ref().is_none());
+        // After clearing, "target gone" is not stale (nothing to rebuild).
+        assert!(!rc.cache_is_stale_for(None));
+    }
+
+    #[test]
     fn table_snapshot_round_trip() {
         let mut tc = TableCell::new(typeface());
         tc.cell_at_mut(0, 0).unwrap().textbox.replace_text("alpha".to_string());

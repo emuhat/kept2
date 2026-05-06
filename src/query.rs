@@ -473,6 +473,7 @@ pub(crate) fn normalize_entity_token(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cell::TextBox;
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -709,6 +710,152 @@ mod tests {
         let title_fallback = vec![(fallback_entity, "patrickfoy".to_string())];
         let got = resolve_persons(&[person_ref("patrick")], &alias_index, &title_fallback);
         assert_eq!(got, vec![alias_entity]);
+    }
+
+    // ----- executor (matches) -----
+    //
+    // Smoke coverage for `matches` — the function the search popup and the
+    // active view both rely on to filter cells. Each test exercises one
+    // filter dimension at a time so a regression in any one of them can't
+    // hide behind another passing.
+
+    fn typeface() -> skia_safe::Typeface {
+        skia_safe::FontMgr::new()
+            .new_from_data(include_bytes!("../resources/fonts/Figtree.ttf"), None)
+            .expect("font loads")
+    }
+
+    /// Build a Plain cell with the given body text + an optional title.
+    /// The title forces heading mode so `heading_tag_names` will see the
+    /// trailing `#tag`s as tags.
+    fn make_cell(body: &str, title: Option<&str>, ts_ms: i64) -> Cell {
+        let tf = typeface();
+        let mut cell = Cell::new(tf.clone(), body.to_string());
+        cell.timestamp = ts_ms;
+        cell.edited_at = ts_ms;
+        if let Some(t) = title {
+            let mut tb = TextBox::new(tf, t.to_string());
+            tb.set_force_heading(true);
+            cell.title = Some(tb);
+        }
+        cell
+    }
+
+    fn empty_ctx(today: NaiveDate) -> MatchContext {
+        MatchContext {
+            today,
+            person_targets: Vec::new(),
+            person_excludes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn matches_tag_include_requires_all_listed_tags() {
+        let cell = make_cell("body", Some("Standup #urgent #planning"), 0);
+        let ctx = empty_ctx(day(2026, 1, 1));
+        assert!(matches(&parse("#urgent"), &cell, &ctx), "single tag hit");
+        assert!(
+            matches(&parse("#urgent #planning"), &cell, &ctx),
+            "all tags present → match"
+        );
+        assert!(
+            !matches(&parse("#urgent #missing"), &cell, &ctx),
+            "missing one tag → no match"
+        );
+    }
+
+    #[test]
+    fn matches_tag_exclude_filters_out_cells_with_listed_tag() {
+        let cell = make_cell("body", Some("Note #stale"), 0);
+        let ctx = empty_ctx(day(2026, 1, 1));
+        assert!(
+            !matches(&parse("-#stale"), &cell, &ctx),
+            "excluded tag present → no match"
+        );
+        let untagged = make_cell("body", Some("Note"), 0);
+        assert!(
+            matches(&parse("-#stale"), &untagged, &ctx),
+            "no excluded tag → match"
+        );
+    }
+
+    #[test]
+    fn matches_time_filter_day_constrains_to_that_local_date() {
+        // Build cells timestamped on two different local-time dates.
+        // Use noon UTC to dodge timezone edge cases — the local date for
+        // both is the same calendar day no matter the host TZ.
+        use chrono::TimeZone;
+        let jan1_noon = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap().timestamp_millis();
+        let jan2_noon = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 12, 0, 0).unwrap().timestamp_millis();
+        let cell1 = make_cell("note", None, jan1_noon);
+        let cell2 = make_cell("note", None, jan2_noon);
+        // The cell's local date may differ from UTC date in some TZs.
+        // Compute it via the same local_date_for_ms the executor uses.
+        let cell1_local = local_date_for_ms(jan1_noon);
+        let ast = Ast {
+            include: Filters {
+                time: Some(TimeFilter::Day(cell1_local)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx = empty_ctx(cell1_local);
+        assert!(matches(&ast, &cell1, &ctx), "cell on the day matches");
+        assert!(
+            !matches(&ast, &cell2, &ctx),
+            "cell on different day excluded"
+        );
+    }
+
+    #[test]
+    fn matches_entity_include_requires_kept_link_to_person() {
+        // Build a cell whose body has a `kept://<uuid>` link to Alice.
+        let alice_id = Uuid::now_v7();
+        let bob_id = Uuid::now_v7();
+        let tf = typeface();
+        let mut cell = Cell::new(tf, "hi @Alice".to_string());
+        cell.add_link_to_first(3..9, format!("kept://{}", alice_id));
+        // AST asks for cells linking to Alice.
+        let ast = Ast {
+            include: Filters {
+                entities: vec![EntityRef {
+                    kind: EntityKind::Person,
+                    id: "alice".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx_alice = MatchContext {
+            today: day(2026, 1, 1),
+            person_targets: vec![alice_id],
+            person_excludes: Vec::new(),
+        };
+        let ctx_bob = MatchContext {
+            today: day(2026, 1, 1),
+            person_targets: vec![bob_id],
+            person_excludes: Vec::new(),
+        };
+        assert!(matches(&ast, &cell, &ctx_alice), "kept link to Alice → match");
+        assert!(
+            !matches(&ast, &cell, &ctx_bob),
+            "kept link is to Alice, not Bob → no match"
+        );
+    }
+
+    #[test]
+    fn matches_free_text_substring_is_case_insensitive() {
+        let cell = make_cell("Some Body Of Text", None, 0);
+        let ctx = empty_ctx(day(2026, 1, 1));
+        assert!(matches(&parse("body of"), &cell, &ctx), "substring hit");
+        assert!(
+            matches(&parse("BODY OF"), &cell, &ctx),
+            "case-insensitive"
+        );
+        assert!(
+            !matches(&parse("missing"), &cell, &ctx),
+            "no substring → no match"
+        );
     }
 
     #[test]
