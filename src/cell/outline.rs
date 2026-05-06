@@ -2,6 +2,7 @@
 //! order is the list order; tree shape is implicit (a bullet's children
 //! are the contiguous run of subsequent bullets at depth > self).
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use skia_safe::{Canvas, Font, Paint, Rect, Typeface};
@@ -59,6 +60,12 @@ impl Bullet {
     pub fn take_pending_link_url(&mut self) -> Option<String> {
         self.textbox.take_pending_link_url()
     }
+
+    /// Drain any pending inline-tag name (mirrors
+    /// `take_pending_link_url`).
+    pub fn take_pending_tag_name(&mut self) -> Option<String> {
+        self.textbox.take_pending_tag_name()
+    }
 }
 
 struct OutlineDrag {
@@ -91,6 +98,13 @@ pub struct OutlineCell {
     width: f32,
     height: f32,
     font_scale: f32,
+    /// Per-frame "show only these bullets" hint. Set by the app's cell-
+    /// render dispatch when the active view filters by `#tag` AND this
+    /// cell matches via body bullets only (title doesn't carry the tag).
+    /// Cleared (None) for focused cells — interaction always operates
+    /// on the full outline so navigation / hit-testing stay coherent.
+    /// Not persisted; re-derived each frame from the active filter.
+    bullet_filter: Option<HashSet<Uuid>>,
 }
 
 impl OutlineCell {
@@ -112,6 +126,7 @@ impl OutlineCell {
             width: 0.0,
             height: 0.0,
             font_scale: 1.0,
+            bullet_filter: None,
         }
     }
 
@@ -143,11 +158,56 @@ impl OutlineCell {
             width: 0.0,
             height: 0.0,
             font_scale: 1.0,
+            bullet_filter: None,
         }
     }
 
     pub fn bullets(&self) -> &[Bullet] {
         &self.bullets
+    }
+
+    /// Stash the per-frame bullet-visibility hint. The app calls this
+    /// before render based on the active view's tag filter; tick reads
+    /// it. None ⇒ render all bullets.
+    pub fn set_bullet_filter(&mut self, ids: Option<HashSet<Uuid>>) {
+        self.bullet_filter = ids;
+    }
+
+    /// Bullet IDs whose text contains any of `include_tags` (inline
+    /// tags only — `#word` preceded by whitespace or start-of-text),
+    /// plus all of their subtree descendants. Used by the app to
+    /// compute the per-frame `bullet_filter` for tag-filtered views.
+    /// Names compared case-insensitively to match `query::matches`.
+    pub fn bullets_matching_any_tag(&self, include_tags: &[String]) -> HashSet<Uuid> {
+        if include_tags.is_empty() {
+            return HashSet::new();
+        }
+        let lowered: Vec<String> = include_tags
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let mut out: HashSet<Uuid> = HashSet::new();
+        for i in 0..self.bullets.len() {
+            let text = self.bullets[i].textbox.text();
+            let hit = crate::cell::parse_inline_tags(text).iter().any(|r| {
+                if r.end > r.start + 1 {
+                    let name = text[r.start + 1..r.end].to_ascii_lowercase();
+                    lowered.iter().any(|t| t == &name)
+                } else {
+                    false
+                }
+            });
+            if hit {
+                let root_depth = self.bullets[i].depth;
+                out.insert(self.bullets[i].id);
+                let mut k = i + 1;
+                while k < self.bullets.len() && self.bullets[k].depth > root_depth {
+                    out.insert(self.bullets[k].id);
+                    k += 1;
+                }
+            }
+        }
+        out
     }
 
     pub fn typeface(&self) -> &Typeface {
@@ -169,10 +229,32 @@ impl OutlineCell {
         None
     }
 
+    /// Drain the first pending inline-tag name across all bullets.
+    pub fn take_pending_tag_name(&mut self) -> Option<String> {
+        for b in &mut self.bullets {
+            if let Some(name) = b.take_pending_tag_name() {
+                return Some(name);
+            }
+        }
+        None
+    }
+
     /// Resolve the bullet index containing the given absolute y. Clamps to
     /// first/last on out-of-bounds and on small inter-bullet gaps.
     fn bullet_idx_at_y(&self, abs_y: f32) -> usize {
-        if let Some(idx) = self.bullets.iter().position(|b| {
+        // Honor the per-frame bullet_filter: filtered-out bullets weren't
+        // ticked this frame, so their textbox.y_origin() / height carry
+        // stale values from a previous render. Treat them as invisible
+        // for hit-testing so clicks never land on a hidden bullet.
+        let visible = |i: usize| match &self.bullet_filter {
+            Some(set) => set.contains(&self.bullets[i].id),
+            None => true,
+        };
+        if let Some(idx) = (0..self.bullets.len()).find(|&i| {
+            if !visible(i) {
+                return false;
+            }
+            let b = &self.bullets[i];
             let top = b.textbox.y_origin();
             let bot = top + b.textbox.height();
             abs_y >= top && abs_y < bot
@@ -180,9 +262,12 @@ impl OutlineCell {
             return idx;
         }
         if abs_y < self.y_origin {
-            0
+            (0..self.bullets.len()).find(|&i| visible(i)).unwrap_or(0)
         } else {
-            self.bullets.len().saturating_sub(1)
+            (0..self.bullets.len())
+                .rev()
+                .find(|&i| visible(i))
+                .unwrap_or_else(|| self.bullets.len().saturating_sub(1))
         }
     }
 
@@ -254,11 +339,37 @@ impl OutlineCell {
         bullet_paint.set_anti_alias(true);
         bullet_paint.set_color(crate::color::BULLET_MARKER);
 
+        // Per-bullet visibility for tag-filtered views. None ⇒ all
+        // bullets visible; Some ⇒ render only listed IDs, depth-
+        // normalized so the shallowest visible bullet sits flush-left.
+        let visible: Vec<bool> = match &self.bullet_filter {
+            Some(set) => self.bullets.iter().map(|b| set.contains(&b.id)).collect(),
+            None => vec![true; self.bullets.len()],
+        };
+        let depth_offset_subtract: u32 = if self.bullet_filter.is_some() {
+            self.bullets
+                .iter()
+                .zip(visible.iter())
+                .filter_map(|(b, v)| if *v { Some(b.depth) } else { None })
+                .min()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let mut bullet_y_bands: Vec<(f32, f32)> = Vec::with_capacity(self.bullets.len());
         let suppress_caret = active_indices.is_some();
         let mut cur_y = y;
-        for (_idx, bullet) in self.bullets.iter_mut().enumerate() {
-            let depth_offset = (bullet.depth as f32) * indent_per_level;
+        for (idx, bullet) in self.bullets.iter_mut().enumerate() {
+            if !visible[idx] {
+                // Skipped (filtered out). Push a degenerate band so
+                // index-keyed callers (active-overlay, hit-test) stay
+                // aligned and never land on a filtered bullet.
+                bullet_y_bands.push((cur_y, cur_y));
+                continue;
+            }
+            let normalized_depth = bullet.depth.saturating_sub(depth_offset_subtract);
+            let depth_offset = (normalized_depth as f32) * indent_per_level;
             let marker_x = x + depth_offset + indent_per_level / 2.0;
             let marker_y = cur_y + line_height / 2.0;
             canvas.draw_circle((marker_x, marker_y), radius, &bullet_paint);
@@ -527,6 +638,19 @@ impl OutlineCell {
             return false;
         }
         self.bullets[idx].textbox.link_at_doc_pos(abs_x, abs_y)
+    }
+
+    /// True if an inline `#tag` in the bullet under `(abs_x, abs_y)`
+    /// is hit. Sibling of `link_at_doc_pos`.
+    pub fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        if abs_y < self.y_origin || abs_y > self.y_origin + self.height {
+            return false;
+        }
+        let idx = self.bullet_idx_at_y(abs_y);
+        if idx >= self.bullets.len() {
+            return false;
+        }
+        self.bullets[idx].textbox.tag_at_doc_pos(abs_x, abs_y)
     }
 
     pub fn replace_in_bullet_with_link(

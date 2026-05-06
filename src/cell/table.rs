@@ -466,6 +466,17 @@ impl TableCell {
         false
     }
 
+    pub fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        for row in &self.cells {
+            for entry in row {
+                if entry.textbox.tag_at_doc_pos(abs_x, abs_y) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn copy_selection(&self) -> String {
         for row in &self.cells {
             for entry in row {
@@ -613,6 +624,19 @@ impl TableCell {
             for entry in row {
                 if let Some(url) = entry.textbox.take_pending_link_url() {
                     return Some(url);
+                }
+            }
+        }
+        None
+    }
+
+    /// Drain the first pending inline-tag name from any of the inner
+    /// cells (mirrors `take_pending_link_url`).
+    pub fn take_pending_tag_name(&mut self) -> Option<String> {
+        for row in &mut self.cells {
+            for entry in row {
+                if let Some(name) = entry.textbox.take_pending_tag_name() {
+                    return Some(name);
                 }
             }
         }

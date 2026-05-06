@@ -124,6 +124,40 @@ pub(super) fn parse_heading_tags(text: &str, heading_end: usize) -> Vec<Range<us
     tags
 }
 
+/// Parse `#tag` tokens anywhere in `text`. A token is `#` followed by
+/// zero or more non-whitespace, non-`#` chars; the `#` must be preceded
+/// by whitespace or sit at the start of the text (so `abc#xyz` and
+/// embedded fragments like `http://x.com#y` are NOT tags). A bare `#`
+/// counts (matches `parse_heading_tags`'s "tag-in-progress" rule). Tag
+/// ranges include the leading `#`. Returned in source order.
+pub fn parse_inline_tags(text: &str) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut tags: Vec<Range<usize>> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let prev_is_boundary = i == 0 || (bytes[i - 1] as char).is_whitespace();
+        if bytes[i] == b'#' && prev_is_boundary {
+            let start = i;
+            let mut end = i + 1;
+            // Walk forward: tag body is non-whitespace, non-`#` chars.
+            // A second `#` ends the tag (so `#a#b` parses as `#a` and
+            // then `#b` doesn't qualify because it's not whitespace-led).
+            while end < bytes.len() {
+                let c = bytes[end] as char;
+                if c.is_whitespace() || c == '#' {
+                    break;
+                }
+                end += 1;
+            }
+            tags.push(start..end);
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    tags
+}
+
 /// End byte of the visible portion of a line: drops a single trailing
 /// `'\n'` (which lives at the end of the line range but isn't drawn).
 pub(super) fn trim_nl_end(text: &str, line: &Range<usize>) -> usize {

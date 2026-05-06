@@ -24,6 +24,7 @@ pub use table::{TableCell, TableSnapshot};
 pub use textbox::TextBox;
 
 pub(crate) use common::{open_url, primary_mod};
+pub use wrap::parse_inline_tags;
 
 use common::TITLE_BODY_GAP;
 use wrap::parse_heading_tags;
@@ -456,6 +457,27 @@ impl Cell {
         }
     }
 
+    /// True if `(abs_x, abs_y)` lands on an inline `#tag` substring in
+    /// this cell. Sibling of `link_at_doc_pos` — same hand-cursor
+    /// affordance, different navigation target.
+    pub fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        if let Some(title) = self.title.as_ref() {
+            if title.tag_at_doc_pos(abs_x, abs_y) {
+                return true;
+            }
+        }
+        match &self.kind {
+            CellKind::Plain(tb) => tb.tag_at_doc_pos(abs_x, abs_y),
+            CellKind::Outline(oc) => oc.tag_at_doc_pos(abs_x, abs_y),
+            CellKind::PopPop(_) => false,
+            CellKind::Table(tc) => tc.tag_at_doc_pos(abs_x, abs_y),
+            CellKind::Reference(rc) => match rc.cache_ref() {
+                Some(cache) => cache.tag_at_doc_pos(abs_x, abs_y),
+                None => false,
+            },
+        }
+    }
+
     /// Replace `range` with `text` in the focused textbox (the cell itself
     /// for Plain, or the bullet matching `bullet_id` for Outline) and link
     /// the inserted text to `url`.
@@ -581,31 +603,99 @@ impl Cell {
         }
     }
 
-    /// True iff the title slot is focused and the caret currently sits
-    /// inside (or right at the end of) one of the trailing `#tag` tokens.
-    /// Used by the persistence flush to defer saving the cell while a
-    /// tag is mid-edit — without this gate, every keystroke commits a
-    /// new partial-name tag to the DB, which yanks the cell out of any
-    /// tag-filtered sidebar view as the spelling shifts.
+    /// All distinct tag names attached to this cell, aggregating:
+    /// - **Title** trailing `#tags` (cell-level intent).
+    /// - **Body** inline `#tags` — `#word` preceded by whitespace or
+    ///   start-of-text. Applies to Plain text, Outline bullets, and
+    ///   Table cells.
+    /// - **PopPop** body is opted out (`#` is the comment-line marker).
+    /// - **Reference** cells own no editable text.
+    ///
+    /// This is what the query matcher and the persistence layer key on,
+    /// so adding `#urgent` anywhere in any editable slot puts the cell
+    /// into the `#urgent` filter view.
+    pub fn all_tag_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.heading_tag_names();
+        let mut push = |name: String| {
+            if !name.is_empty() && !out.contains(&name) {
+                out.push(name);
+            }
+        };
+        let mut scan = |text: &str| {
+            for r in parse_inline_tags(text) {
+                if r.end > r.start + 1 {
+                    push(text[r.start + 1..r.end].to_string());
+                }
+            }
+        };
+        match &self.kind {
+            CellKind::Plain(tb) => scan(tb.text()),
+            CellKind::Outline(oc) => {
+                for b in oc.bullets() {
+                    scan(b.textbox().text());
+                }
+            }
+            CellKind::Table(tc) => {
+                for r in 0..tc.rows() {
+                    for c in 0..tc.cols() {
+                        if let Some(entry) = tc.cell_at(r, c) {
+                            scan(entry.textbox.text());
+                        }
+                    }
+                }
+            }
+            CellKind::PopPop(_) | CellKind::Reference(_) => {}
+        }
+        out
+    }
+
+    /// True iff the focused editable slot's caret currently sits inside
+    /// (or right at the end of) a `#tag` token. Used by the persistence
+    /// flush to defer saving the cell while a tag is mid-edit — without
+    /// this gate, every keystroke commits a new partial-name tag to the
+    /// DB, which yanks the cell out of any tag-filtered view as the
+    /// spelling shifts. Also gates the visibility filter so the focused
+    /// cell stays on screen during the rename.
+    ///
+    /// Per-slot rules:
+    /// - **Title**: trailing-tag rule (matches `parse_heading_tags`),
+    ///   since the title's tag list is "all trailing `#tokens`".
+    /// - **Plain body / Outline bullet / Table cell**: inline rule
+    ///   (matches `parse_inline_tags`) — `#word` preceded by whitespace
+    ///   or start-of-text counts.
+    /// - **PopPop body**: always false. `#` is the comment-line marker
+    ///   in PopPop and has no tag semantics.
+    /// - **Reference cell**: always false. Read-only embed.
     ///
     /// Edge: caret == r.start (right before the `#`) is *not* considered
     /// in-progress — the user is positioned to type chars before the
     /// tag, which doesn't change the tag itself. caret == r.end (just
     /// after the last char) IS in-progress — the next keystroke would
     /// extend the tag.
-    pub fn caret_in_in_progress_title_tag(&self) -> bool {
-        if !self.title_focused {
+    pub fn caret_in_in_progress_tag(&self) -> bool {
+        if self.title_focused {
+            let Some(title) = self.title.as_ref() else {
+                return false;
+            };
+            let Some((_, caret)) = title.primary_caret() else {
+                return false;
+            };
+            let text = title.text();
+            let title_end = text.find('\n').unwrap_or(text.len());
+            return parse_heading_tags(text, title_end)
+                .iter()
+                .any(|r| caret > r.start && caret <= r.end);
+        }
+        // Body slots: inline tag detection. PopPop opted out because `#`
+        // is the comment-line marker there. Reference has no editable
+        // text, so focused_text_and_caret returns None.
+        if matches!(&self.kind, CellKind::PopPop(_)) {
             return false;
         }
-        let Some(title) = self.title.as_ref() else {
+        let Some((text, caret)) = self.focused_text_and_caret() else {
             return false;
         };
-        let Some((_, caret)) = title.primary_caret() else {
-            return false;
-        };
-        let text = title.text();
-        let title_end = text.find('\n').unwrap_or(text.len());
-        parse_heading_tags(text, title_end)
+        parse_inline_tags(text)
             .iter()
             .any(|r| caret > r.start && caret <= r.end)
     }
@@ -668,6 +758,28 @@ impl Cell {
             // clickable just like inline links anywhere else.
             CellKind::Reference(rc) => match rc.cache_mut() {
                 Some(cache) => cache.take_pending_link_url(),
+                None => None,
+            },
+        }
+    }
+
+    /// Drain the first inline-tag name (without `#`) stashed by any
+    /// inner `TextBox` during the most recent `mouse_down`. The app
+    /// layer routes it through `push_view(Query::tag(name))` — same
+    /// destination as the sidebar tag-row click.
+    pub fn take_pending_tag_name(&mut self) -> Option<String> {
+        if let Some(t) = self.title.as_mut() {
+            if let Some(name) = t.take_pending_tag_name() {
+                return Some(name);
+            }
+        }
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.take_pending_tag_name(),
+            CellKind::Outline(oc) => oc.take_pending_tag_name(),
+            CellKind::PopPop(_) => None,
+            CellKind::Table(tc) => tc.take_pending_tag_name(),
+            CellKind::Reference(rc) => match rc.cache_mut() {
+                Some(cache) => cache.take_pending_tag_name(),
                 None => None,
             },
         }
@@ -1714,6 +1826,118 @@ mod tests {
         assert!(tags.contains(&"urgent".to_string()));
         assert!(tags.contains(&"person".to_string()));
         assert_eq!(cell.heading_title().as_deref(), Some("My Notes"));
+    }
+
+    #[test]
+    fn parse_inline_tags_finds_word_boundary_tags_only() {
+        use crate::cell::parse_inline_tags;
+        // Whitespace- or start-led `#word` tokens; embedded `#` (e.g.,
+        // URL fragment) does not qualify.
+        let text = "alpha #foo and #bar plus url#frag and #";
+        let names: Vec<&str> = parse_inline_tags(text)
+            .iter()
+            .map(|r| &text[r.start..r.end])
+            .collect();
+        assert_eq!(names, vec!["#foo", "#bar", "#"]);
+    }
+
+    #[test]
+    fn all_tag_names_aggregates_title_and_body_for_plain() {
+        let mut cell = Cell::new(typeface(), "follow up #urgent later".to_string());
+        cell.toggle_title_focus();
+        cell.title.as_mut().unwrap().replace_text("Note #person".to_string());
+        let tags = cell.all_tag_names();
+        assert!(tags.contains(&"person".to_string()));
+        assert!(tags.contains(&"urgent".to_string()));
+    }
+
+    #[test]
+    fn all_tag_names_picks_up_outline_bullet_tags() {
+        let tb = TextBox::new(typeface(), "buy milk #shopping".to_string());
+        let oc = OutlineCell::from_bullets(
+            typeface(),
+            vec![Bullet::new(Uuid::now_v7(), tb, 0)],
+        );
+        let mut cell = Cell::new(typeface(), String::new());
+        cell.kind = CellKind::Outline(oc);
+        let tags = cell.all_tag_names();
+        assert!(tags.contains(&"shopping".to_string()));
+    }
+
+    #[test]
+    fn all_tag_names_excludes_poppop_body() {
+        let mut cell = Cell::new_poppop(typeface());
+        if let CellKind::PopPop(pc) = &mut cell.kind {
+            pc.textbox_mut()
+                .replace_text("# this is a poppop comment, not a tag\n1 + 1".to_string());
+        }
+        let tags = cell.all_tag_names();
+        assert!(tags.is_empty(), "PopPop body must not contribute tags");
+    }
+
+    #[test]
+    fn caret_in_in_progress_tag_detects_body_edit() {
+        // Plain cell with `#foo` mid-body, caret right after `o` (inside
+        // the tag): predicate fires.
+        let mut cell = Cell::new(typeface(), String::new());
+        if let CellKind::Plain(tb) = &mut cell.kind {
+            tb.replace_text("note #foo".to_string());
+            tb.set_caret_at(9); // end-of-text, inside `#foo` (5..9)
+        }
+        cell.title_focused = false;
+        assert!(cell.caret_in_in_progress_tag());
+    }
+
+    #[test]
+    fn textbox_tag_at_returns_name_for_byte_inside_inline_tag() {
+        let tb = TextBox::new(typeface(), "follow up #shopping later".to_string());
+        // `#shopping` lives at bytes 10..19. Byte 14 (mid-tag) hits.
+        assert_eq!(tb.tag_at(14).as_deref(), Some("shopping"));
+        // Byte 9 (the space just before `#`) doesn't.
+        assert_eq!(tb.tag_at(9), None);
+        // Byte 19 (just past the last char) doesn't.
+        assert_eq!(tb.tag_at(19), None);
+    }
+
+    #[test]
+    fn outline_bullets_matching_any_tag_includes_subtree_descendants() {
+        // depth: 0 (#urgent), 1 (no tag), 1 (no tag), 0 (no tag), 1 (#urgent)
+        // Expected match for `urgent`: bullets 0,1,2 (subtree of 0) and
+        // bullet 4 (its own subtree). Bullet 3 stays out.
+        let mk = |t: &str, d: u32| {
+            Bullet::new(
+                Uuid::now_v7(),
+                TextBox::new(typeface(), t.to_string()),
+                d,
+            )
+        };
+        let bullets = vec![
+            mk("root #urgent", 0),
+            mk("child a", 1),
+            mk("child b", 1),
+            mk("sibling root", 0),
+            mk("nested #urgent", 1),
+        ];
+        let ids: Vec<Uuid> = bullets.iter().map(|b| b.id()).collect();
+        let oc = OutlineCell::from_bullets(typeface(), bullets);
+        let m = oc.bullets_matching_any_tag(&["urgent".to_string()]);
+        assert!(m.contains(&ids[0]));
+        assert!(m.contains(&ids[1]));
+        assert!(m.contains(&ids[2]));
+        assert!(!m.contains(&ids[3]));
+        assert!(m.contains(&ids[4]));
+    }
+
+    #[test]
+    fn caret_in_in_progress_tag_false_when_caret_outside_tag() {
+        // Caret AFTER the tag's whitespace boundary: not in progress.
+        let mut cell = Cell::new(typeface(), String::new());
+        if let CellKind::Plain(tb) = &mut cell.kind {
+            tb.replace_text("note #foo ".to_string());
+            tb.set_caret_at(10); // after the trailing space
+        }
+        cell.title_focused = false;
+        assert!(!cell.caret_in_in_progress_tag());
     }
 
     #[test]

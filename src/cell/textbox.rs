@@ -21,7 +21,7 @@ use super::common::{
 use super::wrap::{
     draw_line_with_links, find_line_at, find_word_at, find_word_left_of, find_word_right_of,
     hit_affinity, line_x_at_offset, locate_caret, next_char_boundary, parse_heading_tags,
-    prev_char_boundary, step_horizontal, trim_nl_end, wrap_text_styled,
+    parse_inline_tags, prev_char_boundary, step_horizontal, trim_nl_end, wrap_text_styled,
 };
 
 #[derive(Clone)]
@@ -98,6 +98,11 @@ pub struct TextBox {
     /// `KeptApp`. Buffering here keeps click detection in the cell while
     /// keeping navigation policy in the app.
     pending_link_url: Option<String>,
+    /// Tag name (without leading `#`) set by a click on an inline `#tag`
+    /// substring. Drained by the app, which navigates to that tag's
+    /// filter view via `push_view(Query::tag(name))`. Same buffering
+    /// rationale as `pending_link_url`.
+    pending_tag_name: Option<String>,
 }
 
 impl TextBox {
@@ -127,6 +132,7 @@ impl TextBox {
             force_heading: false,
             enable_comment_coloring: false,
             pending_link_url: None,
+            pending_tag_name: None,
         }
     }
 
@@ -136,6 +142,39 @@ impl TextBox {
     /// `open_url` for external URLs).
     pub fn take_pending_link_url(&mut self) -> Option<String> {
         self.pending_link_url.take()
+    }
+
+    /// Drain an inline-tag name (without leading `#`) set by a click in
+    /// the most recent `mouse_down`. The app routes it through
+    /// `push_view(Query::tag(name))` — same destination as the sidebar
+    /// tag-row click.
+    pub fn take_pending_tag_name(&mut self) -> Option<String> {
+        self.pending_tag_name.take()
+    }
+
+    /// Tag name (without leading `#`) at byte position `byte`, if any.
+    /// Uses the same `parse_inline_tags` rule as the persistence and
+    /// query layers so visual styling, click target, and DB membership
+    /// stay aligned.
+    pub fn tag_at(&self, byte: usize) -> Option<String> {
+        for r in parse_inline_tags(&self.text) {
+            if byte >= r.start && byte < r.end && r.end > r.start + 1 {
+                return Some(self.text[r.start + 1..r.end].to_string());
+            }
+        }
+        None
+    }
+
+    /// True iff `(abs_x, abs_y)` lands on an inline-tag substring.
+    /// Powers the hand cursor on hover (mirrors `link_at_doc_pos`).
+    pub fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        let lx = abs_x - self.x_origin;
+        let ly = abs_y - self.y_origin;
+        if lx < 0.0 || lx > self.width || ly < 0.0 || ly > self.height {
+            return false;
+        }
+        let (idx, _) = self.hit_test(lx, ly);
+        self.tag_at(idx).is_some()
     }
 
     /// Override the body-text color. Used by PopPopCell for the output
@@ -855,6 +894,48 @@ impl TextBox {
             }
         }
 
+        // Inline-tag dim overlay: re-draw `#tag` substrings on each
+        // body line in the muted ghost color so they read as metadata,
+        // not prose. Skips heading lines (titles handle their trailing
+        // tags via the dedicated tag-layout path) and comment lines
+        // (PopPop already colors those green and exempts them from tag
+        // semantics anyway). Same font as the underlying line; just an
+        // overdraw with a different paint, which is cheap and visually
+        // clean at the antialias level.
+        let inline_tag_ranges = parse_inline_tags(&self.text);
+        if !inline_tag_ranges.is_empty() {
+            let mut tag_dim_paint = Paint::default();
+            tag_dim_paint.set_anti_alias(true);
+            tag_dim_paint.set_color(crate::color::TEXT_GHOST);
+            for (li, line) in self.body_lines.iter().enumerate() {
+                if self.line_is_heading.get(li).copied().unwrap_or(false) {
+                    continue;
+                }
+                if self.line_is_comment.get(li).copied().unwrap_or(false) {
+                    continue;
+                }
+                let visible_end = trim_nl_end(&self.text, line);
+                let line_text = &self.text[line.start..line.end];
+                let baseline = baselines_local[li] + y;
+                for r in &inline_tag_ranges {
+                    let s = r.start.max(line.start).min(visible_end);
+                    let e = r.end.min(visible_end);
+                    if s >= e {
+                        continue;
+                    }
+                    let prefix_w = body_font
+                        .measure_str(&line_text[..s - line.start], Some(&text_paint))
+                        .0;
+                    canvas.draw_str(
+                        &self.text[s..e],
+                        Point::new(x + prefix_w, baseline),
+                        &body_font,
+                        &tag_dim_paint,
+                    );
+                }
+            }
+        }
+
         if show_caret {
             let mut caret_paint = Paint::default();
             caret_paint.set_anti_alias(false);
@@ -995,11 +1076,17 @@ impl TextBox {
 
         // Plain click on a link opens it in view mode; primary-modifier+click
         // opens it while editing (so plain clicks in edit mode still move the
-        // caret). The primary modifier is Cmd on Mac, Ctrl elsewhere.
+        // caret). The primary modifier is Cmd on Mac, Ctrl elsewhere. Same
+        // semantics apply to inline `#tag` substrings — click navigates to
+        // that tag's filter view.
         let plain_in_view = !editing && !mods.shift_key() && !mods.alt_key();
         let modified_in_edit =
             editing && primary_mod(mods) && !mods.shift_key() && !mods.alt_key();
         if plain_in_view || modified_in_edit {
+            if let Some(name) = self.tag_at(idx) {
+                self.pending_tag_name = Some(name);
+                return true;
+            }
             if let Some(link) = self.link_at(idx) {
                 self.pending_link_url = Some(link.url.clone());
                 return true;

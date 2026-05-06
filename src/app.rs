@@ -1671,8 +1671,9 @@ impl KeptApp {
         }
     }
 
-    /// True if the mouse is currently over a link in any visible cell. Used
-    /// by the host (`main.rs`) to swap the system cursor to a hand pointer.
+    /// True if the mouse is currently over a link or an inline `#tag` in
+    /// any visible cell. Used by the host (`main.rs`) to swap the system
+    /// cursor to a hand pointer.
     pub fn is_hovering_link(&self) -> bool {
         let (x, y) = self.mouse_pos;
         // Sidebar columns / out-of-bounds have no links.
@@ -1685,7 +1686,7 @@ impl KeptApp {
             if !self.is_visible_for_view(cell, &ctx) {
                 continue;
             }
-            if cell.link_at_doc_pos(x, doc_y) {
+            if cell.link_at_doc_pos(x, doc_y) || cell.tag_at_doc_pos(x, doc_y) {
                 return true;
             }
         }
@@ -1801,14 +1802,17 @@ impl KeptApp {
     /// - `People` → no cells visible (the page is bespoke).
     /// - `Ast` → delegate to `query::matches` against `view.ast`.
     fn is_visible_for_view(&self, cell: &Cell, ctx: &query::MatchContext) -> bool {
-        // A focused cell whose caret is mid-edit inside a `#tag` token in
-        // the title stays visible regardless of filter match. Otherwise
-        // the in-memory `heading_tag_names()` shifts on every keystroke
-        // and the cell yanks out from under the user the instant they
-        // edit the tag they're filtering by. Once the caret moves out
-        // (whitespace, focus loss, navigating away from the title), the
-        // filter re-evaluates with the finalized spelling.
-        if self.focused == Some(cell.id) && cell.caret_in_in_progress_title_tag() {
+        // A focused cell whose caret is mid-edit inside a `#tag` token
+        // stays visible regardless of filter match. Otherwise the in-
+        // memory tag set shifts on every keystroke and the cell yanks
+        // out from under the user the instant they edit the tag they're
+        // filtering by. Gated on edit mode: outside editing no
+        // keystrokes can change the text, so the filter should re-
+        // evaluate normally (matches the persistence-flush gate).
+        if self.editing
+            && self.focused == Some(cell.id)
+            && cell.caret_in_in_progress_tag()
+        {
             return true;
         }
         match self.view.view_kind {
@@ -2297,6 +2301,11 @@ impl KeptApp {
     }
 
     pub fn flush_persistence(&mut self) {
+        // Snapshot before grabbing `&mut self.db` (else borrow conflict).
+        // The deferral predicate only matters for the cell currently
+        // being typed into; both flags get re-read fresh next flush.
+        let editing_snapshot = self.editing;
+        let focused_snapshot = self.focused;
         let Some(db) = self.db.as_mut() else {
             self.dirty_cells.clear();
             self.pending_deletes.clear();
@@ -2318,8 +2327,16 @@ impl KeptApp {
             // The dirty mark is re-asserted so the next flush — once
             // the caret leaves the tag (whitespace, focus loss, or
             // moving outside the title) — saves the finalized name.
+            //
+            // Gated on `editing && focused`: the deferral exists for
+            // in-flight typing, and typing only happens to the focused
+            // cell in edit mode. Outside that (e.g., user hit Escape),
+            // no keystrokes can change the text, so we save immediately
+            // — otherwise the dirty cell would languish until something
+            // else broke the predicate (re-focus, click elsewhere, …).
+            let actively_editing = editing_snapshot && focused_snapshot == Some(id);
             if let Some(cell) = self.cells.iter().find(|c| c.id == id) {
-                if cell.caret_in_in_progress_title_tag() {
+                if actively_editing && cell.caret_in_in_progress_tag() {
                     self.dirty_cells.insert(id);
                     continue;
                 }
@@ -2833,7 +2850,27 @@ impl KeptApp {
                             render_focused,
                         )
                     } else {
+                        // Bullet-granular tag filter for non-focused
+                        // outline cells: when the active view filters by
+                        // `#tag` and this outline matches via body
+                        // bullets only (title doesn't carry the tag),
+                        // restrict the render to matching bullets +
+                        // their subtree descendants. Cleared (None) for
+                        // focused cells so interaction always sees the
+                        // full outline.
+                        // Clone the include-tag list so we can take a
+                        // mutable borrow on `self.cells` without keeping
+                        // an outstanding immutable borrow on `self.view`.
+                        let include_tags = self.view.ast.include.tags.clone();
                         let cell = &mut self.cells[i];
+                        let filter = compute_outline_bullet_filter(
+                            cell,
+                            &include_tags,
+                            cell_is_focused,
+                        );
+                        if let CellKind::Outline(oc) = &mut cell.kind {
+                            oc.set_bullet_filter(filter);
+                        }
                         cell.tick(
                             canvas,
                             cell_x,
@@ -3617,10 +3654,12 @@ impl KeptApp {
         let Some(cell) = self.cell(focused_id) else {
             return;
         };
-        // Tag autocomplete only applies in the title slot — `#tag` only
-        // has structural meaning in headings. Body `#` (including the
-        // PopPop comment marker) shouldn't trigger the popup.
-        if kind == MentionKind::Tag && !cell.title_focused {
+        // Tag autocomplete: open in any editable text slot EXCEPT the
+        // PopPop body, where `#` is the comment-line marker (not a tag).
+        if kind == MentionKind::Tag
+            && !cell.title_focused
+            && matches!(cell.kind, crate::cell::CellKind::PopPop(_))
+        {
             return;
         }
         let Some((text, caret)) = cell.focused_text_and_caret() else {
@@ -6847,6 +6886,15 @@ impl KeptApp {
         if let Some(url) = pending {
             self.handle_link_click(&url);
         }
+        // Same shape for inline `#tag` clicks: the textbox stashed the
+        // tag name; drain and navigate to the tag's filter view (same
+        // destination as a sidebar tag-row click).
+        let pending_tag = self
+            .cell_mut(target)
+            .and_then(|c| c.take_pending_tag_name());
+        if let Some(name) = pending_tag {
+            self.push_view(Query::tag(name));
+        }
         result
     }
 
@@ -7139,6 +7187,41 @@ fn result_snippet(text: &str, query: &str) -> String {
     let prefix = if start_chars > 0 { "…" } else { "" };
     let suffix = if end_chars < flat.chars().count() { "…" } else { "" };
     format!("{prefix}{snippet}{suffix}")
+}
+
+/// Per-frame bullet filter for an outline cell rendered under a tag-
+/// filtered view. Returns Some(set of bullet IDs) iff:
+/// - the cell is NOT the focused cell (focused cells render full so
+///   navigation / hit-testing operate on the complete outline);
+/// - the active view has at least one tag-include filter; AND
+/// - the cell's title doesn't carry any of the include tags (so the
+///   cell matched via body bullets only — title-tagged cells are
+///   whole-cell matches).
+/// Otherwise None — render all bullets.
+fn compute_outline_bullet_filter(
+    cell: &Cell,
+    include_tags: &[String],
+    cell_is_focused: bool,
+) -> Option<HashSet<Uuid>> {
+    if cell_is_focused || include_tags.is_empty() {
+        return None;
+    }
+    let CellKind::Outline(oc) = &cell.kind else {
+        return None;
+    };
+    let title_tags = cell.heading_tag_names();
+    let title_carries = include_tags
+        .iter()
+        .any(|t| title_tags.iter().any(|n| n.eq_ignore_ascii_case(t)));
+    if title_carries {
+        return None;
+    }
+    let m = oc.bullets_matching_any_tag(include_tags);
+    if m.is_empty() {
+        None
+    } else {
+        Some(m)
+    }
 }
 
 fn format_date_label(d: chrono::NaiveDate) -> String {

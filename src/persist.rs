@@ -6,8 +6,8 @@ use skia_safe::Typeface;
 use uuid::Uuid;
 
 use crate::cell::{
-    Bullet, Cell, CellKind, OutlineCell, PopPopCell, ReferenceCell, ReferenceTarget, TableCell,
-    TextBox,
+    parse_inline_tags, Bullet, Cell, CellKind, OutlineCell, PopPopCell, ReferenceCell,
+    ReferenceTarget, TableCell, TextBox,
 };
 
 /// Resolved database path: env override → OS data dir → CWD fallback.
@@ -1183,18 +1183,46 @@ fn normalize_alias(display_name: &str) -> String {
 }
 
 fn tag_names_from_persisted(pc: &PersistedCell) -> Vec<String> {
-    let Some(t) = pc.title.as_ref() else {
-        return Vec::new();
-    };
     let mut out: Vec<String> = Vec::new();
-    let heading_end = t.text.find('\n').unwrap_or(t.text.len());
-    for r in parse_trailing_tags(&t.text, heading_end) {
-        if r.end > r.start + 1 {
-            let name = t.text[r.start + 1..r.end].to_string();
-            if !out.contains(&name) {
-                out.push(name);
+    let mut push = |name: String| {
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    };
+    if let Some(t) = pc.title.as_ref() {
+        let heading_end = t.text.find('\n').unwrap_or(t.text.len());
+        for r in parse_trailing_tags(&t.text, heading_end) {
+            if r.end > r.start + 1 {
+                push(t.text[r.start + 1..r.end].to_string());
             }
         }
+    }
+    // Body inline tags: any `#word` preceded by whitespace or start-of-
+    // text. PopPop opts out (its `#` is the comment marker); Reference
+    // owns no editable text.
+    let scan = |text: &str, sink: &mut dyn FnMut(String)| {
+        for r in parse_inline_tags(text) {
+            if r.end > r.start + 1 {
+                sink(text[r.start + 1..r.end].to_string());
+            }
+        }
+    };
+    let mut into_out = |name: String| push(name);
+    match &pc.body {
+        CellBody::Plain { text, .. } => scan(text, &mut into_out),
+        CellBody::Outline { blocks } => {
+            for b in blocks {
+                scan(&b.text, &mut into_out);
+            }
+        }
+        CellBody::Table { cells, .. } => {
+            for row in cells {
+                for c in row {
+                    scan(&c.text, &mut into_out);
+                }
+            }
+        }
+        CellBody::PopPop { .. } | CellBody::Reference { .. } => {}
     }
     out
 }

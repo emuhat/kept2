@@ -331,8 +331,11 @@ pub fn matches(ast: &Ast, cell: &Cell, ctx: &MatchContext) -> bool {
             return false;
         }
     }
-    // Tag includes — cell must have ALL listed tags.
-    let cell_tags = cell.heading_tag_names();
+    // Tag includes — cell must have ALL listed tags. `all_tag_names`
+    // aggregates title trailing tags + body inline tags (Plain text,
+    // Outline bullets, Table cells). PopPop body and Reference cells
+    // contribute nothing.
+    let cell_tags = cell.all_tag_names();
     for needed in &ast.include.tags {
         if !cell_tags.iter().any(|n| n.eq_ignore_ascii_case(needed)) {
             return false;
