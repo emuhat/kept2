@@ -536,9 +536,42 @@ impl TextBox {
     }
 
     /// Insert `s` at every cursor (replacing each cursor's selection).
+    /// Any `http(s)://…` URLs in the pasted text are auto-linkified —
+    /// each pasted region gets a `LinkSpan` over the detected URL.
     pub fn paste(&mut self, s: &str) {
-        if !s.is_empty() {
+        if s.is_empty() {
+            return;
+        }
+        let urls = detect_urls(s);
+        if urls.is_empty() {
             self.insert_text(s);
+            return;
+        }
+        // Each selection's pre-edit `[a, b)` is replaced by `s` (length
+        // `s_len`). After all replacements, the text inserted for the
+        // i-th selection (in left-to-right order) lands at byte offset
+        // `a_i + cumulative_growth_from_prior_selections`. Compute
+        // those landing offsets first, then do the insertion, then add
+        // `LinkSpan`s relative to each landing offset.
+        let mut starts: Vec<Range<usize>> =
+            self.sels.items.iter().map(|sel| sel.range()).collect();
+        starts.sort_by_key(|r| r.start);
+        let mut insert_starts: Vec<usize> = Vec::with_capacity(starts.len());
+        let mut cum: isize = 0;
+        let s_len = s.len() as isize;
+        for r in &starts {
+            let landing = r.start as isize + cum;
+            insert_starts.push(landing.max(0) as usize);
+            cum += s_len - (r.end - r.start) as isize;
+        }
+        self.insert_text(s);
+        for &start in &insert_starts {
+            for (range, url) in &urls {
+                let abs = (start + range.start)..(start + range.end);
+                if abs.end <= self.text.len() {
+                    self.add_link(abs, url.clone());
+                }
+            }
         }
     }
 
@@ -1637,4 +1670,55 @@ fn resolve_click_unit(
         }
         _ => (idx, idx, affinity, DragKind::Char),
     }
+}
+
+/// Find every `http://` and `https://` URL in `s`. Each URL extends from
+/// the scheme through the first whitespace (or end of string), with
+/// trailing punctuation that's commonly NOT part of URLs (`.,;:!?])}`)
+/// peeled off — so "see https://example.com." linkifies the URL without
+/// the trailing period. Returns `(byte_range_in_s, url_string)` pairs.
+fn detect_urls(s: &str) -> Vec<(Range<usize>, String)> {
+    let mut out: Vec<(Range<usize>, String)> = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        let prefix_len = if s[i..].starts_with("https://") {
+            8
+        } else if s[i..].starts_with("http://") {
+            7
+        } else {
+            i += s[i..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            continue;
+        };
+        let scheme_start = i;
+        let body_start = i + prefix_len;
+        let mut end = body_start;
+        for c in s[body_start..].chars() {
+            if c.is_whitespace() {
+                break;
+            }
+            end += c.len_utf8();
+        }
+        // Peel trailing punctuation that's almost never part of a URL.
+        while end > body_start {
+            let last = s[..end].chars().last().unwrap();
+            if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}') {
+                end -= last.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if end > body_start {
+            let url = s[scheme_start..end].to_string();
+            out.push((scheme_start..end, url));
+            i = end;
+        } else {
+            // Bare "http://" with nothing after: skip past the scheme.
+            i = body_start;
+        }
+    }
+    out
 }

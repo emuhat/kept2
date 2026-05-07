@@ -1542,6 +1542,59 @@ mod tests {
     }
 
     #[test]
+    fn paste_url_creates_link() {
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.paste("https://example.com");
+        assert_eq!(tb.text(), "https://example.com");
+        let links = tb.links();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].range, 0..19);
+        assert_eq!(links[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn paste_url_inside_text_lands_at_correct_offset() {
+        let mut tb = TextBox::new(typeface(), "before  after".to_string());
+        tb.set_caret_at(7); // between the two spaces
+        tb.paste("see https://example.com here");
+        assert_eq!(tb.text(), "before see https://example.com here after");
+        let links = tb.links();
+        assert_eq!(links.len(), 1);
+        // "https://example.com" sits at byte 11..30 of the new text.
+        assert_eq!(links[0].range, 11..30);
+        assert_eq!(links[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn paste_url_trims_trailing_punctuation() {
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.paste("Visit https://example.com.");
+        // Sentence period stays in the text; the link doesn't include it.
+        assert_eq!(tb.text(), "Visit https://example.com.");
+        let links = tb.links();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].range, 6..25);
+        assert_eq!(links[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn paste_plain_text_creates_no_links() {
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.paste("nothing to see here");
+        assert!(tb.links().is_empty());
+    }
+
+    #[test]
+    fn paste_multiple_urls_creates_multiple_links() {
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.paste("a https://one.com b http://two.org c");
+        assert_eq!(tb.links().len(), 2);
+        let urls: Vec<&str> = tb.links().iter().map(|l| l.url.as_str()).collect();
+        assert!(urls.contains(&"https://one.com"));
+        assert!(urls.contains(&"http://two.org"));
+    }
+
+    #[test]
     fn poppop_body_has_no_auto_heading() {
         // After v4 the `# ` prefix no longer triggers heading rendering on
         // body text. A PopPop input that opens with `# Foo` is treated as a
