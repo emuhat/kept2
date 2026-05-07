@@ -109,19 +109,20 @@
      inkscape:groupmode="layer"
      id="layer1">
     <circle
-       style="display:inline;fill:#f4eed7;stroke:#000000;stroke-width:8.97107;stroke-dasharray:none;stroke-opacity:1;filter:url(#filter1);opacity:0.49963663"
+       style="display:inline;opacity:0.499637;fill:#f4eed7;stroke:#000000;stroke-width:8.97107;stroke-dasharray:none;stroke-opacity:1;filter:url(#filter1)"
        id="circle1"
        cx="100.47637"
        cy="102.93851"
        r="88.881119"
-       inkscape:label="path3" />
+       inkscape:label="path3"
+       transform="matrix(0.88049755,0,0,0.88049755,11.16438,11.121494)" />
     <circle
-       style="fill:#f4eed7;stroke:#c8d6e5;stroke-width:8.97107;stroke-dasharray:none;stroke-opacity:1"
+       style="fill:#f4eed7;stroke:#c8d6e5;stroke-width:7.89901;stroke-dasharray:none;stroke-opacity:1"
        id="path3"
-       cx="99.418037"
-       cy="101.88018"
-       r="88.881119"
-       inkscape:label="path3" />
+       cx="98.701721"
+       cy="100.82674"
+       inkscape:label="path3"
+       r="78.259605" />
     <text
        xml:space="preserve"
        transform="matrix(0.3671452,0,0,0.3671452,-39.049379,-39.394013)"
@@ -130,24 +131,24 @@
     <text
        xml:space="preserve"
        style="font-size:226.891px;writing-mode:lr-tb;direction:ltr;display:inline;opacity:0.500413;fill:#000000;fill-opacity:1;stroke-width:6.20649;filter:url(#filter3)"
-       x="35.198174"
-       y="182.11371"
+       x="39.580692"
+       y="181.10236"
        id="text4"><tspan
          sodipodi:role="line"
          id="tspan4"
          style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:226.891px;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';fill:#000000;fill-opacity:1;stroke-width:6.2065"
-         x="35.198174"
-         y="182.11371">k</tspan></text>
+         x="39.580692"
+         y="181.10236">k</tspan></text>
     <text
        xml:space="preserve"
        style="font-size:226.891px;writing-mode:lr-tb;direction:ltr;display:inline;fill:#4586d2;fill-opacity:1;stroke-width:6.20649"
-       x="33.175472"
-       y="180.42815"
+       x="37.557991"
+       y="179.41679"
        id="text2"><tspan
          sodipodi:role="line"
          id="tspan2"
          style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:226.891px;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';fill:#4586d2;fill-opacity:1;stroke-width:6.2065"
-         x="33.175472"
-         y="180.42815">k</tspan></text>
+         x="37.557991"
+         y="179.41679">k</tspan></text>
   </g>
 </svg>
