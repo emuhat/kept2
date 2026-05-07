@@ -3,7 +3,7 @@ use skia_safe::{
 };
 use uuid::Uuid;
 
-use super::{KeptApp, fit_text_ellipsized};
+use super::{KeptApp, clamp_rect_to_viewport, fit_text_ellipsized};
 
 /// Cell context menu (right-click). Two muted timestamp lines + a
 /// "Delete cell" action separated by a hairline.
@@ -129,7 +129,12 @@ fn draw_menu_row(
 }
 
 impl KeptApp {
-    pub(super) fn render_cell_context_menu(&mut self, canvas: &Canvas) {
+    pub(super) fn render_cell_context_menu(
+        &mut self,
+        canvas: &Canvas,
+        view_w: f32,
+        view_h: f32,
+    ) {
         let Some(menu) = self.cell_context_menu.as_ref() else {
             self.hit_tests.cell_menu.delete = None;
             self.hit_tests.cell_menu.surface = None;
@@ -157,11 +162,16 @@ impl KeptApp {
         }
         let menu_h =
             pad + info_h * 2.0 + 1.0 + action_h * action_count as f32 + pad;
-        let rect = Rect::new(
-            menu.anchor_x,
-            menu.anchor_y,
-            menu.anchor_x + menu_w,
-            menu.anchor_y + menu_h,
+        let rect = clamp_rect_to_viewport(
+            Rect::new(
+                menu.anchor_x,
+                menu.anchor_y,
+                menu.anchor_x + menu_w,
+                menu.anchor_y + menu_h,
+            ),
+            view_w,
+            view_h,
+            4.0,
         );
 
         draw_menu_card(canvas, rect, scale);
@@ -261,7 +271,12 @@ impl KeptApp {
         self.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
     }
 
-    pub(super) fn render_tag_context_menu(&mut self, canvas: &Canvas) {
+    pub(super) fn render_tag_context_menu(
+        &mut self,
+        canvas: &Canvas,
+        view_w: f32,
+        view_h: f32,
+    ) {
         let Some(menu) = self.tag_context_menu.as_ref() else {
             self.hit_tests.tag_menu.delete = None;
             return;
@@ -271,11 +286,16 @@ impl KeptApp {
         let row_h = 26.0 * scale;
         let menu_w = 160.0 * scale;
         let menu_h = row_h + pad * 2.0;
-        let rect = Rect::new(
-            menu.anchor_x,
-            menu.anchor_y,
-            menu.anchor_x + menu_w,
-            menu.anchor_y + menu_h,
+        let rect = clamp_rect_to_viewport(
+            Rect::new(
+                menu.anchor_x,
+                menu.anchor_y,
+                menu.anchor_x + menu_w,
+                menu.anchor_y + menu_h,
+            ),
+            view_w,
+            view_h,
+            4.0,
         );
         draw_menu_card(canvas, rect, scale);
 
@@ -306,7 +326,12 @@ impl KeptApp {
     /// Rename (always enabled) and Delete person (disabled when the
     /// entity has a backing cell or any `kept://` references; the row
     /// shows the count so the user knows what's blocking).
-    pub(super) fn render_people_context_menu(&mut self, canvas: &Canvas) {
+    pub(super) fn render_people_context_menu(
+        &mut self,
+        canvas: &Canvas,
+        view_w: f32,
+        view_h: f32,
+    ) {
         let Some(menu) = self.people_context_menu.as_ref() else {
             self.hit_tests.people_menu.rename = None;
             self.hit_tests.people_menu.delete = None;
@@ -317,11 +342,16 @@ impl KeptApp {
         let row_h = 26.0 * scale;
         let menu_w = 200.0 * scale;
         let menu_h = row_h * 2.0 + pad * 2.0;
-        let rect = Rect::new(
-            menu.anchor_x,
-            menu.anchor_y,
-            menu.anchor_x + menu_w,
-            menu.anchor_y + menu_h,
+        let rect = clamp_rect_to_viewport(
+            Rect::new(
+                menu.anchor_x,
+                menu.anchor_y,
+                menu.anchor_x + menu_w,
+                menu.anchor_y + menu_h,
+            ),
+            view_w,
+            view_h,
+            4.0,
         );
         draw_menu_card(canvas, rect, scale);
 

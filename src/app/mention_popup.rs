@@ -1,7 +1,7 @@
 use skia_safe::{Canvas, Font, Paint, PaintStyle, Point, Rect};
 use uuid::Uuid;
 
-use super::KeptApp;
+use super::{KeptApp, clamp_rect_to_viewport};
 
 const MENTION_POPUP_WIDTH: f32 = 220.0;
 const MENTION_POPUP_ROW_H: f32 = 28.0;
@@ -364,7 +364,7 @@ impl KeptApp {
         }
     }
 
-    pub(super) fn render_mention_popup(&self, canvas: &Canvas) {
+    pub(super) fn render_mention_popup(&self, canvas: &Canvas, view_w: f32, view_h: f32) {
         let Some(popup) = self.mention_popup.as_ref() else {
             return;
         };
@@ -406,8 +406,18 @@ impl KeptApp {
             (visible as f32) * row_h + pad * 2.0
         };
 
-        let popup_x = anchor_x;
-        let popup_y = anchor_y_below + 4.0 * scale;
+        // Anchor below the trigger char, then clamp into the viewport
+        // so a popup near the right or bottom edge doesn't paint past
+        // the window.
+        let initial_top = anchor_y_below + 4.0 * scale;
+        let clamped = clamp_rect_to_viewport(
+            Rect::new(anchor_x, initial_top, anchor_x + popup_w, initial_top + popup_h),
+            view_w,
+            view_h,
+            4.0,
+        );
+        let popup_x = clamped.left;
+        let popup_y = clamped.top;
 
         // Drop shadow (drawn first, slightly offset).
         let mut shadow_paint = Paint::default();

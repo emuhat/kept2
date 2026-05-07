@@ -2420,10 +2420,10 @@ impl KeptApp {
 
         // Overlays (window space, drawn last so they layer on top).
         self.render_search_popup(canvas, width);
-        self.render_mention_popup(canvas);
-        self.render_tag_context_menu(canvas);
-        self.render_people_context_menu(canvas);
-        self.render_cell_context_menu(canvas);
+        self.render_mention_popup(canvas, width, height);
+        self.render_tag_context_menu(canvas, width, height);
+        self.render_people_context_menu(canvas, width, height);
+        self.render_cell_context_menu(canvas, width, height);
 
         // Persistence flush is global (dirty cells aren't per-pane), so it
         // runs once per frame, after all panes have rendered.
@@ -5741,6 +5741,31 @@ fn fit_text_ellipsized(text: &str, max_width: f32, font: &Font, paint: &Paint) -
     }
     out.push_str(ELLIPSIS);
     out
+}
+
+/// Shift `rect` so it stays inside the `[margin, view-margin]` window
+/// in both axes. Used by floating overlays (context menus, mention
+/// popup) so they don't draw past the right/bottom edges when their
+/// anchor falls near a corner. If the rect is taller/wider than the
+/// available space, the top-left wins (anchored at `margin`).
+fn clamp_rect_to_viewport(rect: Rect, view_w: f32, view_h: f32, margin: f32) -> Rect {
+    let w = rect.width();
+    let h = rect.height();
+    let mut left = rect.left;
+    if left + w + margin > view_w {
+        left = view_w - w - margin;
+    }
+    if left < margin {
+        left = margin;
+    }
+    let mut top = rect.top;
+    if top + h + margin > view_h {
+        top = view_h - h - margin;
+    }
+    if top < margin {
+        top = margin;
+    }
+    Rect::new(left, top, left + w, top + h)
 }
 
 /// same font as everything else in the app.
