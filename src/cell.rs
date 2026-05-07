@@ -1492,6 +1492,35 @@ mod tests {
     }
 
     #[test]
+    fn outline_split_with_active_selection_replaces_it() {
+        // Highlighting a word and pressing Enter should delete the
+        // selection first and then split at the resulting caret —
+        // matching every other text input. Pre-fix, the selected run
+        // stayed and the split landed at the selection's head.
+        let mut tb = TextBox::new(typeface(), "alpha BRAVO charlie".to_string());
+        // Select "BRAVO" (bytes 6..11). Head at end so the caret lands
+        // there after delete.
+        tb.select_range(6, 11);
+        let mut oc = OutlineCell::from_bullets(
+            typeface(),
+            vec![Bullet::new(Uuid::now_v7(), tb, 0)],
+        );
+        oc.split_focused_for_test();
+        let bullets = oc.bullets();
+        assert_eq!(bullets.len(), 2, "split produced two bullets");
+        assert_eq!(
+            bullets[0].textbox().text(),
+            "alpha ",
+            "selected word removed from prefix bullet",
+        );
+        assert_eq!(
+            bullets[1].textbox().text(),
+            " charlie",
+            "suffix bullet starts where the selection ended",
+        );
+    }
+
+    #[test]
     fn outline_bullet_link_survives_split_then_undo() {
         let mut tb = TextBox::new(typeface(), "before LINK after".to_string());
         tb.add_link(7..11, "https://example.com/".to_string());

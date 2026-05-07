@@ -314,9 +314,40 @@ impl TextBox {
         self.sels = Selections::single_caret(i);
     }
 
+    /// Replace selections with a single selection from `anchor` to
+    /// `head` (in byte offsets). Both ends are clamped to the nearest
+    /// char boundary at or before the requested index. `head` is the
+    /// caret position; the visible range is `[min(anchor, head),
+    /// max(anchor, head))`.
+    pub fn select_range(&mut self, anchor: usize, head: usize) {
+        let snap = |i: usize| -> usize {
+            let mut n = i.min(self.text.len());
+            while n > 0 && !self.text.is_char_boundary(n) {
+                n -= 1;
+            }
+            n
+        };
+        self.sels = Selections {
+            items: vec![Selection {
+                anchor: snap(anchor),
+                head: snap(head),
+                affinity: Affinity::Downstream,
+            }],
+            primary: 0,
+        };
+    }
+
     /// True iff any selection has a non-empty range (anchor != head).
     pub fn has_selection(&self) -> bool {
         self.sels.items.iter().any(|s| !s.is_collapsed())
+    }
+
+    /// Replace every non-empty selection with empty text. Carets land at
+    /// the deletion point. No-op when nothing is selected.
+    pub fn delete_selection(&mut self) {
+        if self.has_selection() {
+            self.insert_text("");
+        }
     }
 
     /// Replace selections with a single selection that spans the entire text.

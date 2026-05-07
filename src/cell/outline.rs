@@ -900,6 +900,12 @@ impl OutlineCell {
         let Some(idx) = self.focused_index() else {
             return false;
         };
+        // Enter on a non-empty selection deletes the selection first,
+        // then splits at the resulting caret — matching the behavior
+        // every other text input has (TextBox's own Enter does the
+        // same via insert_text("\n")). Without this the bullet keeps
+        // the highlighted run and the split lands at its head.
+        self.bullets[idx].textbox.delete_selection();
         let Some((_anchor, head)) = self.bullets[idx].textbox.primary_caret() else {
             return false;
         };
