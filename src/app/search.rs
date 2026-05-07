@@ -316,49 +316,6 @@ impl KeptApp {
         }
     }
 
-    /// Cmd/Ctrl+C while the search popup has focus: copy the input's
-    /// selection. No fallback to "copy the whole query" — that's atypical
-    /// for an input field and not worth the ambiguity.
-    pub(super) fn search_copy_to_clipboard(&mut self) -> bool {
-        let Some(state) = self.search.as_ref() else { return false };
-        let text = state.input.copy_primary_selection();
-        if text.is_empty() {
-            return false;
-        }
-        if let Some(cb) = self.clipboard.as_mut() {
-            let _ = cb.set_text(text);
-        }
-        true
-    }
-
-    pub(super) fn search_cut_to_clipboard(&mut self) -> bool {
-        let Some(state) = self.search.as_mut() else { return false };
-        let text = state.input.cut_primary_selection();
-        if text.is_empty() {
-            return false;
-        }
-        if let Some(cb) = self.clipboard.as_mut() {
-            let _ = cb.set_text(text);
-        }
-        true
-    }
-
-    pub(super) fn search_paste_from_clipboard(&mut self) -> bool {
-        let Some(cb) = self.clipboard.as_mut() else { return false };
-        let text = match cb.get_text() {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
-        if text.is_empty() {
-            return false;
-        }
-        // Search input is single-line; strip newlines on paste.
-        let cleaned: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
-        if let Some(state) = self.search.as_mut() {
-            state.input.paste(&cleaned);
-        }
-        true
-    }
 }
 
 fn result_snippet(text: &str, query: &str) -> String {

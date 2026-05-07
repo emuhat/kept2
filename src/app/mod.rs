@@ -2927,42 +2927,47 @@ impl KeptApp {
                 }
                 _ => {}
             }
-            // Cmd/Ctrl + letter combos: clipboard + select-all are routed
-            // to the search input; other letter shortcuts (zoom, new cell,
-            // undo, etc.) are swallowed so they don't fire behind the
-            // popup. Named keys (arrows, Home/End, Backspace) under
-            // primary_mod fall through to the TextBox so line-edge
-            // (Cmd+Arrow on Mac), word-nav (Ctrl+Arrow on Linux/Win), and
-            // word-Backspace all work.
+            // Cmd/Ctrl + letter combos: clipboard + select-all route
+            // through the shared TextBox helper; other letter shortcuts
+            // (zoom, new cell, undo, etc.) are swallowed so they don't
+            // fire behind the popup. Named keys (arrows, Home/End,
+            // Backspace) under primary_mod fall through to the TextBox
+            // so line-edge (Cmd+Arrow on Mac), word-nav (Ctrl+Arrow on
+            // Linux/Win), and word-Backspace all work.
             if primary_mod(mods) {
-                if let Key::Character(s) = &event.logical_key {
-                    let s = s.as_str();
-                    if s.eq_ignore_ascii_case("c") {
-                        self.search_copy_to_clipboard();
-                        return true;
-                    }
-                    if s.eq_ignore_ascii_case("x") {
-                        self.search_cut_to_clipboard();
-                        if let Some(state) = self.search.as_mut() {
-                            state.selected = 0;
+                let mut handled = false;
+                let mut text_changed = false;
+                {
+                    let search_state = self.search.as_mut();
+                    let clipboard = self.clipboard.as_mut();
+                    if let Some(state) = search_state {
+                        let pre = state.input.text().to_string();
+                        if apply_clipboard_shortcut(
+                            &mut state.input,
+                            clipboard,
+                            event,
+                            mods,
+                            true,
+                        ) {
+                            handled = true;
+                            text_changed = state.input.text() != pre;
+                            if text_changed {
+                                state.selected = 0;
+                            }
                         }
-                        return true;
                     }
-                    if s.eq_ignore_ascii_case("v") {
-                        self.search_paste_from_clipboard();
-                        if let Some(state) = self.search.as_mut() {
-                            state.selected = 0;
-                        }
-                        return true;
+                }
+                if handled {
+                    if text_changed {
+                        // Mention popup tracks search input text; keep
+                        // it in sync after a paste/cut.
+                        self.sync_mention_popup();
                     }
-                    if s.eq_ignore_ascii_case("a") {
-                        if let Some(state) = self.search.as_mut() {
-                            state.input.select_all();
-                        }
-                        return true;
-                    }
-                    // Other letter combos: swallow so app shortcuts don't
-                    // fire while the popup is up.
+                    return true;
+                }
+                if let Key::Character(_) = &event.logical_key {
+                    // Other letter combos: swallow so app shortcuts
+                    // don't fire while the popup is up.
                     return true;
                 }
                 // Fall through for Named keys.
@@ -2997,7 +3002,9 @@ impl KeptApp {
 
         // People-page rename input: Enter and Esc both commit (Esc is a
         // "blur" that keeps the typed text live, matching the cell
-        // edit-vs-view modal elsewhere). Everything else flows into the
+        // edit-vs-view modal elsewhere). Clipboard shortcuts route
+        // through the shared helper so Cmd+V actually pastes instead
+        // of typing a literal "v"; everything else flows into the
         // embedded TextBox.
         if event.state == ElementState::Pressed && self.people_rename.is_some() {
             match &event.logical_key {
@@ -3007,7 +3014,18 @@ impl KeptApp {
                 }
                 _ => {}
             }
-            if let Some(rs) = self.people_rename.as_mut() {
+            let rename = self.people_rename.as_mut();
+            let clipboard = self.clipboard.as_mut();
+            if let Some(rs) = rename {
+                if apply_clipboard_shortcut(
+                    &mut rs.input,
+                    clipboard,
+                    event,
+                    modifiers.state(),
+                    true,
+                ) {
+                    return true;
+                }
                 return rs.input.handle_key(event, modifiers);
             }
         }
@@ -3022,7 +3040,18 @@ impl KeptApp {
                 }
                 _ => {}
             }
-            if let Some(input) = self.people_add.as_mut() {
+            let input = self.people_add.as_mut();
+            let clipboard = self.clipboard.as_mut();
+            if let Some(input) = input {
+                if apply_clipboard_shortcut(
+                    input,
+                    clipboard,
+                    event,
+                    modifiers.state(),
+                    true,
+                ) {
+                    return true;
+                }
                 return input.handle_key(event, modifiers);
             }
         }
@@ -5766,6 +5795,73 @@ fn clamp_rect_to_viewport(rect: Rect, view_w: f32, view_h: f32, margin: f32) -> 
         top = margin;
     }
     Rect::new(left, top, left + w, top + h)
+}
+
+/// Cmd/Ctrl+C/X/V/A on a TextBox, with the system clipboard wired up.
+/// Returns true iff the key was a clipboard shortcut and was handled —
+/// the caller should `return true` from its key handler. Pass
+/// `single_line=true` for inline inputs (search, rename, add) so paste
+/// flattens newlines into spaces. The cell-level paste path stays
+/// separate because it has snapshot/undo concerns this helper doesn't
+/// know about.
+fn apply_clipboard_shortcut(
+    input: &mut TextBox,
+    clipboard: Option<&mut Clipboard>,
+    event: &KeyEvent,
+    mods: winit::keyboard::ModifiersState,
+    single_line: bool,
+) -> bool {
+    if event.state != ElementState::Pressed || !primary_mod(mods) {
+        return false;
+    }
+    let Key::Character(s) = &event.logical_key else {
+        return false;
+    };
+    let s = s.as_str();
+    if s.eq_ignore_ascii_case("c") {
+        let text = input.copy_primary_selection();
+        if !text.is_empty() {
+            if let Some(cb) = clipboard {
+                let _ = cb.set_text(text);
+            }
+        }
+        return true;
+    }
+    if s.eq_ignore_ascii_case("x") {
+        let text = input.cut_primary_selection();
+        if !text.is_empty() {
+            if let Some(cb) = clipboard {
+                let _ = cb.set_text(text);
+            }
+        }
+        return true;
+    }
+    if s.eq_ignore_ascii_case("v") {
+        let Some(cb) = clipboard else {
+            return true;
+        };
+        let text = match cb.get_text() {
+            Ok(t) => t,
+            Err(_) => return true,
+        };
+        if text.is_empty() {
+            return true;
+        }
+        let cleaned: String = if single_line {
+            text.chars()
+                .map(|c| if c == '\n' { ' ' } else { c })
+                .collect()
+        } else {
+            text
+        };
+        input.paste(&cleaned);
+        return true;
+    }
+    if s.eq_ignore_ascii_case("a") {
+        input.select_all();
+        return true;
+    }
+    false
 }
 
 /// same font as everything else in the app.
