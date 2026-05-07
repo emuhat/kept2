@@ -4,7 +4,7 @@
 //! + links + line wrap cache + drag state.
 
 use std::ops::Range;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use skia_safe::{Canvas, Color, Font, Paint, Point, Rect, Typeface};
 use winit::{
@@ -112,9 +112,18 @@ pub struct TextBox {
     /// silently and is never popped — bounded by `TEXTBOX_UNDO_CAP`.
     undo_stack: Vec<TextBoxSnapshot>,
     redo_stack: Vec<TextBoxSnapshot>,
+    /// Wall-clock time of the most recent edit. Two edits within
+    /// `TEXTBOX_COALESCE_INTERVAL` collapse into one undo entry — so
+    /// typing "hello" reverts as a single undo, not five.
+    last_edit_at: Option<Instant>,
+    /// "Decisive" gestures (mouse click, arrow nav, undo/redo, paste,
+    /// cut) flip this on; `record_undo` checks it and refuses to
+    /// coalesce when set. Mirrors `KeptApp::coalesce_break`.
+    coalesce_break: bool,
 }
 
 const TEXTBOX_UNDO_CAP: usize = 200;
+const TEXTBOX_COALESCE_INTERVAL: Duration = Duration::from_millis(600);
 
 impl TextBox {
     pub fn new(typeface: Typeface, initial_text: String) -> Self {
@@ -146,6 +155,8 @@ impl TextBox {
             pending_tag_name: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            last_edit_at: None,
+            coalesce_break: false,
         }
     }
 
@@ -273,10 +284,14 @@ impl TextBox {
     /// Drops any links that no longer fit within the new text.
     pub fn replace_text(&mut self, new_text: String) {
         let new_len = new_text.len();
+        self.record_undo();
         self.text = new_text;
         self.body_lines_width = f32::NAN;
         self.sels = Selections::single_caret(0);
         self.links.retain(|l| l.range.end <= new_len);
+        // Whole-text replacement is decisive — no coalescing into the
+        // next edit.
+        self.break_coalesce();
     }
 
     /// Split this textbox's links at byte offset `at`, returning links that
@@ -574,10 +589,14 @@ impl TextBox {
         let lo = anchor.min(head);
         let hi = anchor.max(head);
         let cut_text = self.text[lo..hi].to_string();
+        self.record_undo();
         self.apply_edit(&Edit {
             range: lo..hi,
             replacement: String::new(),
         });
+        // Cut isn't part of a typing burst — break so the next edit
+        // doesn't merge with it.
+        self.break_coalesce();
         cut_text
     }
 
@@ -591,6 +610,9 @@ impl TextBox {
         let urls = detect_urls(s);
         if urls.is_empty() {
             self.insert_text(s);
+            // Paste is its own undo unit even when no URLs were
+            // detected — break so subsequent typing doesn't merge.
+            self.break_coalesce();
             return;
         }
         // Each selection's pre-edit `[a, b)` is replaced by `s` (length
@@ -619,6 +641,9 @@ impl TextBox {
                 }
             }
         }
+        // Paste is its own undo unit — break so the next edit doesn't
+        // merge with it.
+        self.break_coalesce();
     }
 
     /// Restore document state from a snapshot. Resets transient input state
@@ -1079,6 +1104,7 @@ impl TextBox {
                 } else {
                     self.move_horizontal(-1, shift);
                 }
+                self.break_coalesce();
                 true
             }
             Key::Named(NamedKey::ArrowRight) => {
@@ -1089,22 +1115,27 @@ impl TextBox {
                 } else {
                     self.move_horizontal(1, shift);
                 }
+                self.break_coalesce();
                 true
             }
             Key::Named(NamedKey::ArrowUp) => {
                 self.move_vertical(-1, shift);
+                self.break_coalesce();
                 true
             }
             Key::Named(NamedKey::ArrowDown) => {
                 self.move_vertical(1, shift);
+                self.break_coalesce();
                 true
             }
             Key::Named(NamedKey::Home) => {
                 self.move_to_line_edge(false, shift);
+                self.break_coalesce();
                 true
             }
             Key::Named(NamedKey::End) => {
                 self.move_to_line_edge(true, shift);
+                self.break_coalesce();
                 true
             }
             Key::Named(NamedKey::Backspace) => {
@@ -1147,6 +1178,9 @@ impl TextBox {
         modifiers: &Modifiers,
         editing: bool,
     ) -> bool {
+        // A click is a deliberate caret move — end any in-progress
+        // typing burst so the next edit starts a fresh undo entry.
+        self.break_coalesce();
         let lx = abs_x - self.x_origin;
         let ly = abs_y - self.y_origin;
 
@@ -1597,11 +1631,13 @@ impl TextBox {
     pub fn replace_with_text(&mut self, range: Range<usize>, text: String) {
         let start = range.start;
         let inserted_len = text.len();
+        self.record_undo();
         self.apply_edit(&Edit {
             range,
             replacement: text,
         });
         self.set_caret_at(start + inserted_len);
+        self.break_coalesce();
     }
 
     /// Replace `range` with `text` and add a link covering the inserted text.
@@ -1610,6 +1646,7 @@ impl TextBox {
     pub fn replace_with_link(&mut self, range: Range<usize>, text: String, url: String) {
         let start = range.start;
         let inserted_len = text.len();
+        self.record_undo();
         self.apply_edit(&Edit {
             range,
             replacement: text,
@@ -1622,6 +1659,7 @@ impl TextBox {
             });
         }
         self.set_caret_at(end);
+        self.break_coalesce();
     }
 
     fn apply_edits_right_to_left(&mut self, mut edits: Vec<Edit>) {
@@ -1640,15 +1678,44 @@ impl TextBox {
     }
 
     fn record_undo(&mut self) {
-        let snap = self.snapshot();
-        self.undo_stack.push(snap);
-        if self.undo_stack.len() > TEXTBOX_UNDO_CAP {
-            // Drop the oldest entry. `Vec::remove(0)` is O(n) but the
-            // stack is bounded by TEXTBOX_UNDO_CAP and trim happens at
-            // most once per edit.
-            self.undo_stack.remove(0);
+        let now = Instant::now();
+        // Coalesce consecutive edits within the time window unless a
+        // decisive gesture (mouse click, arrow nav, paste, undo/redo)
+        // ended the burst. When we coalesce, the existing top-of-stack
+        // snapshot already captures the start-of-burst state — just
+        // skip the push.
+        let can_coalesce = !self.coalesce_break
+            && !self.undo_stack.is_empty()
+            && self
+                .last_edit_at
+                .map(|t| now.duration_since(t) < TEXTBOX_COALESCE_INTERVAL)
+                .unwrap_or(false);
+        if !can_coalesce {
+            let snap = self.snapshot();
+            self.undo_stack.push(snap);
+            if self.undo_stack.len() > TEXTBOX_UNDO_CAP {
+                // Drop the oldest entry. `Vec::remove(0)` is O(n) but
+                // the stack is bounded by TEXTBOX_UNDO_CAP and trim
+                // happens at most once per edit.
+                self.undo_stack.remove(0);
+            }
         }
+        // Any edit invalidates the redo stack — even a coalesced one.
+        // Otherwise: type, undo, type-within-window would coalesce
+        // (skip the push) and leave a stale redo entry pointing at
+        // the abandoned future.
         self.redo_stack.clear();
+        self.last_edit_at = Some(now);
+        self.coalesce_break = false;
+    }
+
+    /// End the current typing burst — the next edit starts a fresh
+    /// undo entry instead of coalescing into the previous one. Called
+    /// from gestures that move the caret deliberately (mouse_down,
+    /// arrow nav) and from edits that aren't part of a typing burst
+    /// (paste, cut, undo, redo).
+    pub fn break_coalesce(&mut self) {
+        self.coalesce_break = true;
     }
 
     /// Roll the textbox back one edit. Returns true iff there was
@@ -1661,6 +1728,7 @@ impl TextBox {
         let cur = self.snapshot();
         self.restore(prev);
         self.redo_stack.push(cur);
+        self.coalesce_break = true;
         true
     }
 
@@ -1672,6 +1740,7 @@ impl TextBox {
         let cur = self.snapshot();
         self.restore(next);
         self.undo_stack.push(cur);
+        self.coalesce_break = true;
         true
     }
 

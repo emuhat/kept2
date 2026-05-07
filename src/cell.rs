@@ -1646,13 +1646,62 @@ mod tests {
 
     #[test]
     fn textbox_new_edit_clears_redo_stack() {
+        // Bursts coalesce by default; break_coalesce between forces
+        // separate undo entries so this test exercises the redo-clear
+        // path explicitly.
         let mut tb = TextBox::new(typeface(), String::new());
         tb.insert_text("a");
+        tb.break_coalesce();
         tb.insert_text("b");
-        tb.undo(); // text = "a", redo has "ab"
-        tb.insert_text("c"); // text = "ac"; redo cleared
+        tb.undo(); // text = "a"; redo has "ab"
+        tb.break_coalesce();
+        tb.insert_text("c"); // redo cleared by the new edit
         assert_eq!(tb.text(), "ac");
         assert!(!tb.redo(), "redo cleared by the new edit");
+    }
+
+    #[test]
+    fn textbox_typing_burst_coalesces_into_one_undo() {
+        // Five rapid keystrokes should be one undo entry — undoing
+        // returns to the start of the burst, not one char back.
+        let mut tb = TextBox::new(typeface(), String::new());
+        for c in "hello".chars() {
+            tb.insert_text(&c.to_string());
+        }
+        assert_eq!(tb.text(), "hello");
+        assert!(tb.undo());
+        assert_eq!(tb.text(), "", "burst undid as a single unit");
+        assert!(!tb.undo(), "no second undo entry");
+    }
+
+    #[test]
+    fn textbox_break_coalesce_starts_new_undo_entry() {
+        // A deliberate gesture (mouse click, arrow nav) between two
+        // bursts should make them separately undoable. Simulate the
+        // gesture with break_coalesce.
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.insert_text("foo");
+        tb.break_coalesce();
+        tb.insert_text("bar");
+        assert_eq!(tb.text(), "foobar");
+        assert!(tb.undo());
+        assert_eq!(tb.text(), "foo", "second burst undone alone");
+        assert!(tb.undo());
+        assert_eq!(tb.text(), "", "first burst undone next");
+    }
+
+    #[test]
+    fn textbox_paste_does_not_coalesce_with_following_typing() {
+        // Paste sets break_coalesce so subsequent typing is its own
+        // undo entry, matching the app-level pattern.
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.paste("pasted ");
+        tb.insert_text("typed");
+        assert_eq!(tb.text(), "pasted typed");
+        assert!(tb.undo());
+        assert_eq!(tb.text(), "pasted ", "typed burst undone first");
+        assert!(tb.undo());
+        assert_eq!(tb.text(), "", "paste undone next");
     }
 
     #[test]
