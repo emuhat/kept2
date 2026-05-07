@@ -103,7 +103,18 @@ pub struct TextBox {
     /// filter view via `push_view(Query::tag(name))`. Same buffering
     /// rationale as `pending_link_url`.
     pending_tag_name: Option<String>,
+    /// Local undo stack — pre-edit `TextBoxSnapshot`s pushed by every
+    /// run through `apply_edits_right_to_left` (the chokepoint for
+    /// every text mutation). Drives Cmd+Z inside inline inputs that
+    /// don't have a cell-level undo wrapper (search popup, people
+    /// rename, people add). For cells, app-level Cmd+Z is intercepted
+    /// before the `TextBox` ever sees it, so this stack accumulates
+    /// silently and is never popped — bounded by `TEXTBOX_UNDO_CAP`.
+    undo_stack: Vec<TextBoxSnapshot>,
+    redo_stack: Vec<TextBoxSnapshot>,
 }
+
+const TEXTBOX_UNDO_CAP: usize = 200;
 
 impl TextBox {
     pub fn new(typeface: Typeface, initial_text: String) -> Self {
@@ -133,6 +144,8 @@ impl TextBox {
             enable_comment_coloring: false,
             pending_link_url: None,
             pending_tag_name: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -1612,10 +1625,54 @@ impl TextBox {
     }
 
     fn apply_edits_right_to_left(&mut self, mut edits: Vec<Edit>) {
+        if edits.is_empty() {
+            return;
+        }
+        // One undo entry per "user action" — every text mutation funnels
+        // through this method, so a single record_undo here covers
+        // typing, paste, cut, delete_selection, and the Backspace /
+        // Delete / Enter branches of handle_key.
+        self.record_undo();
         edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
         for edit in &edits {
             self.apply_edit(edit);
         }
+    }
+
+    fn record_undo(&mut self) {
+        let snap = self.snapshot();
+        self.undo_stack.push(snap);
+        if self.undo_stack.len() > TEXTBOX_UNDO_CAP {
+            // Drop the oldest entry. `Vec::remove(0)` is O(n) but the
+            // stack is bounded by TEXTBOX_UNDO_CAP and trim happens at
+            // most once per edit.
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    /// Roll the textbox back one edit. Returns true iff there was
+    /// something to undo. The current state is pushed onto the redo
+    /// stack so a subsequent `redo()` can replay it.
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            return false;
+        };
+        let cur = self.snapshot();
+        self.restore(prev);
+        self.redo_stack.push(cur);
+        true
+    }
+
+    /// Replay one undone edit. Returns true iff there was a redo entry.
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            return false;
+        };
+        let cur = self.snapshot();
+        self.restore(next);
+        self.undo_stack.push(cur);
+        true
     }
 
     fn apply_edit(&mut self, edit: &Edit) {

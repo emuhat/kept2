@@ -5792,13 +5792,15 @@ fn clamp_rect_to_viewport(rect: Rect, view_w: f32, view_h: f32, margin: f32) -> 
     Rect::new(left, top, left + w, top + h)
 }
 
-/// Cmd/Ctrl+C/X/V/A on a TextBox, with the system clipboard wired up.
-/// Returns true iff the key was a clipboard shortcut and was handled —
+/// Cmd/Ctrl+C/X/V/A and Cmd+Z / Cmd+Shift+Z / Cmd+Y on a `TextBox`,
+/// with the system clipboard wired up and undo routed through the
+/// textbox's local stack. Returns true iff the key was handled —
 /// the caller should `return true` from its key handler. Pass
 /// `single_line=true` for inline inputs (search, rename, add) so paste
-/// flattens newlines into spaces. The cell-level paste path stays
-/// separate because it has snapshot/undo concerns this helper doesn't
-/// know about.
+/// flattens newlines into spaces. The cell-level paste/undo path stays
+/// separate because it has snapshot/cell-undo concerns this helper
+/// doesn't know about; cells intercept these shortcuts at the app
+/// level before forwarding to the focused `TextBox`.
 fn apply_clipboard_shortcut(
     input: &mut TextBox,
     clipboard: Option<&mut Clipboard>,
@@ -5854,6 +5856,19 @@ fn apply_clipboard_shortcut(
     }
     if s.eq_ignore_ascii_case("a") {
         input.select_all();
+        return true;
+    }
+    if s.eq_ignore_ascii_case("z") {
+        if mods.shift_key() {
+            input.redo();
+        } else {
+            input.undo();
+        }
+        return true;
+    }
+    if s.eq_ignore_ascii_case("y") {
+        // Windows-flavored redo. Cmd+Shift+Z above covers the Mac form.
+        input.redo();
         return true;
     }
     false

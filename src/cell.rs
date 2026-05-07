@@ -1607,6 +1607,55 @@ mod tests {
     }
 
     #[test]
+    fn textbox_undo_reverts_typed_text() {
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.insert_text("hello");
+        assert_eq!(tb.text(), "hello");
+        assert!(tb.undo());
+        assert_eq!(tb.text(), "");
+        // Nothing left to undo.
+        assert!(!tb.undo());
+    }
+
+    #[test]
+    fn textbox_redo_replays_undone_edit() {
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.insert_text("hello");
+        tb.undo();
+        assert!(tb.redo());
+        assert_eq!(tb.text(), "hello");
+        assert!(!tb.redo());
+    }
+
+    #[test]
+    fn textbox_undo_reverts_paste_including_links() {
+        // The auto-linkified paste path adds LinkSpans after
+        // insert_text returns. Undo must restore the pre-paste state
+        // — empty text AND empty links.
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.paste("see https://example.com");
+        assert!(!tb.text().is_empty());
+        assert_eq!(tb.links().len(), 1);
+        assert!(tb.undo());
+        assert_eq!(tb.text(), "");
+        assert!(
+            tb.links().is_empty(),
+            "link added during paste must vanish on undo",
+        );
+    }
+
+    #[test]
+    fn textbox_new_edit_clears_redo_stack() {
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.insert_text("a");
+        tb.insert_text("b");
+        tb.undo(); // text = "a", redo has "ab"
+        tb.insert_text("c"); // text = "ac"; redo cleared
+        assert_eq!(tb.text(), "ac");
+        assert!(!tb.redo(), "redo cleared by the new edit");
+    }
+
+    #[test]
     fn long_word_breaks_inside_when_no_whitespace() {
         // A single token wider than max_width must be hard-broken at
         // char boundaries — otherwise the line renders past the right
