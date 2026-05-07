@@ -1595,6 +1595,54 @@ mod tests {
     }
 
     #[test]
+    fn long_word_breaks_inside_when_no_whitespace() {
+        // A single token wider than max_width must be hard-broken at
+        // char boundaries — otherwise the line renders past the right
+        // edge of the cell. Pre-fix, this returned one line containing
+        // the whole 200-char string regardless of max_width.
+        use super::wrap::wrap_paragraph_into;
+        let tf = typeface();
+        let font = skia_safe::Font::from_typeface(&tf, 16.0);
+        let paint = skia_safe::Paint::default();
+        let long: String = "a".repeat(200);
+        let mut out = Vec::new();
+        wrap_paragraph_into(&long, 0, long.len(), &font, &paint, 100.0, &mut out);
+        assert!(out.len() > 1, "long word must break into multiple lines");
+        // Every emitted line should fit (allowing the very last to be
+        // short; the final piece is the remainder).
+        for line in &out {
+            let w = font.measure_str(&long[line.start..line.end], Some(&paint)).0;
+            assert!(
+                w <= 100.0 || (line.end - line.start) <= 1,
+                "line width {} exceeds max_width 100",
+                w,
+            );
+        }
+        // Lines together cover the whole input contiguously.
+        assert_eq!(out.first().unwrap().start, 0);
+        assert_eq!(out.last().unwrap().end, long.len());
+    }
+
+    #[test]
+    fn long_word_followed_by_short_word_wraps_correctly() {
+        use super::wrap::wrap_paragraph_into;
+        let tf = typeface();
+        let font = skia_safe::Font::from_typeface(&tf, 16.0);
+        let paint = skia_safe::Paint::default();
+        let text = format!("{} tail", "x".repeat(200));
+        let mut out = Vec::new();
+        wrap_paragraph_into(&text, 0, text.len(), &font, &paint, 100.0, &mut out);
+        // The trailing "tail" word should still be present at the end
+        // of the final line, not stranded.
+        let last = out.last().unwrap();
+        assert!(
+            text[last.start..last.end].ends_with("tail"),
+            "tail word must land on the final line, got {:?}",
+            &text[last.start..last.end],
+        );
+    }
+
+    #[test]
     fn poppop_body_has_no_auto_heading() {
         // After v4 the `# ` prefix no longer triggers heading rendering on
         // body text. A PopPop input that opens with `# Foo` is treated as a

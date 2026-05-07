@@ -469,15 +469,67 @@ pub(super) fn wrap_paragraph_into(
     let mut line_start = start;
     let mut have_word = false;
     for word in &words {
-        if !have_word {
-            have_word = true;
-            continue;
+        if have_word {
+            let candidate = &text[line_start..word.end];
+            if font.measure_str(candidate, Some(paint)).0 > max_width {
+                out.push(line_start..word.start);
+                line_start = word.start;
+            }
         }
-        let candidate = &text[line_start..word.end];
-        if font.measure_str(candidate, Some(paint)).0 > max_width {
-            out.push(line_start..word.start);
-            line_start = word.start;
+        have_word = true;
+        // If this word starts the line and is itself wider than the
+        // viewport (e.g., a long URL with no spaces), break inside it
+        // at char boundaries — otherwise the line would render outside
+        // the cell. Each emitted slice is the largest char-bounded
+        // prefix that fits; the trailing remainder stays on the
+        // current line for the next word check to extend.
+        if line_start == word.start
+            && font.measure_str(&text[word.start..word.end], Some(paint)).0 > max_width
+        {
+            let mut cursor = word.start;
+            while font.measure_str(&text[cursor..word.end], Some(paint)).0 > max_width {
+                let take = largest_prefix_fitting(
+                    &text[cursor..word.end],
+                    font,
+                    paint,
+                    max_width,
+                );
+                let next = if take == 0 {
+                    // Even one char overflows (max_width is sub-glyph).
+                    // Force one char so we don't loop forever.
+                    text[cursor..word.end]
+                        .chars()
+                        .next()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(1)
+                } else {
+                    take
+                };
+                if cursor + next >= word.end {
+                    break;
+                }
+                out.push(line_start..cursor + next);
+                cursor += next;
+                line_start = cursor;
+            }
         }
     }
     out.push(line_start..end);
+}
+
+/// Largest byte length `n` such that `s[..n]` ends on a char boundary
+/// and `font.measure_str(&s[..n])` ≤ `max_width`. Returns 0 if even the
+/// first character doesn't fit. O(n) measure calls in the worst case.
+fn largest_prefix_fitting(s: &str, font: &Font, paint: &Paint, max_width: f32) -> usize {
+    let mut last_fit = 0;
+    for (i, _) in s.char_indices() {
+        if i == 0 {
+            continue;
+        }
+        if font.measure_str(&s[..i], Some(paint)).0 > max_width {
+            return last_fit;
+        }
+        last_fit = i;
+    }
+    s.len()
 }
