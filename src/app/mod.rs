@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use arboard::Clipboard;
 use uuid::{Uuid, uuid};
 use skia_safe::{
-    BlurStyle, Canvas, Color, Font, FontMgr, MaskFilter, Paint, PaintStyle, PathEffect, Point,
+    BlurStyle, Canvas, Font, FontMgr, MaskFilter, Paint, PaintStyle, PathEffect, Point,
     Rect, Typeface,
 };
 use winit::{
@@ -18,8 +18,10 @@ use crate::cell::{
 use crate::persist::{ContextRef, Db, Entity, db_path};
 use crate::query;
 
+mod context_menus;
 mod mention_popup;
 mod search;
+use context_menus::{CellContextMenu, PeopleContextMenu, TagContextMenu};
 use mention_popup::{MentionKind, MentionPopup};
 use search::SearchState;
 
@@ -89,13 +91,6 @@ fn split_title_name_and_tags(text: &str) -> (String, String) {
         name_end -= 1;
     }
     (text[..name_end].to_string(), text[tags_start..].to_string())
-}
-
-
-struct TagContextMenu {
-    name: String,
-    anchor_x: f32,
-    anchor_y: f32,
 }
 
 /// Last-frame hit-test rects, populated during render and consumed by
@@ -202,45 +197,6 @@ enum PageKind {
 struct PeopleRenameState {
     entity_id: Uuid,
     input: TextBox,
-}
-
-/// Right-click menu anchored on a cell in the doc area. Replaces the
-/// old kebab affordance: timestamps render as muted info rows, and a
-/// "Delete cell" row is the only action.
-struct CellContextMenu {
-    cell_id: Uuid,
-    anchor_x: f32,
-    anchor_y: f32,
-    /// When the right-click hit-tested onto a specific bullet inside an
-    /// outline cell, the bullet's id + a short snippet of its text. Drives
-    /// the "Copy '<snippet>' bullet sub-tree as embed" menu row. None for
-    /// non-outline cells or right-clicks landing in outline whitespace.
-    bullet_id: Option<Uuid>,
-    bullet_snippet: Option<String>,
-    /// Cell id used as the *source* for any "Surface as reference"
-    /// action invoked from this menu (whole-cell or subtree). Equals
-    /// `cell_id` when the menu is anchored on a normal cell. When
-    /// anchored on a Reference cell, this is `Reference.target.cell_id()`
-    /// — references always resolve to the original source, never to
-    /// another reference (no chained-reference creation).
-    reference_origin_cell_id: Uuid,
-}
-
-/// Right-click menu over a People-page row. `deletable` and `ref_count`
-/// are precomputed at open time so the menu render doesn't have to walk
-/// every cell's links each frame; if the user creates a new mention
-/// while the menu is open, they'll see stale state — that's fine, the
-/// menu is dismissed by any click anyway.
-struct PeopleContextMenu {
-    entity_id: Uuid,
-    anchor_x: f32,
-    anchor_y: f32,
-    /// True when the entity has no `primary_cell_id` AND zero `kept://`
-    /// references in any cell. Drives the Delete row's enabled state.
-    deletable: bool,
-    /// Reference count surfaced as muted text under "Delete" when the
-    /// entity isn't deletable. `None` when deletable (zero, suppressed).
-    ref_count: Option<usize>,
 }
 
 /// What the user is viewing in the doc area / highlighting in the sidebar.
@@ -543,13 +499,6 @@ const ENTITY_CREATE_BTN_W: f32 = 220.0;
 const PEOPLE_ROW_H: f32 = 36.0;
 const PEOPLE_ROW_PAD_X: f32 = 12.0;
 const PEOPLE_ROW_FONT_SIZE: f32 = 18.0;
-
-/// Cell context menu (right-click). Two muted timestamp lines + a
-/// "Delete cell" action separated by a hairline.
-const CELL_MENU_WIDTH: f32 = 220.0;
-const CELL_MENU_INFO_H: f32 = 22.0;
-const CELL_MENU_ACTION_H: f32 = 26.0;
-const CELL_MENU_PAD: f32 = 6.0;
 
 /// Reference-cell embed wrapper. Warm-tan dashed border with a faint warm
 /// background tint, plus a muted footer line ("↗ originally <date>") so the
@@ -3583,183 +3532,6 @@ impl KeptApp {
         true
     }
 
-    /// Right-click context menu over a cell. Two muted info lines
-    /// (Created / Last edited timestamps) followed by a hairline and a
-    /// red "Delete cell" action row. Anchored at the cursor position
-    /// recorded when the menu opened.
-    fn render_cell_context_menu(&mut self, canvas: &Canvas) {
-        let Some(menu) = self.cell_context_menu.as_ref() else {
-            self.hit_tests.cell_menu.delete = None;
-            self.hit_tests.cell_menu.surface = None;
-            self.hit_tests.cell_menu.surface_subtree = None;
-            return;
-        };
-        let Some(cell) = self.cell(menu.cell_id) else {
-            self.hit_tests.cell_menu.delete = None;
-            self.hit_tests.cell_menu.surface = None;
-            self.hit_tests.cell_menu.surface_subtree = None;
-            return;
-        };
-        let scale = self.font_scale;
-        let pad = CELL_MENU_PAD * scale;
-        let info_h = CELL_MENU_INFO_H * scale;
-        let action_h = CELL_MENU_ACTION_H * scale;
-        let menu_w = CELL_MENU_WIDTH * scale;
-
-        // Compute action rows. Order matches the visual stack.
-        let has_subtree = menu.bullet_id.is_some();
-        let mut action_count: usize = 1; // Delete cell
-        action_count += 1; // Surface as reference (always)
-        if has_subtree {
-            action_count += 1;
-        }
-        let menu_h =
-            pad + info_h * 2.0 + 1.0 + action_h * action_count as f32 + pad;
-        let radius = 6.0 * scale;
-        let rect = Rect::new(
-            menu.anchor_x,
-            menu.anchor_y,
-            menu.anchor_x + menu_w,
-            menu.anchor_y + menu_h,
-        );
-
-        // Drop shadow.
-        let mut shadow = Paint::default();
-        shadow.set_anti_alias(true);
-        shadow.set_color(crate::color::SHADOW_MENU);
-        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
-        canvas.draw_round_rect(
-            Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
-            radius,
-            radius,
-            &shadow,
-        );
-
-        // Background + border.
-        let mut bg = Paint::default();
-        bg.set_anti_alias(true);
-        bg.set_color(crate::color::BG_CARD);
-        canvas.draw_round_rect(rect, radius, radius, &bg);
-        let mut border = Paint::default();
-        border.set_anti_alias(true);
-        border.set_style(PaintStyle::Stroke);
-        border.set_stroke_width(1.0);
-        border.set_color(crate::color::MENU_BORDER);
-        canvas.draw_round_rect(rect, radius, radius, &border);
-
-        // Two muted info lines.
-        let info_font = Font::from_typeface(&self.typeface, 12.0 * scale);
-        let mut info_paint = Paint::default();
-        info_paint.set_anti_alias(true);
-        info_paint.set_color(crate::color::TEXT_MUTED_GREY);
-        let (_, im) = info_font.metrics();
-        let line1_baseline =
-            rect.top + pad + (info_h + (-im.ascent) - im.descent) * 0.5;
-        let line2_baseline = line1_baseline + info_h;
-        canvas.draw_str(
-            format!("Created {}", format_timestamp(cell.timestamp)),
-            Point::new(rect.left + pad * 2.0, line1_baseline),
-            &info_font,
-            &info_paint,
-        );
-        canvas.draw_str(
-            format!("Last edited {}", format_timestamp(cell.edited_at)),
-            Point::new(rect.left + pad * 2.0, line2_baseline),
-            &info_font,
-            &info_paint,
-        );
-
-        // Hairline divider above the action rows.
-        let divider_y = rect.top + pad + info_h * 2.0 + 0.5;
-        let mut divider = Paint::default();
-        divider.set_anti_alias(false);
-        divider.set_color(crate::color::HAIRLINE_DIVIDER);
-        canvas.draw_line(
-            Point::new(rect.left + pad, divider_y),
-            Point::new(rect.right - pad, divider_y),
-            &divider,
-        );
-
-        let action_font = Font::from_typeface(&self.typeface, 13.0 * scale);
-        let (_, am) = action_font.metrics();
-        let mouse_x = self.mouse_pos.0;
-        let mouse_y = self.mouse_pos.1;
-        let mut row_top = rect.top + pad + info_h * 2.0 + 1.0;
-        let mut draw_row = |label: &str, color: Color, hover_bg: Color| -> Rect {
-            let r = Rect::new(
-                rect.left + pad * 0.5,
-                row_top,
-                rect.right - pad * 0.5,
-                row_top + action_h,
-            );
-            let hovered = mouse_x >= r.left
-                && mouse_x <= r.right
-                && mouse_y >= r.top
-                && mouse_y <= r.bottom;
-            if hovered {
-                let mut hp = Paint::default();
-                hp.set_anti_alias(true);
-                hp.set_color(hover_bg);
-                canvas.draw_round_rect(r, 4.0 * scale, 4.0 * scale, &hp);
-            }
-            let mut paint = Paint::default();
-            paint.set_anti_alias(true);
-            paint.set_color(color);
-            let baseline =
-                r.top + (action_h + (-am.ascent) - am.descent) * 0.5;
-            // Truncate the label so a long bullet snippet (e.g.
-            // "Surface 'long bullet text…' as reference") doesn't
-            // overflow the menu's right edge. Available width is the
-            // row interior minus the left text inset and a matching
-            // right inset for symmetry.
-            let text_left = r.left + pad * 2.0;
-            let avail = (r.right - pad * 2.0 - text_left).max(0.0);
-            let fitted = fit_text_ellipsized(label, avail, &action_font, &paint);
-            canvas.draw_str(
-                &fitted,
-                Point::new(text_left, baseline),
-                &action_font,
-                &paint,
-            );
-            row_top += action_h;
-            r
-        };
-
-        // Delete row (red, hover red-tinted).
-        let delete_rect = draw_row(
-            "Delete cell",
-            crate::color::DELETE_TEXT,
-            crate::color::DELETE_HOVER_BG,
-        );
-
-        // Surface as reference — always present. Creates a new reference
-        // cell at "now" pointing to this cell. Lands wherever a fresh
-        // Ctrl+N cell would land. Hover uses the warm-tan tint.
-        let surface_rect = draw_row(
-            "Surface as reference",
-            crate::color::TEXT_MENU_ROW,
-            crate::color::EMBED_HOVER,
-        );
-
-        // Surface bullet sub-tree as reference — only when right-click hit
-        // a bullet inside an outline.
-        let surface_subtree_rect = if has_subtree {
-            let snip = menu.bullet_snippet.as_deref().unwrap_or("[empty]");
-            let label = format!("Surface '{}' as reference", snip);
-            Some(draw_row(
-                &label,
-                crate::color::TEXT_MENU_ROW,
-                crate::color::EMBED_HOVER,
-            ))
-        } else {
-            None
-        };
-
-        self.hit_tests.cell_menu.delete = Some(delete_rect);
-        self.hit_tests.cell_menu.surface = Some(surface_rect);
-        self.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
-    }
-
     /// Render the entity page for `entity_id` into the doc area. Returns
     /// the total content height (so `tick` can update `doc_height` for the
     /// scrollbar). Layout, top to bottom: display_name heading, metadata
@@ -4776,209 +4548,6 @@ impl KeptApp {
         // separator (`sb_w - 1.0` is the separator itself).
         self.sidebar_scroll
             .draw_bar(canvas, sb_w - 1.0, height, total_h);
-    }
-
-    fn render_tag_context_menu(&mut self, canvas: &Canvas) {
-        let Some(menu) = self.tag_context_menu.as_ref() else {
-            self.hit_tests.tag_menu.delete = None;
-            return;
-        };
-        let scale = self.font_scale;
-        let pad = 6.0 * scale;
-        let row_h = 26.0 * scale;
-        let menu_w = 160.0 * scale;
-        let menu_h = row_h + pad * 2.0;
-        let rect = Rect::new(
-            menu.anchor_x,
-            menu.anchor_y,
-            menu.anchor_x + menu_w,
-            menu.anchor_y + menu_h,
-        );
-        // Drop shadow.
-        let mut shadow = Paint::default();
-        shadow.set_anti_alias(true);
-        shadow.set_color(crate::color::SHADOW_MENU);
-        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
-        canvas.draw_round_rect(
-            Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
-            6.0 * scale,
-            6.0 * scale,
-            &shadow,
-        );
-        // Background card.
-        let mut bg = Paint::default();
-        bg.set_anti_alias(true);
-        bg.set_color(crate::color::BG_CARD);
-        canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &bg);
-        let mut border = Paint::default();
-        border.set_anti_alias(true);
-        border.set_style(PaintStyle::Stroke);
-        border.set_stroke_width(1.0);
-        border.set_color(crate::color::MENU_BORDER);
-        canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &border);
-        // "Delete tag" row.
-        let row_rect = Rect::new(
-            rect.left + pad * 0.5,
-            rect.top + pad,
-            rect.right - pad * 0.5,
-            rect.top + pad + row_h,
-        );
-        let mouse_x = self.mouse_pos.0;
-        let mouse_y = self.mouse_pos.1;
-        let hovered = mouse_x >= row_rect.left
-            && mouse_x <= row_rect.right
-            && mouse_y >= row_rect.top
-            && mouse_y <= row_rect.bottom;
-        if hovered {
-            let mut hp = Paint::default();
-            hp.set_anti_alias(true);
-            hp.set_color(crate::color::DELETE_HOVER_BG);
-            canvas.draw_round_rect(row_rect, 4.0 * scale, 4.0 * scale, &hp);
-        }
-        let font = Font::from_typeface(&self.typeface, 13.0 * scale);
-        let (_, m) = font.metrics();
-        let baseline = row_rect.top + (row_h + (-m.ascent) - m.descent) * 0.5;
-        let mut text_paint = Paint::default();
-        text_paint.set_anti_alias(true);
-        text_paint.set_color(crate::color::DELETE_TEXT);
-        canvas.draw_str(
-            format!("Delete tag #{}", menu.name),
-            Point::new(row_rect.left + pad, baseline),
-            &font,
-            &text_paint,
-        );
-        self.hit_tests.tag_menu.delete = Some(row_rect);
-    }
-
-    /// Right-click menu rendered over a People-page row. Two actions:
-    /// Rename (always enabled) and Delete person (disabled when the
-    /// entity has a backing cell or any `kept://` references; the row
-    /// shows the count so the user knows what's blocking).
-    fn render_people_context_menu(&mut self, canvas: &Canvas) {
-        let Some(menu) = self.people_context_menu.as_ref() else {
-            self.hit_tests.people_menu.rename = None;
-            self.hit_tests.people_menu.delete = None;
-            return;
-        };
-        let scale = self.font_scale;
-        let pad = 6.0 * scale;
-        let row_h = 26.0 * scale;
-        let menu_w = 200.0 * scale;
-        let menu_h = row_h * 2.0 + pad * 2.0;
-        let rect = Rect::new(
-            menu.anchor_x,
-            menu.anchor_y,
-            menu.anchor_x + menu_w,
-            menu.anchor_y + menu_h,
-        );
-        // Drop shadow.
-        let mut shadow = Paint::default();
-        shadow.set_anti_alias(true);
-        shadow.set_color(crate::color::SHADOW_MENU);
-        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
-        canvas.draw_round_rect(
-            Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
-            6.0 * scale,
-            6.0 * scale,
-            &shadow,
-        );
-        // Background.
-        let mut bg = Paint::default();
-        bg.set_anti_alias(true);
-        bg.set_color(crate::color::BG_CARD);
-        canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &bg);
-        let mut border = Paint::default();
-        border.set_anti_alias(true);
-        border.set_style(PaintStyle::Stroke);
-        border.set_stroke_width(1.0);
-        border.set_color(crate::color::MENU_BORDER);
-        canvas.draw_round_rect(rect, 6.0 * scale, 6.0 * scale, &border);
-
-        let font = Font::from_typeface(&self.typeface, 13.0 * scale);
-        let (_, m) = font.metrics();
-        let mouse_x = self.mouse_pos.0;
-        let mouse_y = self.mouse_pos.1;
-        let mut text_paint = Paint::default();
-        text_paint.set_anti_alias(true);
-        text_paint.set_color(crate::color::TEXT_PRIMARY);
-        let mut dim_paint = Paint::default();
-        dim_paint.set_anti_alias(true);
-        dim_paint.set_color(crate::color::TEXT_DISABLED);
-        let mut delete_paint = Paint::default();
-        delete_paint.set_anti_alias(true);
-        delete_paint.set_color(crate::color::DELETE_TEXT);
-
-        // Rename row.
-        let rename_rect = Rect::new(
-            rect.left + pad * 0.5,
-            rect.top + pad,
-            rect.right - pad * 0.5,
-            rect.top + pad + row_h,
-        );
-        let rename_hovered = mouse_x >= rename_rect.left
-            && mouse_x <= rename_rect.right
-            && mouse_y >= rename_rect.top
-            && mouse_y <= rename_rect.bottom;
-        if rename_hovered {
-            let mut hp = Paint::default();
-            hp.set_anti_alias(true);
-            hp.set_color(crate::color::HOVER_FAINT);
-            canvas.draw_round_rect(rename_rect, 4.0 * scale, 4.0 * scale, &hp);
-        }
-        let rename_baseline =
-            rename_rect.top + (row_h + (-m.ascent) - m.descent) * 0.5;
-        canvas.draw_str(
-            "Rename",
-            Point::new(rename_rect.left + pad, rename_baseline),
-            &font,
-            &text_paint,
-        );
-        self.hit_tests.people_menu.rename = Some(rename_rect);
-
-        // Delete row.
-        let delete_rect = Rect::new(
-            rect.left + pad * 0.5,
-            rect.top + pad + row_h,
-            rect.right - pad * 0.5,
-            rect.top + pad + row_h * 2.0,
-        );
-        let delete_hovered = menu.deletable
-            && mouse_x >= delete_rect.left
-            && mouse_x <= delete_rect.right
-            && mouse_y >= delete_rect.top
-            && mouse_y <= delete_rect.bottom;
-        if delete_hovered {
-            let mut hp = Paint::default();
-            hp.set_anti_alias(true);
-            hp.set_color(crate::color::DELETE_HOVER_BG);
-            canvas.draw_round_rect(delete_rect, 4.0 * scale, 4.0 * scale, &hp);
-        }
-        let delete_baseline =
-            delete_rect.top + (row_h + (-m.ascent) - m.descent) * 0.5;
-        let label = if menu.deletable {
-            "Delete person".to_string()
-        } else {
-            match menu.ref_count {
-                Some(n) if n > 0 => format!("Delete person ({n} refs)"),
-                _ => "Delete person (in use)".to_string(),
-            }
-        };
-        let label_paint = if menu.deletable {
-            &delete_paint
-        } else {
-            &dim_paint
-        };
-        canvas.draw_str(
-            label,
-            Point::new(delete_rect.left + pad, delete_baseline),
-            &font,
-            label_paint,
-        );
-        if menu.deletable {
-            self.hit_tests.people_menu.delete = Some(delete_rect);
-        } else {
-            self.hit_tests.people_menu.delete = None;
-        }
     }
 
     fn record_edit(&mut self, pre: CellSnapshot, post: CellSnapshot) {
@@ -6326,15 +5895,6 @@ fn draw_toggle(canvas: &Canvas, rect: Rect, on: bool, hovered: bool) {
     knob.set_anti_alias(true);
     knob.set_color(crate::color::BG_CARD);
     canvas.draw_circle((cx, cy), knob_r, &knob);
-}
-
-fn format_timestamp(epoch_ms: i64) -> String {
-    use chrono::{Local, TimeZone};
-    let dt = Local
-        .timestamp_millis_opt(epoch_ms)
-        .single()
-        .unwrap_or_else(|| Local.timestamp_millis_opt(0).single().unwrap());
-    dt.format("%-d %B %Y, %-I:%M %p").to_string()
 }
 
 fn local_date_for_ms(epoch_ms: i64) -> chrono::NaiveDate {
