@@ -203,6 +203,88 @@ struct TagContextMenu {
     anchor_y: f32,
 }
 
+/// Last-frame hit-test rects, populated during render and consumed by
+/// `mouse_down`. Grouped by UI surface; each substruct's contents are
+/// only meaningful while that surface is on screen and are cleared (or
+/// overwritten) at the start of every render that owns them.
+#[derive(Default)]
+struct HitTestState {
+    sidebar: SidebarHits,
+    cell_menu: CellMenuHits,
+    tag_menu: TagMenuHits,
+    people_menu: PeopleMenuHits,
+    search: SearchHits,
+    entity_page: EntityPageHits,
+    people_page: PeoplePageHits,
+}
+
+#[derive(Default)]
+struct SidebarHits {
+    /// Context-row rects (window coords).
+    contexts: Vec<(Uuid, Rect)>,
+    /// Date-header rects.
+    dates: Vec<(chrono::NaiveDate, Rect)>,
+    /// Tag-row rects.
+    tags: Vec<(String, Rect)>,
+    /// PAGES section row rects — dispatched to `push_view(...)`.
+    pages: Vec<(PageKind, Rect)>,
+}
+
+#[derive(Default)]
+struct CellMenuHits {
+    delete: Option<Rect>,
+    /// Always present when the menu is open.
+    surface: Option<Rect>,
+    /// `None` when the right-click didn't hit a bullet (non-outline cell,
+    /// or outline whitespace).
+    surface_subtree: Option<Rect>,
+}
+
+#[derive(Default)]
+struct TagMenuHits {
+    delete: Option<Rect>,
+}
+
+#[derive(Default)]
+struct PeopleMenuHits {
+    rename: Option<Rect>,
+    /// `None` when the entity isn't deletable (the row still renders but
+    /// click is suppressed).
+    delete: Option<Rect>,
+}
+
+#[derive(Default)]
+struct SearchHits {
+    /// Search-popup input rect (window coords). `Some` only while the
+    /// popup is open; routes clicks into the search `TextBox`.
+    input: Option<Rect>,
+}
+
+#[derive(Default)]
+struct EntityPageHits {
+    /// "+ Create backing cell" button rect (doc coords). `Some` only when
+    /// the current view is `Entity(eid)` and the entity has no
+    /// `primary_cell_id`.
+    create_button: Option<Rect>,
+    /// "REFERENCED IN" embed-card rects paired with the source cell ids
+    /// they point at. Cleared on every entity-page render and repopulated.
+    refs: Vec<(Uuid, Rect)>,
+    /// Active/inactive toggle rect. `Some` only while in `ViewKind::Entity(_)`.
+    active_toggle: Option<Rect>,
+}
+
+#[derive(Default)]
+struct PeoplePageHits {
+    /// Row rects (entity_id, doc-space). Used to route clicks into entity
+    /// nav or rename.
+    rows: Vec<(Uuid, Rect)>,
+    /// "+ Add person…" footer-row rect (doc coords). `None` when the
+    /// People page isn't active.
+    add: Option<Rect>,
+    /// "Show inactive" toggle rect.
+    show_inactive_toggle: Option<Rect>,
+}
+
 struct MentionPopup {
     /// What the popup is anchored to: a focused cell's text or the search
     /// bar's input. Drives sync, render-anchor, and commit behavior.
@@ -1058,56 +1140,15 @@ pub struct KeptApp {
     /// floating card at the anchor; clicks inside dispatch the action,
     /// clicks elsewhere dismiss.
     cell_context_menu: Option<CellContextMenu>,
-    /// "Delete cell" row rect on the cell context menu, captured each
-    /// render for hit-testing.
-    last_cell_menu_delete_rect: Option<Rect>,
-    /// "Surface as reference" row rect (always present when the menu is open).
-    last_cell_menu_surface_rect: Option<Rect>,
-    /// "Surface '<snippet>' as reference" (sub-tree) row rect. None when
-    /// the right-click didn't hit a bullet (non-outline cell, or outline
-    /// whitespace).
-    last_cell_menu_surface_subtree_rect: Option<Rect>,
-    /// Sidebar context-row rects (window coords) from last frame, for hit-testing.
-    last_sidebar_rects: Vec<(Uuid, Rect)>,
-    /// Sidebar date-header rects from last frame, for hit-testing.
-    last_sidebar_date_rects: Vec<(chrono::NaiveDate, Rect)>,
-    /// Sidebar tag-row rects from last frame, for hit-testing.
-    last_sidebar_tag_rects: Vec<(String, Rect)>,
     /// Active right-click context menu for a tag (only shown for tags
     /// with zero attached cells). When `Some`, render and hit-test the
     /// menu at the stored anchor.
     tag_context_menu: Option<TagContextMenu>,
-    /// "Delete tag" row rect from the last render — used by mouse_down to
-    /// dispatch the click.
-    last_tag_menu_delete_rect: Option<Rect>,
-    /// Search-popup input rect (window coords) from last frame. Populated
-    /// when the popup is open so `mouse_down` can route clicks into the
-    /// search TextBox; None when the popup is closed.
-    last_search_input_rect: Option<Rect>,
-    /// "+ Create backing cell" button rect on the entity page from the
-    /// last frame (doc coords). Some only when the current view is
-    /// `Entity(eid)` and the entity has no `primary_cell_id`. Used by
-    /// `mouse_down` to route a click into the create flow (Chunk 2).
-    last_entity_create_button_rect: Option<Rect>,
-    /// Doc-space rects of the entity page's "REFERENCED IN" embed cards
-    /// from the last render, paired with the source cell ids they point
-    /// at. Cleared on every entity-page render and repopulated; clicks
-    /// that land in any rect navigate to that source cell.
-    last_entity_page_ref_rects: Vec<(Uuid, Rect)>,
-    /// Sidebar PAGES section row rects (window coords) from last frame.
-    /// Hit-tested by `mouse_down` to dispatch to `push_view(Query::people())`.
-    last_sidebar_pages_rects: Vec<(PageKind, Rect)>,
     /// Sidebar's scroll state. Same `Scroller` that backs each pane —
     /// kinetic decay, scrollbar fade, interrupt rules all match. Wheel
     /// events whose mouse position falls in the sidebar column route
     /// here instead of to any pane's scroller.
     sidebar_scroll: Scroller,
-    /// People-page row rects (entity_id, doc-space rect) from last frame.
-    /// Used by `mouse_down` to route clicks into entity nav or rename.
-    last_people_row_rects: Vec<(Uuid, Rect)>,
-    /// "+ Add person…" footer-row rect (doc coords) from the last People
-    /// render. None when the People page isn't active.
-    last_people_add_rect: Option<Rect>,
     /// Inline rename in progress on the People page. While `Some`, that
     /// row renders an editable `TextBox` instead of static text.
     people_rename: Option<PeopleRenameState>,
@@ -1120,24 +1161,14 @@ pub struct KeptApp {
     /// entities are hidden from the list. Always-show in the @-mention
     /// popup (with downweight). Session-only — no persistence in v1.
     show_inactive: bool,
-    /// Active/inactive toggle rect on the entity page from last frame.
-    /// `Some` only while in `ViewKind::Entity(_)`.
-    last_entity_active_toggle_rect: Option<Rect>,
-    /// "Show inactive" toggle rect on the People page from last frame.
-    /// `Some` only while in `ViewKind::People`.
-    last_people_show_inactive_toggle_rect: Option<Rect>,
     /// Active right-click menu over a People-page row.
     people_context_menu: Option<PeopleContextMenu>,
-    /// "Rename" row rect on the People context menu, captured each
-    /// render for hit-testing.
-    last_people_menu_rename_rect: Option<Rect>,
-    /// "Delete person" row rect on the People context menu. None when
-    /// the entity isn't deletable (the row still renders but click is
-    /// suppressed).
-    last_people_menu_delete_rect: Option<Rect>,
     /// True while the user is mouse-dragging inside the search input
     /// (selecting text). Drives `mouse_drag_to` / `mouse_up` routing.
     search_dragging: bool,
+    /// Last-frame hit-test rects, populated during render and consumed
+    /// by `mouse_down`. See `HitTestState` for per-surface grouping.
+    hit_tests: HitTestState,
     // ---- Entity caches (invariants #1–#7) ----
     /// All entity rows from the DB. Source of identity (kind, display_name).
     entities: Vec<Entity>,
@@ -1354,30 +1385,14 @@ impl KeptApp {
             dirty_contexts: HashSet::new(),
             pending_context_deletes: HashSet::new(),
             cell_context_menu: None,
-            last_cell_menu_delete_rect: None,
-            last_cell_menu_surface_rect: None,
-            last_cell_menu_surface_subtree_rect: None,
-            last_sidebar_rects: Vec::new(),
-            last_sidebar_date_rects: Vec::new(),
-            last_sidebar_tag_rects: Vec::new(),
             tag_context_menu: None,
-            last_tag_menu_delete_rect: None,
-            last_search_input_rect: None,
-            last_entity_create_button_rect: None,
-            last_entity_page_ref_rects: Vec::new(),
-            last_sidebar_pages_rects: Vec::new(),
             sidebar_scroll: Scroller::new(),
-            last_people_row_rects: Vec::new(),
-            last_people_add_rect: None,
             people_rename: None,
             people_add: None,
             show_inactive: false,
-            last_entity_active_toggle_rect: None,
-            last_people_show_inactive_toggle_rect: None,
             people_context_menu: None,
-            last_people_menu_rename_rect: None,
-            last_people_menu_delete_rect: None,
             search_dragging: false,
+            hit_tests: HitTestState::default(),
             entities,
             entity_alias_index,
             cell_to_entity,
@@ -2770,7 +2785,7 @@ impl KeptApp {
         // bespoke pages and bypass that entire path.
         let view_kind_local = self.view.view_kind.clone();
         if !matches!(view_kind_local, ViewKind::Ast | ViewKind::Context(_)) {
-            self.last_entity_create_button_rect = None;
+            self.hit_tests.entity_page.create_button = None;
         }
 
         // Card backdrop and focus ring use this. We pull `cells_left` and
@@ -3936,15 +3951,15 @@ impl KeptApp {
     /// recorded when the menu opened.
     fn render_cell_context_menu(&mut self, canvas: &Canvas) {
         let Some(menu) = self.cell_context_menu.as_ref() else {
-            self.last_cell_menu_delete_rect = None;
-            self.last_cell_menu_surface_rect = None;
-            self.last_cell_menu_surface_subtree_rect = None;
+            self.hit_tests.cell_menu.delete = None;
+            self.hit_tests.cell_menu.surface = None;
+            self.hit_tests.cell_menu.surface_subtree = None;
             return;
         };
         let Some(cell) = self.cell(menu.cell_id) else {
-            self.last_cell_menu_delete_rect = None;
-            self.last_cell_menu_surface_rect = None;
-            self.last_cell_menu_surface_subtree_rect = None;
+            self.hit_tests.cell_menu.delete = None;
+            self.hit_tests.cell_menu.surface = None;
+            self.hit_tests.cell_menu.surface_subtree = None;
             return;
         };
         let scale = self.font_scale;
@@ -4102,9 +4117,9 @@ impl KeptApp {
             None
         };
 
-        self.last_cell_menu_delete_rect = Some(delete_rect);
-        self.last_cell_menu_surface_rect = Some(surface_rect);
-        self.last_cell_menu_surface_subtree_rect = surface_subtree_rect;
+        self.hit_tests.cell_menu.delete = Some(delete_rect);
+        self.hit_tests.cell_menu.surface = Some(surface_rect);
+        self.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
     }
 
     /// Render the entity page for `entity_id` into the doc area. Returns
@@ -4124,7 +4139,7 @@ impl KeptApp {
         mouse_doc_x: f32,
         mouse_doc_y: f32,
     ) -> f32 {
-        self.last_entity_create_button_rect = None;
+        self.hit_tests.entity_page.create_button = None;
 
         let entity = match self.entities.iter().find(|e| e.id == entity_id).cloned() {
             Some(e) => e,
@@ -4216,7 +4231,7 @@ impl KeptApp {
             && mouse_doc_y >= toggle_rect.top
             && mouse_doc_y <= toggle_rect.bottom;
         draw_toggle(canvas, toggle_rect, entity.is_active, toggle_hovered);
-        self.last_entity_active_toggle_rect = Some(toggle_rect);
+        self.hit_tests.entity_page.active_toggle = Some(toggle_rect);
 
         y += -mm.ascent + mm.descent;
         y += ENTITY_SECTION_GAP * scale;
@@ -4324,7 +4339,7 @@ impl KeptApp {
                 &meta_font,
                 &lp,
             );
-            self.last_entity_create_button_rect = Some(btn_rect);
+            self.hit_tests.entity_page.create_button = Some(btn_rect);
             y += btn_h;
         }
 
@@ -4333,8 +4348,8 @@ impl KeptApp {
         // newest-first by `edited_at`. The previews aren't real cells —
         // they live only as long as this page render. Click an embed →
         // navigate to the source cell; rect-tracked in
-        // `last_entity_page_ref_rects` for hit-test in `mouse_down`.
-        self.last_entity_page_ref_rects.clear();
+        // `hit_tests.entity_page.refs` for hit-test in `mouse_down`.
+        self.hit_tests.entity_page.refs.clear();
         let kept_url = format!("kept://{}", entity_id);
         let primary = entity.primary_cell_id;
         let mut mentions: Vec<(usize, i64)> = self
@@ -4402,7 +4417,7 @@ impl KeptApp {
                     &footer_text,
                     scale,
                 );
-                self.last_entity_page_ref_rects.push((
+                self.hit_tests.entity_page.refs.push((
                     target_cell_id,
                     Rect::new(cells_left, y, cells_left + content_width, y + total_h),
                 ));
@@ -4427,9 +4442,9 @@ impl KeptApp {
         mouse_doc_x: f32,
         mouse_doc_y: f32,
     ) -> f32 {
-        self.last_people_row_rects.clear();
-        self.last_people_add_rect = None;
-        self.last_people_show_inactive_toggle_rect = None;
+        self.hit_tests.people_page.rows.clear();
+        self.hit_tests.people_page.add = None;
+        self.hit_tests.people_page.show_inactive_toggle = None;
 
         let mut y = MARGIN_TOP;
 
@@ -4484,7 +4499,7 @@ impl KeptApp {
             && mouse_doc_y >= toggle_rect.top
             && mouse_doc_y <= toggle_rect.bottom;
         draw_toggle(canvas, toggle_rect, self.show_inactive, toggle_hovered);
-        self.last_people_show_inactive_toggle_rect = Some(toggle_rect);
+        self.hit_tests.people_page.show_inactive_toggle = Some(toggle_rect);
 
         y += -tm.ascent + tm.descent + 24.0 * scale;
 
@@ -4582,7 +4597,7 @@ impl KeptApp {
                 &divider_paint,
             );
 
-            self.last_people_row_rects.push((*entity_id, row_rect));
+            self.hit_tests.people_page.rows.push((*entity_id, row_rect));
             y += row_h;
         }
 
@@ -4624,7 +4639,7 @@ impl KeptApp {
                 &muted,
             );
         }
-        self.last_people_add_rect = Some(add_rect);
+        self.hit_tests.people_page.add = Some(add_rect);
         y += row_h;
 
         y - MARGIN_TOP
@@ -4902,10 +4917,10 @@ impl KeptApp {
         // Individual context rows are intentionally absent — clicking a date
         // opens the full day in the doc area; cross-context navigation
         // happens via Ctrl+Shift+Up/Down or arrow-edge crossing.
-        self.last_sidebar_rects.clear();
-        self.last_sidebar_date_rects.clear();
-        self.last_sidebar_tag_rects.clear();
-        self.last_sidebar_pages_rects.clear();
+        self.hit_tests.sidebar.contexts.clear();
+        self.hit_tests.sidebar.dates.clear();
+        self.hit_tests.sidebar.tags.clear();
+        self.hit_tests.sidebar.pages.clear();
 
         let date_font_for_pages =
             Font::from_typeface(&self.typeface, SIDEBAR_DATE_FONT_SIZE * scale);
@@ -4957,7 +4972,7 @@ impl KeptApp {
             &date_font_for_pages,
             &row_paint,
         );
-        self.last_sidebar_pages_rects
+        self.hit_tests.sidebar.pages
             .push((PageKind::People, people_rect));
         sidebar_y += date_h + item_gap + date_gap;
 
@@ -5050,7 +5065,7 @@ impl KeptApp {
                 &date_font,
                 &date_paint,
             );
-            self.last_sidebar_date_rects.push((d, date_rect));
+            self.hit_tests.sidebar.dates.push((d, date_rect));
             y += date_h + item_gap + date_gap;
         }
         let _ = (item_h, indent); // sized constants reserved for future per-context rows
@@ -5105,7 +5120,7 @@ impl KeptApp {
                     &date_font,
                     &tp,
                 );
-                self.last_sidebar_tag_rects.push((name, row_rect));
+                self.hit_tests.sidebar.tags.push((name, row_rect));
                 y += date_h + item_gap;
             }
         }
@@ -5127,7 +5142,7 @@ impl KeptApp {
 
     fn render_search_popup(&mut self, canvas: &Canvas, width: f32) {
         if self.search.is_none() {
-            self.last_search_input_rect = None;
+            self.hit_tests.search.input = None;
             return;
         }
         let scale = self.font_scale;
@@ -5198,7 +5213,7 @@ impl KeptApp {
         if let Some(state) = self.search.as_mut() {
             state.input.tick(canvas, input_x, input_y, input_w, true, true);
         }
-        self.last_search_input_rect = Some(Rect::new(
+        self.hit_tests.search.input = Some(Rect::new(
             input_x,
             input_y,
             input_x + input_w,
@@ -5313,7 +5328,7 @@ impl KeptApp {
 
     fn render_tag_context_menu(&mut self, canvas: &Canvas) {
         let Some(menu) = self.tag_context_menu.as_ref() else {
-            self.last_tag_menu_delete_rect = None;
+            self.hit_tests.tag_menu.delete = None;
             return;
         };
         let scale = self.font_scale;
@@ -5380,7 +5395,7 @@ impl KeptApp {
             &font,
             &text_paint,
         );
-        self.last_tag_menu_delete_rect = Some(row_rect);
+        self.hit_tests.tag_menu.delete = Some(row_rect);
     }
 
     /// Right-click menu rendered over a People-page row. Two actions:
@@ -5389,8 +5404,8 @@ impl KeptApp {
     /// shows the count so the user knows what's blocking).
     fn render_people_context_menu(&mut self, canvas: &Canvas) {
         let Some(menu) = self.people_context_menu.as_ref() else {
-            self.last_people_menu_rename_rect = None;
-            self.last_people_menu_delete_rect = None;
+            self.hit_tests.people_menu.rename = None;
+            self.hit_tests.people_menu.delete = None;
             return;
         };
         let scale = self.font_scale;
@@ -5466,7 +5481,7 @@ impl KeptApp {
             &font,
             &text_paint,
         );
-        self.last_people_menu_rename_rect = Some(rename_rect);
+        self.hit_tests.people_menu.rename = Some(rename_rect);
 
         // Delete row.
         let delete_rect = Rect::new(
@@ -5508,9 +5523,9 @@ impl KeptApp {
             label_paint,
         );
         if menu.deletable {
-            self.last_people_menu_delete_rect = Some(delete_rect);
+            self.hit_tests.people_menu.delete = Some(delete_rect);
         } else {
-            self.last_people_menu_delete_rect = None;
+            self.hit_tests.people_menu.delete = None;
         }
     }
 
@@ -6632,7 +6647,7 @@ impl KeptApp {
         if x < SIDEBAR_WIDTH * self.font_scale {
             // Sidebar rects are in content-space; map mouse to match.
             let y = y + self.sidebar_scroll.scroll_y;
-            for (name, rect) in self.last_sidebar_tag_rects.clone() {
+            for (name, rect) in self.hit_tests.sidebar.tags.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     let count = self
                         .db
@@ -6662,7 +6677,7 @@ impl KeptApp {
         }
         if matches!(self.view.view_kind, ViewKind::People) {
             let doc_y = y + self.scroll_y;
-            for (entity_id, rect) in self.last_people_row_rects.clone() {
+            for (entity_id, rect) in self.hit_tests.people_page.rows.clone() {
                 if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     self.open_people_context_menu(entity_id, x, y);
                     return true;
@@ -6751,7 +6766,7 @@ impl KeptApp {
         // tag" row deletes; clicking anywhere else closes the menu and
         // falls through to normal click routing.
         if self.tag_context_menu.is_some() {
-            if let Some(rect) = self.last_tag_menu_delete_rect {
+            if let Some(rect) = self.hit_tests.tag_menu.delete {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.tag_context_menu.take() {
                         if let Some(db) = self.db.as_mut() {
@@ -6770,7 +6785,7 @@ impl KeptApp {
         // People context menu: same pattern. Rename starts inline edit;
         // Delete drops the entity; click outside dismisses.
         if self.people_context_menu.is_some() {
-            if let Some(rect) = self.last_people_menu_rename_rect {
+            if let Some(rect) = self.hit_tests.people_menu.rename {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.people_context_menu.take() {
                         self.start_people_rename(menu.entity_id);
@@ -6778,7 +6793,7 @@ impl KeptApp {
                     return true;
                 }
             }
-            if let Some(rect) = self.last_people_menu_delete_rect {
+            if let Some(rect) = self.hit_tests.people_menu.delete {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.people_context_menu.take() {
                         self.delete_person_entity(menu.entity_id);
@@ -6798,7 +6813,7 @@ impl KeptApp {
         // beneath don't get focus changes / selections.
         if self.search.is_some() {
             self.search_dragging = false;
-            if let Some(rect) = self.last_search_input_rect {
+            if let Some(rect) = self.hit_tests.search.input {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.search_dragging = true;
                     if let Some(state) = self.search.as_mut() {
@@ -6846,7 +6861,7 @@ impl KeptApp {
                 }
             };
             // PAGES section first (top of the sidebar).
-            for (kind, rect) in self.last_sidebar_pages_rects.clone() {
+            for (kind, rect) in self.hit_tests.sidebar.pages.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_context_menu = None;
                     return match kind {
@@ -6856,19 +6871,19 @@ impl KeptApp {
             }
             // Context rows first (they're indented inside dates so their bbox
             // overlaps date row gaps in some edge cases — context wins).
-            for (id, rect) in self.last_sidebar_rects.clone() {
+            for (id, rect) in self.hit_tests.sidebar.contexts.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_context_menu = None;
                     return open(self, Query::context(id));
                 }
             }
-            for (date, rect) in self.last_sidebar_date_rects.clone() {
+            for (date, rect) in self.hit_tests.sidebar.dates.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_context_menu = None;
                     return open(self, Query::date(date));
                 }
             }
-            for (name, rect) in self.last_sidebar_tag_rects.clone() {
+            for (name, rect) in self.hit_tests.sidebar.tags.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_context_menu = None;
                     return open(self, Query::tag(name));
@@ -6890,7 +6905,7 @@ impl KeptApp {
         // click anywhere else dismisses and falls through to normal
         // cell routing.
         if self.cell_context_menu.is_some() {
-            if let Some(rect) = self.last_cell_menu_delete_rect {
+            if let Some(rect) = self.hit_tests.cell_menu.delete {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
                         self.delete_cell_by_id(menu.cell_id);
@@ -6900,7 +6915,7 @@ impl KeptApp {
             }
             // "Surface as reference" — create a new reference cell at "now"
             // pointing to the right-clicked cell.
-            if let Some(rect) = self.last_cell_menu_surface_rect {
+            if let Some(rect) = self.hit_tests.cell_menu.surface {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
                         // `reference_origin_cell_id` is the embed's
@@ -6919,7 +6934,7 @@ impl KeptApp {
             // Same source-resolution rule via `reference_origin_cell_id`
             // so subtree references from inside embeds point at the
             // original outline, not at the embed.
-            if let Some(rect) = self.last_cell_menu_surface_subtree_rect {
+            if let Some(rect) = self.hit_tests.cell_menu.surface_subtree {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
                         if let Some(bid) = menu.bullet_id {
@@ -6938,7 +6953,7 @@ impl KeptApp {
         // Entity-page active/inactive toggle (always present in entity
         // view; rect is None outside it).
         if let ViewKind::Entity(eid) = self.view.view_kind {
-            if let Some(rect) = self.last_entity_active_toggle_rect {
+            if let Some(rect) = self.hit_tests.entity_page.active_toggle {
                 if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     self.toggle_entity_active(eid);
                     return true;
@@ -6950,7 +6965,7 @@ impl KeptApp {
         // viewing a cell-less entity). Wire-up of the actual create flow
         // is deferred to Chunk 2; for now, swallow the click so it doesn't
         // fall through.
-        if let Some(rect) = self.last_entity_create_button_rect {
+        if let Some(rect) = self.hit_tests.entity_page.create_button {
             if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                 // TODO(chunk-2): trigger create_backing_cell_for_entity.
                 return true;
@@ -6960,11 +6975,11 @@ impl KeptApp {
         // Entity-page "REFERENCED IN" embed cards: clicking any of them
         // navigates to the source cell at its real timeline location.
         // Snapshotted into a local first to avoid the &self borrow on
-        // `last_entity_page_ref_rects` outliving the &mut self call to
+        // `hit_tests.entity_page.refs` outliving the &mut self call to
         // `navigate_to_reference`.
         if matches!(self.view.view_kind, ViewKind::Entity(_)) {
             let hit = self
-                .last_entity_page_ref_rects
+                .hit_tests.entity_page.refs
                 .iter()
                 .find(|(_, rect)| {
                     x >= rect.left
@@ -6989,7 +7004,7 @@ impl KeptApp {
             // on the People page, including any in-progress rename
             // / add input — toggling the filter shouldn't lose typed
             // text but shouldn't get masked by the input rects either.
-            if let Some(rect) = self.last_people_show_inactive_toggle_rect {
+            if let Some(rect) = self.hit_tests.people_page.show_inactive_toggle {
                 if x >= rect.left
                     && x <= rect.right
                     && doc_y >= rect.top
@@ -7010,7 +7025,7 @@ impl KeptApp {
             let renaming_id = self.people_rename.as_ref().map(|s| s.entity_id);
             if let Some(rid) = renaming_id {
                 let rename_rect = self
-                    .last_people_row_rects
+                    .hit_tests.people_page.rows
                     .iter()
                     .find(|(eid, _)| *eid == rid)
                     .map(|(_, r)| *r);
@@ -7031,7 +7046,7 @@ impl KeptApp {
                 self.commit_people_rename();
             }
             if self.people_add.is_some() {
-                if let Some(ar) = self.last_people_add_rect {
+                if let Some(ar) = self.hit_tests.people_page.add {
                     if x >= ar.left
                         && x <= ar.right
                         && doc_y >= ar.top
@@ -7048,13 +7063,13 @@ impl KeptApp {
 
             // No input was inside the click → "Add person" footer starts
             // an Add input; a row click navigates to its entity page.
-            if let Some(rect) = self.last_people_add_rect {
+            if let Some(rect) = self.hit_tests.people_page.add {
                 if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     self.start_people_add();
                     return true;
                 }
             }
-            for (entity_id, rect) in self.last_people_row_rects.clone() {
+            for (entity_id, rect) in self.hit_tests.people_page.rows.clone() {
                 if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     return self.push_view(Query::entity(entity_id));
                 }
