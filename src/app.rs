@@ -4053,9 +4053,17 @@ impl KeptApp {
             paint.set_color(color);
             let baseline =
                 r.top + (action_h + (-am.ascent) - am.descent) * 0.5;
+            // Truncate the label so a long bullet snippet (e.g.
+            // "Surface 'long bullet text…' as reference") doesn't
+            // overflow the menu's right edge. Available width is the
+            // row interior minus the left text inset and a matching
+            // right inset for symmetry.
+            let text_left = r.left + pad * 2.0;
+            let avail = (r.right - pad * 2.0 - text_left).max(0.0);
+            let fitted = fit_text_ellipsized(label, avail, &action_font, &paint);
             canvas.draw_str(
-                label,
-                Point::new(r.left + pad * 2.0, baseline),
+                &fitted,
+                Point::new(text_left, baseline),
                 &action_font,
                 &paint,
             );
@@ -5269,9 +5277,18 @@ impl KeptApp {
                     &date_paint,
                 );
                 let snippet = result_snippet(&cell.full_text(), &query);
+                // Truncate to fit the row's remaining width (right
+                // edge inset by `pad * 0.5` to match the highlight
+                // bg). Otherwise long snippets overflow the popup
+                // border into nothingness.
+                let snippet_left = popup_x + pad + date_w + 12.0 * scale;
+                let snippet_right = popup_x + popup_w - pad * 0.5;
+                let avail = (snippet_right - snippet_left).max(0.0);
+                let fitted =
+                    fit_text_ellipsized(&snippet, avail, &result_font, &row_paint);
                 canvas.draw_str(
-                    &snippet,
-                    Point::new(popup_x + pad + date_w + 12.0 * scale, baseline),
+                    &fitted,
+                    Point::new(snippet_left, baseline),
                     &result_font,
                     &row_paint,
                 );
@@ -7435,6 +7452,41 @@ fn context_ref<'a>(c: &'a Context) -> ContextRef<'a> {
 /// source kind is itself a Reference (chained refs are short-circuited
 /// upstream and shouldn't reach this path). Mirrors text + links + per-row
 /// flags; uses the supplied typeface so the new widgets render in the
+/// Pixel-aware truncation: returns the longest prefix of `text` whose
+/// rendered width (in `font` with `paint`) fits in `max_width`,
+/// followed by `…` if any chars were dropped. Returns the whole input
+/// untouched when it already fits, and an empty string when even the
+/// ellipsis doesn't fit. O(n) measure_str calls — fine for short
+/// menu/popup labels.
+fn fit_text_ellipsized(text: &str, max_width: f32, font: &Font, paint: &Paint) -> String {
+    if max_width <= 0.0 {
+        return String::new();
+    }
+    if font.measure_str(text, Some(paint)).0 <= max_width {
+        return text.to_string();
+    }
+    const ELLIPSIS: &str = "…";
+    let ell_w = font.measure_str(ELLIPSIS, Some(paint)).0;
+    let avail = max_width - ell_w;
+    if avail <= 0.0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut acc_w = 0.0_f32;
+    let mut buf = [0u8; 4];
+    for ch in text.chars() {
+        let s = ch.encode_utf8(&mut buf);
+        let w = font.measure_str(s, Some(paint)).0;
+        if acc_w + w > avail {
+            break;
+        }
+        out.push(ch);
+        acc_w += w;
+    }
+    out.push_str(ELLIPSIS);
+    out
+}
+
 /// same font as everything else in the app.
 /// Trim arbitrary text to a single-line preview suitable for menu labels.
 /// Collapses internal whitespace, truncates with ellipsis past 30 chars,
