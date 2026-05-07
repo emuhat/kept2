@@ -318,7 +318,9 @@ impl TextBox {
     /// `head` (in byte offsets). Both ends are clamped to the nearest
     /// char boundary at or before the requested index. `head` is the
     /// caret position; the visible range is `[min(anchor, head),
-    /// max(anchor, head))`.
+    /// max(anchor, head))`. Test-only for now; production callers go
+    /// through mouse drag or keyboard shift-arrow.
+    #[cfg(test)]
     pub fn select_range(&mut self, anchor: usize, head: usize) {
         let snap = |i: usize| -> usize {
             let mut n = i.min(self.text.len());

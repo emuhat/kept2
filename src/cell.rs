@@ -260,23 +260,6 @@ impl Cell {
         }
     }
 
-    pub fn new_table(typeface: Typeface) -> Self {
-        let now = now_epoch_ms();
-        Self {
-            id: Uuid::now_v7(),
-            kind: CellKind::Table(TableCell::new(typeface)),
-            title: None,
-            title_focused: false,
-            cell_x: 0.0,
-            cell_y: 0.0,
-            cell_w: 0.0,
-            cell_h: 0.0,
-            timestamp: now,
-            edited_at: now,
-            context_hint_id: None,
-        }
-    }
-
     /// Create a reference (read-only embed) cell. Title slot is left None —
     /// references inherit identity from their target, not their own title.
     /// Typeface is unused at construction; included for symmetry with the

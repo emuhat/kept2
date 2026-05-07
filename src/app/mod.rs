@@ -182,7 +182,6 @@ enum NewCellKind {
     Plain,
     Outline,
     PopPop,
-    Table,
 }
 
 /// Sidebar PAGES section row identity. v1 has just `People`; new entries
@@ -3187,9 +3186,6 @@ impl KeptApp {
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("p") => {
                     return self.insert_cell_after_focused(NewCellKind::PopPop);
                 }
-                Key::Character(s) if s.as_str().eq_ignore_ascii_case("j") => {
-                    return self.insert_cell_after_focused(NewCellKind::Table);
-                }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("f") => {
                     // Ctrl+F: enter "focus mode" — render only the focused
                     // cell at full width. Esc or any sidebar click exits.
@@ -4814,7 +4810,6 @@ impl KeptApp {
             NewCellKind::Plain => Cell::new(self.typeface.clone(), String::new()),
             NewCellKind::Outline => Cell::new_outline(self.typeface.clone()),
             NewCellKind::PopPop => Cell::new_poppop(self.typeface.clone()),
-            NewCellKind::Table => Cell::new_table(self.typeface.clone()),
         };
         new_cell.set_font_scale(self.font_scale);
         new_cell.context_hint_id = self.writable_context_id();
