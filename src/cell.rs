@@ -138,8 +138,10 @@ pub enum CellKind {
 impl CellKind {
     /// Build a fresh `CellKind` mirroring `self`'s text + links + per-row
     /// flags, using `typeface` for the new widgets and `scale` as the
-    /// font scale. Returns `None` for `Reference` (chained references are
-    /// short-circuited upstream and shouldn't reach this path).
+    /// font scale. Returns `None` for `Reference` — references can't
+    /// target other references, so a Reference-typed source means the
+    /// embed has nothing renderable and the caller surfaces a
+    /// placeholder.
     ///
     /// Used by the reference-embed cache: each reference cell needs its
     /// own deep clone of the target's content so it can render and accept

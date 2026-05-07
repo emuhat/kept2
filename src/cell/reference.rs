@@ -53,7 +53,7 @@ pub struct ReferenceCell {
     /// works exactly like in any other cell. Rebuilt whenever
     /// `cache_source_edited_at` doesn't match the source's `edited_at`,
     /// so edits at the original propagate. None when the target is
-    /// missing or chained (a placeholder is drawn instead).
+    /// missing (a placeholder is drawn instead).
     /// Boxed because `Cell` contains `CellKind` which contains
     /// `ReferenceCell` — without indirection the type would be infinitely
     /// sized.
@@ -95,7 +95,7 @@ impl ReferenceCell {
 
     /// Replace the cache with `new_cache` (built by the caller from the
     /// resolved source data). Updates the staleness key. Pass `None` for
-    /// `new_cache` when the target is missing / chained.
+    /// `new_cache` when the target is missing.
     pub fn install_cache(&mut self, new_cache: Option<Cell>, source_edited_at: Option<i64>) {
         self.cache = new_cache.map(Box::new);
         self.cache_source_edited_at = source_edited_at;

@@ -299,6 +299,13 @@ struct CellContextMenu {
     /// non-outline cells or right-clicks landing in outline whitespace.
     bullet_id: Option<Uuid>,
     bullet_snippet: Option<String>,
+    /// Cell id used as the *source* for any "Surface as reference"
+    /// action invoked from this menu (whole-cell or subtree). Equals
+    /// `cell_id` when the menu is anchored on a normal cell. When
+    /// anchored on a Reference cell, this is `Reference.target.cell_id()`
+    /// — references always resolve to the original source, never to
+    /// another reference (no chained-reference creation).
+    reference_origin_cell_id: Uuid,
 }
 
 /// Right-click menu over a People-page row. `deletable` and `ref_count`
@@ -1610,8 +1617,8 @@ impl KeptApp {
     /// drawn. Looks up the target out of `self.cells`, dispatches to the
     /// appropriate body's `render_view`, and wraps it in the embed visual
     /// (warm-tan dashed border + faint background tint + footer line).
-    /// Handles dangling references and chained references via placeholder
-    /// text. Records geometry on the reference cell so click-tests work.
+    /// Dangling targets (deleted source) render as a placeholder line.
+    /// Records geometry on the reference cell so click-tests work.
     fn render_reference_cell(
         &mut self,
         canvas: &Canvas,
@@ -1647,12 +1654,6 @@ impl KeptApp {
                     rc.install_cache(None, None);
                 }
                 PreviewKind::Placeholder("↗ [referenced cell deleted]")
-            }
-            Some(tidx) if matches!(self.cells[tidx].kind, CellKind::Reference(_)) => {
-                if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
-                    rc.install_cache(None, None);
-                }
-                PreviewKind::Placeholder("↗ [chained reference]")
             }
             Some(tidx) => {
                 let source_edited_at = self.cells[tidx].edited_at;
@@ -1799,8 +1800,8 @@ impl KeptApp {
         }
     }
 
-    /// One-line muted placeholder for dangling / chained / wrong-kind
-    /// references. Returns the rendered height.
+    /// One-line muted placeholder for dangling / wrong-kind references.
+    /// Returns the rendered height.
     /// Paint the embed's wrapper chrome: faint warm-tan background tint,
     /// dashed warm-tan border, muted footer line. Used by both the
     /// timeline reference cell render and the entity-page references
@@ -6675,28 +6676,56 @@ impl KeptApp {
         ) {
             let doc_y = y + self.scroll_y;
             if let Some(cell_id) = self.find_cell_at(x, doc_y) {
-                // If the right-click landed on a specific bullet inside an
-                // outline cell, capture (bullet_id, snippet) so the menu
-                // can offer "Copy bullet sub-tree as embed."
+                // Right-click on a bullet captures (id, snippet). For
+                // embeds, the embed's cached outline carries the source
+                // bullet ids unchanged (see `build_reference_cache`),
+                // so the bullet id is meaningful against the source.
                 let (bullet_id, bullet_snippet) = self
                     .cell(cell_id)
-                    .and_then(|c| match &c.kind {
-                        CellKind::Outline(oc) => oc
-                            .bullet_at_doc_y(doc_y)
-                            .map(|(id, text)| (Some(id), Some(snippet(&text)))),
-                        _ => None,
+                    .and_then(|c| {
+                        let oc = match &c.kind {
+                            CellKind::Outline(oc) => Some(oc),
+                            CellKind::Reference(rc) => match rc.cache_ref()?.kind {
+                                CellKind::Outline(ref oc) => Some(oc),
+                                _ => None,
+                            },
+                            _ => None,
+                        }?;
+                        oc.bullet_at_doc_y(doc_y)
+                            .map(|(id, text)| (Some(id), Some(snippet(&text))))
                     })
                     .unwrap_or((None, None));
-                // Right-click on an outline bullet selects its subtree
-                // (bullet + descendants). Visualized as the standard
-                // bullet-range highlight; any later op (delete, copy,
-                // indent…) operates on the same range. Focus the cell
-                // so keyboard ops reach it without an extra click.
+
+                // Reference origin: always resolve through embeds to the
+                // source. Surface-as-reference (whole-cell or subtree)
+                // points to the original cell, never to another
+                // reference — no chained-reference creation.
+                let reference_origin_cell_id = self
+                    .cell(cell_id)
+                    .map(|c| match &c.kind {
+                        CellKind::Reference(rc) => rc.target().cell_id(),
+                        _ => cell_id,
+                    })
+                    .unwrap_or(cell_id);
+
+                // Visualize the subtree selection: for direct outlines,
+                // on the cell itself; for embeds, on the cached outline
+                // so the highlight appears inside the embed body.
                 if let Some(bid) = bullet_id {
                     self.focused = Some(cell_id);
                     if let Some(c) = self.cell_mut(cell_id) {
-                        if let CellKind::Outline(oc) = &mut c.kind {
-                            oc.select_subtree(bid);
+                        match &mut c.kind {
+                            CellKind::Outline(oc) => {
+                                oc.select_subtree(bid);
+                            }
+                            CellKind::Reference(rc) => {
+                                if let Some(cache) = rc.cache_mut() {
+                                    if let CellKind::Outline(oc) = &mut cache.kind {
+                                        oc.select_subtree(bid);
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -6706,6 +6735,7 @@ impl KeptApp {
                     anchor_y: y,
                     bullet_id,
                     bullet_snippet,
+                    reference_origin_cell_id,
                 });
                 return true;
             }
@@ -6873,19 +6903,28 @@ impl KeptApp {
             if let Some(rect) = self.last_cell_menu_surface_rect {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
-                        self.surface_as_reference(ReferenceTarget::WholeCell(menu.cell_id));
+                        // `reference_origin_cell_id` is the embed's
+                        // source for Reference cells; the cell itself
+                        // otherwise — references always resolve to
+                        // the original.
+                        self.surface_as_reference(ReferenceTarget::WholeCell(
+                            menu.reference_origin_cell_id,
+                        ));
                     }
                     return true;
                 }
             }
             // "Surface '<snippet>' as reference" — sub-tree target. Only
             // present when the menu was opened over a specific bullet.
+            // Same source-resolution rule via `reference_origin_cell_id`
+            // so subtree references from inside embeds point at the
+            // original outline, not at the embed.
             if let Some(rect) = self.last_cell_menu_surface_subtree_rect {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
                         if let Some(bid) = menu.bullet_id {
                             self.surface_as_reference(ReferenceTarget::Subtree {
-                                cell_id: menu.cell_id,
+                                cell_id: menu.reference_origin_cell_id,
                                 bullet_id: bid,
                             });
                         }
@@ -7448,10 +7487,6 @@ fn context_ref<'a>(c: &'a Context) -> ContextRef<'a> {
     }
 }
 
-/// Build a `CellKind` clone for a reference cache. Returns None when the
-/// source kind is itself a Reference (chained refs are short-circuited
-/// upstream and shouldn't reach this path). Mirrors text + links + per-row
-/// flags; uses the supplied typeface so the new widgets render in the
 /// Pixel-aware truncation: returns the longest prefix of `text` whose
 /// rendered width (in `font` with `paint`) fits in `max_width`,
 /// followed by `…` if any chars were dropped. Returns the whole input
