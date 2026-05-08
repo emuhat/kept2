@@ -1792,6 +1792,24 @@ impl KeptApp {
         }
     }
 
+    /// Distinct tag names across every in-memory cell, alphabetical
+    /// (case-insensitive). The sidebar and the `#`-autocomplete popup
+    /// both source from this so a freshly-committed tag appears on
+    /// the next frame instead of waiting for the debounced save to
+    /// land in the DB. Reference cells are skipped (no editable text).
+    fn all_tag_names_in_memory(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for cell in &self.cells {
+            for name in cell.all_tag_names() {
+                if !name.is_empty() && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        out
+    }
+
     /// Build the per-render `MatchContext`: today's date plus the resolved
     /// entity-id sets for any `@id` refs in the active AST. Both the alias
     /// index and the title-fallback corpus are entity-derived (invariants

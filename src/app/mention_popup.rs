@@ -210,16 +210,15 @@ impl KeptApp {
         out
     }
 
-    /// Tag candidates for the `#`-autocomplete popup. Sourced from the DB
-    /// tags table (the same set the sidebar's TAGS section lists). All
+    /// Tag candidates for the `#`-autocomplete popup. Aggregated from
+    /// the in-memory cells so a tag committed in this session shows up
+    /// in the candidate list before the debounced save flushes. All
     /// tags are treated as "active" — there's no inactive-tag concept.
     fn tag_mention_candidates(&self) -> Vec<(String, bool)> {
-        let names: Vec<String> = self
-            .db
-            .as_ref()
-            .and_then(|db| db.all_tags().ok())
-            .unwrap_or_default();
-        names.into_iter().map(|n| (n, true)).collect()
+        self.all_tag_names_in_memory()
+            .into_iter()
+            .map(|n| (n, true))
+            .collect()
     }
 
     /// Pick the candidate set for the popup's current kind.

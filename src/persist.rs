@@ -522,14 +522,6 @@ impl Db {
     }
 
     /// All known tag names, sorted alphabetically.
-    pub fn all_tags(&self) -> rusqlite::Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT name FROM tags ORDER BY name")?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
     /// Cell ids that currently carry the given tag, by timestamp ascending.
     #[allow(dead_code)]
     pub fn cells_with_tag(&self, name: &str) -> rusqlite::Result<Vec<Uuid>> {

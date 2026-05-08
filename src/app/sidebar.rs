@@ -206,13 +206,11 @@ impl KeptApp {
         }
 
         // ----- TAGS section -----
-        // Sourced from the DB tags table (alphabetical). Skipped when empty
-        // so we don't render a stranded header.
-        let tags: Vec<String> = self
-            .db
-            .as_ref()
-            .and_then(|db| db.all_tags().ok())
-            .unwrap_or_default();
+        // Sourced from the in-memory cells (alphabetical, case-
+        // insensitive) so a tag committed via the popup appears on
+        // the next frame — no waiting for the save debounce. Empty
+        // when no cell carries a tag span.
+        let tags: Vec<String> = self.all_tag_names_in_memory();
         if !tags.is_empty() {
             // Section gap then "TAGS" header (same styling as CONTEXTS).
             y += date_gap;
