@@ -6,6 +6,15 @@
 //! Names describe the *role* (`TEXT_PRIMARY`, `EMBED_BORDER`,
 //! `DIVIDER_PANE`) not the value (`DARK_GREY`, `WARM_TAN`). If we
 //! redesign, the role stays the same and only the hex changes.
+//!
+//! Active palette: realtimecolors.com green-on-pale-green light theme.
+//! Five ramps × 11 shades each:
+//!   - `text` / `bg` / `primary` — green; text and bg share hue.
+//!   - `secondary` — blue; used for links, focus, selection.
+//!   - `accent`    — purple; used for reference-embed chrome to keep
+//!                   embeds visibly distinct from links.
+//! The palette has no red, so destructive actions and PopPop-error
+//! text retain their original reds.
 
 use skia_safe::Color;
 
@@ -13,13 +22,15 @@ use skia_safe::Color;
 // Page / surface backgrounds
 // ---------------------------------------------------------------------------
 
-/// Cream page background; the canvas is cleared to this every frame.
-pub const BG_PAGE: Color = Color::from_rgb(0xfa, 0xf7, 0xf2);
+/// Page background (bg-50). Very pale green; the canvas is cleared to
+/// this every frame.
+pub const BG_PAGE: Color = Color::from_rgb(233, 252, 239);
 
-/// Slightly darker cream — search popup / tag-menu panel fills (where
-/// the page already is `BG_PAGE` and we want a tiny bit of contrast).
+/// Slightly more saturated panel background (bg-100). Search popup /
+/// tag-menu panel fills, where we want a tiny bit of contrast against
+/// `BG_PAGE`.
 #[allow(dead_code)]
-pub const BG_PANEL: Color = Color::from_rgb(0xf2, 0xee, 0xe6);
+pub const BG_PANEL: Color = Color::from_rgb(210, 249, 223);
 
 /// White card backdrop behind the focused cell + context menus + search
 /// popup + scrollbar knob.
@@ -29,66 +40,72 @@ pub const BG_CARD: Color = Color::WHITE;
 // Text
 // ---------------------------------------------------------------------------
 
-/// Primary body / heading / cell text. Near-black with a tiny warm cast.
-pub const TEXT_PRIMARY: Color = Color::from_rgb(0x1c, 0x1c, 0x1c);
+/// Primary body / heading / cell text (text-950). Near-black with a
+/// green tint.
+pub const TEXT_PRIMARY: Color = Color::from_rgb(3, 23, 12);
 
-/// Slightly desaturated text for context-menu rows other than "Delete."
-pub const TEXT_MENU_ROW: Color = Color::from_rgb(0x40, 0x40, 0x40);
+/// Slightly lighter text for context-menu rows other than "Delete"
+/// (text-800).
+pub const TEXT_MENU_ROW: Color = Color::from_rgb(11, 91, 47);
 
-/// Generic muted grey — embed footer text, deleted-cell placeholder,
-/// search-popup secondary text.
-pub const TEXT_MUTED_GREY: Color = Color::from_rgb(0x80, 0x80, 0x80);
+/// Generic muted text (text-700) — embed footer text, deleted-cell
+/// placeholder, search-popup secondary text.
+pub const TEXT_MUTED_GREY: Color = Color::from_rgb(16, 137, 70);
 
-/// Warmer muted variants used in the sidebar + entity-page headers and
-/// info lines. Slight gradations communicate hierarchy.
-pub const TEXT_MUTED_WARM_DEEP: Color = Color::from_rgb(0x60, 0x58, 0x48);
-pub const TEXT_MUTED_WARM: Color = Color::from_rgb(0x70, 0x68, 0x58);
-pub const TEXT_MUTED_WARM_SOFT: Color = Color::from_rgb(0x80, 0x78, 0x68);
-/// Section-header tone (`BACKING CELL`, `REFERENCED IN`) and entity
-/// metadata. Two byte-equivalent shades exist in the wild
-/// (`0x88_78` vs `0x88_7a`); we collapse to `0x7a` here.
-pub const TEXT_SECTION_HEADER: Color = Color::from_rgb(0x90, 0x88, 0x7a);
+/// Three muted gradations used in the sidebar + entity-page headers.
+/// Slight steps communicate hierarchy. text-800 → text-700 → text-600.
+pub const TEXT_MUTED_WARM_DEEP: Color = Color::from_rgb(11, 91, 47);
+pub const TEXT_MUTED_WARM: Color = Color::from_rgb(16, 137, 70);
+pub const TEXT_MUTED_WARM_SOFT: Color = Color::from_rgb(21, 183, 94);
+/// Section-header tone (`BACKING CELL`, `REFERENCED IN`, sidebar
+/// section labels) and entity metadata. text-600.
+pub const TEXT_SECTION_HEADER: Color = Color::from_rgb(21, 183, 94);
 
-/// Outline-cell bullet marker dot. Mid-grey.
-pub const BULLET_MARKER: Color = Color::from_rgb(0x60, 0x60, 0x60);
+/// Outline-cell bullet marker dot (text-700).
+pub const BULLET_MARKER: Color = Color::from_rgb(16, 137, 70);
 
-/// Lightest muted greys, for tertiary info / placeholder labels.
-pub const TEXT_GHOST: Color = Color::from_rgb(0x90, 0x90, 0x90);
-pub const TEXT_DISABLED: Color = Color::from_rgb(0xa0, 0x9a, 0x90);
-pub const TEXT_GHOST_WARM: Color = Color::from_rgb(0xa8, 0xa0, 0x90);
+/// Lightest tints, for tertiary info / placeholder labels. Pale green
+/// shades from the bg ramp so they sit just above the page background
+/// without going neon. bg-200 / bg-300 territory.
+pub const TEXT_GHOST: Color = Color::from_rgb(121, 236, 159); // bg-300
+pub const TEXT_DISABLED: Color = Color::from_rgb(166, 242, 191); // bg-200
+pub const TEXT_GHOST_WARM: Color = Color::from_rgb(166, 242, 191); // bg-200
 
 // ---------------------------------------------------------------------------
 // Inline links + Pop-Pop syntax coloring
 // ---------------------------------------------------------------------------
 
-/// Underlined link text + the underline itself. Mid-blue.
-pub const LINK_TEXT: Color = Color::from_rgb(0x1a, 0x66, 0xc4);
+/// Underlined link text + the underline itself (secondary-600). Mid-blue.
+pub const LINK_TEXT: Color = Color::from_rgb(24, 115, 180);
 
-/// Pop-Pop computed-output column text. Darker blue than `LINK_TEXT` so
+/// Pop-Pop computed-output column text. Darker blue (secondary-700) so
 /// it reads as data rather than as a link.
-pub const POPPOP_OUTPUT: Color = Color::from_rgb(0x18, 0x3a, 0x9c);
+pub const POPPOP_OUTPUT: Color = Color::from_rgb(18, 86, 135);
 
-/// Pop-Pop comment-line text (rows starting with `#`). Dark green.
-pub const POPPOP_COMMENT: Color = Color::from_rgb(0x1f, 0x6b, 0x2a);
+/// Pop-Pop comment-line text (rows starting with `#`). Mid-deep green
+/// from the primary ramp (primary-700).
+pub const POPPOP_COMMENT: Color = Color::from_rgb(18, 135, 71);
 
-/// Pop-Pop error-line text (rendered beneath the failing input row).
+/// Pop-Pop error-line text. Kept red — the palette has no red ramp,
+/// and "error = red" is a near-universal convention.
 pub const POPPOP_ERROR: Color = Color::from_rgb(0x9a, 0x1e, 0x1e);
 
 // ---------------------------------------------------------------------------
 // Accent (focus / selection)
 // ---------------------------------------------------------------------------
 
-/// Base accent blue. Most call sites reach for one of the alpha variants
-/// below; the bare opaque form is here for future use and for symmetry.
+/// Base accent (secondary-500). Most call sites reach for one of the
+/// alpha variants below; the bare opaque form is here for future use
+/// and for symmetry.
 #[allow(dead_code)]
-pub const ACCENT_BLUE: Color = Color::from_rgb(0x4a, 0x90, 0xe2);
+pub const ACCENT_BLUE: Color = Color::from_rgb(31, 144, 224);
 
 /// `ACCENT_BLUE` with a custom alpha — convenience for the few places
 /// (scrollbar fade, focus ring) that need to scale it from a runtime
 /// value rather than a fixed constant.
 #[inline]
 pub const fn accent_blue_alpha(a: u8) -> Color {
-    Color::from_argb(a, 0x4a, 0x90, 0xe2)
+    Color::from_argb(a, 31, 144, 224)
 }
 
 /// Bullet-range / TextBox selection highlight (40/255).
@@ -99,15 +116,17 @@ pub const ACCENT_BLUE_PANE_BORDER: Color = accent_blue_alpha(0x80);
 pub const ACCENT_BLUE_FOCUS_EDIT: Color = accent_blue_alpha(0xff);
 
 // ---------------------------------------------------------------------------
-// Reference embeds (warm tan)
+// Reference embeds
 // ---------------------------------------------------------------------------
 
-/// Warm-tan dashed border around a reference cell.
-pub const EMBED_BORDER: Color = Color::from_rgb(0xb3, 0x92, 0x60);
-/// Faint warm-tan tint filling the embed body's background.
-pub const EMBED_TINT: Color = Color::from_argb(0x0c, 0xb3, 0x92, 0x60);
-/// Warm-tan tint for hovering an embed-related menu row.
-pub const EMBED_HOVER: Color = Color::from_argb(0x20, 0xb3, 0x92, 0x60);
+/// Dashed border around a reference cell. Uses the accent (purple-blue)
+/// ramp so embeds read as visually distinct from inline links, which
+/// use the secondary (blue) ramp.
+pub const EMBED_BORDER: Color = Color::from_rgb(24, 58, 180); // accent-600
+/// Faint accent tint filling the embed body's background.
+pub const EMBED_TINT: Color = Color::from_argb(0x0c, 24, 58, 180);
+/// Accent tint for hovering an embed-related menu row.
+pub const EMBED_HOVER: Color = Color::from_argb(0x20, 24, 58, 180);
 
 // ---------------------------------------------------------------------------
 // Destructive (delete, red)
@@ -120,30 +139,33 @@ pub const DELETE_HOVER_BG: Color = Color::from_argb(0x20, 0xc0, 0x30, 0x30);
 // Borders, dividers, hairlines
 // ---------------------------------------------------------------------------
 
-/// Light-grey 1 px border around context menus / search popup.
-pub const MENU_BORDER: Color = Color::from_rgb(0xc0, 0xc0, 0xc0);
+/// 1 px border around context menus / search popup. bg-200.
+pub const MENU_BORDER: Color = Color::from_rgb(166, 242, 191);
 
-/// Search popup outer border (slightly warmer than `MENU_BORDER`).
-pub const PANEL_BORDER_WARM: Color = Color::from_rgb(0xc8, 0xc0, 0xb0);
+/// Search popup outer border. Same ramp position as `MENU_BORDER`,
+/// keeps the parameter slot for future re-skinning. primary-200.
+pub const PANEL_BORDER_WARM: Color = Color::from_rgb(165, 243, 200);
 
-/// Pane divider — gutter between left/right panes. Default + hovered.
-pub const DIVIDER_PANE: Color = Color::from_rgb(0xdc, 0xd4, 0xc6);
-pub const DIVIDER_PANE_HOVER: Color = Color::from_rgb(0xc8, 0xbf, 0xb0);
+/// Pane divider — gutter between left/right panes. bg-200 default,
+/// bg-300 on hover.
+pub const DIVIDER_PANE: Color = Color::from_rgb(166, 242, 191);
+pub const DIVIDER_PANE_HOVER: Color = Color::from_rgb(121, 236, 159);
 
 /// Hairline divider above the action rows in the cell context menu
-/// (28/255).
-pub const HAIRLINE_DIVIDER: Color = Color::from_argb(0x28, 0x1c, 0x1c, 0x1c);
+/// (28/255 over text-950).
+pub const HAIRLINE_DIVIDER: Color = Color::from_argb(0x28, 3, 23, 12);
 
-/// Hover tint for sidebar rows and entity-page button backgrounds.
-pub const HOVER_FAINT: Color = Color::from_argb(0x18, 0x1c, 0x1c, 0x1c);
+/// Hover tint for sidebar rows and entity-page button backgrounds
+/// (24/255 over text-950).
+pub const HOVER_FAINT: Color = Color::from_argb(0x18, 3, 23, 12);
 
-/// `TEXT_PRIMARY` (the dark `0x1c` near-black) with a runtime alpha.
-/// Used for the cell outline (`CELL_OUTLINE_ALPHA` in app.rs), the
-/// scrollbar thumb (alpha fades with idle time), and the entity-page
-/// "Create backing cell" button background.
+/// `TEXT_PRIMARY` (the deep text-950 green-near-black) with a runtime
+/// alpha. Used for the cell outline (`CELL_OUTLINE_ALPHA` in app.rs),
+/// the scrollbar thumb (alpha fades with idle time), and the
+/// entity-page "Create backing cell" button background.
 #[inline]
 pub const fn dark_alpha(a: u8) -> Color {
-    Color::from_argb(a, 0x1c, 0x1c, 0x1c)
+    Color::from_argb(a, 3, 23, 12)
 }
 
 /// Pure black with a runtime alpha. Drop shadows that scale with the
@@ -153,18 +175,21 @@ pub const fn black_alpha(a: u8) -> Color {
     Color::from_argb(a, 0, 0, 0)
 }
 
-/// Border around the "+ Create backing cell" button on entity pages.
-pub const BUTTON_BORDER_FAINT: Color = Color::from_argb(0x40, 0x1c, 0x1c, 0x1c);
+/// Border around the "+ Create backing cell" button on entity pages
+/// (64/255 over text-950).
+pub const BUTTON_BORDER_FAINT: Color = Color::from_argb(0x40, 3, 23, 12);
 
 /// Toggle pill background when off (entity active/inactive, People
-/// "Show inactive"). Warm muted.
-pub const TOGGLE_OFF_BG: Color = Color::from_argb(0x60, 0x90, 0x88, 0x7a);
+/// "Show inactive"). Mid-green at 96/255.
+pub const TOGGLE_OFF_BG: Color = Color::from_argb(0x60, 21, 183, 94);
 
 /// Background of the inactive-toggle indicator pill (entity page).
-pub const TOGGLE_INACTIVE_BG: Color = Color::from_argb(0x30, 0x40, 0x40, 0x40);
+/// Deeper green at 48/255.
+pub const TOGGLE_INACTIVE_BG: Color = Color::from_argb(0x30, 11, 91, 47);
 
-/// Heading-rule under date / context section labels in the cell loop.
-pub const HEADING_RULE: Color = Color::from_argb(0x80, 0x70, 0x68, 0x58);
+/// Heading-rule under date / context section labels in the cell loop
+/// (128/255 over text-700).
+pub const HEADING_RULE: Color = Color::from_argb(0x80, 16, 137, 70);
 
 // ---------------------------------------------------------------------------
 // Drop shadows
@@ -179,7 +204,9 @@ pub const SHADOW_MENU: Color = Color::from_argb(0x40, 0, 0, 0);
 // Calculator-style grid (Pop-Pop, Table)
 // ---------------------------------------------------------------------------
 
-/// Pale calc-blue alternating row stripe.
-pub const GRID_STRIPE: Color = Color::from_rgb(0xed, 0xf3, 0xfa);
-/// Muted gray vertical column dividers.
-pub const GRID_DIVIDER: Color = Color::from_argb(0x40, 0x60, 0x60, 0x60);
+/// Alternating row stripe. Pulled from the secondary (blue) ramp so the
+/// calc grid keeps a "data-y" feel against the green page bg.
+/// secondary-50.
+pub const GRID_STRIPE: Color = Color::from_rgb(233, 244, 252);
+/// Vertical column dividers (64/255 over text-700).
+pub const GRID_DIVIDER: Color = Color::from_argb(0x40, 16, 137, 70);
