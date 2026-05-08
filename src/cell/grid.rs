@@ -17,7 +17,7 @@ pub(super) fn draw_alternating_row_stripes(
 ) {
     let mut stripe = Paint::default();
     stripe.set_anti_alias(true);
-    stripe.set_color(crate::color::GRID_STRIPE);
+    stripe.set_color(crate::color::grid_stripe());
     for (i, &(top, bot)) in bands.iter().enumerate() {
         if i % 2 == 1 {
             canvas.draw_rect(Rect::new(left, top, right, bot), &stripe);
@@ -30,7 +30,7 @@ pub(super) fn draw_alternating_row_stripes(
 pub(super) fn draw_vertical_divider(canvas: &Canvas, x: f32, y_top: f32, y_bot: f32) {
     let mut paint = Paint::default();
     paint.set_anti_alias(true);
-    paint.set_color(crate::color::GRID_DIVIDER);
+    paint.set_color(crate::color::grid_divider());
     paint.set_stroke_width(1.0);
     canvas.draw_line((x, y_top), (x, y_bot), &paint);
 }

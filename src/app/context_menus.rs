@@ -63,7 +63,7 @@ fn draw_menu_card(canvas: &Canvas, rect: Rect, scale: f32) {
     let radius = 6.0 * scale;
     let mut shadow = Paint::default();
     shadow.set_anti_alias(true);
-    shadow.set_color(crate::color::SHADOW_MENU);
+    shadow.set_color(crate::color::shadow_menu());
     shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
     canvas.draw_round_rect(
         Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
@@ -73,13 +73,13 @@ fn draw_menu_card(canvas: &Canvas, rect: Rect, scale: f32) {
     );
     let mut bg = Paint::default();
     bg.set_anti_alias(true);
-    bg.set_color(crate::color::BG_CARD);
+    bg.set_color(crate::color::bg_card());
     canvas.draw_round_rect(rect, radius, radius, &bg);
     let mut border = Paint::default();
     border.set_anti_alias(true);
     border.set_style(PaintStyle::Stroke);
     border.set_stroke_width(1.0);
-    border.set_color(crate::color::MENU_BORDER);
+    border.set_color(crate::color::menu_border());
     canvas.draw_round_rect(rect, radius, radius, &border);
 }
 
@@ -180,7 +180,7 @@ impl KeptApp {
         let info_font = Font::from_typeface(&self.typeface, 12.0 * scale);
         let mut info_paint = Paint::default();
         info_paint.set_anti_alias(true);
-        info_paint.set_color(crate::color::TEXT_MUTED_GREY);
+        info_paint.set_color(crate::color::text_muted_grey());
         let (_, im) = info_font.metrics();
         let line1_baseline =
             rect.top + pad + (info_h + (-im.ascent) - im.descent) * 0.5;
@@ -202,7 +202,7 @@ impl KeptApp {
         let divider_y = rect.top + pad + info_h * 2.0 + 0.5;
         let mut divider = Paint::default();
         divider.set_anti_alias(false);
-        divider.set_color(crate::color::HAIRLINE_DIVIDER);
+        divider.set_color(crate::color::hairline_divider());
         canvas.draw_line(
             Point::new(rect.left + pad, divider_y),
             Point::new(rect.right - pad, divider_y),
@@ -239,8 +239,8 @@ impl KeptApp {
         // Delete row (red, hover red-tinted).
         let delete_rect = emit_row(
             "Delete cell",
-            crate::color::DELETE_TEXT,
-            crate::color::DELETE_HOVER_BG,
+            crate::color::delete_text(),
+            crate::color::delete_hover_bg(),
         );
 
         // Surface as reference — always present. Creates a new reference
@@ -248,8 +248,8 @@ impl KeptApp {
         // Ctrl+N cell would land. Hover uses the warm-tan tint.
         let surface_rect = emit_row(
             "Surface as reference",
-            crate::color::TEXT_MENU_ROW,
-            crate::color::EMBED_HOVER,
+            crate::color::text_menu_row(),
+            crate::color::embed_hover(),
         );
 
         // Surface bullet sub-tree as reference — only when right-click hit
@@ -259,8 +259,8 @@ impl KeptApp {
             let label = format!("Surface '{}' as reference", snip);
             Some(emit_row(
                 &label,
-                crate::color::TEXT_MENU_ROW,
-                crate::color::EMBED_HOVER,
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
             ))
         } else {
             None
@@ -310,8 +310,8 @@ impl KeptApp {
             canvas,
             row_rect,
             &format!("Delete tag #{}", menu.name),
-            crate::color::DELETE_TEXT,
-            crate::color::DELETE_HOVER_BG,
+            crate::color::delete_text(),
+            crate::color::delete_hover_bg(),
             true,
             pad,
             false,
@@ -369,8 +369,8 @@ impl KeptApp {
             canvas,
             rename_rect,
             "Rename",
-            crate::color::TEXT_PRIMARY,
-            crate::color::HOVER_FAINT,
+            crate::color::text_primary(),
+            crate::color::hover_faint(),
             true,
             pad,
             false,
@@ -398,16 +398,16 @@ impl KeptApp {
             }
         };
         let text_color = if menu.deletable {
-            crate::color::DELETE_TEXT
+            crate::color::delete_text()
         } else {
-            crate::color::TEXT_DISABLED
+            crate::color::text_disabled()
         };
         draw_menu_row(
             canvas,
             delete_rect,
             &label,
             text_color,
-            crate::color::DELETE_HOVER_BG,
+            crate::color::delete_hover_bg(),
             menu.deletable,
             pad,
             false,

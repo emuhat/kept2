@@ -43,17 +43,17 @@ fn draw_sidebar_row(
     if is_active {
         let mut p = Paint::default();
         p.set_anti_alias(true);
-        p.set_color(crate::color::ACCENT_BLUE_SELECTION);
+        p.set_color(crate::color::accent_blue_selection());
         canvas.draw_round_rect(rect, radius, radius, &p);
     } else if is_hovered {
         let mut p = Paint::default();
         p.set_anti_alias(true);
-        p.set_color(crate::color::HOVER_FAINT);
+        p.set_color(crate::color::hover_faint());
         canvas.draw_round_rect(rect, radius, radius, &p);
     }
     let mut text = Paint::default();
     text.set_anti_alias(true);
-    text.set_color(crate::color::TEXT_PRIMARY);
+    text.set_color(crate::color::text_primary());
     let (_, m) = font.metrics();
     let baseline = rect.top + (rect.height() + (-m.ascent) - m.descent) * 0.5;
     canvas.draw_str(label, Point::new(text_x, baseline), font, &text);
@@ -74,12 +74,12 @@ impl KeptApp {
         // Background panel.
         let mut bg_paint = Paint::default();
         bg_paint.set_anti_alias(true);
-        bg_paint.set_color(crate::color::BG_PANEL);
+        bg_paint.set_color(crate::color::bg_panel());
         canvas.draw_rect(Rect::new(0.0, 0.0, sb_w, height.max(0.0)), &bg_paint);
         // Right-edge separator.
         let mut sep = Paint::default();
         sep.set_anti_alias(false);
-        sep.set_color(crate::color::DIVIDER_PANE);
+        sep.set_color(crate::color::divider_pane());
         canvas.draw_rect(
             Rect::new(sb_w - 1.0, 0.0, sb_w, height.max(0.0)),
             &sep,
@@ -100,7 +100,7 @@ impl KeptApp {
             Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
         let mut header_paint = Paint::default();
         header_paint.set_anti_alias(true);
-        header_paint.set_color(crate::color::TEXT_SECTION_HEADER);
+        header_paint.set_color(crate::color::text_section_header());
         let (_, hm) = header_font.metrics();
 
         // Row hit-tests are rebuilt every frame; clear stale ones.

@@ -446,7 +446,7 @@ impl KeptApp {
         // Drop shadow (drawn first, slightly offset).
         let mut shadow_paint = Paint::default();
         shadow_paint.set_anti_alias(true);
-        shadow_paint.set_color(crate::color::SHADOW_SOFT);
+        shadow_paint.set_color(crate::color::shadow_soft());
         canvas.draw_round_rect(
             Rect::new(
                 popup_x + 1.0,
@@ -462,7 +462,7 @@ impl KeptApp {
         // Background.
         let mut bg_paint = Paint::default();
         bg_paint.set_anti_alias(true);
-        bg_paint.set_color(crate::color::BG_CARD);
+        bg_paint.set_color(crate::color::bg_card());
         let popup_rect = Rect::new(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h);
         canvas.draw_round_rect(popup_rect, radius, radius, &bg_paint);
 
@@ -471,7 +471,7 @@ impl KeptApp {
         border_paint.set_anti_alias(true);
         border_paint.set_style(PaintStyle::Stroke);
         border_paint.set_stroke_width(1.0);
-        border_paint.set_color(crate::color::MENU_BORDER);
+        border_paint.set_color(crate::color::menu_border());
         canvas.draw_round_rect(popup_rect, radius, radius, &border_paint);
 
         let body_font = Font::from_typeface(&self.typeface, MENTION_BODY_FONT_SIZE * scale);
@@ -483,7 +483,7 @@ impl KeptApp {
             // Hint row.
             let mut hint_paint = Paint::default();
             hint_paint.set_anti_alias(true);
-            hint_paint.set_color(crate::color::TEXT_MUTED_GREY);
+            hint_paint.set_color(crate::color::text_muted_grey());
             let hint_y = popup_y + pad;
             let baseline = hint_y + text_offset_in_row;
             let label = if query.is_empty() {
@@ -514,12 +514,12 @@ impl KeptApp {
                 if hovered {
                     let mut hp = Paint::default();
                     hp.set_anti_alias(true);
-                    hp.set_color(crate::color::ACCENT_BLUE_SELECTION);
+                    hp.set_color(crate::color::accent_blue_selection());
                     canvas.draw_round_rect(add_rect, 4.0 * scale, 4.0 * scale, &hp);
                 }
                 let mut text_paint = Paint::default();
                 text_paint.set_anti_alias(true);
-                text_paint.set_color(crate::color::TEXT_PRIMARY);
+                text_paint.set_color(crate::color::text_primary());
                 let baseline = add_y + text_offset_in_row;
                 canvas.draw_str(
                     format!("Add {}{}", kind.trigger(), query),
@@ -534,15 +534,15 @@ impl KeptApp {
 
         let mut dim_paint = Paint::default();
         dim_paint.set_anti_alias(true);
-        dim_paint.set_color(crate::color::TEXT_MUTED_GREY);
+        dim_paint.set_color(crate::color::text_muted_grey());
 
         let mut match_paint = Paint::default();
         match_paint.set_anti_alias(true);
-        match_paint.set_color(crate::color::TEXT_PRIMARY);
+        match_paint.set_color(crate::color::text_primary());
 
         let mut hl_paint = Paint::default();
         hl_paint.set_anti_alias(true);
-        hl_paint.set_color(crate::color::ACCENT_BLUE_SELECTION);
+        hl_paint.set_color(crate::color::accent_blue_selection());
 
         let sel_idx = selected.min(visible - 1);
         let mut row_y = popup_y + pad;

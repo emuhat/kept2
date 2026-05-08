@@ -116,7 +116,7 @@ pub(crate) fn compute_poppop_output(
 impl PopPopCell {
     pub fn new(typeface: Typeface) -> Self {
         let mut output = TextBox::new(typeface.clone(), String::new());
-        output.set_text_color(crate::color::POPPOP_OUTPUT);
+        output.set_text_color(crate::color::poppop_output());
         let mut input = TextBox::new(typeface.clone(), String::new());
         // PopPop is the only cell type that wants `#`-prefixed lines
         // colored as comments (and skipped by the evaluator).
@@ -273,7 +273,7 @@ impl PopPopCell {
         if !self.errors.is_empty() {
             let mut err_paint = Paint::default();
             err_paint.set_anti_alias(true);
-            err_paint.set_color(crate::color::POPPOP_ERROR);
+            err_paint.set_color(crate::color::poppop_error());
             for (paragraph_idx, msg) in &self.errors {
                 let Some(&(_, bot_abs, _)) = bands.get(*paragraph_idx) else {
                     continue;

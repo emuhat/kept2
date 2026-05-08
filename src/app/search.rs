@@ -75,7 +75,7 @@ impl KeptApp {
         // Drop shadow.
         let mut shadow = Paint::default();
         shadow.set_anti_alias(true);
-        shadow.set_color(crate::color::SHADOW_MENU);
+        shadow.set_color(crate::color::shadow_menu());
         shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 14.0, false));
         canvas.draw_round_rect(
             Rect::new(popup_x, popup_y + 4.0, popup_x + popup_w, popup_y + popup_h + 4.0),
@@ -87,7 +87,7 @@ impl KeptApp {
         // Background card.
         let mut bg = Paint::default();
         bg.set_anti_alias(true);
-        bg.set_color(crate::color::BG_CARD);
+        bg.set_color(crate::color::bg_card());
         let card = Rect::new(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h);
         canvas.draw_round_rect(card, radius, radius, &bg);
 
@@ -95,7 +95,7 @@ impl KeptApp {
         border.set_anti_alias(true);
         border.set_style(PaintStyle::Stroke);
         border.set_stroke_width(1.0);
-        border.set_color(crate::color::PANEL_BORDER_WARM);
+        border.set_color(crate::color::panel_border_warm());
         canvas.draw_round_rect(card, radius, radius, &border);
 
         // Input row: drive the TextBox directly so caret, selection, arrow
@@ -121,7 +121,7 @@ impl KeptApp {
             let baseline = input_y + (-im.ascent);
             let mut hint = Paint::default();
             hint.set_anti_alias(true);
-            hint.set_color(crate::color::TEXT_GHOST_WARM);
+            hint.set_color(crate::color::text_ghost_warm());
             canvas.draw_str(
                 "Search…",
                 Point::new(input_x, baseline),
@@ -134,7 +134,7 @@ impl KeptApp {
         let div_y = popup_y + pad + input_h - 4.0 * scale;
         let mut div = Paint::default();
         div.set_anti_alias(false);
-        div.set_color(crate::color::TOGGLE_INACTIVE_BG);
+        div.set_color(crate::color::toggle_inactive_bg());
         canvas.draw_line(
             (popup_x + pad, div_y),
             (popup_x + popup_w - pad, div_y),
@@ -149,10 +149,10 @@ impl KeptApp {
         let (_, rm) = result_font.metrics();
         let mut date_paint = Paint::default();
         date_paint.set_anti_alias(true);
-        date_paint.set_color(crate::color::TEXT_MUTED_WARM_SOFT);
+        date_paint.set_color(crate::color::text_muted_warm_soft());
         let mut row_paint = Paint::default();
         row_paint.set_anti_alias(true);
-        row_paint.set_color(crate::color::TEXT_PRIMARY);
+        row_paint.set_color(crate::color::text_primary());
 
         let selected = self.search.as_ref().map(|s| s.selected).unwrap_or(0);
         let mut row_y = popup_y + pad + input_h;
@@ -161,7 +161,7 @@ impl KeptApp {
             if is_selected {
                 let mut sel = Paint::default();
                 sel.set_anti_alias(true);
-                sel.set_color(crate::color::ACCENT_BLUE_SELECTION);
+                sel.set_color(crate::color::accent_blue_selection());
                 canvas.draw_rect(
                     Rect::new(
                         popup_x + pad * 0.5,
@@ -209,7 +209,7 @@ impl KeptApp {
             let baseline = popup_y + pad + input_h + (result_h + (-rm.ascent) - rm.descent) * 0.5;
             let mut empty_paint = Paint::default();
             empty_paint.set_anti_alias(true);
-            empty_paint.set_color(crate::color::TEXT_SECTION_HEADER);
+            empty_paint.set_color(crate::color::text_section_header());
             canvas.draw_str(
                 "no matches",
                 Point::new(popup_x + pad, baseline),

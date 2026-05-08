@@ -337,7 +337,7 @@ impl OutlineCell {
 
         let mut bullet_paint = Paint::default();
         bullet_paint.set_anti_alias(true);
-        bullet_paint.set_color(crate::color::BULLET_MARKER);
+        bullet_paint.set_color(crate::color::bullet_marker());
 
         // Per-bullet visibility for tag-filtered views. None ⇒ all
         // bullets visible; Some ⇒ render only listed IDs, depth-
@@ -394,7 +394,7 @@ impl OutlineCell {
             if let Some((lo, hi)) = active_indices {
                 let mut hl_paint = Paint::default();
                 hl_paint.set_anti_alias(true);
-                hl_paint.set_color(crate::color::ACCENT_BLUE_SELECTION);
+                hl_paint.set_color(crate::color::accent_blue_selection());
                 for i in lo..=hi {
                     if let Some(&(top, bot)) = bullet_y_bands.get(i) {
                         canvas.draw_rect(Rect::new(x, top, x + width, bot), &hl_paint);
