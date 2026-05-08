@@ -3214,11 +3214,9 @@ impl KeptApp {
                     return self.paste_from_clipboard();
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("n") => {
-                    if modifiers.state().shift_key() {
-                        self.rotate_context_now();
-                        return true;
-                    }
-                    return self.insert_cell_after_focused(NewCellKind::Plain, false);
+                    let with_title = modifiers.state().shift_key();
+                    return self
+                        .insert_cell_after_focused(NewCellKind::Plain, with_title);
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("o") => {
                     let with_title = modifiers.state().shift_key();
@@ -3229,6 +3227,16 @@ impl KeptApp {
                     let with_title = modifiers.state().shift_key();
                     return self
                         .insert_cell_after_focused(NewCellKind::PopPop, with_title);
+                }
+                // Rotate context (start a new context "now"). Moved
+                // off Ctrl+Shift+N so that combo can mirror its
+                // siblings (Plain cell, title pre-focused).
+                Key::Character(s)
+                    if s.as_str().eq_ignore_ascii_case("r")
+                        && modifiers.state().shift_key() =>
+                {
+                    self.rotate_context_now();
+                    return true;
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("f") => {
                     // Ctrl+F: enter "focus mode" — render only the focused

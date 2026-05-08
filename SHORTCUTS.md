@@ -60,13 +60,14 @@ In **view mode** (no caret), plain `Up` / `Down` arrow keys also move focus betw
 | `Ctrl+N` | Plain |
 | `Ctrl+O` | Outline |
 | `Ctrl+P` | PopPop calculator |
+| `Ctrl+Shift+N` | Plain, starts in title-edit mode |
 | `Ctrl+Shift+O` | Outline, starts in title-edit mode |
 | `Ctrl+Shift+P` | PopPop, starts in title-edit mode |
-| `Ctrl+Shift+N` | Rotate context (start a new context "now") |
+| `Ctrl+Shift+R` | Rotate context (start a new context "now") |
 
 A new cell is inserted after the currently focused cell and goes straight into edit mode. No-op if the currently focused cell is empty (so the shortcut doesn't pile up blanks).
 
-The `Ctrl+Shift+<letter>` variants pre-attach an empty title and put the cursor in it, equivalent to `Ctrl+<letter>` followed by `Ctrl+T`. Plain cells use the two-step path (Ctrl+Shift+N is taken by context rotation).
+The `Ctrl+Shift+<letter>` variants pre-attach an empty title and put the cursor in it, equivalent to `Ctrl+<letter>` followed by `Ctrl+T`.
 
 ## View
 
