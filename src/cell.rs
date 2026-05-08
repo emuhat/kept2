@@ -1714,12 +1714,11 @@ mod tests {
     }
 
     #[test]
-    fn textbox_replace_with_tag_updates_line_tag_layout() {
-        // Regression: apply_edit's internal rewrap fired before the
-        // new TagSpan was pushed, so line_tag_layout was stale and
-        // the title rendered with no tag styling until the next
-        // width-driven rewrap. After the fix, layout reflects the
-        // new tag immediately.
+    fn textbox_replace_with_tag_visible_immediately() {
+        // Render-time tag styling reads `self.tags` directly (no
+        // layout cache), so a span pushed by replace_with_tag is
+        // picked up on the very next frame regardless of whether the
+        // textbox's width has changed.
         let mut tb = TextBox::new(typeface(), "Notes #u".to_string());
         tb.set_force_heading(true);
         tb.tick(
@@ -1732,21 +1731,10 @@ mod tests {
             false,
             false,
         );
-        // Before the commit, no spans → no tag layout.
-        assert!(
-            tb.line_tag_layout_for_test()
-                .iter()
-                .all(|slot| slot.is_none()),
-            "no spans means no tag layout",
-        );
+        assert!(tb.tags().is_empty());
         tb.replace_with_tag(6..8, "#urgent".to_string());
-        // Layout slot for the heading line is populated WITHOUT
-        // needing another tick / width change.
-        let layout = tb.line_tag_layout_for_test();
-        assert!(
-            layout.iter().any(|slot| slot.is_some()),
-            "tag layout populated immediately after replace_with_tag",
-        );
+        assert_eq!(tb.tags().len(), 1);
+        assert_eq!(tb.tags()[0].range, 6..13);
     }
 
     #[test]

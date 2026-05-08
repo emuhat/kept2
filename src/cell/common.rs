@@ -11,10 +11,6 @@ use std::time::Duration;
 
 pub(crate) const BODY_FONT_SIZE: f32 = 18.0;
 pub(crate) const HEADING_FONT_SCALE: f32 = 1.12;
-/// Trailing `#tag` tokens on a heading line render at this fraction of body
-/// font size, in muted gray, with extra space separating them from the title.
-pub(crate) const HEADING_TAG_FONT_SCALE: f32 = 0.85;
-pub(crate) const HEADING_TAG_GAP: f32 = 12.0;
 /// Vertical breathing room between a cell's title slot and its body.
 /// Logical pixels; scaled with `font_scale`.
 pub(crate) const TITLE_BODY_GAP: f32 = 6.0;

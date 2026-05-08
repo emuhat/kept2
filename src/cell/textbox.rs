@@ -13,10 +13,9 @@ use winit::{
 };
 
 use super::common::{
-    Affinity, BODY_FONT_SIZE, CARET_WIDTH, Edit, HEADING_FONT_SCALE, HEADING_TAG_FONT_SCALE,
-    HEADING_TAG_GAP, LinkSpan, MULTI_CLICK_DIST, MULTI_CLICK_INTERVAL, Selection, Selections,
-    TagSpan, TextBoxSnapshot, line_edge_mod, primary_mod, transform_index,
-    transform_index_closed_end, word_mod,
+    Affinity, BODY_FONT_SIZE, CARET_WIDTH, Edit, HEADING_FONT_SCALE, LinkSpan,
+    MULTI_CLICK_DIST, MULTI_CLICK_INTERVAL, Selection, Selections, TagSpan, TextBoxSnapshot,
+    line_edge_mod, primary_mod, transform_index, transform_index_closed_end, word_mod,
 };
 use super::wrap::{
     draw_line_with_links, find_line_at, find_word_at, find_word_left_of, find_word_right_of,
@@ -59,12 +58,6 @@ pub struct TextBox {
     /// for an error message immediately under the failing input row;
     /// elsewhere this stays empty (or all-zero) and is a no-op.
     line_extra_below: Vec<f32>,
-    /// Aligned with `body_lines`: for heading lines that contain trailing
-    /// `#tag` tokens, holds `(title_end_offset, first_tag_offset)` line-
-    /// relative byte offsets. The title spans `[0, title_end_offset)`,
-    /// `[title_end_offset, first_tag_offset)` is whitespace rendered as a
-    /// gap, and the tag area runs from `first_tag_offset` to the line end.
-    line_tag_layout: Vec<Option<(usize, usize)>>,
     body_lines_width: f32,
     /// Cell-local y-bands per visual line: top-of-cell = 0.
     line_bands: Vec<(f32, f32)>,
@@ -141,7 +134,6 @@ impl TextBox {
             line_is_heading: Vec::new(),
             line_is_comment: Vec::new(),
             line_extra_below: Vec::new(),
-            line_tag_layout: Vec::new(),
             body_lines_width: f32::NAN,
             line_bands: Vec::new(),
             x_origin: 0.0,
@@ -486,15 +478,6 @@ impl TextBox {
     /// for the final paragraph. Used by `PopPopCell` to size row stripes and
     /// align outputs with input rows. Empty after a fresh rewrap if
     /// `body_lines` hasn't been populated yet.
-    /// Test-only accessor for the per-visual-line tag layout. Each
-    /// entry is `Some((title_end_offset, first_tag_offset))` for a
-    /// heading line carrying trailing tags, `None` otherwise.
-    /// Indices are line-relative bytes.
-    #[cfg(test)]
-    pub fn line_tag_layout_for_test(&self) -> &[Option<(usize, usize)>] {
-        &self.line_tag_layout
-    }
-
     pub fn source_line_y_bands(&self) -> Vec<(f32, f32, bool)> {
         let bytes = self.text.as_bytes();
         // Collect (li, top_local, is_heading) per paragraph-starting body line.
@@ -541,18 +524,15 @@ impl TextBox {
     /// Mark a byte range as a `#tag` token. The range should cover the
     /// whole `#tagname` substring (leading `#` included). Used by the
     /// mention popup's tag-commit path and by the persistence layer's
-    /// legacy migration. Invalid ranges are silently dropped. The
-    /// title's heading-tag layout cache is recomputed so the new
-    /// span renders with tag styling immediately — without this the
-    /// span would land in `self.tags` (sidebar sees it) but stay
-    /// invisible visually until the next width-change-driven rewrap.
+    /// legacy migration. Invalid ranges are silently dropped.
+    /// Rendering reads `self.tags` directly each frame (overdraw
+    /// pass), so no cache recomputation is needed here.
     pub fn add_tag(&mut self, range: Range<usize>) {
         if range.start < range.end
             && range.end <= self.text.len()
             && self.text[range.clone()].starts_with('#')
         {
             self.tags.push(TagSpan { range });
-            self.recompute_line_tag_layout();
         }
     }
 
@@ -793,62 +773,9 @@ impl TextBox {
         f
     }
 
-    /// Smaller (non-bold) variant used for `#tag` tokens trailing a heading.
-    fn tag_font(&self) -> Font {
-        Font::from_typeface(
-            &self.typeface,
-            BODY_FONT_SIZE * HEADING_TAG_FONT_SCALE * self.font_scale,
-        )
-    }
-
-    /// Recompute `line_tag_layout` from the current text + body_lines +
-    /// line_is_heading state. Each entry is `(title_end_offset,
-    /// first_tag_offset)` relative to the line's start byte; line is
-    /// otherwise represented as `None` (no tag styling).
-    fn recompute_line_tag_layout(&mut self) {
-        self.line_tag_layout.clear();
-        self.line_tag_layout.resize(self.body_lines.len(), None);
-        // Tags only exist on heading lines, which is the entire textbox
-        // when `force_heading` is set (title slot).
-        if !self.force_heading {
-            return;
-        }
-        let heading_end = self.text.find('\n').unwrap_or(self.text.len());
-        // First tag span that lies wholly within the heading paragraph
-        // — that's the leftmost trailing-tag-run boundary. Spans are
-        // not guaranteed to be sorted, so scan for the min start.
-        let first_tag_start = self
-            .tags
-            .iter()
-            .filter(|t| t.range.end <= heading_end)
-            .map(|t| t.range.start)
-            .min();
-        let Some(first_tag_start) = first_tag_start else {
-            return;
-        };
-        // Walk back from first_tag_start over whitespace to find title_end.
-        let bytes = self.text.as_bytes();
-        let mut title_end = first_tag_start;
-        while title_end > 0 && (bytes[title_end - 1] as char).is_whitespace() {
-            title_end -= 1;
-        }
-        // Find the line that contains first_tag_start; record layout for it.
-        for (li, line) in self.body_lines.iter().enumerate() {
-            if !self.line_is_heading.get(li).copied().unwrap_or(false) {
-                continue;
-            }
-            if first_tag_start >= line.start && first_tag_start < line.end {
-                let line_title_end = title_end.saturating_sub(line.start);
-                let line_first_tag = first_tag_start - line.start;
-                self.line_tag_layout[li] = Some((line_title_end, line_first_tag));
-                break;
-            }
-        }
-    }
-
-    /// Pure-state layout step: set origins, wrap if width changed, recompute
-    /// tag layout, populate `line_bands`. Does NOT draw. `tick` calls this
-    /// first; PopPopCell calls it directly so it can compute row stripes
+    /// Pure-state layout step: set origins, wrap if width changed,
+    /// populate `line_bands`. Does NOT draw. `tick` calls this first;
+    /// PopPopCell calls it directly so it can compute row stripes
     /// before the text gets drawn over them.
     pub fn layout(&mut self, x: f32, y: f32, width: f32) {
         self.x_origin = x;
@@ -874,7 +801,6 @@ impl TextBox {
             self.line_is_heading = headings;
             self.line_is_comment = comments;
             self.body_lines_width = max_text_width;
-            self.recompute_line_tag_layout();
         }
         // Keep `line_extra_below` aligned with `body_lines` length. New
         // entries default to 0 (no extra spacing). PopPopCell may
@@ -922,14 +848,9 @@ impl TextBox {
 
         let body_font = self.body_font();
         let heading_font = self.heading_font();
-        let tag_font = self.tag_font();
-        let tag_gap = HEADING_TAG_GAP * self.font_scale;
         let mut text_paint = Paint::default();
         text_paint.set_anti_alias(true);
         text_paint.set_color(self.text_color);
-        let mut tag_paint = Paint::default();
-        tag_paint.set_anti_alias(true);
-        tag_paint.set_color(crate::color::text_ghost());
 
         let (_, body_metrics) = body_font.metrics();
         let (_, heading_metrics) = heading_font.metrics();
@@ -974,25 +895,10 @@ impl TextBox {
                     } else {
                         &body_font
                     };
-                    let layout = self.line_tag_layout.get(li).copied().flatten();
-                    let x0 = x + line_x_at_offset(
-                        line_text,
-                        s - line.start,
-                        layout,
-                        main_font,
-                        &tag_font,
-                        &text_paint,
-                        tag_gap,
-                    );
-                    let x1 = x + line_x_at_offset(
-                        line_text,
-                        e - line.start,
-                        layout,
-                        main_font,
-                        &tag_font,
-                        &text_paint,
-                        tag_gap,
-                    );
+                    let x0 = x
+                        + line_x_at_offset(line_text, s - line.start, main_font, &text_paint);
+                    let x1 = x
+                        + line_x_at_offset(line_text, e - line.start, main_font, &text_paint);
                     let baseline = baselines_local[li] + y;
                     let m = line_metrics_for(li);
                     let top = baseline + m.ascent;
@@ -1031,51 +937,13 @@ impl TextBox {
             } else {
                 &text_paint
             };
-            let layout = self.line_tag_layout.get(li).copied().flatten();
-            if let Some((title_end, first_tag)) = layout {
-                let line_text = &self.text[line.start..line.end];
-                let visible_offset = visible_end - line.start;
-                let title_end = title_end.min(visible_offset);
-                let first_tag = first_tag.min(visible_offset);
-                if title_end > 0 {
-                    let title_range = line.start..(line.start + title_end);
-                    if self.links.is_empty() {
-                        canvas.draw_str(
-                            &line_text[..title_end],
-                            Point::new(x, baseline),
-                            line_font,
-                            &text_paint,
-                        );
-                    } else {
-                        // Title may contain links (e.g. an `@`-mention to a
-                        // person cell, which inserts a `kept://…` link). Run
-                        // the link-aware drawer over just the title bytes.
-                        draw_line_with_links(
-                            canvas,
-                            &self.text,
-                            &title_range,
-                            &self.links,
-                            x,
-                            baseline,
-                            line_font,
-                            &text_paint,
-                            &link_paint,
-                            &underline_paint,
-                        );
-                    }
-                }
-                if first_tag < visible_offset {
-                    let title_w = line_font
-                        .measure_str(&line_text[..title_end], Some(&text_paint))
-                        .0;
-                    canvas.draw_str(
-                        &line_text[first_tag..visible_offset],
-                        Point::new(x + title_w + tag_gap, baseline),
-                        &tag_font,
-                        &tag_paint,
-                    );
-                }
-            } else if self.links.is_empty() {
+            // Uniform line render: heading and body lines both use a
+            // single font for the whole line. Tag styling is layered
+            // on top via the inline-tag overdraw pass below — the
+            // pre-fix model carved the line into title/gap/tag with
+            // a smaller font for the tag area, which broke when a
+            // `#tag` sat anywhere other than the trailing edge.
+            if self.links.is_empty() {
                 canvas.draw_str(
                     &self.text[visible_line.clone()],
                     Point::new(x, baseline),
@@ -1098,14 +966,13 @@ impl TextBox {
             }
         }
 
-        // Inline-tag dim overlay: re-draw `#tag` substrings on each
-        // body line in the muted ghost color so they read as metadata,
-        // not prose. Skips heading lines (titles handle their trailing
-        // tags via the dedicated tag-layout path) and comment lines
-        // (PopPop already colors those green and exempts them from tag
-        // semantics anyway). Same font as the underlying line; just an
-        // overdraw with a different paint, which is cheap and visually
-        // clean at the antialias level. Driven by `TagSpan`s — typed
+        // Tag overlay: re-draw each `TagSpan` substring in the muted
+        // ghost color so tags read as metadata, not prose. Same font
+        // as the underlying line (heading_font for headings, body_font
+        // otherwise) — just an overdraw with a different paint, which
+        // is cheap and visually clean at the antialias level. Skips
+        // comment lines (PopPop colors them green and exempts them
+        // from tag semantics anyway). Driven by `TagSpan`s — typed
         // `#X` without a span (no popup commit) is plain text.
         let inline_tag_ranges: Vec<Range<usize>> =
             self.tags.iter().map(|t| t.range.clone()).collect();
@@ -1114,12 +981,14 @@ impl TextBox {
             tag_dim_paint.set_anti_alias(true);
             tag_dim_paint.set_color(crate::color::text_ghost());
             for (li, line) in self.body_lines.iter().enumerate() {
-                if self.line_is_heading.get(li).copied().unwrap_or(false) {
-                    continue;
-                }
                 if self.line_is_comment.get(li).copied().unwrap_or(false) {
                     continue;
                 }
+                let line_font = if self.line_is_heading.get(li).copied().unwrap_or(false) {
+                    &heading_font
+                } else {
+                    &body_font
+                };
                 let visible_end = trim_nl_end(&self.text, line);
                 let line_text = &self.text[line.start..line.end];
                 let baseline = baselines_local[li] + y;
@@ -1129,13 +998,13 @@ impl TextBox {
                     if s >= e {
                         continue;
                     }
-                    let prefix_w = body_font
+                    let prefix_w = line_font
                         .measure_str(&line_text[..s - line.start], Some(&text_paint))
                         .0;
                     canvas.draw_str(
                         &self.text[s..e],
                         Point::new(x + prefix_w, baseline),
-                        &body_font,
+                        line_font,
                         &tag_dim_paint,
                     );
                 }
@@ -1161,15 +1030,11 @@ impl TextBox {
                     } else {
                         &body_font
                     };
-                    let layout = self.line_tag_layout.get(li).copied().flatten();
                     x + line_x_at_offset(
                         line_text,
                         prefix_end - line.start,
-                        layout,
                         main_font,
-                        &tag_font,
                         &text_paint,
-                        tag_gap,
                     )
                 };
                 let m = line_metrics_for(li);
@@ -1450,24 +1315,13 @@ impl TextBox {
         } else {
             self.body_font()
         };
-        let tag_font = self.tag_font();
-        let tag_gap = HEADING_TAG_GAP * self.font_scale;
-        let layout = self.line_tag_layout.get(line_idx).copied().flatten();
         let paint = Paint::default();
 
         let mut prev_offset = 0usize;
         let mut prev_w = 0.0f32;
 
         for (offset, _) in line_text.char_indices().skip(1) {
-            let w = line_x_at_offset(
-                line_text,
-                offset,
-                layout,
-                &main_font,
-                &tag_font,
-                &paint,
-                tag_gap,
-            );
+            let w = line_x_at_offset(line_text, offset, &main_font, &paint);
             if w >= local_x {
                 let chosen = if (local_x - prev_w) < (w - local_x) {
                     prev_offset
@@ -1481,15 +1335,7 @@ impl TextBox {
             prev_offset = offset;
         }
 
-        let total_w = line_x_at_offset(
-            line_text,
-            line_text.len(),
-            layout,
-            &main_font,
-            &tag_font,
-            &paint,
-            tag_gap,
-        );
+        let total_w = line_x_at_offset(line_text, line_text.len(), &main_font, &paint);
         let chosen = if (local_x - prev_w) < (total_w - local_x) {
             prev_offset
         } else {
@@ -1915,7 +1761,6 @@ impl TextBox {
             self.line_is_heading.clear();
             self.line_is_comment.clear();
             self.line_extra_below.clear();
-            self.line_tag_layout.clear();
             return;
         }
         let body_font = self.body_font();
@@ -1933,7 +1778,6 @@ impl TextBox {
         self.body_lines = lines;
         self.line_is_heading = headings;
         self.line_is_comment = comments;
-        self.recompute_line_tag_layout();
     }
 }
 

@@ -56,34 +56,18 @@ pub(super) fn draw_line_with_links(
     }
 }
 
-/// X-pixel offset within a line up to byte `target_offset`, accounting for
-/// heading-tag layout: title bytes use `main_font`, the gap between title
-/// and first tag is `tag_gap`, and tag-area bytes use `tag_font`.
+/// X-pixel offset within a line up to byte `target_offset`. Heading
+/// and body lines now use a uniform main-font model — tags are
+/// painted as an overdraw in the original line font, just with a
+/// dimmer color, so position computations don't need to be tag-aware.
 pub(super) fn line_x_at_offset(
     line_text: &str,
     target_offset: usize,
-    tag_layout: Option<(usize, usize)>,
     main_font: &Font,
-    tag_font: &Font,
     paint: &Paint,
-    tag_gap: f32,
 ) -> f32 {
     let target = target_offset.min(line_text.len());
-    let (title_end, first_tag) = match tag_layout {
-        Some((te, ft)) => (te, ft),
-        None => return main_font.measure_str(&line_text[..target], Some(paint)).0,
-    };
-    if target <= title_end {
-        main_font.measure_str(&line_text[..target], Some(paint)).0
-    } else if target <= first_tag {
-        main_font.measure_str(&line_text[..title_end], Some(paint)).0 + tag_gap
-    } else {
-        main_font.measure_str(&line_text[..title_end], Some(paint)).0
-            + tag_gap
-            + tag_font
-                .measure_str(&line_text[first_tag..target], Some(paint))
-                .0
-    }
+    main_font.measure_str(&line_text[..target], Some(paint)).0
 }
 
 /// Parse trailing `#tag` tokens from a heading paragraph. `text` is the
