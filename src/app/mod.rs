@@ -107,6 +107,7 @@ struct HitTestState {
     search: SearchHits,
     entity_page: EntityPageHits,
     people_page: PeoplePageHits,
+    mention_popup: MentionPopupHits,
 }
 
 #[derive(Default)]
@@ -149,6 +150,18 @@ struct SearchHits {
     /// Search-popup input rect (window coords). `Some` only while the
     /// popup is open; routes clicks into the search `TextBox`.
     input: Option<Rect>,
+}
+
+#[derive(Default)]
+struct MentionPopupHits {
+    /// Per-row rects (window coords) — index aligns with the popup's
+    /// filtered candidate list. Mouse click dispatches to the matching
+    /// candidate. Cleared each frame the popup renders.
+    rows: Vec<Rect>,
+    /// "Add @X" / "Add #X" row rect, populated only when the typed
+    /// query produced no matches. Mouse-only — keyboard Enter never
+    /// reaches it (Enter without a match dismisses without commit).
+    add_row: Option<Rect>,
 }
 
 #[derive(Default)]
@@ -5056,6 +5069,35 @@ impl KeptApp {
     pub fn mouse_down(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
         // Any click cancels in-flight kinetic coast on every pane.
         self.kill_all_kinetic();
+
+        // Mention popup intercepts left-clicks first: clicking a row
+        // commits that candidate; clicking the "Add @X" / "Add #X" row
+        // creates a new entity / tag and commits it. A click that
+        // misses the popup dismisses it and falls through to whatever
+        // the click would normally do (focus a cell, etc.).
+        if self.mention_popup.is_some() {
+            let in_rect = |r: Rect| {
+                x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+            };
+            if let Some(rect) = self.hit_tests.mention_popup.add_row {
+                if in_rect(rect) {
+                    self.commit_add_mention();
+                    return true;
+                }
+            }
+            let row_hit = self
+                .hit_tests
+                .mention_popup
+                .rows
+                .iter()
+                .position(|r| in_rect(*r));
+            if let Some(idx) = row_hit {
+                self.commit_mention_row(idx);
+                return true;
+            }
+            // Miss: dismiss popup and continue routing.
+            self.mention_popup = None;
+        }
 
         // Tag context menu intercepts left-clicks: clicking the "Delete
         // tag" row deletes; clicking anywhere else closes the menu and

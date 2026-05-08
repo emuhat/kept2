@@ -364,16 +364,34 @@ impl KeptApp {
         }
     }
 
-    pub(super) fn render_mention_popup(&self, canvas: &Canvas, view_w: f32, view_h: f32) {
-        let Some(popup) = self.mention_popup.as_ref() else {
-            return;
+    pub(super) fn render_mention_popup(&mut self, canvas: &Canvas, view_w: f32, view_h: f32) {
+        // Hit-test rects are rebuilt every frame the popup renders;
+        // clear stale ones up front so an empty/closed popup leaves
+        // none lingering.
+        self.hit_tests.mention_popup.rows.clear();
+        self.hit_tests.mention_popup.add_row = None;
+
+        // Snapshot the popup state into locals so subsequent &mut self
+        // writes (hit_tests) don't fight the popup borrow.
+        let (source, kind, anchor_byte, query, selected) = {
+            let Some(popup) = self.mention_popup.as_ref() else {
+                return;
+            };
+            (
+                popup.source,
+                popup.kind,
+                popup.anchor_byte,
+                popup.query.clone(),
+                popup.selected,
+            )
         };
-        let (anchor_x, anchor_y_below) = match popup.source {
+
+        let (anchor_x, anchor_y_below) = match source {
             MentionSource::Cell { cell_id, bullet_id } => {
                 let Some(cell) = self.cell(cell_id) else {
                     return;
                 };
-                let Some((x, y)) = cell.anchor_doc_pos(bullet_id, popup.anchor_byte) else {
+                let Some((x, y)) = cell.anchor_doc_pos(bullet_id, anchor_byte) else {
                     return;
                 };
                 // Doc-space → window-space: subtract scroll.
@@ -381,10 +399,10 @@ impl KeptApp {
             }
             MentionSource::SearchBar => {
                 let Some(state) = self.search.as_ref() else { return };
-                let Some((x, _)) = state.input.doc_position_of_byte(popup.anchor_byte) else {
+                let Some((x, _)) = state.input.doc_position_of_byte(anchor_byte) else {
                     return;
                 };
-                let Some((_, bot)) = state.input.line_y_band_of_byte(popup.anchor_byte) else {
+                let Some((_, bot)) = state.input.line_y_band_of_byte(anchor_byte) else {
                     return;
                 };
                 (x, bot)
@@ -397,14 +415,21 @@ impl KeptApp {
         let pad = MENTION_POPUP_PAD * scale;
         let radius = MENTION_POPUP_RADIUS * scale;
 
-        let candidates = self.mention_candidates_for(popup.kind);
-        let items = filter_mentions(&candidates, &popup.query);
+        let candidates = self.mention_candidates_for(kind);
+        let items = filter_mentions(&candidates, &query);
         let visible = items.len().min(MENTION_POPUP_MAX_VISIBLE);
-        let popup_h = if visible == 0 {
-            row_h + pad * 2.0
+        // The "Add @X" / "Add #X" row appears at the bottom only when
+        // the user typed something AND nothing matched. Mouse-only —
+        // see commit_mention_via_keyboard for why.
+        let show_add_row = items.is_empty() && !query.is_empty();
+        let row_count = if items.is_empty() {
+            // Hint row ("No matches…" / "Type to search…") plus the
+            // optional Add row.
+            if show_add_row { 2 } else { 1 }
         } else {
-            (visible as f32) * row_h + pad * 2.0
+            visible
         };
+        let popup_h = (row_count as f32) * row_h + pad * 2.0;
 
         // Anchor below the trigger char, then clamp into the viewport
         // so a popup near the right or bottom edge doesn't paint past
@@ -456,14 +481,16 @@ impl KeptApp {
         let text_offset_in_row = (row_h - row_text_height) * 0.5 + (-m.ascent);
 
         if items.is_empty() {
+            // Hint row.
             let mut hint_paint = Paint::default();
             hint_paint.set_anti_alias(true);
             hint_paint.set_color(crate::color::TEXT_MUTED_GREY);
-            let baseline = popup_y + pad + text_offset_in_row;
-            let label = if popup.query.is_empty() {
+            let hint_y = popup_y + pad;
+            let baseline = hint_y + text_offset_in_row;
+            let label = if query.is_empty() {
                 "Type to search…".to_string()
             } else {
-                format!("No matches for \"{}\"", popup.query)
+                format!("No matches for \"{}\"", query)
             };
             canvas.draw_str(
                 label,
@@ -471,6 +498,38 @@ impl KeptApp {
                 &body_font,
                 &hint_paint,
             );
+
+            if show_add_row {
+                let add_y = hint_y + row_h;
+                let add_rect = Rect::new(
+                    popup_x + 4.0 * scale,
+                    add_y,
+                    popup_x + popup_w - 4.0 * scale,
+                    add_y + row_h,
+                );
+                let mouse = self.mouse_pos;
+                let hovered = mouse.0 >= add_rect.left
+                    && mouse.0 <= add_rect.right
+                    && mouse.1 >= add_rect.top
+                    && mouse.1 <= add_rect.bottom;
+                if hovered {
+                    let mut hp = Paint::default();
+                    hp.set_anti_alias(true);
+                    hp.set_color(crate::color::ACCENT_BLUE_SELECTION);
+                    canvas.draw_round_rect(add_rect, 4.0 * scale, 4.0 * scale, &hp);
+                }
+                let mut text_paint = Paint::default();
+                text_paint.set_anti_alias(true);
+                text_paint.set_color(crate::color::TEXT_PRIMARY);
+                let baseline = add_y + text_offset_in_row;
+                canvas.draw_str(
+                    format!("Add {}{}", kind.trigger(), query),
+                    Point::new(popup_x + 12.0 * scale, baseline),
+                    &body_font,
+                    &text_paint,
+                );
+                self.hit_tests.mention_popup.add_row = Some(add_rect);
+            }
             return;
         }
 
@@ -486,27 +545,28 @@ impl KeptApp {
         hl_paint.set_anti_alias(true);
         hl_paint.set_color(crate::color::ACCENT_BLUE_SELECTION);
 
-        let selected = popup.selected.min(visible - 1);
+        let sel_idx = selected.min(visible - 1);
         let mut row_y = popup_y + pad;
         for (i, (item, matches)) in items.iter().take(visible).enumerate() {
-            if i == selected {
-                canvas.draw_round_rect(
-                    Rect::new(
-                        popup_x + 4.0 * scale,
-                        row_y,
-                        popup_x + popup_w - 4.0 * scale,
-                        row_y + row_h,
-                    ),
-                    4.0 * scale,
-                    4.0 * scale,
-                    &hl_paint,
-                );
+            let row_rect = Rect::new(
+                popup_x + 4.0 * scale,
+                row_y,
+                popup_x + popup_w - 4.0 * scale,
+                row_y + row_h,
+            );
+            let mouse = self.mouse_pos;
+            let mouse_hover = mouse.0 >= row_rect.left
+                && mouse.0 <= row_rect.right
+                && mouse.1 >= row_rect.top
+                && mouse.1 <= row_rect.bottom;
+            if i == sel_idx || mouse_hover {
+                canvas.draw_round_rect(row_rect, 4.0 * scale, 4.0 * scale, &hl_paint);
             }
             let baseline = row_y + text_offset_in_row;
             let text_x = popup_x + 12.0 * scale;
             // Render the trigger in dim, then alternate dim / match-paint
             // runs across the suggestion's letters.
-            let trigger = popup.kind.trigger();
+            let trigger = kind.trigger();
             let trigger_w = body_font.measure_str(trigger, Some(&dim_paint)).0;
             canvas.draw_str(trigger, Point::new(text_x, baseline), &body_font, &dim_paint);
             draw_runs_with_matches(
@@ -518,6 +578,7 @@ impl KeptApp {
                 &match_paint,
                 &dim_paint,
             );
+            self.hit_tests.mention_popup.rows.push(row_rect);
             row_y += row_h;
         }
     }
@@ -574,6 +635,68 @@ impl KeptApp {
             }
             MentionKind::Tag => {
                 self.commit_tag_mention(popup.source, start, end, chosen_name);
+            }
+        }
+        self.coalesce_break = true;
+        true
+    }
+
+    /// Commit a specific row by index (mouse click). Sets the popup's
+    /// selected index and runs the same path as keyboard Enter.
+    pub(super) fn commit_mention_row(&mut self, idx: usize) -> bool {
+        if let Some(p) = self.mention_popup.as_mut() {
+            p.selected = idx;
+        }
+        self.commit_mention()
+    }
+
+    /// Commit the typed query as a brand-new entity (for `@`) or tag
+    /// (for `#`). Reachable only via mouse-click on the "Add @X" /
+    /// "Add #X" row — keyboard Enter dismisses without commit so an
+    /// accidental Return doesn't create something the user didn't
+    /// pick deliberately.
+    pub(super) fn commit_add_mention(&mut self) -> bool {
+        let Some(popup) = self.mention_popup.take() else {
+            return false;
+        };
+        let query = popup.query.trim().to_string();
+        if query.is_empty() {
+            return false;
+        }
+        let start = popup.anchor_byte;
+        let end = start + 1 + popup.query.len();
+
+        match popup.kind {
+            MentionKind::Person => {
+                let new_id = match self.db.as_mut() {
+                    Some(db) => match db.create_cell_less_person_entity(&query) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            eprintln!(
+                                "kept: create_cell_less_person_entity failed: {e}",
+                            );
+                            return false;
+                        }
+                    },
+                    None => return false,
+                };
+                self.refresh_entities();
+                let created_at = self
+                    .entities
+                    .iter()
+                    .find(|e| e.id == new_id)
+                    .map(|e| e.created_at)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+                self.undo_stack.push(super::UndoOp::CreateCelllessEntity {
+                    entity_id: new_id,
+                    name: query.clone(),
+                    created_at,
+                });
+                self.redo_stack.clear();
+                self.commit_person_mention(popup.source, start, end, query, new_id);
+            }
+            MentionKind::Tag => {
+                self.commit_tag_mention(popup.source, start, end, query);
             }
         }
         self.coalesce_break = true;
