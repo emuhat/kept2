@@ -53,7 +53,7 @@ fn draw_sidebar_row(
     }
     let mut text = Paint::default();
     text.set_anti_alias(true);
-    text.set_color(crate::color::text_primary());
+    text.set_color(crate::color::sidebar_text_primary());
     let (_, m) = font.metrics();
     let baseline = rect.top + (rect.height() + (-m.ascent) - m.descent) * 0.5;
     canvas.draw_str(label, Point::new(text_x, baseline), font, &text);
@@ -100,7 +100,7 @@ impl KeptApp {
             Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
         let mut header_paint = Paint::default();
         header_paint.set_anti_alias(true);
-        header_paint.set_color(crate::color::text_section_header());
+        header_paint.set_color(crate::color::sidebar_section_header());
         let (_, hm) = header_font.metrics();
 
         // Row hit-tests are rebuilt every frame; clear stale ones.
