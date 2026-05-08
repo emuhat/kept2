@@ -1639,7 +1639,7 @@ impl KeptApp {
         footer_paint.set_color(crate::color::text_muted_grey());
         canvas.draw_str(
             footer_text,
-            Point::new(body_x, footer_baseline),
+            Point::new(body_x, footer_baseline + 10.0*scale),
             &footer_font,
             &footer_paint,
         );

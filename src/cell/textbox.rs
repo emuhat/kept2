@@ -486,6 +486,15 @@ impl TextBox {
     /// for the final paragraph. Used by `PopPopCell` to size row stripes and
     /// align outputs with input rows. Empty after a fresh rewrap if
     /// `body_lines` hasn't been populated yet.
+    /// Test-only accessor for the per-visual-line tag layout. Each
+    /// entry is `Some((title_end_offset, first_tag_offset))` for a
+    /// heading line carrying trailing tags, `None` otherwise.
+    /// Indices are line-relative bytes.
+    #[cfg(test)]
+    pub fn line_tag_layout_for_test(&self) -> &[Option<(usize, usize)>] {
+        &self.line_tag_layout
+    }
+
     pub fn source_line_y_bands(&self) -> Vec<(f32, f32, bool)> {
         let bytes = self.text.as_bytes();
         // Collect (li, top_local, is_heading) per paragraph-starting body line.
@@ -532,13 +541,18 @@ impl TextBox {
     /// Mark a byte range as a `#tag` token. The range should cover the
     /// whole `#tagname` substring (leading `#` included). Used by the
     /// mention popup's tag-commit path and by the persistence layer's
-    /// legacy migration. Invalid ranges are silently dropped.
+    /// legacy migration. Invalid ranges are silently dropped. The
+    /// title's heading-tag layout cache is recomputed so the new
+    /// span renders with tag styling immediately — without this the
+    /// span would land in `self.tags` (sidebar sees it) but stay
+    /// invisible visually until the next width-change-driven rewrap.
     pub fn add_tag(&mut self, range: Range<usize>) {
         if range.start < range.end
             && range.end <= self.text.len()
             && self.text[range.clone()].starts_with('#')
         {
             self.tags.push(TagSpan { range });
+            self.recompute_line_tag_layout();
         }
     }
 
@@ -1763,11 +1777,13 @@ impl TextBox {
             replacement: text,
         });
         let end = start + inserted_len;
-        if inserted_len > 0
-            && end <= self.text.len()
-            && self.text[start..end].starts_with('#')
-        {
-            self.tags.push(TagSpan { range: start..end });
+        // Route through `add_tag` so the heading-tag layout cache
+        // gets recomputed — `apply_edit` above already ran rewrap,
+        // but with the OLD `self.tags`. Without this the new span
+        // lands in `self.tags` (sidebar sees it) but the title
+        // doesn't render with tag styling until the next rewrap.
+        if inserted_len > 0 {
+            self.add_tag(start..end);
         }
         self.set_caret_at(end);
         self.break_coalesce();

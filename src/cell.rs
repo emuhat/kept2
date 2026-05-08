@@ -1714,6 +1714,42 @@ mod tests {
     }
 
     #[test]
+    fn textbox_replace_with_tag_updates_line_tag_layout() {
+        // Regression: apply_edit's internal rewrap fired before the
+        // new TagSpan was pushed, so line_tag_layout was stale and
+        // the title rendered with no tag styling until the next
+        // width-driven rewrap. After the fix, layout reflects the
+        // new tag immediately.
+        let mut tb = TextBox::new(typeface(), "Notes #u".to_string());
+        tb.set_force_heading(true);
+        tb.tick(
+            &skia_safe::surfaces::raster_n32_premul((400, 200))
+                .unwrap()
+                .canvas(),
+            0.0,
+            0.0,
+            400.0,
+            false,
+            false,
+        );
+        // Before the commit, no spans → no tag layout.
+        assert!(
+            tb.line_tag_layout_for_test()
+                .iter()
+                .all(|slot| slot.is_none()),
+            "no spans means no tag layout",
+        );
+        tb.replace_with_tag(6..8, "#urgent".to_string());
+        // Layout slot for the heading line is populated WITHOUT
+        // needing another tick / width change.
+        let layout = tb.line_tag_layout_for_test();
+        assert!(
+            layout.iter().any(|slot| slot.is_some()),
+            "tag layout populated immediately after replace_with_tag",
+        );
+    }
+
+    #[test]
     fn textbox_migrate_tags_from_text_seeds_legacy_spans() {
         // Round-trip simulator for v6→v7 backfill: a freshly-loaded
         // TextBox has no spans; migrate scans trailing/inline tokens
