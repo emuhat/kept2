@@ -16,7 +16,7 @@ mod table;
 mod textbox;
 mod wrap;
 
-pub use common::{TextBoxSnapshot, now_epoch_ms};
+pub use common::{TagSpan, TextBoxSnapshot, now_epoch_ms};
 pub use outline::{Bullet, OutlineCell, OutlineSnapshot};
 pub use poppop::PopPopCell;
 pub use reference::{ReferenceCell, ReferenceTarget};
@@ -536,6 +536,41 @@ impl Cell {
         }
     }
 
+    /// Replace `range` in the focused editable slot with `text` (which
+    /// must start with `#`) and mark the inserted span as a tag — the
+    /// committed form of the `#`-mention popup. PopPop is excluded
+    /// since `#` there is the comment marker, not a tag prefix.
+    pub fn replace_focused_with_tag(
+        &mut self,
+        bullet_id: Option<Uuid>,
+        range: Range<usize>,
+        text: String,
+    ) {
+        if self.title_focused {
+            if let Some(title) = self.title.as_mut() {
+                title.replace_with_tag(range, text);
+            }
+            return;
+        }
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.replace_with_tag(range, text),
+            CellKind::Outline(oc) => {
+                if let Some(bid) = bullet_id {
+                    oc.replace_in_bullet_with_tag(bid, range, text);
+                }
+            }
+            CellKind::Table(tc) => {
+                let (r, c) = tc.focused_index();
+                if let Some(entry) = tc.cell_at_mut(r, c) {
+                    if !entry.readonly {
+                        entry.textbox.replace_with_tag(range, text);
+                    }
+                }
+            }
+            CellKind::PopPop(_) | CellKind::Reference(_) => {}
+        }
+    }
+
     pub fn copy_text(&self) -> String {
         if self.title_focused {
             if let Some(title) = self.title.as_ref() {
@@ -606,25 +641,23 @@ impl Cell {
                 out.push(name);
             }
         };
-        let mut scan = |text: &str| {
-            for r in parse_inline_tags(text) {
-                if r.end > r.start + 1 {
-                    push(text[r.start + 1..r.end].to_string());
-                }
+        let mut absorb = |tb: &TextBox| {
+            for n in tb.all_tag_names() {
+                push(n);
             }
         };
         match &self.kind {
-            CellKind::Plain(tb) => scan(tb.text()),
+            CellKind::Plain(tb) => absorb(tb),
             CellKind::Outline(oc) => {
                 for b in oc.bullets() {
-                    scan(b.textbox().text());
+                    absorb(b.textbox());
                 }
             }
             CellKind::Table(tc) => {
                 for r in 0..tc.rows() {
                     for c in 0..tc.cols() {
                         if let Some(entry) = tc.cell_at(r, c) {
-                            scan(entry.textbox.text());
+                            absorb(&entry.textbox);
                         }
                     }
                 }
@@ -658,6 +691,15 @@ impl Cell {
     /// after the last char) IS in-progress — the next keystroke would
     /// extend the tag.
     pub fn caret_in_in_progress_tag(&self) -> bool {
+        // Span-based tags: only commit-via-popup ranges count. Caret
+        // inside a TagSpan means the user is editing an existing tag
+        // in place — defer save until they leave the span. Typed
+        // `#X` with no span is just text and never defers (it never
+        // would have made a tag in the first place).
+        let in_tag = |tags: &[crate::cell::TagSpan], caret: usize| -> bool {
+            tags.iter()
+                .any(|t| caret > t.range.start && caret <= t.range.end)
+        };
         if self.title_focused {
             let Some(title) = self.title.as_ref() else {
                 return false;
@@ -665,24 +707,23 @@ impl Cell {
             let Some((_, caret)) = title.primary_caret() else {
                 return false;
             };
-            let text = title.text();
-            let title_end = text.find('\n').unwrap_or(text.len());
-            return parse_heading_tags(text, title_end)
-                .iter()
-                .any(|r| caret > r.start && caret <= r.end);
+            return in_tag(title.tags(), caret);
         }
-        // Body slots: inline tag detection. PopPop opted out because `#`
-        // is the comment-line marker there. Reference has no editable
-        // text, so focused_text_and_caret returns None.
         if matches!(&self.kind, CellKind::PopPop(_)) {
             return false;
         }
-        let Some((text, caret)) = self.focused_text_and_caret() else {
+        // Body slot: locate the focused TextBox and check its tags.
+        let tb: Option<&TextBox> = match &self.kind {
+            CellKind::Plain(tb) => Some(tb),
+            CellKind::Outline(oc) => oc.focused_textbox(),
+            CellKind::Table(tc) => tc.focused_textbox(),
+            CellKind::PopPop(_) | CellKind::Reference(_) => None,
+        };
+        let Some(tb) = tb else { return false };
+        let Some((_, caret)) = tb.primary_caret() else {
             return false;
         };
-        parse_inline_tags(text)
-            .iter()
-            .any(|r| caret > r.start && caret <= r.end)
+        in_tag(tb.tags(), caret)
     }
 
     /// Full text of the cell, ignoring selection state. Title (if any) is
@@ -1645,6 +1686,48 @@ mod tests {
     }
 
     #[test]
+    fn textbox_typed_hashtag_without_span_is_not_a_tag() {
+        // The whole point of span-based tags: text alone doesn't make
+        // a tag. heading_tag_names / all_tag_names / tag_at all read
+        // from spans, so typed `#X` with no commit-via-popup span
+        // produces nothing. Migration backfills exist for legacy
+        // data, but a plain TextBox::new doesn't trigger them.
+        let mut tb = TextBox::new(typeface(), "Notes #urgent".to_string());
+        tb.set_force_heading(true);
+        assert!(tb.heading_tag_names().is_empty());
+        assert!(tb.all_tag_names().is_empty());
+        assert_eq!(tb.tag_at(7), None); // inside `#urgent`
+    }
+
+    #[test]
+    fn textbox_replace_with_tag_creates_span() {
+        // Mirror what commit_tag_mention does: replace `#query` with
+        // `#tagname` and mark it. After this, heading_tag_names
+        // surfaces the new tag.
+        let mut tb = TextBox::new(typeface(), "Notes #u".to_string());
+        tb.set_force_heading(true);
+        // `#u` lives at bytes 6..8; replace with `#urgent`.
+        tb.replace_with_tag(6..8, "#urgent".to_string());
+        assert_eq!(tb.text(), "Notes #urgent");
+        assert_eq!(tb.tags().len(), 1);
+        assert_eq!(tb.heading_tag_names(), vec!["urgent".to_string()]);
+    }
+
+    #[test]
+    fn textbox_migrate_tags_from_text_seeds_legacy_spans() {
+        // Round-trip simulator for v6→v7 backfill: a freshly-loaded
+        // TextBox has no spans; migrate scans trailing/inline tokens
+        // and adds them. Idempotent — second call is a no-op.
+        let mut tb = TextBox::new(typeface(), "Notes #urgent".to_string());
+        tb.set_force_heading(true);
+        tb.migrate_tags_from_text();
+        assert_eq!(tb.tags().len(), 1);
+        assert_eq!(tb.heading_tag_names(), vec!["urgent".to_string()]);
+        tb.migrate_tags_from_text();
+        assert_eq!(tb.tags().len(), 1, "migration is idempotent");
+    }
+
+    #[test]
     fn textbox_new_edit_clears_redo_stack() {
         // Bursts coalesce by default; break_coalesce between forces
         // separate undo entries so this test exercises the redo-clear
@@ -1869,6 +1952,7 @@ mod tests {
     fn force_heading_marks_every_line_as_heading() {
         let mut tb = TextBox::new(typeface(), "Notes #urgent #person".to_string());
         tb.set_force_heading(true);
+        tb.migrate_tags_from_text();
         tb.tick(
             &skia_safe::surfaces::raster_n32_premul((400, 200))
                 .unwrap()
@@ -2035,6 +2119,10 @@ mod tests {
         cell.toggle_title_focus();
         let title = cell.title.as_mut().unwrap();
         title.replace_text("My Notes #urgent #person".to_string());
+        // Tag spans only exist post-popup-commit; for fixtures, run
+        // the legacy text-parse migration to populate them — mirrors
+        // the v7 backfill on load.
+        title.migrate_tags_from_text();
         let tags = cell.heading_tag_names();
         assert!(tags.contains(&"urgent".to_string()));
         assert!(tags.contains(&"person".to_string()));
@@ -2057,8 +2145,13 @@ mod tests {
     #[test]
     fn all_tag_names_aggregates_title_and_body_for_plain() {
         let mut cell = Cell::new(typeface(), "follow up #urgent later".to_string());
+        if let CellKind::Plain(tb) = &mut cell.kind {
+            tb.migrate_tags_from_text();
+        }
         cell.toggle_title_focus();
-        cell.title.as_mut().unwrap().replace_text("Note #person".to_string());
+        let title = cell.title.as_mut().unwrap();
+        title.replace_text("Note #person".to_string());
+        title.migrate_tags_from_text();
         let tags = cell.all_tag_names();
         assert!(tags.contains(&"person".to_string()));
         assert!(tags.contains(&"urgent".to_string()));
@@ -2066,7 +2159,8 @@ mod tests {
 
     #[test]
     fn all_tag_names_picks_up_outline_bullet_tags() {
-        let tb = TextBox::new(typeface(), "buy milk #shopping".to_string());
+        let mut tb = TextBox::new(typeface(), "buy milk #shopping".to_string());
+        tb.migrate_tags_from_text();
         let oc = OutlineCell::from_bullets(
             typeface(),
             vec![Bullet::new(Uuid::now_v7(), tb, 0)],
@@ -2095,6 +2189,7 @@ mod tests {
         let mut cell = Cell::new(typeface(), String::new());
         if let CellKind::Plain(tb) = &mut cell.kind {
             tb.replace_text("note #foo".to_string());
+            tb.migrate_tags_from_text();
             tb.set_caret_at(9); // end-of-text, inside `#foo` (5..9)
         }
         cell.title_focused = false;
@@ -2103,7 +2198,8 @@ mod tests {
 
     #[test]
     fn textbox_tag_at_returns_name_for_byte_inside_inline_tag() {
-        let tb = TextBox::new(typeface(), "follow up #shopping later".to_string());
+        let mut tb = TextBox::new(typeface(), "follow up #shopping later".to_string());
+        tb.migrate_tags_from_text();
         // `#shopping` lives at bytes 10..19. Byte 14 (mid-tag) hits.
         assert_eq!(tb.tag_at(14).as_deref(), Some("shopping"));
         // Byte 9 (the space just before `#`) doesn't.

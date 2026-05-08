@@ -678,6 +678,17 @@ impl OutlineCell {
         }
     }
 
+    pub fn replace_in_bullet_with_tag(
+        &mut self,
+        bullet_id: Uuid,
+        range: Range<usize>,
+        text: String,
+    ) {
+        if let Some(b) = self.bullets.iter_mut().find(|b| b.id == bullet_id) {
+            b.textbox.replace_with_tag(range, text);
+        }
+    }
+
     /// Plain-text representation of the current selection — joined bullet text
     /// (one bullet per line, indented with 4 spaces per depth) when a multi-
     /// bullet selection is active, otherwise the focused bullet's textbox
@@ -808,6 +819,11 @@ impl OutlineCell {
         let idx = self.focused_index()?;
         let tb = &self.bullets[idx].textbox;
         tb.primary_caret().map(|(_, h)| (tb.text(), h))
+    }
+
+    pub fn focused_textbox(&self) -> Option<&TextBox> {
+        let idx = self.focused_index()?;
+        Some(&self.bullets[idx].textbox)
     }
 
     /// Anchor a popup at byte `byte` in the bullet identified by `bullet_id`.

@@ -476,7 +476,7 @@ pub(crate) fn normalize_entity_token(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cell::TextBox;
+    use crate::cell::{CellKind, TextBox};
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -729,16 +729,22 @@ mod tests {
     }
 
     /// Build a Plain cell with the given body text + an optional title.
-    /// The title forces heading mode so `heading_tag_names` will see the
-    /// trailing `#tag`s as tags.
+    /// Tag spans are populated from the input text via the legacy
+    /// migration helper so the heading-tags / inline-tags rules still
+    /// apply at the test fixture level (mirroring how a cell loaded
+    /// from a pre-v7 database would look after open).
     fn make_cell(body: &str, title: Option<&str>, ts_ms: i64) -> Cell {
         let tf = typeface();
         let mut cell = Cell::new(tf.clone(), body.to_string());
         cell.timestamp = ts_ms;
         cell.edited_at = ts_ms;
+        if let CellKind::Plain(tb) = &mut cell.kind {
+            tb.migrate_tags_from_text();
+        }
         if let Some(t) = title {
             let mut tb = TextBox::new(tf, t.to_string());
             tb.set_force_heading(true);
+            tb.migrate_tags_from_text();
             cell.set_title(Some(tb));
         }
         cell

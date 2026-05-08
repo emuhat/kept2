@@ -15,8 +15,8 @@ use winit::{
 use super::common::{
     Affinity, BODY_FONT_SIZE, CARET_WIDTH, Edit, HEADING_FONT_SCALE, HEADING_TAG_FONT_SCALE,
     HEADING_TAG_GAP, LinkSpan, MULTI_CLICK_DIST, MULTI_CLICK_INTERVAL, Selection, Selections,
-    TextBoxSnapshot, line_edge_mod, primary_mod, transform_index, transform_index_closed_end,
-    word_mod,
+    TagSpan, TextBoxSnapshot, line_edge_mod, primary_mod, transform_index,
+    transform_index_closed_end, word_mod,
 };
 use super::wrap::{
     draw_line_with_links, find_line_at, find_word_at, find_word_left_of, find_word_right_of,
@@ -80,6 +80,12 @@ pub struct TextBox {
     click_count: u8,
     font_scale: f32,
     links: Vec<LinkSpan>,
+    /// Byte ranges marked as `#tag` tokens. Populated by the mention
+    /// popup's commit path and by the persistence layer's legacy
+    /// migration (one-shot at load if the saved cell has no spans but
+    /// the text has tag-shaped tokens). Typing `#X` without going
+    /// through the popup leaves NO span — so no tag.
+    tags: Vec<TagSpan>,
     /// Body text color. Default dark gray. Cells (e.g. PopPop's output
     /// column) may override to render their textbox in a custom color.
     text_color: Color,
@@ -148,6 +154,7 @@ impl TextBox {
             click_count: 0,
             font_scale: 1.0,
             links: Vec::new(),
+            tags: Vec::new(),
             text_color: crate::color::TEXT_PRIMARY,
             force_heading: false,
             enable_comment_coloring: false,
@@ -181,9 +188,11 @@ impl TextBox {
     /// query layers so visual styling, click target, and DB membership
     /// stay aligned.
     pub fn tag_at(&self, byte: usize) -> Option<String> {
-        for r in parse_inline_tags(&self.text) {
+        for tag in &self.tags {
+            let r = &tag.range;
             if byte >= r.start && byte < r.end && r.end > r.start + 1 {
-                return Some(self.text[r.start + 1..r.end].to_string());
+                let s = &self.text[r.start..r.end];
+                return s.strip_prefix('#').map(|name| name.to_string());
             }
         }
         None
@@ -467,6 +476,7 @@ impl TextBox {
             sels: self.sels.clone(),
             font_scale: self.font_scale,
             links: self.links.clone(),
+            tags: self.tags.clone(),
         }
     }
 
@@ -519,19 +529,87 @@ impl TextBox {
         }
     }
 
-    /// Distinct tag names (without the leading `#`) parsed from trailing
-    /// `#tag` tokens on the first paragraph. Only meaningful when this
-    /// TextBox is in `force_heading` mode (i.e., a cell title); plain body
-    /// TextBoxes return an empty list. Bare `#` is skipped.
+    /// Mark a byte range as a `#tag` token. The range should cover the
+    /// whole `#tagname` substring (leading `#` included). Used by the
+    /// mention popup's tag-commit path and by the persistence layer's
+    /// legacy migration. Invalid ranges are silently dropped.
+    pub fn add_tag(&mut self, range: Range<usize>) {
+        if range.start < range.end
+            && range.end <= self.text.len()
+            && self.text[range.clone()].starts_with('#')
+        {
+            self.tags.push(TagSpan { range });
+        }
+    }
+
+    pub fn tags(&self) -> &[TagSpan] {
+        &self.tags
+    }
+
+    /// One-shot legacy migration: scan the current text for tag-shaped
+    /// tokens and add `TagSpan`s for each. Intended for cells loaded
+    /// from a persisted blob that pre-dates span-based tags. No-op if
+    /// the textbox already has tags. Heading mode (`force_heading`)
+    /// uses the trailing-tags rule (matching `heading_tag_names`'
+    /// previous behavior); body mode uses the inline-tags rule.
+    pub fn migrate_tags_from_text(&mut self) {
+        if !self.tags.is_empty() {
+            return;
+        }
+        if self.force_heading {
+            let heading_end = self.text.find('\n').unwrap_or(self.text.len());
+            for r in parse_heading_tags(&self.text, heading_end) {
+                if r.end > r.start + 1 {
+                    self.tags.push(TagSpan { range: r });
+                }
+            }
+        } else {
+            for r in parse_inline_tags(&self.text) {
+                if r.end > r.start + 1 {
+                    self.tags.push(TagSpan { range: r });
+                }
+            }
+        }
+    }
+
+    /// Distinct tag names (without the leading `#`) within the heading
+    /// paragraph. Only meaningful when this TextBox is in
+    /// `force_heading` mode (i.e., a cell title); plain body TextBoxes
+    /// return an empty list. Names come from `TagSpan`s — typed `#X`
+    /// without a span is NOT a tag.
     pub fn heading_tag_names(&self) -> Vec<String> {
         if !self.force_heading {
             return Vec::new();
         }
         let heading_end = self.text.find('\n').unwrap_or(self.text.len());
         let mut out: Vec<String> = Vec::new();
-        for r in parse_heading_tags(&self.text, heading_end) {
-            if r.end > r.start + 1 {
-                let name = self.text[r.start + 1..r.end].to_string();
+        for tag in &self.tags {
+            if tag.range.end > heading_end || tag.range.end <= tag.range.start + 1 {
+                continue;
+            }
+            let s = &self.text[tag.range.clone()];
+            if let Some(name) = s.strip_prefix('#') {
+                let name = name.to_string();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
+    /// Distinct tag names anywhere in the textbox — body inline tags
+    /// for plain bodies, outline bullets, and table entries. Same
+    /// span-derived rule as `heading_tag_names`.
+    pub fn all_tag_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for tag in &self.tags {
+            if tag.range.end <= tag.range.start + 1 {
+                continue;
+            }
+            let s = &self.text[tag.range.clone()];
+            if let Some(name) = s.strip_prefix('#') {
+                let name = name.to_string();
                 if !out.contains(&name) {
                     out.push(name);
                 }
@@ -654,6 +732,7 @@ impl TextBox {
         self.sels = snap.sels;
         self.font_scale = snap.font_scale;
         self.links = snap.links;
+        self.tags = snap.tags;
         self.body_lines_width = f32::NAN;
         self.mouse_drag = None;
         self.click_count = 0;
@@ -721,11 +800,18 @@ impl TextBox {
             return;
         }
         let heading_end = self.text.find('\n').unwrap_or(self.text.len());
-        let tags = parse_heading_tags(&self.text, heading_end);
-        if tags.is_empty() {
+        // First tag span that lies wholly within the heading paragraph
+        // — that's the leftmost trailing-tag-run boundary. Spans are
+        // not guaranteed to be sorted, so scan for the min start.
+        let first_tag_start = self
+            .tags
+            .iter()
+            .filter(|t| t.range.end <= heading_end)
+            .map(|t| t.range.start)
+            .min();
+        let Some(first_tag_start) = first_tag_start else {
             return;
-        }
-        let first_tag_start = tags[0].start;
+        };
         // Walk back from first_tag_start over whitespace to find title_end.
         let bytes = self.text.as_bytes();
         let mut title_end = first_tag_start;
@@ -1005,8 +1091,10 @@ impl TextBox {
         // (PopPop already colors those green and exempts them from tag
         // semantics anyway). Same font as the underlying line; just an
         // overdraw with a different paint, which is cheap and visually
-        // clean at the antialias level.
-        let inline_tag_ranges = parse_inline_tags(&self.text);
+        // clean at the antialias level. Driven by `TagSpan`s — typed
+        // `#X` without a span (no popup commit) is plain text.
+        let inline_tag_ranges: Vec<Range<usize>> =
+            self.tags.iter().map(|t| t.range.clone()).collect();
         if !inline_tag_ranges.is_empty() {
             let mut tag_dim_paint = Paint::default();
             tag_dim_paint.set_anti_alias(true);
@@ -1662,6 +1750,29 @@ impl TextBox {
         self.break_coalesce();
     }
 
+    /// Replace `range` with `text` (which must start with `#`) and
+    /// mark the inserted run as a tag span. Caret lands at the end of
+    /// the inserted text. Used by the `#`-mention popup commit so the
+    /// inserted `#tagname` is recognized as a tag at save time.
+    pub fn replace_with_tag(&mut self, range: Range<usize>, text: String) {
+        let start = range.start;
+        let inserted_len = text.len();
+        self.record_undo();
+        self.apply_edit(&Edit {
+            range,
+            replacement: text,
+        });
+        let end = start + inserted_len;
+        if inserted_len > 0
+            && end <= self.text.len()
+            && self.text[start..end].starts_with('#')
+        {
+            self.tags.push(TagSpan { range: start..end });
+        }
+        self.set_caret_at(end);
+        self.break_coalesce();
+    }
+
     fn apply_edits_right_to_left(&mut self, mut edits: Vec<Edit>) {
         if edits.is_empty() {
             return;
@@ -1766,6 +1877,18 @@ impl TextBox {
             link.range.start = transform_index(link.range.start, start, del, ins);
             link.range.end = transform_index_closed_end(link.range.end, start, del, ins);
             link.range.start < link.range.end
+        });
+        // Tag spans use the same closed-bound gravity as links: typing
+        // adjacent to a tag stays outside it; edits that erase the
+        // tag's text leave a degenerate range and drop. If the user
+        // backspaces away the leading `#`, the span becomes degenerate
+        // by failing the `starts_with('#')` revalidation below.
+        self.tags.retain_mut(|tag| {
+            tag.range.start = transform_index(tag.range.start, start, del, ins);
+            tag.range.end = transform_index_closed_end(tag.range.end, start, del, ins);
+            tag.range.start < tag.range.end
+                && tag.range.end <= self.text.len()
+                && self.text[tag.range.clone()].starts_with('#')
         });
         self.rewrap();
     }

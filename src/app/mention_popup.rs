@@ -755,10 +755,12 @@ impl KeptApp {
         }
     }
 
-    /// Insert a tag mention: replace `#<query>` with the literal
-    /// `#<chosen>` (no link, no underline). Tags only carry meaning in
-    /// the title, where the existing tag-rendering pass styles trailing
-    /// `#tokens` automatically.
+    /// Insert a tag mention: replace `#<query>` with `#<chosen>`. For
+    /// cell sources, the inserted run is also marked as a `TagSpan`
+    /// so persistence recognizes it as a tag (typed `#X` without a
+    /// span is just plain text). For the search-input source there's
+    /// no styled rendering, so a plain text replace is enough — the
+    /// query parser reads `#tag` syntactically.
     fn commit_tag_mention(
         &mut self,
         source: MentionSource,
@@ -767,7 +769,29 @@ impl KeptApp {
         chosen_name: String,
     ) {
         let replacement = format!("#{chosen_name}");
-        self.replace_search_or_cell_text(source, start, end, replacement);
+        match source {
+            MentionSource::Cell { cell_id, bullet_id } => {
+                let pre = match self.cell(cell_id) {
+                    Some(c) => c.snapshot(),
+                    None => return,
+                };
+                if let Some(c) = self.cell_mut(cell_id) {
+                    c.replace_focused_with_tag(bullet_id, start..end, replacement);
+                }
+                if let Some(c) = self.cell(cell_id) {
+                    let post = c.snapshot();
+                    if !pre.doc_eq(&post) {
+                        let saved_focused = self.focused;
+                        self.focused = Some(cell_id);
+                        self.record_edit(pre, post);
+                        self.focused = saved_focused.or(Some(cell_id));
+                    }
+                }
+            }
+            MentionSource::SearchBar => {
+                self.replace_search_or_cell_text(source, start, end, replacement);
+            }
+        }
     }
 
     /// Plain-text replacement of `[start..end]` with `replacement` in

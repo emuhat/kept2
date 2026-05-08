@@ -125,6 +125,16 @@ pub struct LinkSpan {
     pub url: String,
 }
 
+/// A `#tag` token marked for tag treatment. Pure byte range — the tag's
+/// name is the substring at `range` minus the leading `#`. Tag spans
+/// only exist when the user explicitly committed a tag through the
+/// mention popup (or when they were migrated in from legacy text on
+/// first load): typing `#X` without commit leaves no span and no tag.
+#[derive(Clone, Debug)]
+pub struct TagSpan {
+    pub range: Range<usize>,
+}
+
 /// A point-in-time clone of a cell's document state. Used by undo/redo to
 /// roll a cell back to a previous text + selection + zoom configuration.
 /// View-only state (drag, click count, line cache, geometry) is excluded.
@@ -134,6 +144,7 @@ pub struct TextBoxSnapshot {
     pub sels: Selections,
     pub font_scale: f32,
     pub links: Vec<LinkSpan>,
+    pub tags: Vec<TagSpan>,
 }
 
 /// Whether the platform "primary" modifier is held — Cmd on macOS, Ctrl

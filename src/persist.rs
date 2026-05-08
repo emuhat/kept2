@@ -169,6 +169,83 @@ impl Db {
                  COMMIT;",
             )?;
         }
+        if version < 7 {
+            // v6 → v7: tags became span-based. Walk every cell and
+            // backfill the new `tags` field from the existing
+            // text-parse rules so existing tags keep working. After
+            // this migration, typing `#X` without committing through
+            // the popup leaves no span and no tag.
+            self.migrate_tags_to_spans()?;
+            self.conn
+                .execute_batch("BEGIN; PRAGMA user_version = 7; COMMIT;")?;
+        }
+        Ok(())
+    }
+
+    fn migrate_tags_to_spans(&mut self) -> rusqlite::Result<()> {
+        let rows: Vec<(Vec<u8>, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, body FROM cells")?;
+            let it = stmt.query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let to_records = |ranges: Vec<std::ops::Range<usize>>| -> Vec<TagRecord> {
+            ranges
+                .into_iter()
+                .filter(|r| r.end > r.start + 1)
+                .map(|r| TagRecord {
+                    start: r.start,
+                    end: r.end,
+                })
+                .collect()
+        };
+        let tx = self.conn.transaction()?;
+        for (id_bytes, body_json) in rows {
+            let mut pc: PersistedCell = match serde_json::from_str(&body_json) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if let Some(t) = pc.title.as_mut() {
+                if t.tags.is_empty() {
+                    let heading_end = t.text.find('\n').unwrap_or(t.text.len());
+                    t.tags = to_records(parse_trailing_tags(&t.text, heading_end));
+                }
+            }
+            match &mut pc.body {
+                CellBody::Plain { text, tags, .. } => {
+                    if tags.is_empty() {
+                        *tags = to_records(parse_inline_tags(text));
+                    }
+                }
+                CellBody::Outline { blocks } => {
+                    for b in blocks {
+                        if b.tags.is_empty() {
+                            b.tags = to_records(parse_inline_tags(&b.text));
+                        }
+                    }
+                }
+                CellBody::Table { cells, .. } => {
+                    for row in cells {
+                        for c in row {
+                            if c.tags.is_empty() {
+                                c.tags = to_records(parse_inline_tags(&c.text));
+                            }
+                        }
+                    }
+                }
+                CellBody::PopPop { .. } | CellBody::Reference { .. } => {}
+            }
+            let new_json = match serde_json::to_string(&pc) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            tx.execute(
+                "UPDATE cells SET body = ?1 WHERE id = ?2",
+                params![new_json, id_bytes],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -191,7 +268,10 @@ impl Db {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            if !tag_names_from_persisted(&pc).iter().any(|n| n == "person") {
+            if !tag_names_from_persisted_legacy(&pc)
+                .iter()
+                .any(|n| n == "person")
+            {
                 continue;
             }
             let title_text = match pc.title.as_ref() {
@@ -263,7 +343,7 @@ impl Db {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let names = tag_names_from_persisted(&pc);
+            let names = tag_names_from_persisted_legacy(&pc);
             self.write_cell_tags(&id_bytes, &names)?;
         }
         Ok(())
@@ -347,6 +427,14 @@ impl Db {
                 tb.set_force_heading(true);
                 for l in t.links {
                     tb.add_link(l.start..l.end, l.url);
+                }
+                if t.tags.is_empty() {
+                    // Pre-span data: backfill from trailing #-tokens.
+                    tb.migrate_tags_from_text();
+                } else {
+                    for tag in t.tags {
+                        tb.add_tag(tag.start..tag.end);
+                    }
                 }
                 tb
             });
@@ -823,6 +911,10 @@ struct TitleRecord {
     text: String,
     #[serde(default)]
     links: Vec<LinkRecord>,
+    /// `#tag` spans within the title. Absent in pre-span data — see
+    /// `migrate_tags_in_textbox` for the load-time backfill.
+    #[serde(default)]
+    tags: Vec<TagRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -832,6 +924,8 @@ enum CellBody {
         text: String,
         #[serde(default)]
         links: Vec<LinkRecord>,
+        #[serde(default)]
+        tags: Vec<TagRecord>,
     },
     Outline {
         blocks: Vec<BlockRecord>,
@@ -897,6 +991,8 @@ struct BlockRecord {
     text: String,
     #[serde(default)]
     links: Vec<LinkRecord>,
+    #[serde(default)]
+    tags: Vec<TagRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -905,7 +1001,15 @@ struct TableEntryRecord {
     #[serde(default)]
     links: Vec<LinkRecord>,
     #[serde(default)]
+    tags: Vec<TagRecord>,
+    #[serde(default)]
     readonly: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TagRecord {
+    start: usize,
+    end: usize,
 }
 
 /// Build the wrapped persisted form from a live Cell. Captures the title
@@ -922,6 +1026,14 @@ fn persisted_cell_from(cell: &Cell) -> PersistedCell {
                 url: l.url.clone(),
             })
             .collect(),
+        tags: tb
+            .tags()
+            .iter()
+            .map(|t| TagRecord {
+                start: t.range.start,
+                end: t.range.end,
+            })
+            .collect(),
     });
     PersistedCell {
         title,
@@ -930,6 +1042,15 @@ fn persisted_cell_from(cell: &Cell) -> PersistedCell {
 }
 
 fn cell_to_body(cell: &Cell) -> CellBody {
+    let tag_records = |tb: &TextBox| -> Vec<TagRecord> {
+        tb.tags()
+            .iter()
+            .map(|t| TagRecord {
+                start: t.range.start,
+                end: t.range.end,
+            })
+            .collect()
+    };
     match &cell.kind {
         CellKind::Plain(tb) => CellBody::Plain {
             text: tb.text().to_string(),
@@ -942,6 +1063,7 @@ fn cell_to_body(cell: &Cell) -> CellBody {
                     url: l.url.clone(),
                 })
                 .collect(),
+            tags: tag_records(tb),
         },
         CellKind::Outline(oc) => CellBody::Outline {
             blocks: oc
@@ -961,6 +1083,7 @@ fn cell_to_body(cell: &Cell) -> CellBody {
                             url: l.url.clone(),
                         })
                         .collect(),
+                    tags: tag_records(b.textbox()),
                 })
                 .collect(),
         },
@@ -995,6 +1118,7 @@ fn cell_to_body(cell: &Cell) -> CellBody {
                                     url: l.url.clone(),
                                 })
                                 .collect(),
+                            tags: tag_records(&e.textbox),
                             readonly: e.readonly,
                         })
                         .collect()
@@ -1022,7 +1146,7 @@ fn extract_title_from_body_json(body_json: &str) -> Option<String> {
         return None;
     }
     let extracted = match &mut pc.body {
-        CellBody::Plain { text, links } => take_heading_from_inline(text, links),
+        CellBody::Plain { text, links, .. } => take_heading_from_inline(text, links),
         CellBody::PopPop { text, links } => take_heading_from_inline(text, links),
         CellBody::Outline { blocks } => take_heading_from_outline(blocks),
         CellBody::Table { cells, .. } => take_heading_from_table(cells),
@@ -1080,6 +1204,9 @@ fn take_heading_from_inline(
     Some(TitleRecord {
         text: title_text,
         links: title_links,
+        // Empty — the v7 migration runs after this and backfills tag
+        // spans from the trailing-tags rule.
+        tags: Vec::new(),
     })
 }
 
@@ -1106,11 +1233,13 @@ fn take_heading_from_outline(blocks: &mut Vec<BlockRecord>) -> Option<TitleRecor
             depth: 0,
             text: String::new(),
             links: Vec::new(),
+            tags: Vec::new(),
         });
     }
     Some(TitleRecord {
         text: title_text,
         links: title_links,
+        tags: Vec::new(),
     })
 }
 
@@ -1147,6 +1276,7 @@ fn take_heading_from_table(
     Some(TitleRecord {
         text: title_text,
         links: title_links,
+        tags: Vec::new(),
     })
 }
 
@@ -1182,6 +1312,27 @@ fn normalize_alias(display_name: &str) -> String {
         .join("_")
 }
 
+/// Names from saved span ranges; if no spans are present (legacy data
+/// or a freshly-typed `#X` that the user never committed), the result
+/// is empty — span absence means "not a tag." Falling back to a
+/// text-parse here would re-introduce the accidental-tag bug.
+fn names_from_tag_ranges(text: &str, tags: &[TagRecord], sink: &mut dyn FnMut(String)) {
+    for t in tags {
+        if t.end <= t.start + 1 || t.end > text.len() {
+            continue;
+        }
+        let s = &text[t.start..t.end];
+        if let Some(name) = s.strip_prefix('#') {
+            if !name.is_empty() {
+                sink(name.to_string());
+            }
+        }
+    }
+}
+
+/// Strict (post-v7) reading: tags come from spans only. Used at save
+/// time. New cells where the user typed `#X` without committing
+/// produce no tag — exactly what the no-accidental-tags rule requires.
 fn tag_names_from_persisted(pc: &PersistedCell) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |name: String| {
@@ -1190,35 +1341,81 @@ fn tag_names_from_persisted(pc: &PersistedCell) -> Vec<String> {
         }
     };
     if let Some(t) = pc.title.as_ref() {
-        let heading_end = t.text.find('\n').unwrap_or(t.text.len());
-        for r in parse_trailing_tags(&t.text, heading_end) {
-            if r.end > r.start + 1 {
-                push(t.text[r.start + 1..r.end].to_string());
-            }
-        }
+        names_from_tag_ranges(&t.text, &t.tags, &mut |n| push(n));
     }
-    // Body inline tags: any `#word` preceded by whitespace or start-of-
-    // text. PopPop opts out (its `#` is the comment marker); Reference
-    // owns no editable text.
-    let scan = |text: &str, sink: &mut dyn FnMut(String)| {
-        for r in parse_inline_tags(text) {
-            if r.end > r.start + 1 {
-                sink(text[r.start + 1..r.end].to_string());
-            }
-        }
-    };
-    let mut into_out = |name: String| push(name);
     match &pc.body {
-        CellBody::Plain { text, .. } => scan(text, &mut into_out),
+        CellBody::Plain { text, tags, .. } => {
+            names_from_tag_ranges(text, tags, &mut |n| push(n));
+        }
         CellBody::Outline { blocks } => {
             for b in blocks {
-                scan(&b.text, &mut into_out);
+                names_from_tag_ranges(&b.text, &b.tags, &mut |n| push(n));
             }
         }
         CellBody::Table { cells, .. } => {
             for row in cells {
                 for c in row {
-                    scan(&c.text, &mut into_out);
+                    names_from_tag_ranges(&c.text, &c.tags, &mut |n| push(n));
+                }
+            }
+        }
+        CellBody::PopPop { .. } | CellBody::Reference { .. } => {}
+    }
+    out
+}
+
+/// Legacy reading: span-derived names plus a text-parse fallback for
+/// any record whose `tags` Vec is empty. Used by the v3/v4/v5
+/// migrations that run before the v7 backfill — without the fallback,
+/// pre-v7 data would lose every tag-derived link as the migration
+/// chain rolls forward. Once v7 has run, every record has explicit
+/// spans and the fallback never fires.
+fn tag_names_from_persisted_legacy(pc: &PersistedCell) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |name: String| {
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    };
+    let title_names = |t: &TitleRecord, sink: &mut dyn FnMut(String)| {
+        if !t.tags.is_empty() {
+            names_from_tag_ranges(&t.text, &t.tags, sink);
+        } else {
+            let heading_end = t.text.find('\n').unwrap_or(t.text.len());
+            for r in parse_trailing_tags(&t.text, heading_end) {
+                if r.end > r.start + 1 {
+                    sink(t.text[r.start + 1..r.end].to_string());
+                }
+            }
+        }
+    };
+    let body_names = |text: &str, tags: &[TagRecord], sink: &mut dyn FnMut(String)| {
+        if !tags.is_empty() {
+            names_from_tag_ranges(text, tags, sink);
+        } else {
+            for r in parse_inline_tags(text) {
+                if r.end > r.start + 1 {
+                    sink(text[r.start + 1..r.end].to_string());
+                }
+            }
+        }
+    };
+    if let Some(t) = pc.title.as_ref() {
+        title_names(t, &mut |n| push(n));
+    }
+    match &pc.body {
+        CellBody::Plain { text, tags, .. } => {
+            body_names(text, tags, &mut |n| push(n));
+        }
+        CellBody::Outline { blocks } => {
+            for b in blocks {
+                body_names(&b.text, &b.tags, &mut |n| push(n));
+            }
+        }
+        CellBody::Table { cells, .. } => {
+            for row in cells {
+                for c in row {
+                    body_names(&c.text, &c.tags, &mut |n| push(n));
                 }
             }
         }
@@ -1296,12 +1493,27 @@ fn parse_trailing_tags(text: &str, heading_end: usize) -> Vec<std::ops::Range<us
 }
 
 fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
+    // Apply persisted tag spans to a body TextBox, falling back to the
+    // legacy text-parse migration when no spans were stored — which is
+    // the case for every cell saved before tags became span-based.
+    // Migration is one-shot: once the cell saves again, the spans land
+    // in the JSON and `migrate_tags_from_text` becomes a no-op.
+    let load_body_tags = |tb: &mut TextBox, tags: Vec<TagRecord>| {
+        if tags.is_empty() {
+            tb.migrate_tags_from_text();
+        } else {
+            for t in tags {
+                tb.add_tag(t.start..t.end);
+            }
+        }
+    };
     match body {
-        CellBody::Plain { text, links } => {
+        CellBody::Plain { text, links, tags } => {
             let mut tb = TextBox::new(typeface.clone(), text);
             for l in links {
                 tb.add_link(l.start..l.end, l.url);
             }
+            load_body_tags(&mut tb, tags);
             CellKind::Plain(tb)
         }
         CellBody::Outline { blocks } => {
@@ -1312,6 +1524,7 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
                     for l in b.links {
                         tb.add_link(l.start..l.end, l.url);
                     }
+                    load_body_tags(&mut tb, b.tags);
                     Bullet::new(b.id, tb, b.depth)
                 })
                 .collect();
@@ -1328,38 +1541,29 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
         CellBody::Table { rows: _, cols: _, cells } => {
             // `rows`/`cols` are advisory; trust the actual `cells` shape so
             // a hand-edited or migrated row that disagrees still loads.
-            let row_records: Vec<Vec<(std::ops::Range<usize>, String)>> = cells
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .flat_map(|e| {
-                            e.links
-                                .iter()
-                                .map(|l| (l.start..l.end, l.url.clone()))
-                                .collect::<Vec<_>>()
-                        })
-                        .collect()
-                })
-                .collect();
-            // Build the (text, links, readonly) triples expected by
-            // TableCell::from_records.
-            let triples: Vec<Vec<(String, Vec<(std::ops::Range<usize>, String)>, bool)>> = cells
-                .into_iter()
-                .zip(row_records.into_iter())
-                .map(|(row, _)| {
-                    row.into_iter()
-                        .map(|e| {
-                            let links: Vec<(std::ops::Range<usize>, String)> = e
-                                .links
-                                .into_iter()
-                                .map(|l| (l.start..l.end, l.url))
-                                .collect();
-                            (e.text, links, e.readonly)
-                        })
-                        .collect()
-                })
-                .collect();
-            CellKind::Table(TableCell::from_records(typeface.clone(), triples))
+            // Build (text, links, tags, readonly) tuples for TableCell.
+            let entries: Vec<Vec<(String, Vec<(std::ops::Range<usize>, String)>, Vec<std::ops::Range<usize>>, bool)>> =
+                cells
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|e| {
+                                let links: Vec<(std::ops::Range<usize>, String)> = e
+                                    .links
+                                    .into_iter()
+                                    .map(|l| (l.start..l.end, l.url))
+                                    .collect();
+                                let tags: Vec<std::ops::Range<usize>> = e
+                                    .tags
+                                    .into_iter()
+                                    .map(|t| t.start..t.end)
+                                    .collect();
+                                (e.text, links, tags, e.readonly)
+                            })
+                            .collect()
+                    })
+                    .collect();
+            CellKind::Table(TableCell::from_records_with_tags(typeface.clone(), entries))
         }
         CellBody::Reference { target } => {
             CellKind::Reference(ReferenceCell::new(typeface.clone(), target.into()))
@@ -1394,6 +1598,13 @@ mod tests {
             tb.set_force_heading(true);
             for l in t.links {
                 tb.add_link(l.start..l.end, l.url);
+            }
+            if t.tags.is_empty() {
+                tb.migrate_tags_from_text();
+            } else {
+                for tag in t.tags {
+                    tb.add_tag(tag.start..tag.end);
+                }
             }
             tb
         });
@@ -1565,15 +1776,16 @@ mod tests {
     fn round_trip_title_preserves_text_and_tags() {
         // Title round-trip with trailing tags. The title TextBox is rebuilt
         // with force_heading=true on load; both the text and any inline
-        // links survive the cycle. Tag detection happens off the title's
-        // text via heading_tag_names, so verifying text equality also
-        // verifies tags continue to be parsed correctly.
+        // links survive the cycle. Tag spans round-trip via the new
+        // `tags` field; this fixture seeds the spans through the
+        // legacy text-parse migration.
         let tf = typeface();
         let mut cell = Cell::new(tf.clone(), "body".to_string());
         cell.set_title(Some({
             let mut tb = TextBox::new(tf.clone(), "Project Notes #urgent #planning".to_string());
             tb.set_force_heading(true);
             tb.add_link(0..7, "https://example.com/h".to_string());
+            tb.migrate_tags_from_text();
             tb
         }));
         let back = round_trip(&cell, &tf);
@@ -1642,7 +1854,13 @@ mod tests {
             CellBody::Plain { text, .. } => assert_eq!(text, "body line"),
             _ => panic!("kind survives migration"),
         }
-        assert_eq!(tag_names_from_persisted(&pc), vec!["urgent".to_string()]);
+        // The migration helper produces a TitleRecord with empty tag
+        // spans; the v7 backfill (or `tag_names_from_persisted_legacy`)
+        // is responsible for surfacing the trailing-text tags.
+        assert_eq!(
+            tag_names_from_persisted_legacy(&pc),
+            vec!["urgent".to_string()],
+        );
     }
 
     #[test]
@@ -1674,6 +1892,9 @@ mod tests {
             }
             _ => panic!("kind survives migration"),
         }
-        assert_eq!(tag_names_from_persisted(&pc), vec!["person".to_string()]);
+        assert_eq!(
+            tag_names_from_persisted_legacy(&pc),
+            vec!["person".to_string()],
+        );
     }
 }

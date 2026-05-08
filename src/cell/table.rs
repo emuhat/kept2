@@ -111,6 +111,11 @@ impl TableCell {
         self.focused
     }
 
+    pub fn focused_textbox(&self) -> Option<&TextBox> {
+        let (r, c) = self.focused;
+        self.cell_at(r, c).map(|entry| &entry.textbox)
+    }
+
     #[allow(dead_code)]
     pub fn x_origin(&self) -> f32 {
         self.x_origin
@@ -579,15 +584,41 @@ impl TableCell {
         typeface: Typeface,
         rows: Vec<Vec<(String, Vec<(Range<usize>, String)>, bool)>>,
     ) -> Self {
+        // Re-shape into the tags-aware form with empty tag vectors.
+        let with_tags: Vec<Vec<(String, Vec<(Range<usize>, String)>, Vec<Range<usize>>, bool)>> =
+            rows.into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|(text, links, readonly)| (text, links, Vec::new(), readonly))
+                        .collect()
+                })
+                .collect();
+        Self::from_records_with_tags(typeface, with_tags)
+    }
+
+    /// Build a TableCell with persisted tag spans alongside links. When
+    /// the tag vector for an entry is empty, falls back to the legacy
+    /// text-parse migration on load.
+    pub fn from_records_with_tags(
+        typeface: Typeface,
+        rows: Vec<Vec<(String, Vec<(Range<usize>, String)>, Vec<Range<usize>>, bool)>>,
+    ) -> Self {
         let row_count = rows.len().max(1);
         let col_count = rows.first().map(|r| r.len()).unwrap_or(1).max(1);
         let mut grid: Vec<Vec<TableEntry>> = Vec::with_capacity(row_count);
         for row_recs in rows {
             let mut row: Vec<TableEntry> = Vec::with_capacity(col_count);
-            for (text, links, readonly) in row_recs {
+            for (text, links, tags, readonly) in row_recs {
                 let mut tb = TextBox::new(typeface.clone(), text);
                 for (range, url) in links {
                     tb.add_link(range, url);
+                }
+                if tags.is_empty() {
+                    tb.migrate_tags_from_text();
+                } else {
+                    for range in tags {
+                        tb.add_tag(range);
+                    }
                 }
                 row.push(TableEntry { textbox: tb, readonly });
             }
