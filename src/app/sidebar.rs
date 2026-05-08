@@ -155,7 +155,9 @@ impl KeptApp {
         // Relative-week rows above the per-day list. Each is just a
         // pre-built TimeFilter we hand to push_view; the active
         // highlight uses Query::is_solo_time so navigating away to a
-        // single date or a tag drops the highlight as expected.
+        // single date or a tag drops the highlight as expected. Use
+        // the same row pitch as the per-day rows so the spacing
+        // through CONTEXTS reads as one continuous list.
         for (label, filter) in [
             ("This Week", query::TimeFilter::ThisWeek),
             ("Last Week", query::TimeFilter::LastWeek),
@@ -172,10 +174,8 @@ impl KeptApp {
                 &row_font,
             );
             self.hit_tests.sidebar.weeks.push((filter, week_rect));
-            y += date_h + item_gap;
+            y += date_h + item_gap + date_gap;
         }
-        // Small visual gap before the per-day list.
-        y += date_gap;
 
         // Date rows reflect "where notes live": every date that has at least
         // one cell, plus today (so a freshly-launched empty app still shows
