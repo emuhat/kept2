@@ -108,6 +108,7 @@ impl KeptApp {
         self.hit_tests.sidebar.dates.clear();
         self.hit_tests.sidebar.tags.clear();
         self.hit_tests.sidebar.pages.clear();
+        self.hit_tests.sidebar.weeks.clear();
 
         let row_font =
             Font::from_typeface(&self.typeface, SIDEBAR_DATE_FONT_SIZE * scale);
@@ -150,6 +151,31 @@ impl KeptApp {
             &header_paint,
         );
         y += header_h;
+
+        // Relative-week rows above the per-day list. Each is just a
+        // pre-built TimeFilter we hand to push_view; the active
+        // highlight uses Query::is_solo_time so navigating away to a
+        // single date or a tag drops the highlight as expected.
+        for (label, filter) in [
+            ("This Week", query::TimeFilter::ThisWeek),
+            ("Last Week", query::TimeFilter::LastWeek),
+        ] {
+            let week_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
+            draw_sidebar_row(
+                canvas,
+                week_rect,
+                label,
+                self.view.is_solo_time(filter.clone()),
+                in_row(week_rect),
+                radius,
+                pad_x,
+                &row_font,
+            );
+            self.hit_tests.sidebar.weeks.push((filter, week_rect));
+            y += date_h + item_gap;
+        }
+        // Small visual gap before the per-day list.
+        y += date_gap;
 
         // Date rows reflect "where notes live": every date that has at least
         // one cell, plus today (so a freshly-launched empty app still shows

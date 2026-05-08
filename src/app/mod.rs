@@ -120,6 +120,9 @@ struct SidebarHits {
     tags: Vec<(String, Rect)>,
     /// PAGES section row rects — dispatched to `push_view(...)`.
     pages: Vec<(PageKind, Rect)>,
+    /// Relative-week rows (This Week, Last Week) above the date list.
+    /// Each entry is the time filter the click should activate.
+    weeks: Vec<(query::TimeFilter, Rect)>,
 }
 
 #[derive(Default)]
@@ -254,6 +257,16 @@ impl Query {
         ast.include.time = Some(query::TimeFilter::Day(d));
         Self { view_kind: ViewKind::Ast, ast }
     }
+    fn this_week() -> Self {
+        let mut ast = query::Ast::default();
+        ast.include.time = Some(query::TimeFilter::ThisWeek);
+        Self { view_kind: ViewKind::Ast, ast }
+    }
+    fn last_week() -> Self {
+        let mut ast = query::Ast::default();
+        ast.include.time = Some(query::TimeFilter::LastWeek);
+        Self { view_kind: ViewKind::Ast, ast }
+    }
     fn tag(name: String) -> Self {
         let mut ast = query::Ast::default();
         ast.include.tags = vec![name.to_lowercase()];
@@ -308,13 +321,19 @@ impl Query {
     /// Sidebar-date highlighting: true when the AST is exactly `Day(d)`
     /// with no other filters / text in an Ast view.
     fn is_solo_date(&self, d: chrono::NaiveDate) -> bool {
+        self.is_solo_time(query::TimeFilter::Day(d))
+    }
+    /// Sidebar-time highlighting: true when the AST is exactly the
+    /// given time filter with nothing else set. Used for both the
+    /// per-day rows and the This Week / Last Week rows.
+    fn is_solo_time(&self, filter: query::TimeFilter) -> bool {
         matches!(self.view_kind, ViewKind::Ast)
             && self.ast.exclude.tags.is_empty()
             && self.ast.exclude.entities.is_empty()
             && self.ast.include.tags.is_empty()
             && self.ast.include.entities.is_empty()
             && self.ast.text.is_empty()
-            && self.ast.include.time == Some(query::TimeFilter::Day(d))
+            && self.ast.include.time.as_ref() == Some(&filter)
     }
 }
 
@@ -5259,6 +5278,20 @@ impl KeptApp {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     self.cell_context_menu = None;
                     return open(self, Query::context(id));
+                }
+            }
+            for (filter, rect) in self.hit_tests.sidebar.weeks.clone() {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    self.cell_context_menu = None;
+                    let q = match filter {
+                        query::TimeFilter::ThisWeek => Query::this_week(),
+                        query::TimeFilter::LastWeek => Query::last_week(),
+                        // Anything else would mean we shipped a row
+                        // we don't know how to dispatch — fall back
+                        // to a no-op rather than guessing.
+                        _ => return false,
+                    };
+                    return open(self, q);
                 }
             }
             for (date, rect) in self.hit_tests.sidebar.dates.clone() {
