@@ -464,7 +464,7 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 const IDLE_CONTEXT_THRESHOLD: Duration = Duration::from_secs(15 * 60);
 
 const SIDEBAR_WIDTH: f32 = 180.0;
-const SIDEBAR_HEADER_FONT_SIZE: f32 = 11.0;
+const SIDEBAR_HEADER_FONT_SIZE: f32 = 13.0;
 
 /// Context-section header drawn in Date view between cell groups from
 /// different contexts. `H` covers `PAD_TOP + text + PAD_BOTTOM`. The bottom
@@ -3218,13 +3218,17 @@ impl KeptApp {
                         self.rotate_context_now();
                         return true;
                     }
-                    return self.insert_cell_after_focused(NewCellKind::Plain);
+                    return self.insert_cell_after_focused(NewCellKind::Plain, false);
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("o") => {
-                    return self.insert_cell_after_focused(NewCellKind::Outline);
+                    let with_title = modifiers.state().shift_key();
+                    return self
+                        .insert_cell_after_focused(NewCellKind::Outline, with_title);
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("p") => {
-                    return self.insert_cell_after_focused(NewCellKind::PopPop);
+                    let with_title = modifiers.state().shift_key();
+                    return self
+                        .insert_cell_after_focused(NewCellKind::PopPop, with_title);
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("f") => {
                     // Ctrl+F: enter "focus mode" — render only the focused
@@ -4807,7 +4811,7 @@ impl KeptApp {
         }
     }
 
-    fn insert_cell_after_focused(&mut self, kind: NewCellKind) -> bool {
+    fn insert_cell_after_focused(&mut self, kind: NewCellKind, with_title: bool) -> bool {
         // If the user is viewing a closed context, jump to the current open
         // one before inserting. The note belongs in "today," not in history.
         let auto_switched = self.ensure_writable_context();
@@ -4853,6 +4857,14 @@ impl KeptApp {
         };
         new_cell.set_font_scale(self.font_scale);
         new_cell.context_hint_id = self.writable_context_id();
+        // When the user asked for "create + title" in one keystroke,
+        // pre-attach an empty title and aim the cursor at it. Done
+        // before the snapshot so undo/redo round-trips the
+        // title-focused state — redoing the InsertCell op restores
+        // the same caret position the user expected.
+        if with_title {
+            new_cell.toggle_title_focus();
+        }
         let new_id = new_cell.id;
         let snapshot = new_cell.snapshot();
         self.insert_cell_sorted(new_cell);
