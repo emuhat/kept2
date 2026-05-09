@@ -1819,17 +1819,70 @@ impl KeptApp {
     }
 
     /// Open `q` in the *other* pane, splitting first if needed. The
-    /// "other" pane becomes active, so subsequent keystrokes go there.
-    /// Used by Alt+click on sidebar entries — the low-friction path for
-    /// "I've got this open here, give me that over there."
-    fn open_in_other_pane(&mut self, q: Query) -> bool {
+    /// active pane is *preserved* across the call — Alt-open is a
+    /// "show that there but keep my focus here" gesture, not a focus
+    /// move. Returns the destination pane index unconditionally;
+    /// callers always want to apply follow-up side effects (focus a
+    /// cell, enter focus mode, scroll into view) even when
+    /// `push_view` short-circuits because the destination was
+    /// already on that view. `self.foo` deref-writes hit the
+    /// (preserved) original active pane, so use the returned index
+    /// for any pane-state writes that should land on the destination.
+    fn open_in_other_pane(&mut self, q: Query) -> Option<usize> {
+        let saved_active = self.active_pane;
         if self.panes.len() < 2 {
+            // `split_pane` activates the new pane; we restore active
+            // below so the user's keyboard focus doesn't jump.
             self.split_pane();
-        } else {
-            let other = (self.active_pane + 1) % self.panes.len();
-            self.set_active_pane(other);
         }
-        self.push_view(q)
+        let other = (saved_active + 1) % self.panes.len();
+        // Push regardless of whether the view changes — the no-op
+        // case (destination already on `q`) still counts as a
+        // successful "land here" for the caller's purposes.
+        self.push_view_in_pane(other, q);
+        self.active_pane = saved_active;
+        Some(other)
+    }
+
+    /// Run `push_view(q)` against `pane_idx` regardless of the
+    /// currently-active pane. Implemented by temporarily swapping
+    /// `active_pane` (since `push_view` writes to the active pane via
+    /// `Deref`), then restoring it. The swap doesn't go through
+    /// `set_active_pane` — that has menu-closing side effects we
+    /// don't want to fire on Alt-open.
+    fn push_view_in_pane(&mut self, pane_idx: usize, q: Query) -> bool {
+        let saved = self.active_pane;
+        self.active_pane = pane_idx;
+        let result = self.push_view(q);
+        self.active_pane = saved;
+        result
+    }
+
+    /// Open a specific cell in the other pane, in focus mode (the
+    /// cell fills the pane like Ctrl+F does locally). Pushes the
+    /// cell's date view, then writes focus / focus_mode directly to
+    /// the destination pane (the active pane is preserved by
+    /// `open_in_other_pane`, so deref-writes go to the wrong pane).
+    /// Returns false when the cell isn't in `self.cells` or the
+    /// destination pane was already on the same view.
+    fn open_cell_in_other_pane(&mut self, cell_id: Uuid) -> bool {
+        let target_date = match self.cell(cell_id) {
+            Some(c) => local_date_for_ms(c.timestamp),
+            None => return false,
+        };
+        let Some(other) = self.open_in_other_pane(Query::date(target_date)) else {
+            return false;
+        };
+        // Write to the destination pane directly. View mode by design —
+        // the user is glancing at the cell, not editing it. Focus mode
+        // enlarges the cell to fill the pane so the gesture reads as
+        // "show me this in detail over there."
+        let pane = &mut self.panes[other];
+        pane.focused = Some(cell_id);
+        pane.editing = false;
+        pane.focus_mode = true;
+        pane.pending_caret_scroll = true;
+        true
     }
 
     /// Ctrl+W q — close the active pane. No-op when only one pane remains
@@ -6510,10 +6563,20 @@ impl KeptApp {
         // Pane-area click. Activate the clicked pane up front so any
         // doc-space math sees the right scroll, and so an Alt-drag pan
         // captured below moves focus consistently with a non-Alt click
-        // would have.
+        // would have. EXCEPT for plain-Alt clicks (no Shift, no
+        // primary mod): those are "look at the other pane without
+        // committing focus there" gestures (open-in-other-pane,
+        // Alt-drag pan), and the user expects their active pane to
+        // stay put. Shift+Alt+click (multi-cursor) and any non-Alt
+        // click still activate.
         let pane_idx = self.pane_at(x, y);
+        let m = modifiers.state();
+        let alt_no_switch =
+            m.alt_key() && !m.shift_key() && !cell::primary_mod(m);
         if let Some(pi) = pane_idx {
-            self.set_active_pane(pi);
+            if !alt_no_switch {
+                self.set_active_pane(pi);
+            }
         }
         let doc_y = y + self.scroll_y;
 
@@ -6581,7 +6644,7 @@ impl KeptApp {
         let alt = modifiers.state().alt_key();
         let open = |app: &mut Self, q: Query| -> bool {
             if alt {
-                app.open_in_other_pane(q)
+                app.open_in_other_pane(q).is_some()
             } else {
                 app.push_view(q)
             }
@@ -6903,6 +6966,27 @@ impl KeptApp {
         let Some(target) = self.find_cell_at(x, doc_y) else {
             return false;
         };
+        // Plain Alt+click on a cell → open *the cell* in the other
+        // pane. Sibling of Alt+click on a sidebar entry / search
+        // result. Suppressed when the click landed on a link or
+        // `#tag` — those have their own Alt+click semantic (open
+        // the *link/tag* in the other pane), kept by falling through
+        // so `cell.mouse_down` + the pending-link/tag drain below
+        // run as before. Suppressed under Shift (Shift+Alt+click is
+        // the multi-cursor add) and under the primary modifier
+        // (which is already taken on links for "open link while
+        // editing").
+        let m = modifiers.state();
+        let plain_alt = m.alt_key() && !m.shift_key() && !cell::primary_mod(m);
+        if plain_alt {
+            let on_link_or_tag = self
+                .cell(target)
+                .map(|c| c.link_at_doc_pos(x, doc_y) || c.tag_at_doc_pos(x, doc_y))
+                .unwrap_or(false);
+            if !on_link_or_tag {
+                return self.open_cell_in_other_pane(target);
+            }
+        }
         // Cross-cell click drops to view mode (matches keyboard nav). Same-cell
         // click preserves whatever mode the user was in. To start editing a new
         // cell, click it (selects), then hit Enter — or just keep typing once
@@ -7007,19 +7091,28 @@ impl KeptApp {
                     return;
                 };
                 if let Some((q, focus_cell)) = q {
-                    if alt {
-                        self.open_in_other_pane(q);
+                    // Track which pane just received the view so the
+                    // optional cell-focus step writes there, not on
+                    // the (possibly unchanged) active pane.
+                    let target_pane = if alt {
+                        self.open_in_other_pane(q)
                     } else {
-                        self.push_view(q);
-                    }
-                    if let Some(cell_id) = focus_cell {
-                        // Cell-target link: also focus the cell + drop
-                        // edit mode + scroll it into view. Applies to
-                        // whichever pane just opened the view (the
-                        // active pane post-`open_in_other_pane`).
-                        self.focused = Some(cell_id);
-                        self.editing = false;
-                        self.pending_caret_scroll = true;
+                        if self.push_view(q) {
+                            Some(self.active_pane)
+                        } else {
+                            None
+                        }
+                    };
+                    if let (Some(cell_id), Some(idx)) = (focus_cell, target_pane) {
+                        // Cell-target link: focus the cell + drop edit
+                        // mode + scroll it into view on the pane that
+                        // just received the view. Active pane is
+                        // preserved by `open_in_other_pane`, so write
+                        // through `self.panes[idx]` directly.
+                        let pane = &mut self.panes[idx];
+                        pane.focused = Some(cell_id);
+                        pane.editing = false;
+                        pane.pending_caret_scroll = true;
                     }
                 }
                 return;

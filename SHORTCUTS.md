@@ -21,8 +21,11 @@ Drag the divider with the mouse to resize. Click anywhere in a pane to make it a
 
 | Trigger | Behavior |
 |---|---|
-| `Alt+click` on a sidebar entry | Opens that view in the other pane (splits first if there's only one). The other pane becomes active. |
+| `Alt+click` on a sidebar entry | Opens that view in the other pane (splits first if there's only one). |
+| `Alt+click` on a cell | Opens the cell in the other pane in **focus mode** (cell fills the pane). Splits if needed. Clicks anywhere on the cell — title, body, whitespace. Suppressed when the click is on a link or `#tag` inside the cell, since those keep their own Alt+click semantic ("open the link/tag in the other pane"). |
 | `Alt+Enter` in the search popup | Lands the result in the other pane (splits if needed). |
+
+Alt-opens never auto-switch the active pane — the destination receives the view (and, for cell opens, the focus + focus-mode), but your keyboard / typing stays where it was. Useful for "show that there while I keep working here."
 
 Plain click / plain Enter open in the active pane as usual.
 
@@ -137,7 +140,7 @@ Inside tables, `Tab` advances cells; `Backspace` / `Delete` clear the focused ce
 
 ### Multi-cursor
 
-`Alt+click` inside a cell adds a secondary caret/selection at the click position.
+`Shift+Alt+click` inside a cell adds a secondary caret/selection at the click position. (Plain `Alt+click` is reserved for "open the cell in the other pane.")
 
 ## Right-click menus
 

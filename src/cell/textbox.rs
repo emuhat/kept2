@@ -1235,7 +1235,13 @@ impl TextBox {
         self.last_click_time = Some(now);
         self.last_click_pos = (lx, ly);
 
-        if mods.shift_key() {
+        // Shift+click extends the primary selection. Shift+Alt+click,
+        // however, is the multi-cursor-add chord (the app-level click
+        // dispatcher routes plain Alt+click to "open in other pane",
+        // so the multi-cursor binding moved here). Let it fall
+        // through to the alt branch below by gating the shift path
+        // on !alt.
+        if mods.shift_key() && !mods.alt_key() {
             if self.sels.primary < self.sels.items.len() {
                 let s = &mut self.sels.items[self.sels.primary];
                 s.head = idx;

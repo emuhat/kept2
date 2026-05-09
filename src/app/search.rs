@@ -255,21 +255,29 @@ impl KeptApp {
         };
         if let Some(cell) = self.cell(id) {
             let target_date = local_date_for_ms(cell.timestamp);
-            if in_other_pane {
-                // Alt+Enter: split-or-swap to the other pane, then nav there.
-                self.open_in_other_pane(Query::date(target_date));
+            // Track the destination pane so the cell-focus / scroll
+            // step lands there, since `open_in_other_pane` preserves
+            // the *active* pane (the user expects their typing focus
+            // to stay where they were searching from).
+            let dest_pane = if in_other_pane {
+                self.open_in_other_pane(Query::date(target_date))
+            } else if self.push_view(Query::date(target_date)) {
+                Some(self.active_pane)
             } else {
-                // Plain Enter: deliberate nav in active pane. Push the
-                // pre-search view onto history so Cmd+[ returns to where
-                // the user was before searching. No-op when target equals
-                // current.
-                self.push_view(Query::date(target_date));
+                Some(self.active_pane)
+            };
+            if let Some(idx) = dest_pane {
+                let pane = &mut self.panes[idx];
+                pane.focused = Some(id);
+                pane.editing = false;
+                pane.coalesce_break = true;
+                pane.pending_caret_scroll = true;
+                return;
             }
         }
-        self.focused = Some(id);
-        self.editing = false;
+        // Fallback (cell vanished): no focus changes; just break
+        // coalesce so the next edit starts a fresh undo entry.
         self.coalesce_break = true;
-        self.pending_caret_scroll = true;
     }
 
     /// Top-N matching cell IDs for the popup result list. Parses `query`
