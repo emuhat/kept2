@@ -69,6 +69,14 @@ A new cell is inserted after the currently focused cell and goes straight into e
 
 The `Ctrl+Shift+<letter>` variants pre-attach an empty title and put the cursor in it, equivalent to `Ctrl+<letter>` followed by `Ctrl+T`.
 
+## References
+
+| Key | Action |
+|---|---|
+| `Ctrl+E` | Envelope the focused Reference cell — wraps it in an outline so you can write notes around the embed. No-op on non-Reference cells. |
+
+"Unwrap envelope" lives only on the right-click menu of an envelope outline. Bullet notes are dropped on unwrap; `Ctrl+Z` restores them.
+
 ## View
 
 | Key | Action |

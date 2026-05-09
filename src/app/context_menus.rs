@@ -46,6 +46,11 @@ pub(super) struct CellContextMenu {
     /// produces another Subtree pointing at the same bullet, instead
     /// of degrading to a WholeCell of the source.
     pub(super) source_reference_target: Option<ReferenceTarget>,
+    /// True when the menu was opened on an envelope outline (an
+    /// `OutlineCell` carrying a `reference_header`). Drives the
+    /// "Unwrap" row, which converts the envelope back to a bare
+    /// Reference at the same id / timestamp.
+    pub(super) source_is_envelope: bool,
 }
 
 /// Right-click menu over a People-page row. `deletable` and `ref_count`
@@ -148,6 +153,7 @@ impl KeptApp {
             self.hit_tests.cell_menu.surface = None;
             self.hit_tests.cell_menu.surface_subtree = None;
             self.hit_tests.cell_menu.envelope = None;
+            self.hit_tests.cell_menu.unwrap = None;
             return;
         };
         let Some(cell) = self.cell(menu.cell_id) else {
@@ -155,6 +161,7 @@ impl KeptApp {
             self.hit_tests.cell_menu.surface = None;
             self.hit_tests.cell_menu.surface_subtree = None;
             self.hit_tests.cell_menu.envelope = None;
+            self.hit_tests.cell_menu.unwrap = None;
             return;
         };
         let scale = self.font_scale;
@@ -170,12 +177,19 @@ impl KeptApp {
         // `source_reference_target`). Wraps the embed in an outline so
         // the user can write notes around it.
         let has_envelope = menu.source_reference_target.is_some();
+        // Unwrap is the inverse — only on envelope outlines. Mutually
+        // exclusive with `has_envelope` since one targets Reference
+        // sources and the other targets Outline sources.
+        let has_unwrap = menu.source_is_envelope;
         let mut action_count: usize = 1; // Delete cell
         action_count += 1; // Surface as reference (always)
         if has_subtree {
             action_count += 1;
         }
         if has_envelope {
+            action_count += 1;
+        }
+        if has_unwrap {
             action_count += 1;
         }
         let menu_h =
@@ -298,10 +312,23 @@ impl KeptApp {
             None
         };
 
+        // Unwrap — inverse of Envelope. The user's note bullets are
+        // dropped; Ctrl+Z restores them if the action was a mistake.
+        let unwrap_rect = if has_unwrap {
+            Some(emit_row(
+                "Unwrap envelope",
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ))
+        } else {
+            None
+        };
+
         self.hit_tests.cell_menu.delete = Some(delete_rect);
         self.hit_tests.cell_menu.surface = Some(surface_rect);
         self.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
         self.hit_tests.cell_menu.envelope = envelope_rect;
+        self.hit_tests.cell_menu.unwrap = unwrap_rect;
     }
 
     pub(super) fn render_tag_context_menu(

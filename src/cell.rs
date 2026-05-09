@@ -1562,6 +1562,29 @@ mod tests {
     }
 
     #[test]
+    fn envelope_snapshot_carries_target_for_unwrap() {
+        // Unwrap pulls the header target off the live cell to build a
+        // bare Reference with the same pointer. Independently of the
+        // app layer, verify the data flow: an envelope's snapshot
+        // surfaces the same target the reverse op would consume.
+        let target = ReferenceTarget::Subtree {
+            cell_id: Uuid::now_v7(),
+            bullet_id: Uuid::now_v7(),
+        };
+        let mut oc = OutlineCell::with_envelope(typeface(), target);
+        let bid = oc.bullets()[0].id();
+        oc.replace_in_bullet_with_text(bid, 0..0, "user notes".to_string());
+
+        let snap = oc.snapshot();
+        assert_eq!(snap.reference_header, Some(target));
+        // The pre-snapshot also carries the bullet text — that's
+        // what makes the unwrap undoable: Ctrl+Z restores it via
+        // OutlineCell::restore.
+        assert_eq!(snap.bullets.len(), 1);
+        assert_eq!(snap.bullets[0].textbox.text, "user notes");
+    }
+
+    #[test]
     fn outline_split_with_active_selection_replaces_it() {
         // Highlighting a word and pressing Enter should delete the
         // selection first and then split at the resulting caret —

@@ -137,6 +137,11 @@ struct CellMenuHits {
     /// Reference cell (turns it into an outline with the original
     /// embed pinned at the top).
     envelope: Option<Rect>,
+    /// "Unwrap" row — only populated when the menu's source is an
+    /// envelope outline. Reverse of envelope: the cell becomes a
+    /// bare Reference again. The user's notes are dropped (recoverable
+    /// via Ctrl+Z).
+    unwrap: Option<Rect>,
 }
 
 #[derive(Default)]
@@ -462,6 +467,17 @@ enum UndoOp {
     /// can't round-trip that via `CellEdit`, so envelope gets its own
     /// op with both snapshots and a kind-rebuild on apply.
     Envelope {
+        cell_id: Uuid,
+        pre: CellSnapshot,
+        post: CellSnapshot,
+        pre_focused: Option<Uuid>,
+    },
+    /// Inverse of `Envelope`: turn an envelope outline back into a
+    /// bare Reference at the same id / timestamp. The user's bullet
+    /// notes live in `pre`, so Ctrl+Z restores them verbatim. Kept
+    /// distinct from `Envelope` so the redo arm replays the same
+    /// direction the user originally intended.
+    Unwrap {
         cell_id: Uuid,
         pre: CellSnapshot,
         post: CellSnapshot,
@@ -3497,6 +3513,24 @@ impl KeptApp {
                     self.coalesce_break = true;
                     return true;
                 }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("e") => {
+                    // Ctrl+E: envelope the focused Reference cell.
+                    // No-op for any other cell kind — envelope only
+                    // applies to references. Unwrap is menu-only on
+                    // purpose (so the user can't accidentally drop
+                    // notes by hitting the same combo twice).
+                    let Some(id) = self.focused else {
+                        return false;
+                    };
+                    let is_reference = matches!(
+                        self.cell(id).map(|c| &c.kind),
+                        Some(CellKind::Reference(_))
+                    );
+                    if is_reference {
+                        return self.envelope_reference(id);
+                    }
+                    return false;
+                }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("t") => {
                     // Ctrl/Cmd+T: create + focus the title slot on the
                     // focused cell. Idempotent — focuses an existing title.
@@ -4768,6 +4802,26 @@ impl KeptApp {
                 self.dirty_cells.insert(*cell_id);
                 self.focused = *pre_focused;
             }
+            UndoOp::Unwrap {
+                cell_id,
+                pre,
+                pre_focused,
+                ..
+            } => {
+                // Mirror Envelope's undo: rebuild the pre-snapshot
+                // (which is the envelope outline including the
+                // user's notes) at the same cell id.
+                if let Some(idx) = self.cell_idx(*cell_id) {
+                    let cell = Cell::from_snapshot(
+                        *cell_id,
+                        pre.clone(),
+                        &self.typeface,
+                    );
+                    self.cells[idx] = cell;
+                }
+                self.dirty_cells.insert(*cell_id);
+                self.focused = *pre_focused;
+            }
         }
         self.redo_stack.push(op);
         self.dragging_cell = None;
@@ -4905,6 +4959,18 @@ impl KeptApp {
                 bump_focused_edited = false;
             }
             UndoOp::Envelope { cell_id, post, .. } => {
+                if let Some(idx) = self.cell_idx(*cell_id) {
+                    let cell = Cell::from_snapshot(
+                        *cell_id,
+                        post.clone(),
+                        &self.typeface,
+                    );
+                    self.cells[idx] = cell;
+                }
+                self.dirty_cells.insert(*cell_id);
+                self.focused = Some(*cell_id);
+            }
+            UndoOp::Unwrap { cell_id, post, .. } => {
                 if let Some(idx) = self.cell_idx(*cell_id) {
                     let cell = Cell::from_snapshot(
                         *cell_id,
@@ -5273,6 +5339,62 @@ impl KeptApp {
         true
     }
 
+    /// Reverse of `envelope_reference`: turn an envelope outline back
+    /// into a bare Reference at the same id / timestamp. Bullet notes
+    /// the user typed into the envelope are dropped from the live
+    /// cell — the pre-snapshot in the undo entry preserves them so
+    /// Ctrl+Z restores everything if the unwrap was a mistake.
+    fn unwrap_envelope(&mut self, cell_id: Uuid) -> bool {
+        let Some(idx) = self.cell_idx(cell_id) else {
+            return false;
+        };
+        let target = match &self.cells[idx].kind {
+            CellKind::Outline(oc) => match oc.reference_header() {
+                Some(h) => h.target(),
+                None => return false,
+            },
+            _ => return false,
+        };
+        let pre_focused = self.focused;
+        let pre = self.cells[idx].snapshot();
+        let timestamp = self.cells[idx].timestamp;
+        let edited_at = self.cells[idx].edited_at;
+        let context_hint = self.cells[idx].context_hint_id;
+
+        let mut new_cell = Cell::from_parts(
+            cell_id,
+            CellKind::Reference(cell::ReferenceCell::new(
+                self.typeface.clone(),
+                target,
+            )),
+            None,
+            timestamp,
+            edited_at,
+            context_hint,
+        );
+        new_cell.set_font_scale(self.font_scale);
+        let post = new_cell.snapshot();
+
+        self.cells[idx] = new_cell;
+        self.focused = Some(cell_id);
+        // References don't have an edit mode.
+        self.editing = false;
+        self.dragging_cell = None;
+        self.pending_caret_scroll = true;
+        self.mark_cell_dirty(cell_id);
+        self.touch_cell(cell_id);
+
+        self.undo_stack.push(UndoOp::Unwrap {
+            cell_id,
+            pre,
+            post,
+            pre_focused,
+        });
+        self.redo_stack.clear();
+        self.coalesce_break = true;
+        true
+    }
+
     /// Bring the primary caret of the focused cell into view if it's outside
     /// the viewport. Used after edits, caret movement, and zoom changes.
     fn scroll_caret_into_view(&mut self) {
@@ -5419,6 +5541,14 @@ impl KeptApp {
                         CellKind::Reference(rc) => Some(rc.target()),
                         _ => None,
                     });
+                // Envelope detection — drives the "Unwrap" row.
+                let source_is_envelope = self
+                    .cell(cell_id)
+                    .map(|c| match &c.kind {
+                        CellKind::Outline(oc) => oc.has_reference_header(),
+                        _ => false,
+                    })
+                    .unwrap_or(false);
 
                 // Visualize the subtree selection: for direct outlines,
                 // on the cell itself; for embeds, on the cached outline
@@ -5449,6 +5579,7 @@ impl KeptApp {
                     bullet_snippet,
                     reference_origin_cell_id,
                     source_reference_target,
+                    source_is_envelope,
                 });
                 return true;
             }
@@ -5700,6 +5831,16 @@ impl KeptApp {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
                         self.envelope_reference(menu.cell_id);
+                    }
+                    return true;
+                }
+            }
+            // "Unwrap envelope" — inverse of envelope. Bullet notes
+            // are dropped (recoverable via Ctrl+Z).
+            if let Some(rect) = self.hit_tests.cell_menu.unwrap {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        self.unwrap_envelope(menu.cell_id);
                     }
                     return true;
                 }
