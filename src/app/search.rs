@@ -94,7 +94,7 @@ impl KeptApp {
         let mut border = Paint::default();
         border.set_anti_alias(true);
         border.set_style(PaintStyle::Stroke);
-        border.set_stroke_width(1.0);
+        border.set_stroke_width(2.0);
         border.set_color(crate::color::panel_border_warm());
         canvas.draw_round_rect(card, radius, radius, &border);
 

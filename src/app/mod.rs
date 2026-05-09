@@ -28,13 +28,13 @@ use search::SearchState;
 
 const FONT_BYTES: &[u8] = include_bytes!("../../resources/fonts/Figtree.ttf");
 
-const MARGIN_X: f32 = 40.0;
+const MARGIN_X: f32 = 20.0;
 const MARGIN_TOP: f32 = 20.0;
-const CELL_GAP: f32 = 32.0;
+const CELL_GAP: f32 = 25.0;
 /// Outer padding around the focused cell in focus mode (Ctrl+F). Smaller
 /// than `MARGIN_X` so the cell really feels "kinda fullscreen."
 const FOCUS_MODE_PAD: f32 = 16.0;
-const FOCUS_PAD: f32 = 10.0;
+const FOCUS_PAD: f32 = 5.0;
 const FOCUS_RADIUS: f32 = 10.0;
 const FOCUS_STROKE: f32 = 1.0;
 const FOCUS_STROKE_EDIT: f32 = 2.0;

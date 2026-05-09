@@ -28,7 +28,7 @@
      inkscape:document-units="mm"
      inkscape:zoom="0.78484147"
      inkscape:cx="396.25837"
-     inkscape:cy="351.0263"
+     inkscape:cy="326.81759"
      inkscape:window-width="1854"
      inkscape:window-height="1131"
      inkscape:window-x="0"
@@ -38,6 +38,12 @@
      showgrid="false" />
   <defs
      id="defs1">
+    <rect
+       x="-303.24595"
+       y="-291.77867"
+       width="415.37051"
+       height="625.60405"
+       id="rect7" />
     <rect
        x="254.82853"
        y="294.32695"
@@ -120,7 +126,7 @@
          inkscape:label="path3"
          transform="matrix(0.71843258,0,0,0.71843258,10.760792,44.491507)" />
       <circle
-         style="fill:#eff1f6;fill-opacity:1;stroke:#003554;stroke-width:6.44511;stroke-dasharray:none;stroke-opacity:1"
+         style="fill:#eff1f6;fill-opacity:1;stroke:#a344da;stroke-width:6.44511;stroke-dasharray:none;stroke-opacity:1"
          id="path3"
          cx="82.185951"
          cy="117.68554"
@@ -145,14 +151,19 @@
          y="170.51082">k</tspan></text>
     <text
        xml:space="preserve"
-       style="font-size:226.891px;writing-mode:lr-tb;direction:ltr;display:inline;fill:#2de27d;fill-opacity:1;stroke-width:6.20649"
+       style="font-size:226.891px;writing-mode:lr-tb;direction:ltr;display:inline;fill:#003554;fill-opacity:1;stroke-width:6.20649"
        x="43.288979"
        y="168.82526"
        id="text2"><tspan
          sodipodi:role="line"
          id="tspan2"
-         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:226.891px;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';fill:#2de27d;fill-opacity:1;stroke-width:6.2065"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:226.891px;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';fill:#003554;fill-opacity:1;stroke-width:6.2065"
          x="43.288979"
          y="168.82526">k</tspan></text>
+    <text
+       xml:space="preserve"
+       transform="scale(0.26458333)"
+       id="text7"
+       style="fill:#003554;text-orientation:auto;stroke-width:3.64724409;writing-mode:lr-tb;direction:ltr;-inkscape-font-specification:'Figtree Bold';font-family:Figtree;font-weight:bold;font-style:normal;font-stretch:normal;font-variant:normal;stroke:#a344da;stroke-opacity:1;opacity:0.50041292;fill-opacity:1;white-space:pre;shape-inside:url(#rect7)" />
   </g>
 </svg>
