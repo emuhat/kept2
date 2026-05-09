@@ -74,6 +74,13 @@ impl Bullet {
         &self.textbox
     }
 
+    /// Mutable accessor for the bullet's textbox. Used by Cell-level
+    /// span operations (e.g. global tag-strip) that need to reach
+    /// every editable surface in the cell.
+    pub fn textbox_mut(&mut self) -> &mut TextBox {
+        &mut self.textbox
+    }
+
     pub fn active(&self) -> bool {
         self.active
     }
@@ -249,6 +256,14 @@ impl OutlineCell {
 
     pub fn bullets(&self) -> &[Bullet] {
         &self.bullets
+    }
+
+    /// Mutable bullet slice for cell-level span operations that
+    /// touch every editable surface. Most callers should reach for
+    /// the existing tick / edit / split helpers instead — this is
+    /// the bulk-mutate escape hatch.
+    pub fn bullets_mut(&mut self) -> &mut [Bullet] {
+        &mut self.bullets
     }
 
     /// Borrow the optional reference header (envelope outlines).

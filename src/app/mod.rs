@@ -2749,6 +2749,35 @@ impl KeptApp {
     /// both source from this so a freshly-committed tag appears on
     /// the next frame instead of waiting for the debounced save to
     /// land in the DB. Reference cells are skipped (no editable text).
+    /// Right-click "Delete tag" handler. Strips every `TagSpan`
+    /// covering `#name` from any in-memory cell, marks those cells
+    /// dirty + bumps their `edited_at` so the next persistence
+    /// flush rewrites their JSON without the spans, and deletes the
+    /// row from the DB's `tags` table. The underlying text is left
+    /// alone — the tag styling/semantic disappears, but the bytes
+    /// stay where they were so the user can decide whether to clean
+    /// them up. Cell-side strip happens in memory immediately so
+    /// the sidebar drops the tag on the next frame, even before the
+    /// debounced save fires.
+    fn delete_tag_globally(&mut self, name: &str) {
+        let mut affected: Vec<Uuid> = Vec::new();
+        for cell in &mut self.cells {
+            if cell.remove_tags_named(name) {
+                affected.push(cell.id);
+            }
+        }
+        for id in affected {
+            self.mark_cell_dirty(id);
+            self.touch_cell(id);
+        }
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.delete_tag(name) {
+                eprintln!("kept: delete_tag failed for {name}: {e}");
+            }
+        }
+        self.coalesce_break = true;
+    }
+
     fn all_tag_names_in_memory(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for cell in &self.cells {
@@ -6284,37 +6313,34 @@ impl KeptApp {
         self.last_scroll_time = Some(Instant::now());
     }
 
-    /// Right-click handler. Currently the only surface that does anything
-    /// useful is sidebar tag rows: right-clicking on a tag with zero cells
-    /// opens a one-item "Delete tag" context menu. Returns true if the
-    /// click was consumed.
+    /// Right-click handler. Sidebar tag rows offer a "Delete tag"
+    /// context menu (strips the tag from any cells still carrying
+    /// it AND drops the DB row). Doc-area right-clicks open the
+    /// per-cell or per-row context menu. Returns true if the click
+    /// was consumed.
     pub fn right_click(&mut self, x: f32, y: f32) -> bool {
         // Right-clicking anywhere first closes any open menu.
         let was_open = self.tag_context_menu.take().is_some()
             | self.people_context_menu.take().is_some()
             | self.cell_context_menu.take().is_some();
-        // Sidebar: tag rows offer a context menu (delete-tag for empty
-        // tags). Everything else in the sidebar dismisses an open menu.
+        // Sidebar: any tag row offers the delete menu. The previous
+        // gate (`count == 0` against `db.cells_with_tag`) was unreachable
+        // — every visible tag has at least one in-memory cell carrying
+        // its span (otherwise it wouldn't appear in the sidebar via
+        // `all_tag_names_in_memory`). The delete operation now strips
+        // tag spans from those cells in addition to dropping the DB
+        // row, so there's nothing safety-critical to gate on.
         if x < SIDEBAR_WIDTH * self.font_scale {
             // Sidebar rects are in content-space; map mouse to match.
             let y = y + self.sidebar_scroll.scroll_y;
             for (name, rect) in self.hit_tests.sidebar.tags.clone() {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    let count = self
-                        .db
-                        .as_ref()
-                        .and_then(|db| db.cells_with_tag(&name).ok())
-                        .map(|v| v.len())
-                        .unwrap_or(usize::MAX);
-                    if count == 0 {
-                        self.tag_context_menu = Some(TagContextMenu {
-                            name,
-                            anchor_x: x,
-                            anchor_y: y,
-                        });
-                        return true;
-                    }
-                    return was_open;
+                    self.tag_context_menu = Some(TagContextMenu {
+                        name,
+                        anchor_x: x,
+                        anchor_y: y,
+                    });
+                    return true;
                 }
             }
             return was_open;
@@ -6447,11 +6473,7 @@ impl KeptApp {
             if let Some(rect) = self.hit_tests.tag_menu.delete {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.tag_context_menu.take() {
-                        if let Some(db) = self.db.as_mut() {
-                            if let Err(e) = db.delete_tag(&menu.name) {
-                                eprintln!("kept: delete_tag failed for {}: {}", menu.name, e);
-                            }
-                        }
+                        self.delete_tag_globally(&menu.name);
                     }
                     return true;
                 }

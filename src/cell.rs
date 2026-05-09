@@ -663,6 +663,40 @@ impl Cell {
     /// This is what the query matcher and the persistence layer key on,
     /// so adding `#urgent` anywhere in any editable slot puts the cell
     /// into the `#urgent` filter view.
+    /// Drop every `TagSpan` whose covered substring is `#name`,
+    /// across every textbox the cell owns (title + body shape's
+    /// textboxes). Used by the sidebar's "Delete tag" right-click
+    /// to remove the tag from any cell still carrying it. Returns
+    /// whether anything changed (so the caller can mark dirty +
+    /// touch `edited_at` only on actual mutations).
+    pub fn remove_tags_named(&mut self, name: &str) -> bool {
+        let mut changed = false;
+        if let Some(title) = self.title.as_mut() {
+            changed |= title.remove_tags_named(name);
+        }
+        match &mut self.kind {
+            CellKind::Plain(tb) => changed |= tb.remove_tags_named(name),
+            CellKind::Outline(oc) => {
+                for b in oc.bullets_mut() {
+                    changed |= b.textbox_mut().remove_tags_named(name);
+                }
+            }
+            CellKind::Table(tc) => {
+                for r in 0..tc.rows() {
+                    for c in 0..tc.cols() {
+                        if let Some(entry) = tc.cell_at_mut(r, c) {
+                            changed |= entry.textbox.remove_tags_named(name);
+                        }
+                    }
+                }
+            }
+            // PopPop body opts out of inline tags; Reference cells own
+            // no editable text. Nothing to strip in either.
+            CellKind::PopPop(_) | CellKind::Reference(_) => {}
+        }
+        changed
+    }
+
     pub fn all_tag_names(&self) -> Vec<String> {
         let mut out: Vec<String> = self.heading_tag_names();
         let mut push = |name: String| {

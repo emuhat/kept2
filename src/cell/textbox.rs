@@ -538,6 +538,28 @@ impl TextBox {
     /// legacy migration. Invalid ranges are silently dropped.
     /// Rendering reads `self.tags` directly each frame (overdraw
     /// pass), so no cache recomputation is needed here.
+    /// Drop every `TagSpan` whose covered substring is exactly
+    /// `#name`. Used by global tag-deletion (right-click "Delete
+    /// tag" in the sidebar): the user has decided this tag should
+    /// vanish, so any cell still carrying a span for it gets the
+    /// span removed. The underlying text is left alone — only the
+    /// styling/semantic span goes away. Returns whether anything
+    /// changed (so the caller can mark dirty + push undo entries
+    /// only when the operation actually mutated state).
+    pub fn remove_tags_named(&mut self, name: &str) -> bool {
+        let target = format!("#{name}");
+        let before = self.tags.len();
+        self.tags.retain(|t| {
+            if t.range.end > self.text.len() || t.range.start >= t.range.end {
+                // Stale / collapsed span: defensively keep (nothing to
+                // compare against). Won't render anyway.
+                return true;
+            }
+            self.text.get(t.range.clone()).map_or(true, |s| s != target)
+        });
+        self.tags.len() != before
+    }
+
     pub fn add_tag(&mut self, range: Range<usize>) {
         if range.start < range.end
             && range.end <= self.text.len()
