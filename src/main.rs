@@ -118,18 +118,12 @@ impl ApplicationHandler for Application {
                 let x = position.x as f32 / self.dpi;
                 let y = position.y as f32 / self.dpi;
                 self.last_mouse_pos = (x, y);
-                self.kept_app.cursor_moved(x, y);
-                if self.kept_app.mouse_drag_to(x, y) {
+                let cursor_changed = self.kept_app.cursor_moved(x, y);
+                let drag_changed = self.kept_app.mouse_drag_to(x, y);
+                if cursor_changed || drag_changed {
                     self.env.window.request_redraw();
                 }
-                let icon = if self.kept_app.is_hovering_divider() {
-                    CursorIcon::ColResize
-                } else if self.kept_app.is_hovering_link() {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
-                };
-                self.env.window.set_cursor(icon);
+                self.env.window.set_cursor(self.cursor_icon_for_state());
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let (x, y) = self.last_mouse_pos;
@@ -206,6 +200,27 @@ impl ApplicationHandler for Application {
         event_loop.set_control_flow(ControlFlow::WaitUntil(
             self.previous_frame_start + frame_duration,
         ));
+    }
+}
+
+impl Application {
+    /// Pick the system cursor icon for the current app state.
+    /// Priority order: divider resize wins, then a closed-hand
+    /// "grabbing" while an Alt-drag pan is in flight, then link
+    /// hover, then default. Alt-held alone doesn't flip the cursor
+    /// pre-emptively (Alt also drives multi-cursor add and
+    /// link-open-in-other-pane in the cell layer; a grab cursor
+    /// would be misleading there).
+    fn cursor_icon_for_state(&self) -> CursorIcon {
+        if self.kept_app.is_hovering_divider() {
+            CursorIcon::ColResize
+        } else if self.kept_app.is_panning() {
+            CursorIcon::Grabbing
+        } else if self.kept_app.is_hovering_link() {
+            CursorIcon::Pointer
+        } else {
+            CursorIcon::Default
+        }
     }
 }
 

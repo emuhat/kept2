@@ -148,11 +148,7 @@ impl CellKind {
     pub fn clone_for_scale(&self, typeface: &Typeface, scale: f32) -> Option<CellKind> {
         match self {
             CellKind::Plain(tb) => {
-                let mut new_tb = TextBox::new(typeface.clone(), tb.text().to_string());
-                new_tb.set_font_scale(scale);
-                for l in tb.links() {
-                    new_tb.add_link(l.range.clone(), l.url.clone());
-                }
+                let new_tb = tb.clone_for_cache(typeface.clone(), scale);
                 Some(CellKind::Plain(new_tb))
             }
             CellKind::Outline(oc) => {
@@ -160,12 +156,7 @@ impl CellKind {
                     .bullets()
                     .iter()
                     .map(|b| {
-                        let mut tb =
-                            TextBox::new(typeface.clone(), b.textbox().text().to_string());
-                        tb.set_font_scale(scale);
-                        for l in b.textbox().links() {
-                            tb.add_link(l.range.clone(), l.url.clone());
-                        }
+                        let tb = b.textbox().clone_for_cache(typeface.clone(), scale);
                         Bullet::new(b.id(), tb, b.depth())
                     })
                     .collect();
@@ -1547,6 +1538,30 @@ mod tests {
         let new_links = bullets[1].textbox().links();
         assert_eq!(new_links.len(), 1, "suffix link rebased onto new bullet");
         assert_eq!(new_links[0].range, 2..6);
+    }
+
+    #[test]
+    fn clone_for_cache_preserves_links_and_tags_on_textbox() {
+        // The single source of truth for "deep-copy a TextBox into an
+        // embed cache" must carry every render-affecting span across:
+        // text, font scale, heading mode, links, AND tags. Embedded
+        // titles in particular surface tags, so dropping them was the
+        // bug that motivated this helper.
+        let mut tb = TextBox::new(typeface(), "Patrick #person and link".to_string());
+        tb.set_force_heading(true);
+        tb.set_font_scale(1.25);
+        tb.add_link(20..24, "https://example.com/".to_string());
+        tb.add_tag(8..15);
+
+        let cloned = tb.clone_for_cache(typeface(), 1.0);
+        assert_eq!(cloned.text(), "Patrick #person and link");
+        assert_eq!(cloned.font_scale(), 1.0, "scale override applies");
+        let cloned_tags = cloned.tags();
+        assert_eq!(cloned_tags.len(), 1, "tag span survives the clone");
+        assert_eq!(cloned_tags[0].range, 8..15);
+        let cloned_links = cloned.links();
+        assert_eq!(cloned_links.len(), 1, "link span survives the clone");
+        assert_eq!(cloned_links[0].range, 20..24);
     }
 
     #[test]

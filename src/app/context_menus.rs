@@ -33,13 +33,25 @@ pub(super) struct CellContextMenu {
     /// non-outline cells or right-clicks landing in outline whitespace.
     pub(super) bullet_id: Option<Uuid>,
     pub(super) bullet_snippet: Option<String>,
-    /// Cell id used as the *source* for any "Surface as reference"
-    /// action invoked from this menu (whole-cell or subtree). Equals
-    /// `cell_id` when the menu is anchored on a normal cell. When
-    /// anchored on a Reference cell, this is `Reference.target.cell_id()`
-    /// — references always resolve to the original source, never to
+    /// Cell id used as the source for the *whole-cell* "Surface as
+    /// reference" action invoked from this menu. Equals `cell_id`
+    /// when the menu is anchored on a normal cell. When anchored on
+    /// a Reference cell, this is `Reference.target.cell_id()` —
+    /// references always resolve to the original source, never to
     /// another reference (no chained-reference creation).
+    ///
+    /// The *subtree* surface uses `bullet_origin_cell_id` instead;
+    /// the two diverge only for envelope outlines (whole-cell
+    /// surfaces target the envelope itself; a header-bullet subtree
+    /// surfaces from the header's embedded source).
     pub(super) reference_origin_cell_id: Uuid,
+    /// Cell id that owns `bullet_id` — set whenever `bullet_id` is.
+    /// May differ from `reference_origin_cell_id` when the click
+    /// landed inside a nested embed (envelope header, recursive
+    /// embed): the bullet's source is the deepest embed's target,
+    /// not the outermost cell's surface origin. Drives the
+    /// "Surface '<snippet>' as reference" subtree row.
+    pub(super) bullet_origin_cell_id: Option<Uuid>,
     /// `Some` when the menu was opened on a Reference cell — captures
     /// that reference's actual target (WholeCell or Subtree). Drives
     /// the whole-cell surface row so re-surfacing a Subtree reference

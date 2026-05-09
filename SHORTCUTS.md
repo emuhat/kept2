@@ -154,5 +154,7 @@ Inside tables, `Tab` advances cells; `Backspace` / `Delete` clear the focused ce
 | Gesture | Action |
 |---|---|
 | Wheel | Scroll the pane under the cursor (independent of which pane is active) |
+| Drag the scrollbar thumb | Direct scrolling; flick-and-release coasts via kinetic decay |
+| `Alt` + drag | Pan the pane under the cursor like grabbing paper; flick to coast. Disambiguated from `Alt`+click (multi-cursor add / open-link-in-other-pane) by a small drag threshold — short drags stay clicks, longer drags become a pan |
 | Drag the divider | Resize the split (clamped between 15% and 85%) |
 | Click | Activate the pane that was clicked, then dispatch normally |

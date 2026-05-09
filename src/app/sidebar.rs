@@ -119,30 +119,12 @@ impl KeptApp {
             mouse_x >= r.left && mouse_x <= r.right && mouse_y >= r.top && mouse_y <= r.bottom
         };
 
-        // ---- PAGES section ----
-        let pages_header_baseline = pad_top + (-hm.ascent);
-        canvas.draw_str(
-            "PAGES",
-            Point::new(pad_x, pages_header_baseline),
-            &header_font,
-            &header_paint,
-        );
-        let mut y = pad_top + header_h;
-        let people_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
-        draw_sidebar_row(
-            canvas,
-            people_rect,
-            "People",
-            matches!(self.view.view_kind, ViewKind::People),
-            in_row(people_rect),
-            radius,
-            pad_x,
-            &row_font,
-        );
-        self.hit_tests.sidebar.pages.push((PageKind::People, people_rect));
-        y += date_h + item_gap + date_gap;
-
         // ---- CONTEXTS section ----
+        // Sidebar order: CONTEXTS first (the daily/weekly working
+        // surfaces — the most-used navigation), then TAGS (filtering
+        // by topic), then PAGES (People — once per session, not the
+        // primary surface).
+        let mut y = pad_top;
         let contexts_header_baseline = y + (-hm.ascent);
         canvas.draw_str(
             "CONTEXTS",
@@ -265,6 +247,33 @@ impl KeptApp {
                 y += date_h + item_gap;
             }
         }
+
+        // ---- PAGES section (bottom) ----
+        // Single-item section in v1 (People). Lives at the bottom so
+        // CONTEXTS and TAGS — the daily working surfaces — own the
+        // top of the sidebar.
+        y += date_gap;
+        let pages_header_baseline = y + (-hm.ascent);
+        canvas.draw_str(
+            "PAGES",
+            Point::new(pad_x, pages_header_baseline),
+            &header_font,
+            &header_paint,
+        );
+        y += header_h;
+        let people_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
+        draw_sidebar_row(
+            canvas,
+            people_rect,
+            "People",
+            matches!(self.view.view_kind, ViewKind::People),
+            in_row(people_rect),
+            radius,
+            pad_x,
+            &row_font,
+        );
+        self.hit_tests.sidebar.pages.push((PageKind::People, people_rect));
+        y += date_h + item_gap;
 
         canvas.restore();
 

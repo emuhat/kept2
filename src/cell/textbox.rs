@@ -547,6 +547,31 @@ impl TextBox {
         }
     }
 
+    /// Build a fresh `TextBox` that mirrors `self`'s rendered
+    /// content for use as a read-only embed cache (Reference cells,
+    /// envelope outline headers, the entity-page references list).
+    /// Copies everything that affects how the text *renders* — text,
+    /// font scale, heading mode, link spans, tag spans — so the
+    /// cache looks identical to the source. View state (selection,
+    /// caret, drag, undo stack, layout cache) is intentionally
+    /// dropped: the cache is a separate live widget that owns its
+    /// own interaction state across frames. `scale` overrides the
+    /// source's recorded scale, since callers typically want the
+    /// cache to render at the app's current zoom level rather than
+    /// whatever the source was last rendered at.
+    pub fn clone_for_cache(&self, typeface: Typeface, scale: f32) -> Self {
+        let mut new_tb = TextBox::new(typeface, self.text.clone());
+        new_tb.set_force_heading(self.force_heading);
+        new_tb.set_font_scale(scale);
+        for l in &self.links {
+            new_tb.add_link(l.range.clone(), l.url.clone());
+        }
+        for t in &self.tags {
+            new_tb.add_tag(t.range.clone());
+        }
+        new_tb
+    }
+
     pub fn tags(&self) -> &[TagSpan] {
         &self.tags
     }

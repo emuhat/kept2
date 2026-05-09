@@ -46,6 +46,16 @@ const FOCUS_SHADOW_DY: f32 = 3.0;
 const DOC_BOTTOM_PAD: f32 = 24.0;
 const SCROLLBAR_INSET: f32 = 4.0;
 const SCROLLBAR_WIDTH: f32 = 4.0;
+/// Visual width while hovered or being dragged — wide enough to
+/// reliably grab. The horizontal hit zone (`SCROLLBAR_HOVER_SLOP`) is
+/// even wider so the cursor counts as "near" before reaching the bar
+/// itself.
+const SCROLLBAR_HOVER_WIDTH: f32 = 10.0;
+/// Half-width of the "mouse is near the scrollbar" hit zone, measured
+/// from the wide-bar centerline. Anything inside this zone wakes the
+/// bar up (forces alpha to full + widens the thumb) so the user can
+/// see what they're aiming at before clicking.
+const SCROLLBAR_HOVER_SLOP: f32 = 14.0;
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 const SCROLLBAR_HOLD: Duration = Duration::from_millis(800);
 const SCROLLBAR_FADE: Duration = Duration::from_millis(700);
@@ -560,6 +570,23 @@ const EMBED_FOOTER_FONT_SIZE: f32 = 12.0;
 /// share a value but their roles are distinct).
 const ENVELOPE_HEADER_GAP: f32 = 6.0;
 
+/// Cursor displacement (logical px) at which an Alt-down click
+/// promotes from a tentative click to a committed pan-drag. Below
+/// this, the gesture stays a regular Alt+click (multi-cursor add /
+/// link-open-in-other-pane); past it, the cell-level drag-state is
+/// aborted and pan takes over. Sized to comfortably swallow trackpad
+/// jitter — a few px of accidental motion shouldn't yank the doc.
+const ALT_PAN_THRESHOLD: f32 = 6.0;
+
+/// Pan-drag scroll amplification — each pixel of cursor motion drives
+/// `PAN_GAIN` pixels of scroll. Without this, dragging matches cursor
+/// 1:1 and is no faster than the wheel, which defeats the purpose of
+/// the gesture. Applied uniformly to the threshold-cross jump and to
+/// every per-frame drag delta, so the kinetic-fling sample window
+/// also sees the amplified deltas (a flick at the end of a drag
+/// coasts proportionally further).
+const PAN_GAIN: f32 = 2.5;
+
 /// Maximum nesting depth for embed previews. When an envelope outline
 /// is itself the target of a reference, its header (the inner embed)
 /// is rendered recursively up to this many levels deep. Beyond the
@@ -646,16 +673,49 @@ pub struct Scroller {
     /// burst; bled off by `step_kinetic`. Sign: positive = scrolling
     /// toward higher `scroll_y` (visually downward).
     scroll_velocity_y: f32,
-    /// Recent wheel samples within `KINETIC_VELOCITY_WINDOW`. Smooths
-    /// the velocity estimate against trackpad jitter (microsecond-gap
-    /// events would otherwise produce runaway dy/dt). Pruned at the
-    /// head every wheel event.
-    recent_wheel: VecDeque<(Instant, f32)>,
+    /// Recent scroll-delta samples within `KINETIC_VELOCITY_WINDOW`,
+    /// shared by every input that contributes to kinetic state — wheel
+    /// events and scrollbar-thumb drags. Smooths the velocity estimate
+    /// against trackpad jitter (microsecond-gap events would otherwise
+    /// produce runaway dy/dt). Pruned at the head whenever a sample is
+    /// pushed or velocity is recomputed.
+    recent_samples: VecDeque<(Instant, f32)>,
     /// Wall-clock time the most recent scroll change was applied —
     /// either by `apply_wheel` or by `step_kinetic`. Anchors the dt
     /// for kinetic integration so a frame triggered by the wheel
     /// itself doesn't double-apply velocity.
     last_scroll_apply_at: Option<Instant>,
+    /// Last thumb rect (window coords) drawn by `draw_bar`. Used by
+    /// mouse_down for hit-testing — empty rect when the bar wasn't
+    /// drawn this frame (no content overflow, or fully faded).
+    last_thumb_rect: Rect,
+    /// Last track band: (top_y, bot_y, viewport_h, content_h, bar_center_x)
+    /// from the most recent draw. Needed to translate a drag in
+    /// window-y back into a scroll position. None when the bar wasn't
+    /// drawn (no overflow / fully faded — neither hover nor drag is
+    /// meaningful then).
+    last_bar_geom: Option<BarGeom>,
+    /// True while the cursor is inside the wide "near the scrollbar"
+    /// hit zone. Drives both the bar's visual widening and forcing
+    /// alpha to full in `draw_bar`. Set externally by `set_hover`
+    /// from the cursor-move handler.
+    hover: bool,
+    /// `Some(grab_offset_y)` while the user is dragging the thumb.
+    /// `grab_offset_y` is the y-distance from the thumb's top to the
+    /// initial click point, kept constant through the drag so the
+    /// thumb doesn't jump under the cursor on the first move.
+    dragging: Option<f32>,
+}
+
+#[derive(Clone, Copy)]
+struct BarGeom {
+    track_top: f32,
+    track_bot: f32,
+    viewport_h: f32,
+    content_h: f32,
+    /// X-coordinate of the wide-bar centerline (constant whether the
+    /// bar is currently drawn thin or wide).
+    bar_center_x: f32,
 }
 
 impl Scroller {
@@ -665,8 +725,12 @@ impl Scroller {
             max_scroll: 0.0,
             last_scroll_time: None,
             scroll_velocity_y: 0.0,
-            recent_wheel: VecDeque::new(),
+            recent_samples: VecDeque::new(),
             last_scroll_apply_at: None,
+            last_thumb_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+            last_bar_geom: None,
+            hover: false,
+            dragging: None,
         }
     }
 
@@ -701,7 +765,7 @@ impl Scroller {
         // 2) Fallback for wheel mice (which don't carry meaningful
         //    phase): a wheel event after a >KINETIC_BURST_GAP idle
         //    counts as a fresh gesture and interrupts.
-        let last_sample_at = self.recent_wheel.back().map(|&(t, _)| t);
+        let last_sample_at = self.recent_samples.back().map(|&(t, _)| t);
         let burst_gap_elapsed = match last_sample_at {
             Some(t) => now.duration_since(t) > KINETIC_BURST_GAP,
             None => true,
@@ -710,7 +774,7 @@ impl Scroller {
             || (burst_gap_elapsed && self.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY);
         if interrupt && self.scroll_velocity_y.abs() >= KINETIC_MIN_VELOCITY {
             self.scroll_velocity_y = 0.0;
-            self.recent_wheel.clear();
+            self.recent_samples.clear();
         }
         // A `Started` event with dy=0 (pure touch, no scroll motion) is
         // ONLY for interruption — don't pollute the velocity window or
@@ -719,34 +783,14 @@ impl Scroller {
             return interrupt;
         }
 
-        // Append this sample and prune anything older than the window.
+        // Append this sample and recompute velocity from the window.
         // dy=0 is also pushed — libinput sends a dy=0 sentinel on
         // touchpad lift, and counting it correctly drops velocity to
-        // zero if the user paused before releasing.
-        self.recent_wheel.push_back((now, dy));
-        let cutoff = now - KINETIC_VELOCITY_WINDOW;
-        while self
-            .recent_wheel
-            .front()
-            .map_or(false, |&(t, _)| t < cutoff)
-        {
-            self.recent_wheel.pop_front();
-        }
-        // Velocity = sum(dy) / window_span. Span is from the oldest
-        // sample to now (not the full window), so the very first event
-        // in a burst gets a meaningful estimate based on its own dy and
-        // a sub-millisecond dt — clamped below.
-        let total_dy: f32 = self.recent_wheel.iter().map(|&(_, d)| d).sum();
-        let span = self
-            .recent_wheel
-            .front()
-            .map(|&(t, _)| now.duration_since(t).as_secs_f32())
-            .unwrap_or(0.0)
-            // Floor the span so a single fresh sample doesn't divide by
-            // ~0 and produce a runaway velocity.
-            .max(0.016);
-        let raw_v = total_dy / span;
-        self.scroll_velocity_y = raw_v.clamp(-KINETIC_MAX_VELOCITY, KINETIC_MAX_VELOCITY);
+        // zero if the user paused before releasing. The averaging /
+        // pruning math lives on `recompute_velocity_from_window` so
+        // wheel and scrollbar-thumb drag agree on the formula.
+        self.recent_samples.push_back((now, dy));
+        self.recompute_velocity_from_window(now);
 
         // Direct apply. Kinetic integration in `step_kinetic` uses dt
         // since the last scroll application — when the wheel just fired
@@ -812,7 +856,7 @@ impl Scroller {
     /// (mouse_down, key press) so user input always wins over coast.
     fn kill_kinetic(&mut self) {
         self.scroll_velocity_y = 0.0;
-        self.recent_wheel.clear();
+        self.recent_samples.clear();
         self.last_scroll_apply_at = None;
     }
 
@@ -824,19 +868,20 @@ impl Scroller {
 
     /// Draw the right-edge thumb-only scrollbar. Tucks `SCROLLBAR_INSET`
     /// inside `right_edge_x`, vertical inset top & bottom. No-op when
-    /// content fits or fade has decayed.
+    /// content fits. Hover or active drag forces full opacity and a
+    /// wider thumb so the cursor can grab it; otherwise the thumb fades
+    /// per `scrollbar_alpha`. Records the drawn thumb rect on `self`
+    /// for `mouse_down` hit-testing.
     fn draw_bar(
-        &self,
+        &mut self,
         canvas: &Canvas,
         right_edge_x: f32,
         viewport_h: f32,
         content_h: f32,
     ) {
         if self.max_scroll <= 0.0 || content_h <= 0.0 {
-            return;
-        }
-        let alpha = scrollbar_alpha(self.last_scroll_time);
-        if alpha <= 0.0 {
+            self.last_thumb_rect = Rect::new(0.0, 0.0, 0.0, 0.0);
+            self.last_bar_geom = None;
             return;
         }
         let track_top = 6.0_f32;
@@ -847,19 +892,224 @@ impl Scroller {
         let thumb_top =
             track_top + (self.scroll_y / self.max_scroll) * (track_len - thumb_h);
         let thumb_bot = thumb_top + thumb_h;
-        let bar_x = right_edge_x - SCROLLBAR_INSET - SCROLLBAR_WIDTH;
+
+        // Wide-bar centerline anchors hover detection (and thin-bar
+        // drawing too — both are aligned so the bar doesn't shift x as
+        // it widens). `bar_x` always reads from this center.
+        let center_x = right_edge_x - SCROLLBAR_INSET - SCROLLBAR_HOVER_WIDTH * 0.5;
+
+        // Always remember geometry so mouse_down + cursor_moved have
+        // something to hit-test against, even if we're about to skip
+        // the visual draw because the fade has decayed.
+        self.last_bar_geom = Some(BarGeom {
+            track_top,
+            track_bot,
+            viewport_h,
+            content_h,
+            bar_center_x: center_x,
+        });
+
+        let active = self.hover || self.dragging.is_some();
+        let raw_alpha = scrollbar_alpha(self.last_scroll_time);
+        let alpha = if active { 1.0 } else { raw_alpha };
+        if alpha <= 0.0 {
+            // Faded out and nobody's hovering — record empty hit rect
+            // (mouse_down won't grab; cursor proximity will revive it
+            // on the next move via `set_hover_for_point`).
+            self.last_thumb_rect = Rect::new(0.0, 0.0, 0.0, 0.0);
+            return;
+        }
+
+        let width = if active {
+            SCROLLBAR_HOVER_WIDTH
+        } else {
+            SCROLLBAR_WIDTH
+        };
+        let bar_x = center_x - width * 0.5;
+        let thumb_rect = Rect::new(bar_x, thumb_top, bar_x + width, thumb_bot);
 
         let mut sb_paint = Paint::default();
         sb_paint.set_anti_alias(true);
         let alpha_byte = (alpha * 0xb0 as f32).round() as u8;
         sb_paint.set_color(crate::color::dark_alpha(alpha_byte));
-        let r = SCROLLBAR_WIDTH * 0.5;
-        canvas.draw_round_rect(
-            Rect::new(bar_x, thumb_top, bar_x + SCROLLBAR_WIDTH, thumb_bot),
-            r,
-            r,
-            &sb_paint,
-        );
+        let r = width * 0.5;
+        canvas.draw_round_rect(thumb_rect, r, r, &sb_paint);
+        self.last_thumb_rect = thumb_rect;
+    }
+
+    /// Update the hover flag from a window-coord cursor position. The
+    /// hover band is `bar_center_x ± SCROLLBAR_HOVER_SLOP` over the
+    /// track's vertical range. Returns true if hover changed (caller
+    /// can use this to schedule a redraw, since the bar's visual
+    /// widening / fade-revival depends on hover state).
+    fn set_hover_for_point(&mut self, x: f32, y: f32) -> bool {
+        let new_hover = match self.last_bar_geom {
+            Some(g) => {
+                (x - g.bar_center_x).abs() <= SCROLLBAR_HOVER_SLOP
+                    && y >= g.track_top
+                    && y <= g.track_bot
+            }
+            None => false,
+        };
+        let changed = new_hover != self.hover;
+        self.hover = new_hover;
+        changed
+    }
+
+    /// If `(x, y)` lands inside the thumb's hit zone (using the wide
+    /// rect for ergonomics — hover state isn't a precondition),
+    /// returns `Some(grab_offset)` where `grab_offset = y -
+    /// thumb_top`. The caller stores this as `dragging` so subsequent
+    /// drag-to events can hold the thumb under the cursor without
+    /// jumping.
+    fn thumb_hit(&self, x: f32, y: f32) -> Option<f32> {
+        let g = self.last_bar_geom?;
+        // Use the wide hit-zone width regardless of current visual
+        // width so a click on a thin bar still grabs cleanly.
+        let hit_left = g.bar_center_x - SCROLLBAR_HOVER_WIDTH * 0.5;
+        let hit_right = g.bar_center_x + SCROLLBAR_HOVER_WIDTH * 0.5;
+        if x < hit_left || x > hit_right {
+            return None;
+        }
+        let track_len = (g.track_bot - g.track_top).max(1.0);
+        let raw_thumb = (g.viewport_h / g.content_h.max(1.0)) * track_len;
+        let thumb_h = raw_thumb.max(SCROLLBAR_MIN_THUMB).min(track_len);
+        let thumb_top =
+            g.track_top + (self.scroll_y / self.max_scroll.max(1.0)) * (track_len - thumb_h);
+        let thumb_bot = thumb_top + thumb_h;
+        if y < thumb_top || y > thumb_bot {
+            return None;
+        }
+        Some(y - thumb_top)
+    }
+
+    /// Begin a thumb drag — `grab_offset` comes from `thumb_hit`. Kills
+    /// any in-flight kinetic coast (user is taking direct control)
+    /// and pins hover on so the bar stays wide for the duration.
+    fn start_thumb_drag(&mut self, grab_offset: f32) {
+        self.kill_kinetic();
+        self.dragging = Some(grab_offset);
+        self.hover = true;
+        self.last_scroll_time = Some(Instant::now());
+    }
+
+    /// Apply a thumb-drag motion: translates the new mouse y back into
+    /// a scroll position. Records the resulting `dy` as a kinetic
+    /// sample so velocity is populated when the user releases — a fast
+    /// fling-and-release leaves enough velocity for `step_kinetic` to
+    /// keep coasting after `end_thumb_drag`. No-op if not dragging or
+    /// geometry is stale. Returns true if `scroll_y` changed.
+    fn apply_thumb_drag(&mut self, y: f32) -> bool {
+        let (Some(grab_offset), Some(g)) = (self.dragging, self.last_bar_geom) else {
+            return false;
+        };
+        let track_len = (g.track_bot - g.track_top).max(1.0);
+        let raw_thumb = (g.viewport_h / g.content_h.max(1.0)) * track_len;
+        let thumb_h = raw_thumb.max(SCROLLBAR_MIN_THUMB).min(track_len);
+        let scroll_range = (track_len - thumb_h).max(1.0);
+        let desired_thumb_top = (y - grab_offset).clamp(g.track_top, g.track_top + scroll_range);
+        let new_scroll = ((desired_thumb_top - g.track_top) / scroll_range) * self.max_scroll;
+        let clamped = new_scroll.clamp(0.0, self.max_scroll);
+        let dy = clamped - self.scroll_y;
+        if dy.abs() < f32::EPSILON {
+            return false;
+        }
+        self.scroll_y = clamped;
+        let now = Instant::now();
+        self.recent_samples.push_back((now, dy));
+        self.recompute_velocity_from_window(now);
+        self.last_scroll_time = Some(now);
+        self.last_scroll_apply_at = Some(now);
+        true
+    }
+
+    /// End a thumb drag. Recomputes velocity at release so a "drag,
+    /// pause, then release" gesture doesn't fling on motion that
+    /// already finished — handled by the shared
+    /// `finalize_drag_release`. Caller usually pairs this with
+    /// `set_hover_for_point` so the bar's wide-hover state matches
+    /// whatever the cursor is over post-drag.
+    fn end_thumb_drag(&mut self) -> bool {
+        let was_dragging = self.dragging.take().is_some();
+        if was_dragging {
+            self.finalize_drag_release(Instant::now());
+        }
+        was_dragging
+    }
+
+    fn is_dragging_thumb(&self) -> bool {
+        self.dragging.is_some()
+    }
+
+    /// Apply an incremental scroll delta from a pan-drag (Space-drag
+    /// pan in the doc area). Same kinetic-sample bookkeeping as
+    /// `apply_wheel` and `apply_thumb_drag` — pushes a `(now, dy)`
+    /// sample and recomputes velocity — but without the wheel-event
+    /// interrupt logic, since pan deltas are by definition a
+    /// continuous gesture, not a fresh burst. Returns true if
+    /// `scroll_y` actually moved (false when clamped against a
+    /// bound). Bound-hits intentionally don't push a sample so the
+    /// existing samples age out naturally and velocity drops to zero
+    /// at the wall.
+    fn apply_pan_delta(&mut self, dy: f32) -> bool {
+        if dy.abs() < f32::EPSILON {
+            return false;
+        }
+        let new_y = (self.scroll_y + dy).clamp(0.0, self.max_scroll);
+        let actual = new_y - self.scroll_y;
+        if actual.abs() < f32::EPSILON {
+            return false;
+        }
+        self.scroll_y = new_y;
+        let now = Instant::now();
+        self.recent_samples.push_back((now, actual));
+        self.recompute_velocity_from_window(now);
+        self.last_scroll_time = Some(now);
+        self.last_scroll_apply_at = Some(now);
+        true
+    }
+
+    /// Drag-release fling-finalization, shared by every drag path
+    /// (scrollbar thumb, Space-drag pan). Prunes stale samples
+    /// relative to `now` (so a "drag, pause, release" gesture
+    /// doesn't fling on motion that already ended), recomputes
+    /// velocity from whatever survives, and anchors
+    /// `last_scroll_apply_at` to `now` so the first kinetic step
+    /// after release doesn't double-apply velocity from the last
+    /// drag sample.
+    fn finalize_drag_release(&mut self, now: Instant) {
+        self.recompute_velocity_from_window(now);
+        self.last_scroll_apply_at = Some(now);
+    }
+
+    /// Prune `recent_samples` to the velocity window relative to `now`,
+    /// then set `scroll_velocity_y` from whatever survives. Called
+    /// during drag (every move) and at release (where stale samples
+    /// from a paused gesture get pruned away). Same averaging shape as
+    /// `apply_wheel`'s inline computation, factored out so both
+    /// drag-mid and drag-release paths agree on the math.
+    fn recompute_velocity_from_window(&mut self, now: Instant) {
+        let cutoff = now - KINETIC_VELOCITY_WINDOW;
+        while self
+            .recent_samples
+            .front()
+            .map_or(false, |&(t, _)| t < cutoff)
+        {
+            self.recent_samples.pop_front();
+        }
+        if self.recent_samples.is_empty() {
+            self.scroll_velocity_y = 0.0;
+            return;
+        }
+        let total_dy: f32 = self.recent_samples.iter().map(|&(_, d)| d).sum();
+        let span = self
+            .recent_samples
+            .front()
+            .map(|&(t, _)| now.duration_since(t).as_secs_f32())
+            .unwrap_or(0.0)
+            .max(0.016);
+        let raw_v = total_dy / span;
+        self.scroll_velocity_y = raw_v.clamp(-KINETIC_MAX_VELOCITY, KINETIC_MAX_VELOCITY);
     }
 }
 
@@ -1019,6 +1269,63 @@ pub struct KeptApp {
     entity_title_fallback: Vec<(Uuid, String)>,
     /// Most recent cursor position in window (logical) coords, used for hover.
     mouse_pos: (f32, f32),
+    /// Tentative Alt-drag pan. Set at `mouse_down` when Alt is held +
+    /// the click lands in a pane; until the cursor's accumulated
+    /// y-displacement crosses `ALT_PAN_THRESHOLD` we don't commit to
+    /// pan — the click might be a plain Alt+click (multi-cursor add /
+    /// link-open). On threshold cross, the existing cell-level drag
+    /// (if any) is aborted and `pan_drag` takes over.
+    tentative_pan: Option<TentativePan>,
+    /// In-flight pan-drag. While `Some`, every `cursor_moved`
+    /// translates the y-delta into a scroll on the captured pane's
+    /// scroller, feeding the same kinetic sample queue used by the
+    /// wheel and the scrollbar thumb. On release, kinetic decay
+    /// carries any leftover velocity (a flick coasts).
+    pan_drag: Option<PanDrag>,
+}
+
+/// Which surface's `Scroller` a pan-drag is bound to. Sidebar gets
+/// its own scroller (independent of any pane's), so the gesture
+/// needs to track which surface it targets.
+#[derive(Clone, Copy)]
+enum PanTarget {
+    Pane(usize),
+    Sidebar,
+}
+
+/// Pan-drag binding: which scroller is being driven and the last
+/// cursor y observed (to compute frame-by-frame deltas without
+/// accumulating drift from absolute-position math).
+#[derive(Clone, Copy)]
+struct PanDrag {
+    target: PanTarget,
+    last_y: f32,
+}
+
+/// Pre-commit state for an Alt-drag gesture — captured at mouse_down,
+/// promoted to `PanDrag` once the cursor moves more than
+/// `ALT_PAN_THRESHOLD` from the initial click point. The dispatch
+/// (cell-level OR sidebar-level) is deferred while this is `Some`:
+/// on threshold cross we drop the deferred click (no multi-cursor
+/// add, no link navigation, no view change); on `mouse_up` without a
+/// cross we replay it through the matching dispatcher so the
+/// gesture commits as a plain Alt+click.
+#[derive(Clone, Copy)]
+struct TentativePan {
+    target: PanTarget,
+    click_x: f32,
+    click_y: f32,
+    /// Doc-space y at click time. For pane targets this is the
+    /// pane-scroll-adjusted y; for the sidebar it's the sidebar-
+    /// scroll-adjusted y. Captured here so a scroll change between
+    /// click and replay (kinetic decay finishing, etc.) can't shift
+    /// hit-test geometry out from under the replay.
+    click_doc_y: f32,
+    /// Modifier state at click time. Re-using `mouse_up`'s "now"
+    /// modifiers would let "alt down, click, alt up, release"
+    /// dispatch as a plain click — wrong; the user committed to
+    /// alt-click semantics the moment they pressed.
+    click_modifiers: Modifiers,
 }
 
 #[derive(Clone)]
@@ -1237,11 +1544,60 @@ impl KeptApp {
             cell_to_entity,
             entity_title_fallback,
             mouse_pos: (-1.0, -1.0),
+            tentative_pan: None,
+            pan_drag: None,
         }
     }
 
-    pub fn cursor_moved(&mut self, x: f32, y: f32) {
+    /// Returns true if anything changed that needs a redraw — currently
+    /// either a scrollbar hover transition (thin → wide / faded → full)
+    /// or an in-flight thumb drag updating `scroll_y`.
+    pub fn cursor_moved(&mut self, x: f32, y: f32) -> bool {
         self.mouse_pos = (x, y);
+        // Hover-state for every scrollbar: sidebar's bar uses raw (x, y)
+        // because the sidebar lives in window coords; pane bars also
+        // use window coords (pane scroller's geometry is recorded in
+        // window space by `tick_pane`). Hover bands don't overlap, so
+        // at most one bar will end up `hover=true` per move.
+        let mut changed = self.sidebar_scroll.set_hover_for_point(x, y);
+        for pane in &mut self.panes {
+            changed |= pane.scroller.set_hover_for_point(x, y);
+        }
+        // If a thumb drag is in progress, apply it. mouse_drag_to also
+        // routes drags, but cursor_moved fires for plain motion too —
+        // so a moving cursor with the button held updates the scroll
+        // even without a drag-specific delta.
+        if self.sidebar_scroll.is_dragging_thumb() {
+            changed |= self.sidebar_scroll.apply_thumb_drag(y);
+        }
+        for pane in &mut self.panes {
+            if pane.scroller.is_dragging_thumb() {
+                changed |= pane.scroller.apply_thumb_drag(y);
+            }
+        }
+        // Alt-drag pan: first chance per move to promote a tentative
+        // Alt+click into a committed pan once the cursor has moved
+        // past the threshold. The promotion itself jump-pans by the
+        // full from-click displacement, so we don't need an extra
+        // delta-apply on the same frame.
+        changed |= self.maybe_promote_tentative_pan(y);
+        // y motion translates to an opposite-sign scroll delta (drag
+        // the cursor down → paper moves with you → viewport moves up
+        // the document → scroll_y decreases). Updates `last_y` so
+        // subsequent moves compute deltas off the most recent sample,
+        // which keeps the math drift-free if the bound clamps at
+        // either end.
+        if let Some(pd) = self.pan_drag.as_mut() {
+            let dy_cursor = y - pd.last_y;
+            pd.last_y = y;
+            if dy_cursor.abs() >= f32::EPSILON {
+                let target = pd.target;
+                changed |= self
+                    .pan_scroller_mut(target)
+                    .apply_pan_delta(-dy_cursor * PAN_GAIN);
+            }
+        }
+        changed
     }
 
     // ----- pane helpers -----
@@ -1255,6 +1611,82 @@ impl KeptApp {
                 && y >= p.last_rect.top
                 && y < p.last_rect.bottom
         })
+    }
+
+    /// Resolve a `PanTarget` to a mutable `Scroller` reference. Sidebar
+    /// and per-pane scrollers share the same `Scroller` type, so the
+    /// pan code can call `apply_pan_delta` / `kill_kinetic` /
+    /// `finalize_drag_release` uniformly through this resolver.
+    fn pan_scroller_mut(&mut self, target: PanTarget) -> &mut Scroller {
+        match target {
+            PanTarget::Pane(i) => &mut self.panes[i].scroller,
+            PanTarget::Sidebar => &mut self.sidebar_scroll,
+        }
+    }
+
+    /// Inspect a cursor sample against an active `tentative_pan`. If
+    /// the cursor has moved more than `ALT_PAN_THRESHOLD` from the
+    /// initial click y, promote the gesture: abort the cell-level
+    /// drag started at mouse_down, kill kinetic on the captured
+    /// scroller, jump-pan by the full from-click displacement (so the
+    /// doc catches up to the current cursor on the very first frame
+    /// after commit), and install `pan_drag` so subsequent cursor
+    /// samples flow through `apply_pan_delta`. Returns true if a
+    /// promotion happened (caller can OR into its redraw flag). No-op
+    /// when no tentative is set, when the threshold isn't crossed, or
+    /// when a committed pan is already running.
+    fn maybe_promote_tentative_pan(&mut self, y: f32) -> bool {
+        if self.pan_drag.is_some() {
+            return false;
+        }
+        let Some(tp) = self.tentative_pan else {
+            return false;
+        };
+        let dy_from_click = y - tp.click_y;
+        if dy_from_click.abs() <= ALT_PAN_THRESHOLD {
+            return false;
+        }
+        // Abort whatever cell-level drag started at mouse_down (drag-
+        // select extension, multi-cursor extend) so it doesn't keep
+        // tracking under us. Cell.mouse_up cleanly closes its drag
+        // state without committing additional side effects. Sidebar
+        // targets never set `dragging_cell`, so the `take()` is a
+        // no-op there.
+        if let Some(id) = self.dragging_cell.take() {
+            if let Some(cell) = self.cell_mut(id) {
+                cell.mouse_up();
+            }
+        }
+        let target = tp.target;
+        let scroller = self.pan_scroller_mut(target);
+        scroller.kill_kinetic();
+        // Apply the full from-click-to-current displacement (gain-
+        // amplified) so the doc lands under the cursor — and a bit
+        // beyond — instead of jumping to track only post-threshold
+        // motion. The same delta feeds the velocity sampler, so a
+        // fast threshold-cross arrives as one big sample, matching
+        // how a fast wheel burst would.
+        let _ = scroller.apply_pan_delta(-dy_from_click * PAN_GAIN);
+        self.pan_drag = Some(PanDrag { target, last_y: y });
+        self.tentative_pan = None;
+        true
+    }
+
+    /// True iff some text input is currently consuming keystrokes —
+    /// the active pane is in cell edit mode (which covers cell body
+    /// and title editing, both of which set `editing` when entered),
+    /// the search popup is open, or a People-page inline edit is
+    /// running. The mention popup is always nested inside one of
+    /// those, so it's covered transitively.
+    ///
+    /// Used to gate behavior that conflicts with typing — e.g.,
+    /// Space-drag pan is suppressed while text inputs are focused
+    /// because Space types a character there.
+    fn is_text_input_focused(&self) -> bool {
+        self.editing
+            || self.search.is_some()
+            || self.people_rename.is_some()
+            || self.people_add.is_some()
     }
 
     /// True if `x` falls inside the divider's hit slop. Only meaningful
@@ -1814,15 +2246,9 @@ impl KeptApp {
         let mut cache = match target {
             ReferenceTarget::WholeCell(_) => {
                 let kind = source.kind.clone_for_scale(typeface, scale)?;
-                let title = source.title().map(|t| {
-                    let mut new_t = TextBox::new(typeface.clone(), t.text().to_string());
-                    new_t.set_force_heading(true);
-                    new_t.set_font_scale(scale);
-                    for l in t.links() {
-                        new_t.add_link(l.range.clone(), l.url.clone());
-                    }
-                    new_t
-                });
+                let title = source
+                    .title()
+                    .map(|t| t.clone_for_cache(typeface.clone(), scale));
                 let mut cache = Cell::from_parts(
                     Uuid::now_v7(),
                     kind,
@@ -1844,14 +2270,7 @@ impl KeptApp {
                 let bullets: Vec<cell::Bullet> = oc.bullets()[range]
                     .iter()
                     .map(|b| {
-                        let mut tb = TextBox::new(
-                            typeface.clone(),
-                            b.textbox().text().to_string(),
-                        );
-                        tb.set_font_scale(scale);
-                        for l in b.textbox().links() {
-                            tb.add_link(l.range.clone(), l.url.clone());
-                        }
+                        let tb = b.textbox().clone_for_cache(typeface.clone(), scale);
                         let new_depth = b.depth().saturating_sub(root_depth);
                         cell::Bullet::new(b.id(), tb, new_depth)
                     })
@@ -2105,6 +2524,13 @@ impl KeptApp {
         if idle {
             self.flush_persistence();
         }
+    }
+
+    /// True while an Alt-drag pan is in flight (committed past the
+    /// drag threshold). Used by the host (`main.rs`) to swap the
+    /// system cursor to a closed-hand "grabbing" icon.
+    pub fn is_panning(&self) -> bool {
+        self.pan_drag.is_some()
     }
 
     /// True if the mouse is currently over a link or an inline `#tag` in
@@ -3291,19 +3717,21 @@ impl KeptApp {
         }
 
         // Per-pane scrollbar in window coords, anchored at the pane's right edge.
-        self.scroller.draw_bar(
-            canvas,
-            pane_right,
-            self.viewport_height,
-            self.doc_height,
-        );
+        let viewport_h = self.viewport_height;
+        let doc_h = self.doc_height;
+        self.scroller.draw_bar(canvas, pane_right, viewport_h, doc_h);
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
-        // Any pressed key cancels in-flight kinetic coast on every pane.
-        // Releases don't (so a kinetic scroll doesn't get killed by the
-        // user releasing a modifier they were holding while wheeling).
-        if event.state == ElementState::Pressed {
+        // Any *fresh* key press cancels in-flight kinetic coast on
+        // every pane. Releases don't (so a kinetic scroll doesn't get
+        // killed by the user releasing a modifier they were holding
+        // while wheeling). OS auto-repeat events also don't — those
+        // are the system reasserting the held state, not new user
+        // input, and killing kinetic on every repeat would nuke a
+        // post-mouse-up Space-drag fling while the user is still
+        // holding Space.
+        if event.state == ElementState::Pressed && !event.repeat {
             self.kill_all_kinetic();
         }
 
@@ -5689,14 +6117,14 @@ impl KeptApp {
                 // meaningful against the source.
                 let hit = self
                     .cell_mut(cell_id)
-                    .and_then(|c| select_subtree_at_doc_y(c, doc_y));
+                    .and_then(|c| select_subtree_at_doc_y(c, cell_id, doc_y));
                 if hit.is_some() {
                     self.focused = Some(cell_id);
                 }
-                let (bullet_id, bullet_snippet) = hit
-                    .as_ref()
-                    .map(|(id, text)| (Some(*id), Some(snippet(text))))
-                    .unwrap_or((None, None));
+                let (bullet_origin_cell_id, bullet_id, bullet_snippet) = match hit.as_ref() {
+                    Some((origin, id, text)) => (Some(*origin), Some(*id), Some(snippet(text))),
+                    None => (None, None, None),
+                };
 
                 // Reference origin: always resolve through embeds to the
                 // source. Surface-as-reference (whole-cell or subtree)
@@ -5734,6 +6162,7 @@ impl KeptApp {
                     bullet_id,
                     bullet_snippet,
                     reference_origin_cell_id,
+                    bullet_origin_cell_id,
                     source_reference_target,
                     source_is_envelope,
                 });
@@ -5838,6 +6267,23 @@ impl KeptApp {
             return true;
         }
 
+        // Scrollbar thumb grab. Wins over divider / sidebar / cell
+        // dispatch because the bar is a visible UI element directly
+        // under the cursor — clicking on it should never fall through
+        // to whatever's behind. Sidebar's bar is checked first; pane
+        // bars next. The hit zones don't overlap (bars are anchored
+        // to different right-edges), so at most one match.
+        if let Some(grab) = self.sidebar_scroll.thumb_hit(x, y) {
+            self.sidebar_scroll.start_thumb_drag(grab);
+            return true;
+        }
+        for pane in &mut self.panes {
+            if let Some(grab) = pane.scroller.thumb_hit(x, y) {
+                pane.scroller.start_thumb_drag(grab);
+                return true;
+            }
+        }
+
         // Divider drag: a click within ±DIVIDER_HIT_SLOP of the divider
         // starts a drag. Tracks until mouse_up. Doesn't change active pane
         // or fire any other action.
@@ -5851,84 +6297,156 @@ impl KeptApp {
         // also exits focus mode so the new selection lands in the normal
         // multi-cell layout.
         if x < SIDEBAR_WIDTH * self.font_scale {
-            self.focus_mode = false;
-            // Sidebar rects are stored in content-space; map mouse to
-            // match (sidebar can scroll independently of the doc area).
-            let y = y + self.sidebar_scroll.scroll_y;
-            // Any sidebar interaction commits an in-progress People
-            // rename or add (don't lose typed input on nav).
-            if self.people_rename.is_some() {
-                self.commit_people_rename();
+            // Alt-drag pan deferral, parallel to the doc-area branch
+            // below: capture the click as tentative; threshold-cross
+            // promotes to pan (sidebar's own scroller); release without
+            // a cross replays through `dispatch_sidebar_click`. Letting
+            // the click dispatch fire here would push a new view (a
+            // sidebar nav) before the user has a chance to drag.
+            if modifiers.state().alt_key() && !self.is_text_input_focused() {
+                let click_doc_y = y + self.sidebar_scroll.scroll_y;
+                self.tentative_pan = Some(TentativePan {
+                    target: PanTarget::Sidebar,
+                    click_x: x,
+                    click_y: y,
+                    click_doc_y,
+                    click_modifiers: *modifiers,
+                });
+                return true;
             }
-            if self.people_add.is_some() {
-                self.commit_people_add();
-            }
-            // Alt+click on a sidebar entry opens the target in the *other*
-            // pane (splitting if there's only one). Plain click replaces the
-            // active pane's view as before.
-            let alt = modifiers.state().alt_key();
-            let open = |app: &mut Self, q: Query| -> bool {
-                if alt {
-                    app.open_in_other_pane(q)
-                } else {
-                    app.push_view(q)
-                }
-            };
-            // PAGES section first (top of the sidebar).
-            for (kind, rect) in self.hit_tests.sidebar.pages.clone() {
-                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    self.cell_context_menu = None;
-                    return match kind {
-                        PageKind::People => open(self, Query::people()),
-                    };
-                }
-            }
-            // Context rows first (they're indented inside dates so their bbox
-            // overlaps date row gaps in some edge cases — context wins).
-            for (id, rect) in self.hit_tests.sidebar.contexts.clone() {
-                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    self.cell_context_menu = None;
-                    return open(self, Query::context(id));
-                }
-            }
-            for (filter, rect) in self.hit_tests.sidebar.weeks.clone() {
-                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    self.cell_context_menu = None;
-                    let q = match filter {
-                        query::TimeFilter::ThisWeek => Query::this_week(),
-                        query::TimeFilter::LastWeek => Query::last_week(),
-                        // Anything else would mean we shipped a row
-                        // we don't know how to dispatch — fall back
-                        // to a no-op rather than guessing.
-                        _ => return false,
-                    };
-                    return open(self, q);
-                }
-            }
-            for (date, rect) in self.hit_tests.sidebar.dates.clone() {
-                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    self.cell_context_menu = None;
-                    return open(self, Query::date(date));
-                }
-            }
-            for (name, rect) in self.hit_tests.sidebar.tags.clone() {
-                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    self.cell_context_menu = None;
-                    return open(self, Query::tag(name));
-                }
-            }
-            self.cell_context_menu = None;
-            return false;
+            return self.dispatch_sidebar_click(x, y, modifiers);
         }
 
-        // Click is in the pane area — make the clicked pane active before
-        // computing doc-space coords. (doc_y depends on the pane's scroll.)
-        if let Some(idx) = self.pane_at(x, y) {
-            self.set_active_pane(idx);
+        // Pane-area click. Activate the clicked pane up front so any
+        // doc-space math sees the right scroll, and so an Alt-drag pan
+        // captured below moves focus consistently with a non-Alt click
+        // would have.
+        let pane_idx = self.pane_at(x, y);
+        if let Some(pi) = pane_idx {
+            self.set_active_pane(pi);
         }
-
         let doc_y = y + self.scroll_y;
 
+        // Alt-drag pan deferral. Held Alt + click in any pane area
+        // *might* be the start of a pan, but the click might also be
+        // a plain Alt+click on a People-page row, an entity-page
+        // reference, a cell, etc. We can't tell yet. Capture the
+        // click and skip the doc-area dispatch entirely for now —
+        // `cursor_moved` promotes to a committed pan if the cursor
+        // moves past `ALT_PAN_THRESHOLD`; otherwise `mouse_up`
+        // replays the click via `dispatch_doc_click` so the gesture
+        // commits as the alt-click semantics it would have had.
+        if let Some(pi) = pane_idx {
+            if modifiers.state().alt_key() && !self.is_text_input_focused() {
+                self.tentative_pan = Some(TentativePan {
+                    target: PanTarget::Pane(pi),
+                    click_x: x,
+                    click_y: y,
+                    click_doc_y: doc_y,
+                    click_modifiers: *modifiers,
+                });
+                return true;
+            }
+        }
+
+        self.dispatch_doc_click(x, y, doc_y, modifiers)
+    }
+
+    /// Sidebar-click dispatch — the body of the `mouse_down` sidebar
+    /// branch, factored out so the Alt-drag-pan deferral path can
+    /// replay it on `mouse_up` if the gesture didn't cross the pan
+    /// threshold. Returns whether the click was consumed.
+    fn dispatch_sidebar_click(
+        &mut self,
+        x: f32,
+        y: f32,
+        modifiers: &Modifiers,
+    ) -> bool {
+        self.focus_mode = false;
+        // Sidebar rects are stored in content-space; map mouse to
+        // match (sidebar can scroll independently of the doc area).
+        let y = y + self.sidebar_scroll.scroll_y;
+        // Any sidebar interaction commits an in-progress People
+        // rename or add (don't lose typed input on nav).
+        if self.people_rename.is_some() {
+            self.commit_people_rename();
+        }
+        if self.people_add.is_some() {
+            self.commit_people_add();
+        }
+        // Alt+click on a sidebar entry opens the target in the *other*
+        // pane (splitting if there's only one). Plain click replaces the
+        // active pane's view as before.
+        let alt = modifiers.state().alt_key();
+        let open = |app: &mut Self, q: Query| -> bool {
+            if alt {
+                app.open_in_other_pane(q)
+            } else {
+                app.push_view(q)
+            }
+        };
+        for (kind, rect) in self.hit_tests.sidebar.pages.clone() {
+            if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                self.cell_context_menu = None;
+                return match kind {
+                    PageKind::People => open(self, Query::people()),
+                };
+            }
+        }
+        // Context rows first (they're indented inside dates so their bbox
+        // overlaps date row gaps in some edge cases — context wins).
+        for (id, rect) in self.hit_tests.sidebar.contexts.clone() {
+            if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                self.cell_context_menu = None;
+                return open(self, Query::context(id));
+            }
+        }
+        for (filter, rect) in self.hit_tests.sidebar.weeks.clone() {
+            if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                self.cell_context_menu = None;
+                let q = match filter {
+                    query::TimeFilter::ThisWeek => Query::this_week(),
+                    query::TimeFilter::LastWeek => Query::last_week(),
+                    // Anything else would mean we shipped a row
+                    // we don't know how to dispatch — fall back
+                    // to a no-op rather than guessing.
+                    _ => return false,
+                };
+                return open(self, q);
+            }
+        }
+        for (date, rect) in self.hit_tests.sidebar.dates.clone() {
+            if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                self.cell_context_menu = None;
+                return open(self, Query::date(date));
+            }
+        }
+        for (name, rect) in self.hit_tests.sidebar.tags.clone() {
+            if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                self.cell_context_menu = None;
+                return open(self, Query::tag(name));
+            }
+        }
+        self.cell_context_menu = None;
+        false
+    }
+
+    /// Doc-area click dispatch — the part of `mouse_down` that runs
+    /// once we've decided the click isn't grabbed by a popup, the
+    /// scrollbar thumb, the divider, the sidebar, or an Alt-drag
+    /// pan. Factored out so the `mouse_up` replay path can run the
+    /// same dispatch a click-without-drag would have triggered at
+    /// `mouse_down` time. Caller is responsible for setting the
+    /// active pane and computing `doc_y` (those depend on the
+    /// click's coordinates and need to match between dispatch and
+    /// any deferred replay).
+    fn dispatch_doc_click(
+        &mut self,
+        x: f32,
+        y: f32,
+        doc_y: f32,
+        modifiers: &Modifiers,
+    ) -> bool {
         // Cell context menu dispatch: click on Delete row deletes;
         // click anywhere else dismisses and falls through to normal
         // cell routing.
@@ -5969,9 +6487,18 @@ impl KeptApp {
             if let Some(rect) = self.hit_tests.cell_menu.surface_subtree {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
-                        if let Some(bid) = menu.bullet_id {
+                        // Subtree origin is the cell that *owns* the
+                        // bullet — for clicks inside an envelope
+                        // header (or a deeper nested embed) that's
+                        // the embed's source, not the outer cell.
+                        // `bullet_origin_cell_id` tracks this; it
+                        // diverges from `reference_origin_cell_id`
+                        // for envelope-header bullet hits.
+                        if let (Some(origin), Some(bid)) =
+                            (menu.bullet_origin_cell_id, menu.bullet_id)
+                        {
                             self.surface_as_reference(ReferenceTarget::Subtree {
-                                cell_id: menu.reference_origin_cell_id,
+                                cell_id: origin,
                                 bullet_id: bid,
                             });
                         }
@@ -6131,6 +6658,22 @@ impl KeptApp {
             return false;
         }
 
+        self.dispatch_cell_click(x, doc_y, modifiers)
+    }
+
+    /// Cell-area click dispatch, factored out so it can run from
+    /// `mouse_down` directly (the common path) or from `mouse_up` as
+    /// a replay when an Alt-drag gesture didn't cross the pan
+    /// threshold (i.e., the user really did mean a plain Alt+click).
+    /// Owns: pick the target cell, retire other cells' selections,
+    /// shift focus, set up the cell drag binding, dispatch
+    /// `cell.mouse_down`, and drain any link/tag the click stashed.
+    fn dispatch_cell_click(
+        &mut self,
+        x: f32,
+        doc_y: f32,
+        modifiers: &Modifiers,
+    ) -> bool {
         let Some(target) = self.find_cell_at(x, doc_y) else {
             return false;
         };
@@ -6260,6 +6803,35 @@ impl KeptApp {
     }
 
     pub fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool {
+        // Scrollbar drag wins — translates the y-motion directly into
+        // a scroll position. `cursor_moved` also routes drag motion,
+        // but mouse_drag_to is the fallback path some hosts use for
+        // explicit drag deltas; honor both. Same applies to Space-drag
+        // pan below.
+        if self.sidebar_scroll.is_dragging_thumb() {
+            return self.sidebar_scroll.apply_thumb_drag(y);
+        }
+        for pane in &mut self.panes {
+            if pane.scroller.is_dragging_thumb() {
+                return pane.scroller.apply_thumb_drag(y);
+            }
+        }
+        // Promote a tentative Alt-drag the same way `cursor_moved`
+        // does — caller invokes both per cursor sample, but if some
+        // host only routes drag motion through this path we still
+        // commit on threshold-cross.
+        let promoted = self.maybe_promote_tentative_pan(y);
+        if let Some(pd) = self.pan_drag.as_mut() {
+            let dy_cursor = y - pd.last_y;
+            pd.last_y = y;
+            if dy_cursor.abs() >= f32::EPSILON {
+                let target = pd.target;
+                return self
+                    .pan_scroller_mut(target)
+                    .apply_pan_delta(-dy_cursor * PAN_GAIN);
+            }
+            return promoted;
+        }
         // Divider drag wins — recompute split_ratio relative to the pane
         // area (sidebar's right edge → window's right edge).
         if self.dragging_divider && self.panes.len() >= 2 {
@@ -6286,6 +6858,62 @@ impl KeptApp {
     }
 
     pub fn mouse_up(&mut self) -> bool {
+        // Tentative Alt-drag that never crossed the threshold —
+        // commit it now as a plain Alt+click by replaying the
+        // deferred dispatch on the matching surface. Sidebar
+        // gestures replay through `dispatch_sidebar_click`; doc-area
+        // gestures replay through `dispatch_doc_click` (covers cell
+        // clicks, People-page rows, entity-page references, the cell
+        // context menu, etc.). The cell-level `mouse_up` further
+        // down then commits any drag state set up by the replay. (A
+        // committed pan lives on `pan_drag` and is finalized further
+        // down instead.)
+        if let Some(tp) = self.tentative_pan.take() {
+            match tp.target {
+                PanTarget::Sidebar => {
+                    let _ = self.dispatch_sidebar_click(
+                        tp.click_x,
+                        tp.click_y,
+                        &tp.click_modifiers,
+                    );
+                }
+                PanTarget::Pane(_) => {
+                    let _ = self.dispatch_doc_click(
+                        tp.click_x,
+                        tp.click_y,
+                        tp.click_doc_y,
+                        &tp.click_modifiers,
+                    );
+                }
+            }
+        }
+
+        // End any thumb drag first. Refresh the hover state from the
+        // current cursor position — the bar should drop back to thin
+        // immediately if the cursor wandered off during the drag.
+        let mut ended = self.sidebar_scroll.end_thumb_drag();
+        for pane in &mut self.panes {
+            ended |= pane.scroller.end_thumb_drag();
+        }
+        if ended {
+            let (mx, my) = self.mouse_pos;
+            self.sidebar_scroll.set_hover_for_point(mx, my);
+            for pane in &mut self.panes {
+                pane.scroller.set_hover_for_point(mx, my);
+            }
+            return true;
+        }
+        // End any Space-drag pan. The drag accumulated samples in the
+        // captured pane's scroller; finalize_drag_release prunes
+        // stale samples and anchors `last_scroll_apply_at` so the
+        // next kinetic step takes over cleanly. Velocity is left in
+        // place — a flick coasts via the existing per-frame
+        // `step_kinetic` loop, just like a wheel-burst release.
+        if let Some(pd) = self.pan_drag.take() {
+            self.pan_scroller_mut(pd.target)
+                .finalize_drag_release(Instant::now());
+            return true;
+        }
         if self.dragging_divider {
             self.dragging_divider = false;
             return true;
@@ -6664,7 +7292,22 @@ fn snippet(text: &str) -> String {
 /// headers, recursive nested embeds) until either the deepest matching
 /// outline is found or no outline matches. When a match is found,
 /// highlights the bullet's sub-tree on that outline (`select_subtree`)
-/// and returns `(bullet_id, bullet_text)` for menu state.
+/// and returns `(origin_cell_id, bullet_id, bullet_text)`.
+///
+/// `origin_cell_id` is the id of the source cell whose outline owns
+/// the bullet — *not* `cell.id` when the descent crossed an embed
+/// boundary. Cache outlines preserve source bullet ids verbatim
+/// (see `clone_for_scale` and `build_reference_cache`), so a Subtree
+/// reference built from the returned `(origin, bullet)` resolves
+/// against the live source. Without this, surfacing a bullet from
+/// inside an envelope outline's header would mis-attribute the
+/// bullet to the envelope itself and immediately render as
+/// "[referenced bullet deleted]".
+///
+/// `top_cell_id` is the starting origin — the cell `cell` belongs to.
+/// Embed boundaries (`Reference` cell or `Outline` header band)
+/// update the origin to the embed's `target.cell_id()` for the
+/// recursive call.
 ///
 /// The descent is mutating because the caller wants the visual
 /// highlight to land in the right place — the outline that contains
@@ -6672,37 +7315,54 @@ fn snippet(text: &str) -> String {
 /// exclusive: a click in an envelope's header band routes into the
 /// header cache and ignores the outer outline's bullets, so a single
 /// hit can't double-highlight.
-fn select_subtree_at_doc_y(cell: &mut Cell, doc_y: f32) -> Option<(Uuid, String)> {
-    fn descend(kind: &mut CellKind, doc_y: f32) -> Option<(Uuid, String)> {
+fn select_subtree_at_doc_y(
+    cell: &mut Cell,
+    top_cell_id: Uuid,
+    doc_y: f32,
+) -> Option<(Uuid, Uuid, String)> {
+    fn descend(
+        kind: &mut CellKind,
+        origin: Uuid,
+        doc_y: f32,
+    ) -> Option<(Uuid, Uuid, String)> {
         match kind {
             CellKind::Outline(oc) => {
                 // Envelope outline: a click inside the header band
                 // descends into the embedded reference's cache rather
-                // than treating it as a bullet hit. If the cache is
-                // missing (depth-cap, dangling target) the click falls
-                // on the placeholder — return None and don't fall
-                // through to bullets, since the click wasn't in the
-                // bullet region.
+                // than treating it as a bullet hit. The new origin
+                // is the header's target cell — that's the source
+                // whose bullet ids the cache outline carries. If the
+                // cache is missing (depth-cap, dangling target) the
+                // click falls on the placeholder — return None and
+                // don't fall through to bullets, since the click
+                // wasn't in the bullet region.
                 if let Some((top, bot)) = oc.header_y_band() {
                     if doc_y >= top && doc_y < bot {
+                        let new_origin = oc
+                            .reference_header()
+                            .map(|h| h.target().cell_id())?;
                         return oc
                             .reference_header_mut()
                             .and_then(|h| h.cache_mut())
-                            .and_then(|cache| descend(&mut cache.kind, doc_y));
+                            .and_then(|cache| descend(&mut cache.kind, new_origin, doc_y));
                     }
                 }
                 let (id, text) = oc.bullet_at_doc_y(doc_y)?;
                 oc.select_subtree(id);
-                Some((id, text))
+                Some((origin, id, text))
             }
             CellKind::Reference(rc) => {
+                // Crossing into a Reference cell's cache: the cache
+                // outline carries the target source's bullet ids, so
+                // the origin shifts to that source.
+                let new_origin = rc.target().cell_id();
                 let cache = rc.cache_mut()?;
-                descend(&mut cache.kind, doc_y)
+                descend(&mut cache.kind, new_origin, doc_y)
             }
             _ => None,
         }
     }
-    descend(&mut cell.kind, doc_y)
+    descend(&mut cell.kind, top_cell_id, doc_y)
 }
 
 #[cfg(test)]
