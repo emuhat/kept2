@@ -623,6 +623,15 @@ impl OutlineCell {
             return true;
         }
 
+        // Click landed in the bullet body of an envelope outline —
+        // retire any leftover highlight inside the header cache so it
+        // doesn't visually compete with the new bullet-side selection.
+        if let Some(header) = self.reference_header.as_mut() {
+            if let Some(cache) = header.cache_mut() {
+                cache.clear_all_selections();
+            }
+        }
+
         let idx = self.bullet_idx_at_y(abs_y);
         if idx >= self.bullets.len() {
             return false;
@@ -973,6 +982,25 @@ impl OutlineCell {
         });
         self.focused_bullet = bullet_id;
         true
+    }
+
+    /// Clear every visible selection inside this outline: drops the
+    /// bullet sub-tree highlight, collapses any text drag-select on
+    /// each bullet, and recursively clears the envelope header's
+    /// embedded cache (so a stale highlight inside an embed doesn't
+    /// linger when focus moves away). Used by the app-level mouse_down
+    /// dispatch to retire highlights on cells that aren't the click
+    /// target.
+    pub fn clear_all_selections(&mut self) {
+        self.bullet_selection = None;
+        for b in &mut self.bullets {
+            b.textbox.clear_selection();
+        }
+        if let Some(h) = self.reference_header.as_mut() {
+            if let Some(cache) = h.cache_mut() {
+                cache.clear_all_selections();
+            }
+        }
     }
 
     /// Select all text inside the focused bullet's textbox.

@@ -373,6 +373,17 @@ impl TextBox {
         self.sels.items.iter().any(|s| !s.is_collapsed())
     }
 
+    /// Collapse every selection range — anchor snaps onto head — so no
+    /// visible highlight remains. Caret position is preserved. Called
+    /// when a new mouse_down elsewhere should retire stale highlights
+    /// in cells that aren't the click target (otherwise an old
+    /// selection visually competes with the new one).
+    pub fn clear_selection(&mut self) {
+        for s in &mut self.sels.items {
+            s.anchor = s.head;
+        }
+    }
+
     /// Replace every non-empty selection with empty text. Carets land at
     /// the deletion point. No-op when nothing is selected.
     pub fn delete_selection(&mut self) {

@@ -560,6 +560,15 @@ const EMBED_FOOTER_FONT_SIZE: f32 = 12.0;
 /// share a value but their roles are distinct).
 const ENVELOPE_HEADER_GAP: f32 = 6.0;
 
+/// Maximum nesting depth for embed previews. When an envelope outline
+/// is itself the target of a reference, its header (the inner embed)
+/// is rendered recursively up to this many levels deep. Beyond the
+/// cap, the deepest level shows an "embed depth limit" placeholder
+/// instead of recursing further. Counts the user-facing reference as
+/// level 0, so MAX = 4 means up to four nested dashed-border embeds
+/// can stack before the placeholder appears.
+const MAX_EMBED_DEPTH: usize = 4;
+
 /// Pane divider (gutter between left and right panes). 6 px wide, painted
 /// in the same separator tone as the sidebar's right edge. Hover within
 /// ±DIVIDER_HIT_SLOP px in x grabs it for drag.
@@ -1507,7 +1516,7 @@ impl KeptApp {
                     _ => false,
                 };
                 if is_stale {
-                    let new_cache = self.build_reference_cache(tidx, target);
+                    let new_cache = self.build_reference_cache(tidx, target, 0);
                     if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
                         rc.install_cache(new_cache, Some(source_edited_at));
                     }
@@ -1533,19 +1542,28 @@ impl KeptApp {
                 canvas, msg, body_x, body_y, body_w, scale,
             ),
             PreviewKind::Cached => {
-                if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
-                    if let Some(cache) = rc.cache_mut() {
-                        // Tick the cache: focused mirrors the outer cell's
-                        // focus state (so selection highlights show only
-                        // when this reference is the focused cell). Caret
-                        // is always suppressed — references are read-only.
-                        cache.tick(canvas, body_x, body_y, body_w, focused, false)
-                    } else {
-                        0.0
-                    }
+                // Detach the cache from the host so the &mut borrow on
+                // `self.cells` ends, then route through
+                // `tick_embedded_cell` (which needs &self for the
+                // wrapper / placeholder helpers and recurses on
+                // envelope-outline caches). Re-attach afterwards.
+                let detached = if let CellKind::Reference(rc) =
+                    &mut self.cells[ref_idx].kind
+                {
+                    rc.detach_cache()
                 } else {
-                    0.0
+                    None
+                };
+                let mut h = 0.0;
+                if let Some(mut cache) = detached {
+                    h = self.tick_embedded_cell(
+                        canvas, &mut cache, body_x, body_y, body_w, focused,
+                    );
+                    if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
+                        rc.attach_cache(Some(cache));
+                    }
                 }
+                h
             }
         };
 
@@ -1661,7 +1679,7 @@ impl KeptApp {
                     _ => false,
                 };
                 if is_stale {
-                    let new_cache = self.build_reference_cache(tidx, target);
+                    let new_cache = self.build_reference_cache(tidx, target, 0);
                     if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
                         if let Some(h) = oc.reference_header_mut() {
                             h.install_cache(new_cache, Some(source_edited_at));
@@ -1695,26 +1713,34 @@ impl KeptApp {
                 scale,
             ),
             PreviewKind::Cached => {
-                if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
-                    if let Some(h) = oc.reference_header_mut() {
-                        if let Some(cache) = h.cache_mut() {
-                            cache.tick(
-                                canvas,
-                                body_x_inner,
-                                body_y_inner,
-                                body_w_inner,
-                                focused,
-                                false,
-                            )
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.0
-                    }
+                // Detach + route through `tick_embedded_cell` so a
+                // nested envelope inside this header renders
+                // recursively. Re-attach afterwards.
+                let detached = if let CellKind::Outline(oc) =
+                    &mut self.cells[cell_idx].kind
+                {
+                    oc.reference_header_mut()
+                        .and_then(|h| h.detach_cache())
                 } else {
-                    0.0
+                    None
+                };
+                let mut h = 0.0;
+                if let Some(mut cache) = detached {
+                    h = self.tick_embedded_cell(
+                        canvas,
+                        &mut cache,
+                        body_x_inner,
+                        body_y_inner,
+                        body_w_inner,
+                        focused,
+                    );
+                    if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+                        if let Some(href) = oc.reference_header_mut() {
+                            href.attach_cache(Some(cache));
+                        }
+                    }
                 }
+                h
             }
         };
 
@@ -1761,18 +1787,31 @@ impl KeptApp {
 
     /// Build a fresh cache `Cell` mirroring the source's content. Returns
     /// None when the target isn't renderable (e.g., Subtree whose bullet
-    /// is gone, Subtree pointing at a non-Outline cell). The cache is a
-    /// real `Cell` so it owns selection state across frames and dispatches
+    /// is gone, Subtree pointing at a non-Outline cell), or when the
+    /// embed `depth` has reached `MAX_EMBED_DEPTH`. The cache is a real
+    /// `Cell` so it owns selection state across frames and dispatches
     /// mouse events through the standard machinery.
+    ///
+    /// `depth` counts the *current* embed level — top-level callers
+    /// (a reference cell, an envelope outline header, the entity-page
+    /// references list) pass 0. When the resulting cache is itself an
+    /// envelope outline, this fn recursively builds the nested header's
+    /// cache at `depth + 1`, so `clone_for_scale`'s preserved-header
+    /// gets populated before render time. None at the cap surfaces as a
+    /// "depth limit" placeholder via the render path.
     fn build_reference_cache(
         &self,
         target_idx: usize,
         target: ReferenceTarget,
+        depth: usize,
     ) -> Option<Cell> {
+        if depth >= MAX_EMBED_DEPTH {
+            return None;
+        }
         let source = &self.cells[target_idx];
         let scale = self.font_scale;
         let typeface = &self.typeface;
-        match target {
+        let mut cache = match target {
             ReferenceTarget::WholeCell(_) => {
                 let kind = source.kind.clone_for_scale(typeface, scale)?;
                 let title = source.title().map(|t| {
@@ -1793,7 +1832,7 @@ impl KeptApp {
                     source.context_hint_id,
                 );
                 cache.set_font_scale(scale);
-                Some(cache)
+                cache
             }
             ReferenceTarget::Subtree { bullet_id, .. } => {
                 let oc = match &source.kind {
@@ -1817,6 +1856,9 @@ impl KeptApp {
                         cell::Bullet::new(b.id(), tb, new_depth)
                     })
                     .collect();
+                // Subtree caches never carry an envelope header — the
+                // subtree is bullet content only — so no recursive
+                // resolution is needed here.
                 let mut new_oc = cell::OutlineCell::from_bullets(typeface.clone(), bullets);
                 new_oc.set_font_scale(scale);
                 let mut cache = Cell::from_parts(
@@ -1828,9 +1870,34 @@ impl KeptApp {
                     source.context_hint_id,
                 );
                 cache.set_font_scale(scale);
-                Some(cache)
+                cache
+            }
+        };
+
+        // If the cache cell is an envelope outline, recursively build
+        // the nested header's cache. `clone_for_scale` carried the
+        // header's target across; the cache slot is currently empty.
+        // Resolve the nested target from the live cells list and
+        // install the result (which may itself be a deeper envelope or
+        // a None at the depth cap).
+        if let CellKind::Outline(oc) = &mut cache.kind {
+            if let Some(h) = oc.reference_header_mut() {
+                let nested_target = h.target();
+                let nested_idx = self
+                    .cells
+                    .iter()
+                    .position(|c| c.id == nested_target.cell_id());
+                if let Some(ni) = nested_idx {
+                    let nested_edited_at = self.cells[ni].edited_at;
+                    let nested_cache =
+                        self.build_reference_cache(ni, nested_target, depth + 1);
+                    h.install_cache(nested_cache, Some(nested_edited_at));
+                } else {
+                    h.install_cache(None, None);
+                }
             }
         }
+        Some(cache)
     }
 
     /// One-line muted placeholder for dangling / wrong-kind references.
@@ -1909,6 +1976,116 @@ impl KeptApp {
         paint.set_color(crate::color::text_muted_grey());
         canvas.draw_str(text, Point::new(x, baseline), &font, &paint);
         -m.ascent + m.descent
+    }
+
+    /// Tick a cache `Cell` inside an embed wrapper, with envelope-aware
+    /// recursion. For non-envelope caches this is a thin pass-through
+    /// to `Cell::tick`. For envelope-outline caches it draws the
+    /// nested embed header (recursively rendered through this same fn,
+    /// or a "depth limit" placeholder when the nested cache is None)
+    /// followed by the bullet body, mirroring the top-level
+    /// `render_envelope_outline_cell` chrome.
+    ///
+    /// Caller owns the cache cell — typically detached from a
+    /// `ReferenceCell` or `EmbeddedReference` to drop the host borrow,
+    /// then re-attached after this call returns.
+    fn tick_embedded_cell(
+        &self,
+        canvas: &Canvas,
+        cell: &mut Cell,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+    ) -> f32 {
+        let is_envelope = matches!(
+            &cell.kind,
+            CellKind::Outline(oc) if oc.has_reference_header()
+        );
+        if !is_envelope {
+            return cell.tick(canvas, x, y, width, focused, false);
+        }
+
+        let scale = self.font_scale;
+        let inset = EMBED_INSET * scale;
+        let pad = EMBED_PAD * scale;
+        let body_x_inner = x + inset;
+        let body_y_inner = y + pad;
+        let body_w_inner = (width - 2.0 * inset).max(40.0);
+
+        // Render the nested embedded reference (the envelope's
+        // header). If the nested cache is None — either depth-cap was
+        // hit during the build pass, or the target was unrenderable —
+        // surface a placeholder line.
+        let header_body_h = if let CellKind::Outline(oc) = &mut cell.kind {
+            let detached = oc
+                .reference_header_mut()
+                .and_then(|h| h.detach_cache());
+            match detached {
+                Some(mut nested) => {
+                    let h = self.tick_embedded_cell(
+                        canvas,
+                        &mut nested,
+                        body_x_inner,
+                        body_y_inner,
+                        body_w_inner,
+                        focused,
+                    );
+                    if let Some(href) = oc.reference_header_mut() {
+                        href.attach_cache(Some(nested));
+                    }
+                    h
+                }
+                None => self.render_embed_placeholder(
+                    canvas,
+                    "↗ [embed depth limit]",
+                    body_x_inner,
+                    body_y_inner,
+                    body_w_inner,
+                    scale,
+                ),
+            }
+        } else {
+            0.0
+        };
+
+        // Cache cells carry the source's timestamp from
+        // `build_reference_cache`, so this surfaces the right date for
+        // every nested level without needing the source index.
+        let footer_text = format!(
+            "↗ originally {}",
+            format_date_label(local_date_for_ms(cell.timestamp))
+        );
+        let header_total_h = self.draw_embed_wrapper(
+            canvas,
+            x,
+            y,
+            width,
+            body_x_inner,
+            header_body_h,
+            &footer_text,
+            scale,
+        );
+
+        // Record the header band on the cache outline so hit-testing
+        // inside the cache (drag-select, link clicks) routes correctly
+        // even when this fn is rendering a nested cache cell. Geometry
+        // is in document space (same convention as the top-level
+        // `render_envelope_outline_cell`).
+        if let CellKind::Outline(oc) = &mut cell.kind {
+            oc.set_reference_header_geometry(y, header_total_h);
+        }
+
+        let after_header_y = y + header_total_h + ENVELOPE_HEADER_GAP * scale;
+        let bullets_h = if let CellKind::Outline(oc) = &mut cell.kind {
+            oc.tick(canvas, x, after_header_y, width, focused, false)
+        } else {
+            0.0
+        };
+
+        let total_h = header_total_h + ENVELOPE_HEADER_GAP * scale + bullets_h;
+        cell.set_view_geometry(x, y, width, total_h);
+        total_h
     }
 
     /// Debounced persistence flush. Called once per frame from `tick`,
@@ -4140,11 +4317,12 @@ impl KeptApp {
                 let mut maybe_cache = self.build_reference_cache(
                     target_idx,
                     ReferenceTarget::WholeCell(target_cell_id),
+                    0,
                 );
                 let body_h = match &mut maybe_cache {
-                    Some(cache) => {
-                        cache.tick(canvas, body_x, y + pad, body_w, false, false)
-                    }
+                    Some(cache) => self.tick_embedded_cell(
+                        canvas, cache, body_x, y + pad, body_w, false,
+                    ),
                     None => self.render_embed_placeholder(
                         canvas,
                         "↗ [unrenderable]",
@@ -5501,24 +5679,23 @@ impl KeptApp {
         ) {
             let doc_y = y + self.scroll_y;
             if let Some(cell_id) = self.find_cell_at(x, doc_y) {
-                // Right-click on a bullet captures (id, snippet). For
-                // embeds, the embed's cached outline carries the source
-                // bullet ids unchanged (see `build_reference_cache`),
-                // so the bullet id is meaningful against the source.
-                let (bullet_id, bullet_snippet) = self
-                    .cell(cell_id)
-                    .and_then(|c| {
-                        let oc = match &c.kind {
-                            CellKind::Outline(oc) => Some(oc),
-                            CellKind::Reference(rc) => match rc.cache_ref()?.kind {
-                                CellKind::Outline(ref oc) => Some(oc),
-                                _ => None,
-                            },
-                            _ => None,
-                        }?;
-                        oc.bullet_at_doc_y(doc_y)
-                            .map(|(id, text)| (Some(id), Some(snippet(&text))))
-                    })
+                // Right-click on a bullet captures (id, snippet) AND
+                // visually highlights its sub-tree, descending through
+                // any embed wrappers under the cursor (Reference cells,
+                // envelope outline headers, recursive nested embeds)
+                // until it reaches the actual outline. Cached outlines
+                // carry the source bullet ids unchanged (see
+                // `build_reference_cache`), so the captured id remains
+                // meaningful against the source.
+                let hit = self
+                    .cell_mut(cell_id)
+                    .and_then(|c| select_subtree_at_doc_y(c, doc_y));
+                if hit.is_some() {
+                    self.focused = Some(cell_id);
+                }
+                let (bullet_id, bullet_snippet) = hit
+                    .as_ref()
+                    .map(|(id, text)| (Some(*id), Some(snippet(text))))
                     .unwrap_or((None, None));
 
                 // Reference origin: always resolve through embeds to the
@@ -5550,27 +5727,6 @@ impl KeptApp {
                     })
                     .unwrap_or(false);
 
-                // Visualize the subtree selection: for direct outlines,
-                // on the cell itself; for embeds, on the cached outline
-                // so the highlight appears inside the embed body.
-                if let Some(bid) = bullet_id {
-                    self.focused = Some(cell_id);
-                    if let Some(c) = self.cell_mut(cell_id) {
-                        match &mut c.kind {
-                            CellKind::Outline(oc) => {
-                                oc.select_subtree(bid);
-                            }
-                            CellKind::Reference(rc) => {
-                                if let Some(cache) = rc.cache_mut() {
-                                    if let CellKind::Outline(oc) = &mut cache.kind {
-                                        oc.select_subtree(bid);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
                 self.cell_context_menu = Some(CellContextMenu {
                     cell_id,
                     anchor_x: x,
@@ -5985,6 +6141,16 @@ impl KeptApp {
         if Some(target) != self.focused {
             self.focused = Some(target);
             self.editing = false;
+        }
+        // Retire any visible selection on cells that aren't the click
+        // target. Includes embedded-reference caches (recursively), so
+        // a stale highlight inside a Reference cell or envelope header
+        // doesn't linger when focus moves elsewhere. The target cell's
+        // own selection state is reset by its `mouse_down` below.
+        for other in &mut self.cells {
+            if other.id != target {
+                other.clear_all_selections();
+            }
         }
         // Any click moves/replaces the caret — break coalescing so the next
         // text edit starts a fresh undo entry.
@@ -6491,6 +6657,52 @@ fn snippet(text: &str) -> String {
     }
     let truncated: String = collapsed.chars().take(29).collect();
     format!("{}…", truncated)
+}
+
+/// Walk into `cell` looking for an outline whose bullets cover `doc_y`,
+/// descending through embed wrappers (Reference cells, envelope outline
+/// headers, recursive nested embeds) until either the deepest matching
+/// outline is found or no outline matches. When a match is found,
+/// highlights the bullet's sub-tree on that outline (`select_subtree`)
+/// and returns `(bullet_id, bullet_text)` for menu state.
+///
+/// The descent is mutating because the caller wants the visual
+/// highlight to land in the right place — the outline that contains
+/// the click, not the outermost wrapper. Each layer is mutually
+/// exclusive: a click in an envelope's header band routes into the
+/// header cache and ignores the outer outline's bullets, so a single
+/// hit can't double-highlight.
+fn select_subtree_at_doc_y(cell: &mut Cell, doc_y: f32) -> Option<(Uuid, String)> {
+    fn descend(kind: &mut CellKind, doc_y: f32) -> Option<(Uuid, String)> {
+        match kind {
+            CellKind::Outline(oc) => {
+                // Envelope outline: a click inside the header band
+                // descends into the embedded reference's cache rather
+                // than treating it as a bullet hit. If the cache is
+                // missing (depth-cap, dangling target) the click falls
+                // on the placeholder — return None and don't fall
+                // through to bullets, since the click wasn't in the
+                // bullet region.
+                if let Some((top, bot)) = oc.header_y_band() {
+                    if doc_y >= top && doc_y < bot {
+                        return oc
+                            .reference_header_mut()
+                            .and_then(|h| h.cache_mut())
+                            .and_then(|cache| descend(&mut cache.kind, doc_y));
+                    }
+                }
+                let (id, text) = oc.bullet_at_doc_y(doc_y)?;
+                oc.select_subtree(id);
+                Some((id, text))
+            }
+            CellKind::Reference(rc) => {
+                let cache = rc.cache_mut()?;
+                descend(&mut cache.kind, doc_y)
+            }
+            _ => None,
+        }
+    }
+    descend(&mut cell.kind, doc_y)
 }
 
 #[cfg(test)]

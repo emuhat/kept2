@@ -92,6 +92,22 @@ impl EmbeddedReference {
     pub fn cache_ref(&self) -> Option<&Cell> {
         self.cache.as_deref()
     }
+
+    /// Take ownership of the cache, leaving the slot empty. Paired with
+    /// `attach_cache` to let callers route the cache cell through code
+    /// that needs `&mut self` on the host (the borrow on the host is
+    /// dropped while the cache is detached). Does not touch the
+    /// staleness key — the caller is shuffling, not invalidating.
+    pub fn detach_cache(&mut self) -> Option<Box<Cell>> {
+        self.cache.take()
+    }
+
+    /// Re-install a cache previously taken via `detach_cache`. Caller
+    /// is responsible for passing back the same (or freshly rebuilt)
+    /// cache; staleness key is left as-is.
+    pub fn attach_cache(&mut self, cache: Option<Box<Cell>>) {
+        self.cache = cache;
+    }
 }
 
 /// A read-only window onto another cell (or sub-tree). Renders the
@@ -147,6 +163,14 @@ impl ReferenceCell {
 
     pub fn cache_ref(&self) -> Option<&Cell> {
         self.head.cache_ref()
+    }
+
+    pub fn detach_cache(&mut self) -> Option<Box<Cell>> {
+        self.head.detach_cache()
+    }
+
+    pub fn attach_cache(&mut self, cache: Option<Box<Cell>>) {
+        self.head.attach_cache(cache);
     }
 
     #[allow(dead_code)]

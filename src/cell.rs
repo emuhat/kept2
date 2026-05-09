@@ -169,13 +169,17 @@ impl CellKind {
                         Bullet::new(b.id(), tb, b.depth())
                     })
                     .collect();
-                // Envelope outlines used as a Reference target render
-                // their bullets only — the header is dropped from the
-                // cache. v1 trade-off documented in the plan; users who
-                // want to see the embedded source can click through to
-                // the envelope itself, which renders the header
-                // natively.
-                let mut new_oc = OutlineCell::from_bullets(typeface.clone(), bullets);
+                // Envelope outlines preserve their header in the cache
+                // so recursive embed rendering can resolve nested
+                // references. Carry the target only — the nested cache
+                // rebuilds lazily via the staleness check on the next
+                // render pass (and is depth-capped in
+                // `build_reference_cache`).
+                let header = oc
+                    .reference_header()
+                    .map(|h| EmbeddedReference::new(h.target()));
+                let mut new_oc =
+                    OutlineCell::from_bullets_with_header(typeface.clone(), bullets, header);
                 new_oc.set_font_scale(scale);
                 Some(CellKind::Outline(new_oc))
             }
@@ -1334,6 +1338,31 @@ impl Cell {
         }
     }
 
+    /// Drop every visible selection on this cell — title text drag,
+    /// body text drag, outline bullet sub-tree highlight, table cell
+    /// drag, and any embedded reference cache (recursively, so an
+    /// envelope outline's header cache or a nested embed loses its
+    /// stale highlight too). Used by the app-level mouse_down dispatch
+    /// to retire highlights on cells that aren't the click target —
+    /// otherwise an old highlight stays on screen and visually
+    /// competes with the new selection.
+    pub fn clear_all_selections(&mut self) {
+        if let Some(title) = self.title.as_mut() {
+            title.clear_selection();
+        }
+        match &mut self.kind {
+            CellKind::Plain(tb) => tb.clear_selection(),
+            CellKind::Outline(oc) => oc.clear_all_selections(),
+            CellKind::PopPop(pc) => pc.textbox_mut().clear_selection(),
+            CellKind::Table(tc) => tc.clear_all_selections(),
+            CellKind::Reference(rc) => {
+                if let Some(cache) = rc.cache_mut() {
+                    cache.clear_all_selections();
+                }
+            }
+        }
+    }
+
     /// Select all text in the cell's active text input — title when focused,
     /// otherwise the kind-specific body element.
     pub fn select_all_focused(&mut self) {
@@ -1559,6 +1588,41 @@ mod tests {
             ReferenceTarget::WholeCell(target_id),
         );
         assert!(!oc.is_empty());
+    }
+
+    #[test]
+    fn clone_for_scale_preserves_envelope_header_target() {
+        // Recursive embed rendering depends on `clone_for_scale`
+        // carrying the envelope's header target through to the cache
+        // cell. The cache field is left empty here — `build_reference_cache`
+        // populates it (recursively) during the build pass.
+        let target_id = Uuid::now_v7();
+        let mut oc = OutlineCell::with_envelope(
+            typeface(),
+            ReferenceTarget::WholeCell(target_id),
+        );
+        let bid = oc.bullets()[0].id();
+        oc.replace_in_bullet_with_text(bid, 0..0, "envelope notes".to_string());
+        let kind = CellKind::Outline(oc);
+
+        let cloned = kind
+            .clone_for_scale(&typeface(), 1.0)
+            .expect("envelope outline clones");
+        let CellKind::Outline(new_oc) = cloned else {
+            panic!("clone_for_scale on Outline must yield Outline");
+        };
+        let header = new_oc
+            .reference_header()
+            .expect("header preserved through clone_for_scale");
+        match header.target() {
+            ReferenceTarget::WholeCell(id) => assert_eq!(id, target_id),
+            _ => panic!("WholeCell target survives the clone"),
+        }
+        assert!(
+            header.cache_ref().is_none(),
+            "cache is left empty for `build_reference_cache` to populate"
+        );
+        assert_eq!(new_oc.bullets()[0].textbox().text(), "envelope notes");
     }
 
     #[test]

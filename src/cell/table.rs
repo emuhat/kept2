@@ -482,6 +482,18 @@ impl TableCell {
         false
     }
 
+    /// Collapse every cell's text selection. Used by the cross-cell
+    /// mouse_down housekeeping pass — when focus leaves this table,
+    /// any drag-select inside one of its entries should retire so it
+    /// doesn't compete with the new click target's highlight.
+    pub fn clear_all_selections(&mut self) {
+        for row in &mut self.cells {
+            for entry in row {
+                entry.textbox.clear_selection();
+            }
+        }
+    }
+
     pub fn copy_selection(&self) -> String {
         for row in &self.cells {
             for entry in row {
