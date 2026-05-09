@@ -160,6 +160,6 @@ Inactive cells and bullets are hidden from views by default. The **Show inactive
 |---|---|
 | Wheel | Scroll the pane under the cursor (independent of which pane is active) |
 | Drag the scrollbar thumb | Direct scrolling; flick-and-release coasts via kinetic decay |
-| `Alt` + drag | Pan the pane under the cursor like grabbing paper; flick to coast. Disambiguated from `Alt`+click (multi-cursor add / open-link-in-other-pane) by a small drag threshold — short drags stay clicks, longer drags become a pan |
+| `Alt` + drag | Drag from anywhere in a pane as if you were dragging the scrollbar thumb — cursor y maps absolutely to scroll position (so the gain matches what scrollbar drag would feel like). Flick-and-release coasts via kinetic decay. Disambiguated from `Alt`+click (open in other pane / multi-cursor add) by a small drag threshold; short drags stay clicks, longer drags become pans |
 | Drag the divider | Resize the split (clamped between 15% and 85%) |
 | Click | Activate the pane that was clicked, then dispatch normally |

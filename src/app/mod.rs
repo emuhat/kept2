@@ -608,15 +608,6 @@ const ENVELOPE_HEADER_GAP: f32 = 6.0;
 /// jitter — a few px of accidental motion shouldn't yank the doc.
 const ALT_PAN_THRESHOLD: f32 = 6.0;
 
-/// Pan-drag scroll amplification — each pixel of cursor motion drives
-/// `PAN_GAIN` pixels of scroll. Without this, dragging matches cursor
-/// 1:1 and is no faster than the wheel, which defeats the purpose of
-/// the gesture. Applied uniformly to the threshold-cross jump and to
-/// every per-frame drag delta, so the kinetic-fling sample window
-/// also sees the amplified deltas (a flick at the end of a drag
-/// coasts proportionally further).
-const PAN_GAIN: f32 = 2.5;
-
 /// Maximum nesting depth for embed previews. When an envelope outline
 /// is itself the target of a reference, its header (the inner embed)
 /// is rendered recursively up to this many levels deep. Beyond the
@@ -851,6 +842,17 @@ impl Scroller {
     /// friction, and stops when speed drops below the floor or a
     /// bound is hit. Returns true if `scroll_y` moved.
     fn step_kinetic(&mut self) -> bool {
+        // No kinetic while a drag is in flight (scrollbar thumb or
+        // Alt-drag pan). The drag is direct control — the user's
+        // cursor sets `scroll_y` exactly via `apply_thumb_drag`. The
+        // velocity field still accumulates from drag samples so a
+        // flick-and-release coasts, but until release we'd be
+        // integrating that velocity ON TOP of the user's drag,
+        // which fights the gesture (and inverts when the user
+        // reverses direction faster than the velocity window prunes).
+        if self.dragging.is_some() {
+            return false;
+        }
         if self.scroll_velocity_y.abs() < KINETIC_MIN_VELOCITY {
             self.scroll_velocity_y = 0.0;
             return false;
@@ -1071,31 +1073,36 @@ impl Scroller {
         self.dragging.is_some()
     }
 
-    /// Apply an incremental scroll delta from a pan-drag (Space-drag
-    /// pan in the doc area). Same kinetic-sample bookkeeping as
-    /// `apply_wheel` and `apply_thumb_drag` — pushes a `(now, dy)`
-    /// sample and recomputes velocity — but without the wheel-event
-    /// interrupt logic, since pan deltas are by definition a
-    /// continuous gesture, not a fresh burst. Returns true if
-    /// `scroll_y` actually moved (false when clamped against a
-    /// bound). Bound-hits intentionally don't push a sample so the
-    /// existing samples age out naturally and velocity drops to zero
-    /// at the wall.
-    fn apply_pan_delta(&mut self, dy: f32) -> bool {
-        if dy.abs() < f32::EPSILON {
+    /// Compute the grab offset for an Alt-drag pan starting at
+    /// cursor `y`. Same shape as the offset captured by `thumb_hit`,
+    /// but accepts ANY cursor y (not just inside the visible thumb)
+    /// — the user grabs the doc as if the thumb were under the
+    /// cursor. Returns None when geometry isn't ready (no overflow
+    /// to scroll, or the bar hasn't drawn yet).
+    fn pan_grab_offset_at(&self, y: f32) -> Option<f32> {
+        let g = self.last_bar_geom?;
+        let track_len = (g.track_bot - g.track_top).max(1.0);
+        let raw_thumb = (g.viewport_h / g.content_h.max(1.0)) * track_len;
+        let thumb_h = raw_thumb.max(SCROLLBAR_MIN_THUMB).min(track_len);
+        let scroll_range = (track_len - thumb_h).max(1.0);
+        let thumb_top = g.track_top
+            + (self.scroll_y / self.max_scroll.max(1.0)) * scroll_range;
+        Some(y - thumb_top)
+    }
+
+    /// Begin an Alt-drag pan. Captures the cursor's offset from the
+    /// (conceptual) thumb at `click_y`, then routes through the same
+    /// `dragging` field the scrollbar-thumb drag uses — so per-frame
+    /// motion, velocity sampling, and fling-on-release all share the
+    /// same code path. The user effectively "grabs the thumb" at
+    /// wherever the cursor is, regardless of where the actual thumb
+    /// lives. No-op when geometry isn't ready (no overflow to
+    /// scroll).
+    fn start_pan_drag(&mut self, click_y: f32) -> bool {
+        let Some(grab_offset) = self.pan_grab_offset_at(click_y) else {
             return false;
-        }
-        let new_y = (self.scroll_y + dy).clamp(0.0, self.max_scroll);
-        let actual = new_y - self.scroll_y;
-        if actual.abs() < f32::EPSILON {
-            return false;
-        }
-        self.scroll_y = new_y;
-        let now = Instant::now();
-        self.recent_samples.push_back((now, actual));
-        self.recompute_velocity_from_window(now);
-        self.last_scroll_time = Some(now);
-        self.last_scroll_apply_at = Some(now);
+        };
+        self.start_thumb_drag(grab_offset);
         true
     }
 
@@ -1313,12 +1320,15 @@ pub struct KeptApp {
     /// link-open). On threshold cross, the existing cell-level drag
     /// (if any) is aborted and `pan_drag` takes over.
     tentative_pan: Option<TentativePan>,
-    /// In-flight pan-drag. While `Some`, every `cursor_moved`
-    /// translates the y-delta into a scroll on the captured pane's
-    /// scroller, feeding the same kinetic sample queue used by the
-    /// wheel and the scrollbar thumb. On release, kinetic decay
-    /// carries any leftover velocity (a flick coasts).
-    pan_drag: Option<PanDrag>,
+    /// True while an Alt-drag pan is committed (post-threshold).
+    /// The actual scroll math runs through `Scroller::dragging` —
+    /// same field the scrollbar-thumb drag uses, so a single
+    /// `apply_thumb_drag` pass drives both kinds of gesture
+    /// uniformly. This flag is just a marker so the cursor icon can
+    /// switch to "grabbing" and `mouse_up` can tell that a pan was
+    /// in flight (even when the scroller's dragging slot was
+    /// already cleared by the end-pass).
+    pan_drag: bool,
 }
 
 /// Which surface's `Scroller` a pan-drag is bound to. Sidebar gets
@@ -1330,14 +1340,6 @@ enum PanTarget {
     Sidebar,
 }
 
-/// Pan-drag binding: which scroller is being driven and the last
-/// cursor y observed (to compute frame-by-frame deltas without
-/// accumulating drift from absolute-position math).
-#[derive(Clone, Copy)]
-struct PanDrag {
-    target: PanTarget,
-    last_y: f32,
-}
 
 /// Pre-commit state for an Alt-drag gesture — captured at mouse_down,
 /// promoted to `PanDrag` once the cursor moves more than
@@ -1583,7 +1585,7 @@ impl KeptApp {
             entity_title_fallback,
             mouse_pos: (-1.0, -1.0),
             tentative_pan: None,
-            pan_drag: None,
+            pan_drag: false,
         }
     }
 
@@ -1615,26 +1617,11 @@ impl KeptApp {
         }
         // Alt-drag pan: first chance per move to promote a tentative
         // Alt+click into a committed pan once the cursor has moved
-        // past the threshold. The promotion itself jump-pans by the
-        // full from-click displacement, so we don't need an extra
-        // delta-apply on the same frame.
+        // past the threshold. Promotion installs scroller.dragging
+        // (via `start_pan_drag`); from there the thumb-drag pass
+        // above picks up subsequent moves uniformly with real thumb
+        // drags, so no separate per-frame pan apply is needed.
         changed |= self.maybe_promote_tentative_pan(y);
-        // y motion translates to an opposite-sign scroll delta (drag
-        // the cursor down → paper moves with you → viewport moves up
-        // the document → scroll_y decreases). Updates `last_y` so
-        // subsequent moves compute deltas off the most recent sample,
-        // which keeps the math drift-free if the bound clamps at
-        // either end.
-        if let Some(pd) = self.pan_drag.as_mut() {
-            let dy_cursor = y - pd.last_y;
-            pd.last_y = y;
-            if dy_cursor.abs() >= f32::EPSILON {
-                let target = pd.target;
-                changed |= self
-                    .pan_scroller_mut(target)
-                    .apply_pan_delta(-dy_cursor * PAN_GAIN);
-            }
-        }
         changed
     }
 
@@ -1664,17 +1651,17 @@ impl KeptApp {
 
     /// Inspect a cursor sample against an active `tentative_pan`. If
     /// the cursor has moved more than `ALT_PAN_THRESHOLD` from the
-    /// initial click y, promote the gesture: abort the cell-level
-    /// drag started at mouse_down, kill kinetic on the captured
-    /// scroller, jump-pan by the full from-click displacement (so the
-    /// doc catches up to the current cursor on the very first frame
-    /// after commit), and install `pan_drag` so subsequent cursor
-    /// samples flow through `apply_pan_delta`. Returns true if a
-    /// promotion happened (caller can OR into its redraw flag). No-op
-    /// when no tentative is set, when the threshold isn't crossed, or
-    /// when a committed pan is already running.
+    /// initial click y, promote the gesture: abort any cell-level
+    /// drag started at mouse_down, capture the click-time grab
+    /// offset on the captured scroller (`start_pan_drag`), and apply
+    /// the current cursor y so the scroll position snaps to "thumb
+    /// under the cursor." From there, every cursor_moved /
+    /// mouse_drag_to flows through `apply_thumb_drag` exactly like a
+    /// scrollbar-thumb drag — the user is dragging the (invisible)
+    /// thumb from anywhere in the pane. Returns true if a promotion
+    /// happened.
     fn maybe_promote_tentative_pan(&mut self, y: f32) -> bool {
-        if self.pan_drag.is_some() {
+        if self.pan_drag {
             return false;
         }
         let Some(tp) = self.tentative_pan else {
@@ -1695,17 +1682,22 @@ impl KeptApp {
                 cell.mouse_up();
             }
         }
-        let target = tp.target;
-        let scroller = self.pan_scroller_mut(target);
-        scroller.kill_kinetic();
-        // Apply the full from-click-to-current displacement (gain-
-        // amplified) so the doc lands under the cursor — and a bit
-        // beyond — instead of jumping to track only post-threshold
-        // motion. The same delta feeds the velocity sampler, so a
-        // fast threshold-cross arrives as one big sample, matching
-        // how a fast wheel burst would.
-        let _ = scroller.apply_pan_delta(-dy_from_click * PAN_GAIN);
-        self.pan_drag = Some(PanDrag { target, last_y: y });
+        let scroller = self.pan_scroller_mut(tp.target);
+        // Capture grab offset relative to the thumb's *click-time*
+        // position so subsequent `apply_thumb_drag(y)` calls maintain
+        // the cursor's offset from the thumb, exactly like a real
+        // thumb drag. Then snap the doc to the current cursor — same
+        // sample feeds the velocity window so a fast threshold-cross
+        // coasts on release.
+        if !scroller.start_pan_drag(tp.click_y) {
+            // Geometry not ready (no overflow / bar not drawn) —
+            // there's nothing to scroll. Drop the tentative; the
+            // gesture has nowhere to go.
+            self.tentative_pan = None;
+            return false;
+        }
+        let _ = scroller.apply_thumb_drag(y);
+        self.pan_drag = true;
         self.tentative_pan = None;
         true
     }
@@ -2630,7 +2622,7 @@ impl KeptApp {
     /// drag threshold). Used by the host (`main.rs`) to swap the
     /// system cursor to a closed-hand "grabbing" icon.
     pub fn is_panning(&self) -> bool {
-        self.pan_drag.is_some()
+        self.pan_drag
     }
 
     /// True if the mouse is currently over a link or an inline `#tag` in
@@ -7136,20 +7128,12 @@ impl KeptApp {
             }
         }
         // Promote a tentative Alt-drag the same way `cursor_moved`
-        // does — caller invokes both per cursor sample, but if some
-        // host only routes drag motion through this path we still
-        // commit on threshold-cross.
+        // does — promotion installs `scroller.dragging`, after which
+        // the thumb-drag short-circuit at the top of this fn handles
+        // every subsequent move uniformly with real thumb drags.
         let promoted = self.maybe_promote_tentative_pan(y);
-        if let Some(pd) = self.pan_drag.as_mut() {
-            let dy_cursor = y - pd.last_y;
-            pd.last_y = y;
-            if dy_cursor.abs() >= f32::EPSILON {
-                let target = pd.target;
-                return self
-                    .pan_scroller_mut(target)
-                    .apply_pan_delta(-dy_cursor * PAN_GAIN);
-            }
-            return promoted;
+        if promoted {
+            return true;
         }
         // Divider drag wins — recompute split_ratio relative to the pane
         // area (sidebar's right edge → window's right edge).
@@ -7207,30 +7191,30 @@ impl KeptApp {
             }
         }
 
-        // End any thumb drag first. Refresh the hover state from the
-        // current cursor position — the bar should drop back to thin
-        // immediately if the cursor wandered off during the drag.
+        // End any thumb drag — covers both real scrollbar thumb
+        // drags AND Alt-drag pans (both route through
+        // `scroller.dragging`, so a single end_thumb_drag pass
+        // prunes the velocity window, anchors kinetic dt, and
+        // releases the binding for either kind). Velocity is left in
+        // place — a flick coasts via the per-frame `step_kinetic`
+        // loop, identical to wheel-burst release.
         let mut ended = self.sidebar_scroll.end_thumb_drag();
         for pane in &mut self.panes {
             ended |= pane.scroller.end_thumb_drag();
         }
-        if ended {
+        // Pan-drag marker (drives the "grabbing" cursor) — clear
+        // regardless. The actual scroll cleanup already happened in
+        // end_thumb_drag.
+        let was_panning = std::mem::replace(&mut self.pan_drag, false);
+        if ended || was_panning {
+            // Refresh hover from the current cursor — if the user
+            // released far from any scrollbar, the bar should drop
+            // back to thin immediately.
             let (mx, my) = self.mouse_pos;
             self.sidebar_scroll.set_hover_for_point(mx, my);
             for pane in &mut self.panes {
                 pane.scroller.set_hover_for_point(mx, my);
             }
-            return true;
-        }
-        // End any Space-drag pan. The drag accumulated samples in the
-        // captured pane's scroller; finalize_drag_release prunes
-        // stale samples and anchors `last_scroll_apply_at` so the
-        // next kinetic step takes over cleanly. Velocity is left in
-        // place — a flick coasts via the existing per-frame
-        // `step_kinetic` loop, just like a wheel-burst release.
-        if let Some(pd) = self.pan_drag.take() {
-            self.pan_scroller_mut(pd.target)
-                .finalize_drag_release(Instant::now());
             return true;
         }
         if self.dragging_divider {
