@@ -143,9 +143,11 @@ Inside tables, `Tab` advances cells; `Backspace` / `Delete` clear the focused ce
 
 | Target | Menu |
 |---|---|
-| Cell | Timestamps + Delete cell |
+| Cell | Timestamps + Delete / Surface / Envelope / Unwrap / **Mark inactive** (or Mark active) — and **Mark sub-outline inactive/active** when the click landed on a bullet in this cell |
 | Sidebar tag (with no cells) | Delete tag |
 | People-page row | Rename / Delete person |
+
+Inactive cells and bullets are hidden from views by default. The **Show inactive** toggle at the bottom of the sidebar surfaces them globally — they render dimmed (about 40% alpha) instead of disappearing. Bullet-level inactive cascades by ancestry: marking a sub-outline root inactive hides its whole subtree.
 
 `Esc` dismisses any menu.
 

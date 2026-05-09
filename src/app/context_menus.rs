@@ -3,7 +3,7 @@ use skia_safe::{
 };
 use uuid::Uuid;
 
-use crate::cell::ReferenceTarget;
+use crate::cell::{CellKind, ReferenceTarget};
 
 use super::{KeptApp, clamp_rect_to_viewport, fit_text_ellipsized};
 
@@ -166,6 +166,8 @@ impl KeptApp {
             self.hit_tests.cell_menu.surface_subtree = None;
             self.hit_tests.cell_menu.envelope = None;
             self.hit_tests.cell_menu.unwrap = None;
+            self.hit_tests.cell_menu.toggle_cell_active = None;
+            self.hit_tests.cell_menu.toggle_bullet_active = None;
             return;
         };
         let Some(cell) = self.cell(menu.cell_id) else {
@@ -174,6 +176,8 @@ impl KeptApp {
             self.hit_tests.cell_menu.surface_subtree = None;
             self.hit_tests.cell_menu.envelope = None;
             self.hit_tests.cell_menu.unwrap = None;
+            self.hit_tests.cell_menu.toggle_cell_active = None;
+            self.hit_tests.cell_menu.toggle_bullet_active = None;
             return;
         };
         let scale = self.font_scale;
@@ -193,6 +197,14 @@ impl KeptApp {
         // exclusive with `has_envelope` since one targets Reference
         // sources and the other targets Outline sources.
         let has_unwrap = menu.source_is_envelope;
+        // Bullet-active toggle: only shown when the clicked bullet
+        // lives in *this* cell's outline. For clicks inside a nested
+        // embed (Reference cache, envelope header), the bullet's
+        // origin is a different cell — toggling its active flag from
+        // here would cross-mutate, which we don't want from a menu
+        // anchored on the wrapping cell.
+        let has_bullet_toggle =
+            menu.bullet_id.is_some() && menu.bullet_origin_cell_id == Some(menu.cell_id);
         let mut action_count: usize = 1; // Delete cell
         action_count += 1; // Surface as reference (always)
         if has_subtree {
@@ -202,6 +214,10 @@ impl KeptApp {
             action_count += 1;
         }
         if has_unwrap {
+            action_count += 1;
+        }
+        action_count += 1; // Mark (cell) inactive / active
+        if has_bullet_toggle {
             action_count += 1;
         }
         let menu_h =
@@ -336,11 +352,55 @@ impl KeptApp {
             None
         };
 
+        // Cell active toggle — always present. Label flips with the
+        // current `active` state; click invokes
+        // `KeptApp::toggle_cell_active`.
+        let cell_active_label = if cell.active {
+            "Mark inactive"
+        } else {
+            "Mark active"
+        };
+        let toggle_cell_active_rect = emit_row(
+            cell_active_label,
+            crate::color::text_menu_row(),
+            crate::color::embed_hover(),
+        );
+
+        // Bullet active toggle — only when the click landed on a
+        // bullet inside this same cell. Label uses "sub-outline"
+        // phrasing because toggling a bullet hides its whole subtree
+        // via the ancestor cascade (`compute_effective_active`).
+        let toggle_bullet_active_rect = if has_bullet_toggle {
+            // Look up the bullet's current state for the label.
+            let bullet_active = menu.bullet_id.and_then(|bid| match &cell.kind {
+                CellKind::Outline(oc) => oc
+                    .bullets()
+                    .iter()
+                    .find(|b| b.id() == bid)
+                    .map(|b| b.active()),
+                _ => None,
+            }).unwrap_or(true);
+            let label = if bullet_active {
+                "Mark sub-outline inactive"
+            } else {
+                "Mark sub-outline active"
+            };
+            Some(emit_row(
+                label,
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ))
+        } else {
+            None
+        };
+
         self.hit_tests.cell_menu.delete = Some(delete_rect);
         self.hit_tests.cell_menu.surface = Some(surface_rect);
         self.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
         self.hit_tests.cell_menu.envelope = envelope_rect;
         self.hit_tests.cell_menu.unwrap = unwrap_rect;
+        self.hit_tests.cell_menu.toggle_cell_active = Some(toggle_cell_active_rect);
+        self.hit_tests.cell_menu.toggle_bullet_active = toggle_bullet_active_rect;
     }
 
     pub(super) fn render_tag_context_menu(

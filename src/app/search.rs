@@ -292,10 +292,18 @@ impl KeptApp {
                 &self.entity_title_fallback,
             ),
         };
+        // Inactive cells drop out of search results unless the
+        // global "Show archived" toggle is on, mirroring the
+        // visibility gate in `is_visible_for_view`. Otherwise an
+        // archived cell could surface here, the user clicks it, and
+        // navigates to a date view that has it filtered out — a
+        // dead-end click. Bullet-level cascade isn't applied (search
+        // returns whole cells; the cell-level gate is enough).
+        let show_inactive_cells = self.show_inactive_cells;
         let mut hits: Vec<&Cell> = self
             .cells
             .iter()
-            .filter(|c| query::matches(&ast, c, &ctx))
+            .filter(|c| (c.active || show_inactive_cells) && query::matches(&ast, c, &ctx))
             .collect();
         hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         hits.into_iter().map(|c| c.id).collect()

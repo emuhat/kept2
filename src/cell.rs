@@ -18,12 +18,14 @@ mod wrap;
 
 pub use common::{TagSpan, TextBoxSnapshot, now_epoch_ms};
 pub use outline::{Bullet, OutlineCell, OutlineSnapshot};
+#[cfg(test)]
+pub use outline::BulletSnapshot;
 pub use poppop::PopPopCell;
 pub use reference::{EmbeddedReference, ReferenceCell, ReferenceTarget};
 pub use table::{TableCell, TableSnapshot};
 pub use textbox::TextBox;
 
-pub(crate) use common::{TITLE_BODY_GAP, open_url, primary_mod};
+pub(crate) use common::{INACTIVE_ALPHA, TITLE_BODY_GAP, open_url, primary_mod};
 pub use wrap::parse_inline_tags;
 use wrap::parse_heading_tags;
 
@@ -42,6 +44,11 @@ pub struct CellSnapshot {
     /// title slot.
     pub title: Option<TextBoxSnapshot>,
     pub kind: CellSnapshotKind,
+    /// Active/inactive flag (the "archived" status). True by default;
+    /// false when the user has marked this cell inactive via the cell
+    /// context menu. Driven by `UndoOp::SetCellActive` and gated by
+    /// the global `show_inactive_cells` toggle for visibility.
+    pub active: bool,
 }
 
 #[derive(Clone)]
@@ -122,6 +129,14 @@ pub struct Cell {
     /// Optional hint about which context the cell was created in.
     /// Does NOT determine visibility — that's purely timestamp-based.
     pub context_hint_id: Option<Uuid>,
+    /// "Archived" flag. True by default; set false via the cell
+    /// context menu's "Mark inactive" row. Inactive cells are
+    /// hidden from views (timeline, sidebar dates, search, entity
+    /// references) unless the global `show_inactive_cells` toggle is
+    /// on, in which case they render dimmed. Persisted in the cell
+    /// JSON; visibility/render is gated entirely at the app layer
+    /// (this struct just carries the flag).
+    pub active: bool,
 }
 
 pub enum CellKind {
@@ -223,6 +238,7 @@ impl Cell {
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
+            active: true,
         }
     }
 
@@ -240,6 +256,7 @@ impl Cell {
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
+            active: true,
         }
     }
 
@@ -257,6 +274,7 @@ impl Cell {
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
+            active: true,
         }
     }
 
@@ -278,6 +296,7 @@ impl Cell {
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
+            active: true,
         }
     }
 
@@ -289,6 +308,7 @@ impl Cell {
         timestamp: i64,
         edited_at: i64,
         context_hint_id: Option<Uuid>,
+        active: bool,
     ) -> Self {
         Self {
             id,
@@ -302,6 +322,7 @@ impl Cell {
             timestamp,
             edited_at,
             context_hint_id,
+            active,
         }
     }
 
@@ -397,7 +418,15 @@ impl Cell {
             tb.restore(tbs);
             tb
         });
-        Self::from_parts(id, kind, title, snap.timestamp, snap.edited_at, snap.context_hint_id)
+        Self::from_parts(
+            id,
+            kind,
+            title,
+            snap.timestamp,
+            snap.edited_at,
+            snap.context_hint_id,
+            snap.active,
+        )
     }
 
     /// Add a link span to the cell's first textbox (plain) or first bullet
@@ -1472,17 +1501,19 @@ impl Cell {
                 CellKind::Table(tc) => CellSnapshotKind::Table(tc.snapshot()),
                 CellKind::Reference(rc) => CellSnapshotKind::Reference(rc.target()),
             },
+            active: self.active,
         }
     }
 
     /// Restore from a snapshot of the same variant. Variant mismatches are a
     /// bug (undo stack and live state disagree); fall through silently rather
-    /// than panic. All metadata (timestamp, edited_at, context_hint_id, and
-    /// the title slot) is preserved from the snapshot.
+    /// than panic. All metadata (timestamp, edited_at, context_hint_id, the
+    /// title slot, and the active flag) is preserved from the snapshot.
     pub fn restore(&mut self, snap: CellSnapshot) {
         self.timestamp = snap.timestamp;
         self.edited_at = snap.edited_at;
         self.context_hint_id = snap.context_hint_id;
+        self.active = snap.active;
         self.title = snap.title.map(|tbs| {
             let typeface = self.body_typeface();
             let mut tb = TextBox::new(typeface, String::new());
@@ -1562,6 +1593,101 @@ mod tests {
         let cloned_links = cloned.links();
         assert_eq!(cloned_links.len(), 1, "link span survives the clone");
         assert_eq!(cloned_links[0].range, 20..24);
+    }
+
+    #[test]
+    fn cell_active_round_trips_through_snapshot() {
+        // Toggling Cell.active is a structural edit that flows
+        // through the same snapshot path the undo system uses;
+        // restore() must replay the flag, not just the kind.
+        let mut cell = Cell::new(typeface(), "x".to_string());
+        assert!(cell.active, "new cells default to active");
+        cell.active = false;
+
+        let snap = cell.snapshot();
+        assert!(!snap.active, "snapshot captures the flag");
+
+        let mut reborn = Cell::new(typeface(), String::new());
+        reborn.restore(snap);
+        assert!(!reborn.active, "restore replays the flag");
+    }
+
+    #[test]
+    fn bullet_active_round_trips_through_outline_snapshot() {
+        let mut oc = OutlineCell::new(typeface());
+        let bid = oc.bullets()[0].id();
+        oc.set_bullet_active(bid, false);
+
+        let snap = oc.snapshot();
+        assert_eq!(
+            snap.bullets[0].active, false,
+            "BulletSnapshot carries active"
+        );
+
+        let mut reborn = OutlineCell::new(typeface());
+        reborn.restore(snap);
+        assert!(
+            !reborn.bullets()[0].active(),
+            "outline restore round-trips bullet active"
+        );
+    }
+
+    #[test]
+    fn effective_active_cascades_through_outline_ancestors() {
+        // Build an outline at depths [0, 1, 2, 1, 2]. Mark the FIRST
+        // depth-1 bullet inactive; its depth-2 child should report
+        // effectively-inactive even though its own flag is active.
+        // The next depth-1 sibling and its depth-2 child stay active —
+        // cascade only reaches descendants of the inactive ancestor.
+        let mut oc = OutlineCell::new(typeface());
+        // Replace the seed bullet by snapshot construction (cleanest
+        // path that keeps Bullet ids stable across builds).
+        let snap_bullets = vec![
+            BulletSnapshot {
+                id: Uuid::now_v7(),
+                textbox: TextBox::new(typeface(), "root".to_string()).snapshot(),
+                depth: 0,
+                active: true,
+            },
+            BulletSnapshot {
+                id: Uuid::now_v7(),
+                textbox: TextBox::new(typeface(), "child A".to_string()).snapshot(),
+                depth: 1,
+                active: false, // ← this is the archived sub-outline root
+            },
+            BulletSnapshot {
+                id: Uuid::now_v7(),
+                textbox: TextBox::new(typeface(), "grandchild A".to_string()).snapshot(),
+                depth: 2,
+                active: true,
+            },
+            BulletSnapshot {
+                id: Uuid::now_v7(),
+                textbox: TextBox::new(typeface(), "child B".to_string()).snapshot(),
+                depth: 1,
+                active: true,
+            },
+            BulletSnapshot {
+                id: Uuid::now_v7(),
+                textbox: TextBox::new(typeface(), "grandchild B".to_string()).snapshot(),
+                depth: 2,
+                active: true,
+            },
+        ];
+        let snap = OutlineSnapshot {
+            bullets: snap_bullets,
+            focused_bullet: Uuid::now_v7(),
+            reference_header: None,
+        };
+        oc.restore(snap);
+
+        let eff = oc.compute_effective_active();
+        assert_eq!(eff.len(), 5);
+        assert!(eff[0], "root active");
+        assert!(!eff[1], "self-inactive child A");
+        assert!(!eff[2], "grandchild A inactive via ancestor cascade");
+        assert!(eff[3], "child B unaffected");
+        assert!(eff[4], "grandchild B unaffected");
     }
 
     #[test]

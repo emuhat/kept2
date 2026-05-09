@@ -133,6 +133,10 @@ struct SidebarHits {
     /// Relative-week rows (This Week, Last Week) above the date list.
     /// Each entry is the time filter the click should activate.
     weeks: Vec<(query::TimeFilter, Rect)>,
+    /// "Show archived" toggle pill at the bottom of the sidebar.
+    /// Clicks flip `KeptApp::show_inactive_cells`. None when the
+    /// sidebar didn't render this frame.
+    show_inactive_toggle: Option<Rect>,
 }
 
 #[derive(Default)]
@@ -152,6 +156,14 @@ struct CellMenuHits {
     /// bare Reference again. The user's notes are dropped (recoverable
     /// via Ctrl+Z).
     unwrap: Option<Rect>,
+    /// "Mark cell inactive" / "Mark cell active" — toggles
+    /// `Cell.active`. Always present.
+    toggle_cell_active: Option<Rect>,
+    /// "Mark sub-outline inactive" / "Mark sub-outline active" —
+    /// toggles the clicked bullet's `active` flag. Only present
+    /// when the click landed on a bullet that lives in *this*
+    /// cell's outline (not inside a nested embed).
+    toggle_bullet_active: Option<Rect>,
 }
 
 #[derive(Default)]
@@ -468,6 +480,24 @@ enum UndoOp {
     /// `prev`; redo flips to `new`. No focus side-effects.
     SetEntityActive {
         entity_id: Uuid,
+        prev: bool,
+        new: bool,
+    },
+    /// Cell active/inactive toggle (the "archive" gesture). Same
+    /// shape as `SetEntityActive`; flips `Cell.active` and bumps
+    /// `edited_at` so any embed cache pointing at this cell rebuilds
+    /// on the next render.
+    SetCellActive {
+        cell_id: Uuid,
+        prev: bool,
+        new: bool,
+    },
+    /// Bullet active/inactive toggle (cascades to its sub-outline
+    /// via the ancestor-walk in `compute_effective_active`). Bullet
+    /// ids are unique within a cell; the lookup is a linear scan.
+    SetBulletActive {
+        cell_id: Uuid,
+        bullet_id: Uuid,
         prev: bool,
         new: bool,
     },
@@ -1244,6 +1274,13 @@ pub struct KeptApp {
     /// entities are hidden from the list. Always-show in the @-mention
     /// popup (with downweight). Session-only — no persistence in v1.
     show_inactive: bool,
+    /// Global "Show archived" toggle for cells/bullets. Default false:
+    /// inactive cells are hidden from every view (timeline, sidebar
+    /// dates, search, entity references) and inactive bullets are
+    /// hidden inside their outlines. Toggle on → those items render
+    /// dimmed (alpha-blended) instead of being filtered out.
+    /// Session-only, mirroring `show_inactive`.
+    show_inactive_cells: bool,
     /// Active right-click menu over a People-page row.
     people_context_menu: Option<PeopleContextMenu>,
     /// True while the user is mouse-dragging inside the search input
@@ -1536,6 +1573,7 @@ impl KeptApp {
             people_rename: None,
             people_add: None,
             show_inactive: false,
+            show_inactive_cells: false,
             people_context_menu: None,
             search_dragging: false,
             hit_tests: HitTestState::default(),
@@ -2206,7 +2244,9 @@ impl KeptApp {
         // Bullet body.
         let body_focused = focused && !title_focused;
         let body_caret = show_caret && !title_focused;
+        let show_inactive = self.show_inactive_cells;
         let bullets_h = if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+            oc.set_show_inactive(show_inactive);
             oc.tick(canvas, x, after_header_y, width, body_focused, body_caret)
         } else {
             0.0
@@ -2256,6 +2296,12 @@ impl KeptApp {
                     source.timestamp,
                     source.edited_at,
                     source.context_hint_id,
+                    // Cache cells are internal to the embed render; they
+                    // never enter `self.cells`, so the active flag here
+                    // is unused for visibility. Default to true so the
+                    // embed renders normally regardless of source's
+                    // active state (embeds always render in v1).
+                    true,
                 );
                 cache.set_font_scale(scale);
                 cache
@@ -2287,6 +2333,7 @@ impl KeptApp {
                     source.timestamp,
                     source.edited_at,
                     source.context_hint_id,
+                    true,
                 );
                 cache.set_font_scale(scale);
                 cache
@@ -2613,6 +2660,14 @@ impl KeptApp {
     /// - `People` → no cells visible (the page is bespoke).
     /// - `Ast` → delegate to `query::matches` against `view.ast`.
     fn is_visible_for_view(&self, cell: &Cell, ctx: &query::MatchContext) -> bool {
+        // Inactive ("archived") cells drop out of every view by
+        // default; the global "Show archived" toggle in the sidebar
+        // surfaces them again (rendered dim — see `INACTIVE_ALPHA`).
+        // Checked first so the rest of the predicate doesn't have to
+        // re-filter on each view kind.
+        if !cell.active && !self.show_inactive_cells {
+            return false;
+        }
         // A focused cell whose caret is mid-edit inside a `#tag` token
         // stays visible regardless of filter match. Otherwise the in-
         // memory tag set shifts on every keystroke and the cell yanks
@@ -3572,6 +3627,17 @@ impl KeptApp {
                     // edit mode.
                     let render_focused = cell_is_focused;
                     let show_caret = cell_is_focused && editing_local;
+                    // Inactive ("archived") cells reach this point only
+                    // when the global toggle is on (otherwise the
+                    // visibility filter dropped them earlier). Wrap
+                    // their entire render — body, post-tick outline,
+                    // and any embed chrome — in an alpha layer so the
+                    // dim treatment composites uniformly without
+                    // threading a paint color through every primitive.
+                    let cell_inactive = !self.cells[i].active;
+                    if cell_inactive {
+                        canvas.save_layer_alpha(None, cell::INACTIVE_ALPHA as u32);
+                    }
                     let h = if is_reference {
                         // Reference cells render via the app layer (which can
                         // see the full cell list to look up the target).
@@ -3610,6 +3676,7 @@ impl KeptApp {
                         // mutable borrow on `self.cells` without keeping
                         // an outstanding immutable borrow on `self.view`.
                         let include_tags = self.view.ast.include.tags.clone();
+                        let show_inactive = self.show_inactive_cells;
                         let cell = &mut self.cells[i];
                         let filter = compute_outline_bullet_filter(
                             cell,
@@ -3618,6 +3685,7 @@ impl KeptApp {
                         );
                         if let CellKind::Outline(oc) = &mut cell.kind {
                             oc.set_bullet_filter(filter);
+                            oc.set_show_inactive(show_inactive);
                         }
                         cell.tick(
                             canvas,
@@ -3647,6 +3715,9 @@ impl KeptApp {
                             cell_y + h + FOCUS_PAD,
                         );
                         canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
+                    }
+                    if cell_inactive {
+                        canvas.restore();
                     }
 
                     y += h + CELL_GAP;
@@ -5145,6 +5216,75 @@ impl KeptApp {
         self.coalesce_break = true;
     }
 
+    /// Flip a cell's `active` flag (the "archive" gesture from the
+    /// cell context menu). Mirrors `toggle_entity_active`: pushes a
+    /// dedicated undo op, marks the cell dirty for persistence, and
+    /// touches `edited_at` so any embed cache pointing at this cell
+    /// rebuilds with the new state on the next render. Returns
+    /// whether the toggle landed (false when the cell is missing).
+    fn toggle_cell_active(&mut self, cell_id: Uuid) -> bool {
+        let Some(idx) = self.cell_idx(cell_id) else {
+            return false;
+        };
+        let prev = self.cells[idx].active;
+        let new = !prev;
+        self.cells[idx].active = new;
+        self.mark_cell_dirty(cell_id);
+        self.touch_cell(cell_id);
+        self.undo_stack.push(UndoOp::SetCellActive {
+            cell_id,
+            prev,
+            new,
+        });
+        self.redo_stack.clear();
+        self.coalesce_break = true;
+        self.pending_caret_scroll = true;
+        true
+    }
+
+    /// Flip a single bullet's `active` flag (the "archive sub-outline"
+    /// gesture). Cascade is read at render time via
+    /// `compute_effective_active`; nothing is mutated on descendants
+    /// here. Returns false when the cell isn't an outline or the
+    /// bullet id isn't present (defensive — the menu only offers the
+    /// row when both hold).
+    fn toggle_bullet_active(&mut self, cell_id: Uuid, bullet_id: Uuid) -> bool {
+        let Some(idx) = self.cell_idx(cell_id) else {
+            return false;
+        };
+        let prev = match &self.cells[idx].kind {
+            CellKind::Outline(oc) => oc
+                .bullets()
+                .iter()
+                .find(|b| b.id() == bullet_id)
+                .map(|b| b.active()),
+            _ => None,
+        };
+        let Some(prev) = prev else {
+            return false;
+        };
+        let new = !prev;
+        let mutated = match &mut self.cells[idx].kind {
+            CellKind::Outline(oc) => oc.set_bullet_active(bullet_id, new),
+            _ => false,
+        };
+        if !mutated {
+            return false;
+        }
+        self.mark_cell_dirty(cell_id);
+        self.touch_cell(cell_id);
+        self.undo_stack.push(UndoOp::SetBulletActive {
+            cell_id,
+            bullet_id,
+            prev,
+            new,
+        });
+        self.redo_stack.clear();
+        self.coalesce_break = true;
+        self.pending_caret_scroll = true;
+        true
+    }
+
     /// Hard-delete an entity that has no backing cell and no references.
     /// Caller must have verified those conditions (the menu does that at
     /// open time). Refreshes entity caches and pushes a
@@ -5387,6 +5527,29 @@ impl KeptApp {
                 self.refresh_entities();
                 bump_focused_edited = false;
             }
+            UndoOp::SetCellActive { cell_id, prev, .. } => {
+                if let Some(idx) = self.cell_idx(*cell_id) {
+                    self.cells[idx].active = *prev;
+                    self.mark_cell_dirty(*cell_id);
+                    self.touch_cell(*cell_id);
+                }
+                bump_focused_edited = false;
+            }
+            UndoOp::SetBulletActive {
+                cell_id,
+                bullet_id,
+                prev,
+                ..
+            } => {
+                if let Some(idx) = self.cell_idx(*cell_id) {
+                    if let CellKind::Outline(oc) = &mut self.cells[idx].kind {
+                        oc.set_bullet_active(*bullet_id, *prev);
+                    }
+                    self.mark_cell_dirty(*cell_id);
+                    self.touch_cell(*cell_id);
+                }
+                bump_focused_edited = false;
+            }
             UndoOp::Envelope {
                 cell_id,
                 pre,
@@ -5562,6 +5725,29 @@ impl KeptApp {
                     let _ = db.set_entity_active(*entity_id, *new);
                 }
                 self.refresh_entities();
+                bump_focused_edited = false;
+            }
+            UndoOp::SetCellActive { cell_id, new, .. } => {
+                if let Some(idx) = self.cell_idx(*cell_id) {
+                    self.cells[idx].active = *new;
+                    self.mark_cell_dirty(*cell_id);
+                    self.touch_cell(*cell_id);
+                }
+                bump_focused_edited = false;
+            }
+            UndoOp::SetBulletActive {
+                cell_id,
+                bullet_id,
+                new,
+                ..
+            } => {
+                if let Some(idx) = self.cell_idx(*cell_id) {
+                    if let CellKind::Outline(oc) = &mut self.cells[idx].kind {
+                        oc.set_bullet_active(*bullet_id, *new);
+                    }
+                    self.mark_cell_dirty(*cell_id);
+                    self.touch_cell(*cell_id);
+                }
                 bump_focused_edited = false;
             }
             UndoOp::Envelope { cell_id, post, .. } => {
@@ -5909,6 +6095,7 @@ impl KeptApp {
         let timestamp = self.cells[idx].timestamp;
         let edited_at = self.cells[idx].edited_at;
         let context_hint = self.cells[idx].context_hint_id;
+        let active = self.cells[idx].active;
 
         // Build the new Outline cell directly so we can hand-pick the
         // id / timestamp (replace-in-place semantics). Cell::from_parts
@@ -5922,6 +6109,7 @@ impl KeptApp {
             timestamp,
             edited_at,
             context_hint,
+            active,
         );
         new_cell.set_font_scale(self.font_scale);
         let post = new_cell.snapshot();
@@ -5966,6 +6154,7 @@ impl KeptApp {
         let timestamp = self.cells[idx].timestamp;
         let edited_at = self.cells[idx].edited_at;
         let context_hint = self.cells[idx].context_hint_id;
+        let active = self.cells[idx].active;
 
         let mut new_cell = Cell::from_parts(
             cell_id,
@@ -5977,6 +6166,7 @@ impl KeptApp {
             timestamp,
             edited_at,
             context_hint,
+            active,
         );
         new_cell.set_font_scale(self.font_scale);
         let post = new_cell.snapshot();
@@ -6366,6 +6556,17 @@ impl KeptApp {
         // Sidebar rects are stored in content-space; map mouse to
         // match (sidebar can scroll independently of the doc area).
         let y = y + self.sidebar_scroll.scroll_y;
+        // "Show archived" toggle pill at the bottom: clicks flip the
+        // global flag and don't navigate anywhere. Checked first so
+        // a stray hit on the toggle rect doesn't fall through to a
+        // tag/date row that happens to overlap.
+        if let Some(rect) = self.hit_tests.sidebar.show_inactive_toggle {
+            if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                self.show_inactive_cells = !self.show_inactive_cells;
+                self.cell_context_menu = None;
+                return true;
+            }
+        }
         // Any sidebar interaction commits an in-progress People
         // rename or add (don't lose typed input on nav).
         if self.people_rename.is_some() {
@@ -6524,6 +6725,31 @@ impl KeptApp {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
                         self.unwrap_envelope(menu.cell_id);
+                    }
+                    return true;
+                }
+            }
+            // "Mark inactive" / "Mark active" — flips Cell.active.
+            // The visibility filter / dim render react on the next
+            // frame; if the toggle is off, the cell vanishes from the
+            // current view (still recoverable via Ctrl+Z).
+            if let Some(rect) = self.hit_tests.cell_menu.toggle_cell_active {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        self.toggle_cell_active(menu.cell_id);
+                    }
+                    return true;
+                }
+            }
+            // "Mark sub-outline inactive" / "Mark sub-outline active" —
+            // flips the clicked bullet's active flag (cascade applies
+            // via `compute_effective_active` at render time).
+            if let Some(rect) = self.hit_tests.cell_menu.toggle_bullet_active {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        if let Some(bid) = menu.bullet_id {
+                            self.toggle_bullet_active(menu.cell_id, bid);
+                        }
                     }
                     return true;
                 }

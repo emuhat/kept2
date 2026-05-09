@@ -15,6 +15,12 @@ pub(crate) const HEADING_FONT_SCALE: f32 = 1.12;
 /// Logical pixels; scaled with `font_scale`.
 pub(crate) const TITLE_BODY_GAP: f32 = 6.0;
 pub(crate) const CARET_WIDTH: f32 = 1.5;
+/// Alpha applied via `Canvas::save_layer_alpha` to inactive
+/// ("archived") cells and bullets when they're surfaced by the
+/// global "Show archived" toggle. Lives here so both the app-layer
+/// cell-wrap and the bullet-wrap inside `OutlineCell::tick` share a
+/// single value. ~0.4 (66/255).
+pub(crate) const INACTIVE_ALPHA: u8 = 0x66;
 pub(crate) const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const MULTI_CLICK_DIST: f32 = 5.0;
 

@@ -438,8 +438,11 @@ impl Db {
                 }
                 tb
             });
+            let active = pc.active;
             let kind = body_to_kind(pc.body, typeface);
-            cells.push(Cell::from_parts(id, kind, title, timestamp, edited_at, hint));
+            cells.push(Cell::from_parts(
+                id, kind, title, timestamp, edited_at, hint, active,
+            ));
         }
         Ok(cells)
     }
@@ -894,8 +897,23 @@ impl Db {
 struct PersistedCell {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<TitleRecord>,
+    /// "Archived" status. Default true (active) so legacy JSON
+    /// without this field — every cell saved before this feature
+    /// landed — loads as active. Skip-if-default keeps the JSON
+    /// shape identical for the common case.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    active: bool,
     #[serde(flatten)]
     body: CellBody,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Serialize, Deserialize)]
@@ -992,6 +1010,12 @@ struct BlockRecord {
     links: Vec<LinkRecord>,
     #[serde(default)]
     tags: Vec<TagRecord>,
+    /// Per-bullet "archived" flag. Default true so legacy JSON
+    /// loads bullets as active; serializer skips the field for the
+    /// common active case so the JSON shape stays identical for
+    /// existing data.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    active: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1036,6 +1060,7 @@ fn persisted_cell_from(cell: &Cell) -> PersistedCell {
     });
     PersistedCell {
         title,
+        active: cell.active,
         body: cell_to_body(cell),
     }
 }
@@ -1083,6 +1108,7 @@ fn cell_to_body(cell: &Cell) -> CellBody {
                         })
                         .collect(),
                     tags: tag_records(b.textbox()),
+                    active: b.active(),
                 })
                 .collect(),
             reference_header: oc
@@ -1236,6 +1262,7 @@ fn take_heading_from_outline(blocks: &mut Vec<BlockRecord>) -> Option<TitleRecor
             text: String::new(),
             links: Vec::new(),
             tags: Vec::new(),
+            active: true,
         });
     }
     Some(TitleRecord {
@@ -1527,7 +1554,9 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
                         tb.add_link(l.start..l.end, l.url);
                     }
                     load_body_tags(&mut tb, b.tags);
-                    Bullet::new(b.id, tb, b.depth)
+                    let mut bullet = Bullet::new(b.id, tb, b.depth);
+                    bullet.set_active(b.active);
+                    bullet
                 })
                 .collect();
             let header = reference_header
@@ -1616,6 +1645,7 @@ mod tests {
             }
             tb
         });
+        let active = pc.active;
         let kind = body_to_kind(pc.body, typeface);
         Cell::from_parts(
             cell.id,
@@ -1624,6 +1654,7 @@ mod tests {
             cell.timestamp,
             cell.edited_at,
             cell.context_hint_id,
+            active,
         )
     }
 
@@ -1740,6 +1771,7 @@ mod tests {
             now_epoch_ms(),
             now_epoch_ms(),
             None,
+            true,
         );
         let back = round_trip(&cell, &tf);
         match (&cell.kind, &back.kind) {
@@ -1800,6 +1832,7 @@ mod tests {
             now_epoch_ms(),
             now_epoch_ms(),
             None,
+            true,
         );
         let back = round_trip(&cell, &tf);
         match &back.kind {
@@ -1815,6 +1848,77 @@ mod tests {
                 assert_eq!(reborn.bullets()[0].textbox().text(), "my note");
             }
             _ => panic!("variant must round-trip as Outline"),
+        }
+    }
+
+    #[test]
+    fn cell_active_round_trips_through_persistence() {
+        // Mark a cell inactive, run it through serialize / deserialize,
+        // and assert the flag survives. Mirrors the snapshot test but
+        // exercises the JSON path (PersistedCell.active +
+        // body-to-kind) the on-disk DB uses.
+        let tf = typeface();
+        let mut cell = Cell::new(tf.clone(), "archived note".to_string());
+        cell.active = false;
+        let back = round_trip(&cell, &tf);
+        assert!(!back.active, "active=false survives round-trip");
+    }
+
+    #[test]
+    fn legacy_persisted_cell_without_active_loads_as_active() {
+        // JSON shape from before this feature — no `active` field on
+        // PersistedCell. serde-default = "default_true" so legacy data
+        // deserializes as active. Without that the upgrade path would
+        // mark every existing cell archived on first load.
+        let json = r##"{"kind":"plain","text":"legacy","links":[],"tags":[]}"##;
+        let pc: PersistedCell = serde_json::from_str(json).expect("legacy plain parses");
+        assert!(pc.active, "missing field defaults to true (active)");
+    }
+
+    #[test]
+    fn legacy_block_record_without_active_loads_as_active() {
+        // BlockRecord (outline bullet) has the same default-true
+        // shape. Legacy outlines saved before this feature should
+        // load with every bullet active.
+        let json = r##"{"kind":"outline","blocks":[{"id":"00000000-0000-7000-8000-000000000001","depth":0,"text":"legacy bullet","links":[],"tags":[]}]}"##;
+        let body: CellBody = serde_json::from_str(json).expect("legacy outline parses");
+        let kind = body_to_kind(body, &typeface());
+        match kind {
+            CellKind::Outline(oc) => {
+                assert_eq!(oc.bullets().len(), 1);
+                assert!(
+                    oc.bullets()[0].active(),
+                    "legacy bullet defaults to active"
+                );
+            }
+            _ => panic!("expected Outline kind"),
+        }
+    }
+
+    #[test]
+    fn bullet_active_round_trips_through_persistence() {
+        let tf = typeface();
+        let mut oc = OutlineCell::new(tf.clone());
+        let bid = oc.bullets()[0].id();
+        oc.set_bullet_active(bid, false);
+        let cell = Cell::from_parts(
+            Uuid::now_v7(),
+            CellKind::Outline(oc),
+            None,
+            now_epoch_ms(),
+            now_epoch_ms(),
+            None,
+            true,
+        );
+        let back = round_trip(&cell, &tf);
+        match &back.kind {
+            CellKind::Outline(oc) => {
+                assert!(
+                    !oc.bullets()[0].active(),
+                    "bullet active flag survives round-trip"
+                );
+            }
+            _ => panic!("variant lost"),
         }
     }
 

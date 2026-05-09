@@ -13,7 +13,7 @@ use winit::{
 };
 
 use super::TextBox;
-use super::common::{BODY_FONT_SIZE, TextBoxSnapshot, primary_mod, word_mod};
+use super::common::{BODY_FONT_SIZE, INACTIVE_ALPHA, TextBoxSnapshot, primary_mod, word_mod};
 use super::reference::{EmbeddedReference, ReferenceTarget};
 
 const BULLET_INDENT: f32 = 22.0;
@@ -24,6 +24,11 @@ pub struct BulletSnapshot {
     pub id: Uuid,
     pub textbox: TextBoxSnapshot,
     pub depth: u32,
+    /// "Archived" flag for this individual bullet. Effective active
+    /// state for visibility/render also requires every ancestor (and
+    /// the containing cell) to be active — see
+    /// `OutlineCell::compute_effective_active`.
+    pub active: bool,
 }
 
 #[derive(Clone)]
@@ -40,11 +45,21 @@ pub struct Bullet {
     id: Uuid,
     textbox: TextBox,
     depth: u32,
+    /// Per-bullet "archived" flag. Effective active state cascades
+    /// by ancestry: a bullet is effectively active iff this flag is
+    /// true AND every ancestor bullet is active. Toggled via the
+    /// "Mark sub-outline inactive/active" right-click row.
+    active: bool,
 }
 
 impl Bullet {
     pub fn new(id: Uuid, textbox: TextBox, depth: u32) -> Self {
-        Self { id, textbox, depth }
+        Self {
+            id,
+            textbox,
+            depth,
+            active: true,
+        }
     }
 
     pub fn id(&self) -> Uuid {
@@ -57,6 +72,14 @@ impl Bullet {
 
     pub fn textbox(&self) -> &TextBox {
         &self.textbox
+    }
+
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    pub fn set_active(&mut self, active: bool) {
+        self.active = active;
     }
 
     /// Drain any pending link URL the bullet's textbox stashed during
@@ -115,6 +138,14 @@ pub struct OutlineCell {
     /// on the full outline so navigation / hit-testing stay coherent.
     /// Not persisted; re-derived each frame from the active filter.
     bullet_filter: Option<HashSet<Uuid>>,
+    /// Per-frame mirror of the app's global "Show archived" toggle.
+    /// When false (the default), `tick` skips bullets whose
+    /// effective-active state is false (the bullet's own flag, AND of
+    /// its ancestors). When true, those bullets render with a
+    /// dimmed alpha layer instead of being filtered out. Reset to
+    /// false at the top of each tick by the app's render dispatch
+    /// before the toggle is re-applied for this frame.
+    show_inactive: bool,
     /// Optional read-only embed pinned above the bullets. Set by the
     /// "Envelope" action — the user wraps a Reference cell in an
     /// outline so they can write notes around it, and this slot holds
@@ -137,6 +168,7 @@ impl OutlineCell {
             id,
             textbox: TextBox::new(typeface.clone(), String::new()),
             depth: 0,
+            active: true,
         };
         Self {
             typeface,
@@ -150,6 +182,7 @@ impl OutlineCell {
             height: 0.0,
             font_scale: 1.0,
             bullet_filter: None,
+            show_inactive: false,
             reference_header: None,
             header_y_origin: 0.0,
             header_height: 0.0,
@@ -190,6 +223,7 @@ impl OutlineCell {
                 id,
                 textbox: TextBox::new(typeface.clone(), String::new()),
                 depth: 0,
+                active: true,
             }]
         } else {
             bullets
@@ -206,6 +240,7 @@ impl OutlineCell {
             height: 0.0,
             font_scale: 1.0,
             bullet_filter: None,
+            show_inactive: false,
             reference_header,
             header_y_origin: 0.0,
             header_height: 0.0,
@@ -254,6 +289,15 @@ impl OutlineCell {
     /// it. None ⇒ render all bullets.
     pub fn set_bullet_filter(&mut self, ids: Option<HashSet<Uuid>>) {
         self.bullet_filter = ids;
+    }
+
+    /// Per-frame mirror of the app's global "Show archived" toggle —
+    /// `tick` reads it to decide whether effective-inactive bullets
+    /// are skipped (false) or rendered with a dim alpha layer (true).
+    /// Reset by the app's cell-render dispatch each frame so a stale
+    /// value doesn't persist after the toggle flips.
+    pub fn set_show_inactive(&mut self, on: bool) {
+        self.show_inactive = on;
     }
 
     /// Bullet IDs whose text contains any of `include_tags` (inline
@@ -441,23 +485,35 @@ impl OutlineCell {
         bullet_paint.set_anti_alias(true);
         bullet_paint.set_color(crate::color::bullet_marker());
 
-        // Per-bullet visibility for tag-filtered views. None ⇒ all
-        // bullets visible; Some ⇒ render only listed IDs, depth-
-        // normalized so the shallowest visible bullet sits flush-left.
-        let visible: Vec<bool> = match &self.bullet_filter {
+        // Per-bullet visibility layers two independent filters:
+        //  1. Tag filter — when the active view restricts to a tag,
+        //     only matching bullets and their subtrees render.
+        //     Depth is renormalized so the shallowest visible bullet
+        //     sits flush-left (`depth_offset_subtract`).
+        //  2. Active filter — effective-inactive bullets (own flag
+        //     OR an ancestor's flag is false) are hidden unless the
+        //     global `show_inactive` toggle is on. Depth is NOT
+        //     renormalized for this case — the user is just hiding
+        //     selected sub-outlines, not reframing the document.
+        // A bullet renders only if BOTH pass.
+        let tag_visible: Vec<bool> = match &self.bullet_filter {
             Some(set) => self.bullets.iter().map(|b| set.contains(&b.id)).collect(),
             None => vec![true; self.bullets.len()],
         };
         let depth_offset_subtract: u32 = if self.bullet_filter.is_some() {
             self.bullets
                 .iter()
-                .zip(visible.iter())
+                .zip(tag_visible.iter())
                 .filter_map(|(b, v)| if *v { Some(b.depth) } else { None })
                 .min()
                 .unwrap_or(0)
         } else {
             0
         };
+        let effective_active = self.compute_effective_active();
+        let visible: Vec<bool> = (0..self.bullets.len())
+            .map(|i| tag_visible[i] && (effective_active[i] || self.show_inactive))
+            .collect();
 
         let mut bullet_y_bands: Vec<(f32, f32)> = Vec::with_capacity(self.bullets.len());
         let suppress_caret = active_indices.is_some();
@@ -474,6 +530,15 @@ impl OutlineCell {
             let depth_offset = (normalized_depth as f32) * indent_per_level;
             let marker_x = x + depth_offset + indent_per_level / 2.0;
             let marker_y = cur_y + line_height / 2.0;
+            // Effective-inactive bullets reach this point only when
+            // `show_inactive` is on (otherwise they were filtered out
+            // above). Wrap their draw block — marker + textbox — in
+            // an alpha layer so the dim treatment composites
+            // uniformly with text, tag overdraw, and link underlines.
+            let bullet_inactive = !effective_active[idx];
+            if bullet_inactive {
+                canvas.save_layer_alpha(None, INACTIVE_ALPHA as u32);
+            }
             canvas.draw_circle((marker_x, marker_y), radius, &bullet_paint);
 
             let text_x = x + depth_offset + indent_per_level;
@@ -487,6 +552,9 @@ impl OutlineCell {
                 bullet
                     .textbox
                     .tick(canvas, text_x, cur_y, text_w, bullet_focused, bullet_show_caret);
+            if bullet_inactive {
+                canvas.restore();
+            }
             bullet_y_bands.push((cur_y, cur_y + h));
             cur_y += h;
         }
@@ -964,6 +1032,61 @@ impl OutlineCell {
         Some(i..k)
     }
 
+    /// Compute the effective active state for every bullet, parallel
+    /// to `bullets()`. A bullet is *effectively* active iff its own
+    /// `active` flag is true AND every ancestor (any bullet at
+    /// strictly lower depth that precedes this one in the flat list,
+    /// up to depth 0) is active. Walks the outline once with a
+    /// per-depth "lowest inactive ancestor" tracker so a single
+    /// inactive bullet at depth `d` makes its whole subtree
+    /// effectively inactive — even if the descendants' own flags say
+    /// active. Used by render to skip / dim, and by the bullet
+    /// visibility gate.
+    pub fn compute_effective_active(&self) -> Vec<bool> {
+        let mut effective = Vec::with_capacity(self.bullets.len());
+        // Stack of (depth, active) pairs for the current ancestor
+        // chain. The chain shrinks back when we return to a shallower
+        // depth and grows when we descend.
+        let mut chain: Vec<(u32, bool)> = Vec::new();
+        for b in &self.bullets {
+            while let Some(&(d, _)) = chain.last() {
+                if d >= b.depth {
+                    chain.pop();
+                } else {
+                    break;
+                }
+            }
+            let ancestors_active = chain.iter().all(|&(_, a)| a);
+            let eff = b.active && ancestors_active;
+            effective.push(eff);
+            chain.push((b.depth, b.active));
+        }
+        effective
+    }
+
+    /// Look up a bullet's index by id. Used by `set_bullet_active`
+    /// (and the right-click toggle dispatch) so callers don't need
+    /// to scan the bullet list themselves. Returns None if the id
+    /// isn't in the cell.
+    pub fn bullet_idx(&self, bullet_id: Uuid) -> Option<usize> {
+        self.bullets.iter().position(|b| b.id == bullet_id)
+    }
+
+    /// Mutate a bullet's `active` flag. No effective-active recompute
+    /// is needed (rendering and filtering call
+    /// `compute_effective_active` per frame). Returns whether the
+    /// bullet exists and the flag actually changed.
+    pub fn set_bullet_active(&mut self, bullet_id: Uuid, active: bool) -> bool {
+        let Some(i) = self.bullet_idx(bullet_id) else {
+            return false;
+        };
+        if self.bullets[i].active == active {
+            return false;
+        }
+        self.bullets[i].active = active;
+        true
+    }
+
     /// Select the sub-tree rooted at `bullet_id` — the bullet itself
     /// plus all of its descendants. Drives the same highlight + bullet-
     /// selection key handling as a multi-bullet drag-select, so any
@@ -1054,6 +1177,7 @@ impl OutlineCell {
                     id: b.id,
                     textbox: b.textbox.snapshot(),
                     depth: b.depth,
+                    active: b.active,
                 })
                 .collect(),
             focused_bullet: self.focused_bullet,
@@ -1072,6 +1196,7 @@ impl OutlineCell {
                     id: bs.id,
                     textbox: tb,
                     depth: bs.depth,
+                    active: bs.active,
                 }
             })
             .collect();
@@ -1154,6 +1279,12 @@ impl OutlineCell {
                 id: new_id,
                 textbox: new_tb,
                 depth,
+                // New bullets always start active. Effective-active
+                // cascade (via ancestry) still applies, so a new
+                // bullet under an inactive parent renders as
+                // effectively-inactive without forcing the per-bullet
+                // flag down here.
+                active: true,
             },
         );
         self.focused_bullet = new_id;
@@ -1234,6 +1365,7 @@ impl OutlineCell {
                 id: new_id,
                 textbox: tb,
                 depth: 0,
+                active: true,
             });
             self.focused_bullet = new_id;
             return true;

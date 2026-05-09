@@ -5,7 +5,7 @@ use crate::query;
 
 use super::{
     KeptApp, PageKind, Query, SIDEBAR_HEADER_FONT_SIZE, SIDEBAR_WIDTH, ViewKind,
-    format_date_label, local_date_for_ms,
+    draw_toggle, format_date_label, local_date_for_ms,
 };
 
 const SIDEBAR_PAD_X: f32 = 12.0;
@@ -107,6 +107,7 @@ impl KeptApp {
         self.hit_tests.sidebar.contexts.clear();
         self.hit_tests.sidebar.dates.clear();
         self.hit_tests.sidebar.tags.clear();
+        self.hit_tests.sidebar.show_inactive_toggle = None;
         self.hit_tests.sidebar.pages.clear();
         self.hit_tests.sidebar.weeks.clear();
 
@@ -166,7 +167,14 @@ impl KeptApp {
         // home).
         let mut dates_set: std::collections::BTreeSet<chrono::NaiveDate> =
             std::collections::BTreeSet::new();
+        // Skip cells filtered out by the global "Show archived" toggle
+        // so a date with only inactive cells doesn't leave a clickable
+        // row that lands on an empty timeline.
+        let show_inactive_cells = self.show_inactive_cells;
         for c in &self.cells {
+            if !c.active && !show_inactive_cells {
+                continue;
+            }
             dates_set.insert(local_date_for_ms(c.timestamp));
         }
         dates_set.insert(local_date_for_ms(now_epoch_ms()));
@@ -274,6 +282,50 @@ impl KeptApp {
         );
         self.hit_tests.sidebar.pages.push((PageKind::People, people_rect));
         y += date_h + item_gap;
+
+        // "Show archived" toggle pill at the very bottom of the
+        // sidebar. Single global flag (`KeptApp::show_inactive_cells`)
+        // that surfaces inactive cells/bullets across every view —
+        // see the cascade-aware visibility filter in
+        // `is_visible_for_view` / `OutlineCell::tick`. Layout mirrors
+        // the People-page toggle: muted label on the left, pill on
+        // the right, both centered on the row's text band.
+        y += date_gap;
+        let toggle_row_top = y;
+        let toggle_row_bot = y + date_h;
+        let toggle_h = (date_h * 0.6).max(14.0);
+        let toggle_w = toggle_h * 1.8;
+        let row_mid = (toggle_row_top + toggle_row_bot) * 0.5;
+        let toggle_right = sb_w - pad_x;
+        let toggle_left = toggle_right - toggle_w;
+        let toggle_rect = Rect::new(
+            toggle_left,
+            row_mid - toggle_h * 0.5,
+            toggle_right,
+            row_mid + toggle_h * 0.5,
+        );
+        let toggle_hovered = mouse_x >= toggle_rect.left
+            && mouse_x <= toggle_rect.right
+            && mouse_y >= toggle_rect.top
+            && mouse_y <= toggle_rect.bottom;
+        // Label (same muted-grey style as section headers — this row
+        // is metadata, not navigation).
+        let label_font =
+            Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
+        let mut label_paint = Paint::default();
+        label_paint.set_anti_alias(true);
+        label_paint.set_color(crate::color::sidebar_section_header());
+        let (_, lm) = label_font.metrics();
+        let label_baseline = row_mid + (-lm.ascent + lm.descent) * 0.5 - lm.descent;
+        canvas.draw_str(
+            "Show inactive",
+            Point::new(pad_x, label_baseline),
+            &label_font,
+            &label_paint,
+        );
+        draw_toggle(canvas, toggle_rect, self.show_inactive_cells, toggle_hovered);
+        self.hit_tests.sidebar.show_inactive_toggle = Some(toggle_rect);
+        y = toggle_row_bot + item_gap;
 
         canvas.restore();
 
