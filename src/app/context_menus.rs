@@ -3,6 +3,8 @@ use skia_safe::{
 };
 use uuid::Uuid;
 
+use crate::cell::ReferenceTarget;
+
 use super::{KeptApp, clamp_rect_to_viewport, fit_text_ellipsized};
 
 /// Cell context menu (right-click). Two muted timestamp lines + a
@@ -38,6 +40,12 @@ pub(super) struct CellContextMenu {
     /// — references always resolve to the original source, never to
     /// another reference (no chained-reference creation).
     pub(super) reference_origin_cell_id: Uuid,
+    /// `Some` when the menu was opened on a Reference cell — captures
+    /// that reference's actual target (WholeCell or Subtree). Drives
+    /// the whole-cell surface row so re-surfacing a Subtree reference
+    /// produces another Subtree pointing at the same bullet, instead
+    /// of degrading to a WholeCell of the source.
+    pub(super) source_reference_target: Option<ReferenceTarget>,
 }
 
 /// Right-click menu over a People-page row. `deletable` and `ref_count`

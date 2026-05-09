@@ -5096,6 +5096,15 @@ impl KeptApp {
                         _ => cell_id,
                     })
                     .unwrap_or(cell_id);
+                // For a Reference source, capture its full target so
+                // the whole-cell surface row can preserve a Subtree
+                // pointer when the user re-surfaces it.
+                let source_reference_target: Option<ReferenceTarget> = self
+                    .cell(cell_id)
+                    .and_then(|c| match &c.kind {
+                        CellKind::Reference(rc) => Some(rc.target()),
+                        _ => None,
+                    });
 
                 // Visualize the subtree selection: for direct outlines,
                 // on the cell itself; for embeds, on the cached outline
@@ -5125,6 +5134,7 @@ impl KeptApp {
                     bullet_id,
                     bullet_snippet,
                     reference_origin_cell_id,
+                    source_reference_target,
                 });
                 return true;
             }
@@ -5331,17 +5341,21 @@ impl KeptApp {
                 }
             }
             // "Surface as reference" — create a new reference cell at "now"
-            // pointing to the right-clicked cell.
+            // pointing at the source. For a Reference source, copy its
+            // target verbatim: re-surfacing a Subtree reference yields
+            // another Subtree pointing at the same bullet, not a
+            // WholeCell of the original (the user wants the same chunk,
+            // not the whole note). For a non-Reference source, fall
+            // back to a WholeCell pointer at the cell itself.
             if let Some(rect) = self.hit_tests.cell_menu.surface {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
-                        // `reference_origin_cell_id` is the embed's
-                        // source for Reference cells; the cell itself
-                        // otherwise — references always resolve to
-                        // the original.
-                        self.surface_as_reference(ReferenceTarget::WholeCell(
-                            menu.reference_origin_cell_id,
-                        ));
+                        let target = menu
+                            .source_reference_target
+                            .unwrap_or(ReferenceTarget::WholeCell(
+                                menu.reference_origin_cell_id,
+                            ));
+                        self.surface_as_reference(target);
                     }
                     return true;
                 }
