@@ -31,64 +31,48 @@ impl ReferenceTarget {
     }
 }
 
-/// A read-only window onto another cell (or sub-tree). Renders the
-/// target's content in place; click navigates to the original. Stores
-/// only the pointer + its own layout box — never caches target content
-/// directly. Lookup happens on the shared `Vec<Cell>` at render time.
-pub struct ReferenceCell {
+/// A reference target plus its lazily-rebuilt preview cache. Used both
+/// by `ReferenceCell` (top-level read-only embed) and by the envelope
+/// outline's `reference_header` slot. Carries no layout — geometry is
+/// recorded on the host (cell or outline header band) by the app
+/// layer's render pass.
+///
+/// Boxed `Cell` cache because `Cell` indirectly contains this struct;
+/// without indirection the type would be infinitely sized.
+pub struct EmbeddedReference {
     pub target: ReferenceTarget,
-    /// Carried so the cache can reconstitute body widgets. The reference
-    /// itself doesn't render text directly.
-    typeface: Typeface,
-    /// Layout box for the embed itself, written by the app layer's render
-    /// dispatch. Distinct from the target's own `(x_origin, y_origin)` —
-    /// those belong to the target's render at its real timeline location.
-    x_origin: f32,
-    y_origin: f32,
-    width: f32,
-    height: f32,
-    font_scale: f32,
     /// Persistent cached preview of the target's content. Owns its own
     /// selection state across frames so drag-select inside the embed
     /// works exactly like in any other cell. Rebuilt whenever
     /// `cache_source_edited_at` doesn't match the source's `edited_at`,
     /// so edits at the original propagate. None when the target is
     /// missing (a placeholder is drawn instead).
-    /// Boxed because `Cell` contains `CellKind` which contains
-    /// `ReferenceCell` — without indirection the type would be infinitely
-    /// sized.
     cache: Option<Box<Cell>>,
     /// Source's `edited_at` when `cache` was last rebuilt.
     cache_source_edited_at: Option<i64>,
 }
 
-impl ReferenceCell {
-    pub fn new(typeface: Typeface, target: ReferenceTarget) -> Self {
+impl EmbeddedReference {
+    pub fn new(target: ReferenceTarget) -> Self {
         Self {
             target,
-            typeface,
-            x_origin: 0.0,
-            y_origin: 0.0,
-            width: 0.0,
-            height: 0.0,
-            font_scale: 1.0,
             cache: None,
             cache_source_edited_at: None,
         }
+    }
+
+    pub fn target(&self) -> ReferenceTarget {
+        self.target
     }
 
     /// True if the cache needs rebuilding for `source_edited_at` (None
     /// means the target is gone — invalidate the cache).
     pub fn cache_is_stale_for(&self, source_edited_at: Option<i64>) -> bool {
         match (source_edited_at, self.cache_source_edited_at, &self.cache) {
-            // Target gone. Cache should be cleared if it isn't already.
             (None, _, Some(_)) => true,
             (None, _, None) => false,
-            // Target present, cache missing.
             (Some(_), _, None) => true,
-            // Target present, cache stale.
             (Some(src), Some(cached), Some(_)) => src != cached,
-            // Target present, cache built but no edited_at recorded.
             (Some(_), None, Some(_)) => true,
         }
     }
@@ -108,6 +92,62 @@ impl ReferenceCell {
     pub fn cache_ref(&self) -> Option<&Cell> {
         self.cache.as_deref()
     }
+}
+
+/// A read-only window onto another cell (or sub-tree). Renders the
+/// target's content in place; click navigates to the original. Stores
+/// only the embed pointer + its own layout box — never caches target
+/// content directly here. Lookup happens on the shared `Vec<Cell>` at
+/// render time, with the cache living on the contained
+/// `EmbeddedReference`.
+pub struct ReferenceCell {
+    head: EmbeddedReference,
+    /// Carried so the cache can reconstitute body widgets. The reference
+    /// itself doesn't render text directly.
+    typeface: Typeface,
+    /// Layout box for the embed itself, written by the app layer's render
+    /// dispatch. Distinct from the target's own `(x_origin, y_origin)` —
+    /// those belong to the target's render at its real timeline location.
+    x_origin: f32,
+    y_origin: f32,
+    width: f32,
+    height: f32,
+    font_scale: f32,
+}
+
+impl ReferenceCell {
+    pub fn new(typeface: Typeface, target: ReferenceTarget) -> Self {
+        Self {
+            head: EmbeddedReference::new(target),
+            typeface,
+            x_origin: 0.0,
+            y_origin: 0.0,
+            width: 0.0,
+            height: 0.0,
+            font_scale: 1.0,
+        }
+    }
+
+    /// True if the cache needs rebuilding for `source_edited_at` (None
+    /// means the target is gone — invalidate the cache).
+    pub fn cache_is_stale_for(&self, source_edited_at: Option<i64>) -> bool {
+        self.head.cache_is_stale_for(source_edited_at)
+    }
+
+    /// Replace the cache with `new_cache` (built by the caller from the
+    /// resolved source data). Updates the staleness key. Pass `None` for
+    /// `new_cache` when the target is missing.
+    pub fn install_cache(&mut self, new_cache: Option<Cell>, source_edited_at: Option<i64>) {
+        self.head.install_cache(new_cache, source_edited_at);
+    }
+
+    pub fn cache_mut(&mut self) -> Option<&mut Cell> {
+        self.head.cache_mut()
+    }
+
+    pub fn cache_ref(&self) -> Option<&Cell> {
+        self.head.cache_ref()
+    }
 
     #[allow(dead_code)]
     pub fn typeface(&self) -> &Typeface {
@@ -115,7 +155,16 @@ impl ReferenceCell {
     }
 
     pub fn target(&self) -> ReferenceTarget {
-        self.target
+        self.head.target
+    }
+
+    /// Replace the target. Used by snapshot restore. Caller is
+    /// responsible for invalidating the cache (the new target may
+    /// resolve differently); typically restore() runs immediately
+    /// after.
+    pub fn set_target(&mut self, target: ReferenceTarget) {
+        self.head.target = target;
+        self.head.install_cache(None, None);
     }
 
     #[allow(dead_code)]

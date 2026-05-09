@@ -19,14 +19,12 @@ mod wrap;
 pub use common::{TagSpan, TextBoxSnapshot, now_epoch_ms};
 pub use outline::{Bullet, OutlineCell, OutlineSnapshot};
 pub use poppop::PopPopCell;
-pub use reference::{ReferenceCell, ReferenceTarget};
+pub use reference::{EmbeddedReference, ReferenceCell, ReferenceTarget};
 pub use table::{TableCell, TableSnapshot};
 pub use textbox::TextBox;
 
-pub(crate) use common::{open_url, primary_mod};
+pub(crate) use common::{TITLE_BODY_GAP, open_url, primary_mod};
 pub use wrap::parse_inline_tags;
-
-use common::TITLE_BODY_GAP;
 use wrap::parse_heading_tags;
 
 
@@ -76,7 +74,8 @@ impl CellSnapshot {
         match (&self.kind, &other.kind) {
             (CellSnapshotKind::Plain(a), CellSnapshotKind::Plain(b)) => a.text == b.text,
             (CellSnapshotKind::Outline(a), CellSnapshotKind::Outline(b)) => {
-                a.bullets.len() == b.bullets.len()
+                a.reference_header == b.reference_header
+                    && a.bullets.len() == b.bullets.len()
                     && a.bullets.iter().zip(b.bullets.iter()).all(|(x, y)| {
                         x.depth == y.depth && x.textbox.text == y.textbox.text
                     })
@@ -170,6 +169,12 @@ impl CellKind {
                         Bullet::new(b.id(), tb, b.depth())
                     })
                     .collect();
+                // Envelope outlines used as a Reference target render
+                // their bullets only — the header is dropped from the
+                // cache. v1 trade-off documented in the plan; users who
+                // want to see the embedded source can click through to
+                // the envelope itself, which renders the header
+                // natively.
                 let mut new_oc = OutlineCell::from_bullets(typeface.clone(), bullets);
                 new_oc.set_font_scale(scale);
                 Some(CellKind::Outline(new_oc))
@@ -1445,7 +1450,7 @@ impl Cell {
                 CellKind::Outline(oc) => CellSnapshotKind::Outline(oc.snapshot()),
                 CellKind::PopPop(pc) => CellSnapshotKind::PopPop(pc.snapshot()),
                 CellKind::Table(tc) => CellSnapshotKind::Table(tc.snapshot()),
-                CellKind::Reference(rc) => CellSnapshotKind::Reference(rc.target),
+                CellKind::Reference(rc) => CellSnapshotKind::Reference(rc.target()),
             },
         }
     }
@@ -1475,7 +1480,7 @@ impl Cell {
             (CellKind::PopPop(pc), CellSnapshotKind::PopPop(tbs)) => pc.restore(tbs),
             (CellKind::Table(tc), CellSnapshotKind::Table(ts)) => tc.restore(ts),
             (CellKind::Reference(rc), CellSnapshotKind::Reference(target)) => {
-                rc.target = target;
+                rc.set_target(target);
             }
             _ => {}
         }
@@ -1513,6 +1518,47 @@ mod tests {
         let new_links = bullets[1].textbox().links();
         assert_eq!(new_links.len(), 1, "suffix link rebased onto new bullet");
         assert_eq!(new_links[0].range, 2..6);
+    }
+
+    #[test]
+    fn envelope_outline_round_trips_through_snapshot() {
+        // OutlineSnapshot carries the header target (cache is
+        // session-only and rebuilds lazily). A snapshot-then-restore
+        // recovers both the header and the bullet text exactly.
+        let target_id = Uuid::now_v7();
+        let mut oc = OutlineCell::with_envelope(
+            typeface(),
+            ReferenceTarget::WholeCell(target_id),
+        );
+        let bullet_id = oc.bullets()[0].id();
+        oc.replace_in_bullet_with_text(bullet_id, 0..0, "my note".to_string());
+
+        let snap = oc.snapshot();
+        let mut reborn = OutlineCell::new(typeface());
+        reborn.restore(snap);
+
+        let header = reborn
+            .reference_header()
+            .expect("header restored from snapshot");
+        match header.target() {
+            ReferenceTarget::WholeCell(id) => assert_eq!(id, target_id),
+            _ => panic!("WholeCell target should round-trip"),
+        }
+        assert_eq!(reborn.bullets().len(), 1);
+        assert_eq!(reborn.bullets()[0].textbox().text(), "my note");
+    }
+
+    #[test]
+    fn envelope_outline_is_never_empty() {
+        // The empty-cell flush in the app layer would otherwise eat a
+        // freshly-created envelope before the user typed anything.
+        // Carrying a header target counts as content.
+        let target_id = Uuid::now_v7();
+        let oc = OutlineCell::with_envelope(
+            typeface(),
+            ReferenceTarget::WholeCell(target_id),
+        );
+        assert!(!oc.is_empty());
     }
 
     #[test]

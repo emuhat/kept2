@@ -14,6 +14,7 @@ use winit::{
 
 use super::TextBox;
 use super::common::{BODY_FONT_SIZE, TextBoxSnapshot, primary_mod, word_mod};
+use super::reference::{EmbeddedReference, ReferenceTarget};
 
 const BULLET_INDENT: f32 = 22.0;
 const BULLET_RADIUS: f32 = 3.0;
@@ -29,6 +30,10 @@ pub struct BulletSnapshot {
 pub struct OutlineSnapshot {
     pub bullets: Vec<BulletSnapshot>,
     pub focused_bullet: Uuid,
+    /// Pinned read-only embed (envelope outlines only). Snapshots
+    /// carry only the target — caches are session-only and rebuild
+    /// lazily on the next render.
+    pub reference_header: Option<ReferenceTarget>,
 }
 
 pub struct Bullet {
@@ -79,6 +84,11 @@ enum DragMode {
     /// Drag has crossed bullet boundaries; we own the selection. `head_id`
     /// is the bullet currently under the cursor.
     BulletRange { head_id: Uuid },
+    /// Drag started inside the envelope header's read-only embed.
+    /// Forwards drag/up to the header cache; cross-zone drag (header
+    /// → bullets) is unsupported in v1 — once the cursor leaves the
+    /// header band the drag ends quietly.
+    Header,
 }
 
 #[derive(Clone, Copy)]
@@ -105,6 +115,19 @@ pub struct OutlineCell {
     /// on the full outline so navigation / hit-testing stay coherent.
     /// Not persisted; re-derived each frame from the active filter.
     bullet_filter: Option<HashSet<Uuid>>,
+    /// Optional read-only embed pinned above the bullets. Set by the
+    /// "Envelope" action — the user wraps a Reference cell in an
+    /// outline so they can write notes around it, and this slot holds
+    /// the original reference target plus its preview cache. The app
+    /// layer renders the embed before ticking the bullet body.
+    /// `None` for normal outlines.
+    reference_header: Option<EmbeddedReference>,
+    /// Y-band the app layer wrote during the most recent render of
+    /// the header embed (doc-space). Used to route hit-tests inside
+    /// the band to the cache cell. `(0.0, 0.0)` before the first
+    /// render; ignored unless `reference_header.is_some()`.
+    header_y_origin: f32,
+    header_height: f32,
 }
 
 impl OutlineCell {
@@ -127,12 +150,36 @@ impl OutlineCell {
             height: 0.0,
             font_scale: 1.0,
             bullet_filter: None,
+            reference_header: None,
+            header_y_origin: 0.0,
+            header_height: 0.0,
         }
+    }
+
+    /// Build an outline pre-loaded with a reference header — the
+    /// "Envelope" action's seed shape. Single empty text bullet
+    /// underneath; caret naturally lands there for the user to start
+    /// typing notes around the embedded reference.
+    pub fn with_envelope(typeface: Typeface, target: ReferenceTarget) -> Self {
+        let mut oc = Self::new(typeface);
+        oc.reference_header = Some(EmbeddedReference::new(target));
+        oc
     }
 
     /// Reconstruct an `OutlineCell` from persisted bullets. Bullets must be
     /// non-empty (the OutlineCell invariant). Used by the persistence layer.
     pub fn from_bullets(typeface: Typeface, bullets: Vec<Bullet>) -> Self {
+        Self::from_bullets_with_header(typeface, bullets, None)
+    }
+
+    /// Variant of `from_bullets` that also takes an optional header
+    /// target — used by the persistence layer to reconstruct an
+    /// envelope outline.
+    pub fn from_bullets_with_header(
+        typeface: Typeface,
+        bullets: Vec<Bullet>,
+        reference_header: Option<EmbeddedReference>,
+    ) -> Self {
         let focused_bullet = bullets
             .first()
             .map(|b| b.id)
@@ -159,11 +206,47 @@ impl OutlineCell {
             height: 0.0,
             font_scale: 1.0,
             bullet_filter: None,
+            reference_header,
+            header_y_origin: 0.0,
+            header_height: 0.0,
         }
     }
 
     pub fn bullets(&self) -> &[Bullet] {
         &self.bullets
+    }
+
+    /// Borrow the optional reference header (envelope outlines).
+    pub fn reference_header(&self) -> Option<&EmbeddedReference> {
+        self.reference_header.as_ref()
+    }
+
+    /// Mutable borrow — used by the app layer's render dispatch to
+    /// install / refresh the cache.
+    pub fn reference_header_mut(&mut self) -> Option<&mut EmbeddedReference> {
+        self.reference_header.as_mut()
+    }
+
+    /// True iff this outline carries an envelope header.
+    pub fn has_reference_header(&self) -> bool {
+        self.reference_header.is_some()
+    }
+
+    /// Doc-space `(top, bottom)` of the header band recorded by the
+    /// most recent render. None when there's no header or no render
+    /// has happened yet (`header_height == 0`).
+    pub fn header_y_band(&self) -> Option<(f32, f32)> {
+        if self.reference_header.is_none() || self.header_height <= 0.0 {
+            return None;
+        }
+        Some((self.header_y_origin, self.header_y_origin + self.header_height))
+    }
+
+    /// Stash the header band's geometry. Called by the app layer's
+    /// envelope render dispatch after laying out the embed wrapper.
+    pub fn set_reference_header_geometry(&mut self, y: f32, h: f32) {
+        self.header_y_origin = y;
+        self.header_height = h;
     }
 
     /// Stash the per-frame bullet-visibility hint. The app calls this
@@ -220,7 +303,17 @@ impl OutlineCell {
 
     /// Drain the first pending link URL across all bullets. At most one
     /// can be set per `mouse_down` (only the clicked bullet stashes it).
+    /// Envelope outlines also drain from the header cache (read-only
+    /// embed) so a click on a link inside the embedded preview wakes
+    /// up the same nav path as a top-level reference would.
     pub fn take_pending_link_url(&mut self) -> Option<String> {
+        if let Some(header) = self.reference_header.as_mut() {
+            if let Some(cache) = header.cache_mut() {
+                if let Some(url) = cache.take_pending_link_url() {
+                    return Some(url);
+                }
+            }
+        }
         for b in &mut self.bullets {
             if let Some(url) = b.take_pending_link_url() {
                 return Some(url);
@@ -230,7 +323,16 @@ impl OutlineCell {
     }
 
     /// Drain the first pending inline-tag name across all bullets.
+    /// Header cache is also drained so a `#tag` click inside an
+    /// envelope's embedded preview navigates to the tag view.
     pub fn take_pending_tag_name(&mut self) -> Option<String> {
+        if let Some(header) = self.reference_header.as_mut() {
+            if let Some(cache) = header.cache_mut() {
+                if let Some(name) = cache.take_pending_tag_name() {
+                    return Some(name);
+                }
+            }
+        }
         for b in &mut self.bullets {
             if let Some(name) = b.take_pending_tag_name() {
                 return Some(name);
@@ -504,6 +606,23 @@ impl OutlineCell {
         // Any new click clears any persisted multi-bullet selection.
         self.bullet_selection = None;
 
+        // Envelope header: forward to the read-only cache for selection
+        // drag (same shape as a top-level Reference cell). origin_id is
+        // a sentinel — it's never matched against a bullet — and the
+        // mode flag drives drag_to / mouse_up routing.
+        if self.point_in_header_band(abs_y) {
+            if let Some(header) = self.reference_header.as_mut() {
+                if let Some(cache) = header.cache_mut() {
+                    cache.mouse_down(abs_x, abs_y, modifiers, false);
+                }
+            }
+            self.drag = Some(OutlineDrag {
+                origin_id: Uuid::nil(),
+                mode: DragMode::Header,
+            });
+            return true;
+        }
+
         let idx = self.bullet_idx_at_y(abs_y);
         if idx >= self.bullets.len() {
             return false;
@@ -523,6 +642,14 @@ impl OutlineCell {
         let Some(drag) = self.drag.as_ref() else {
             return false;
         };
+        if matches!(drag.mode, DragMode::Header) {
+            return self
+                .reference_header
+                .as_mut()
+                .and_then(|h| h.cache_mut())
+                .map(|cache| cache.mouse_drag_to(abs_x, abs_y))
+                .unwrap_or(false);
+        }
         let origin_id = drag.origin_id;
         let in_bullet_mode = matches!(drag.mode, DragMode::BulletRange { .. });
 
@@ -585,10 +712,24 @@ impl OutlineCell {
                 self.focused_bullet = head_id;
                 true
             }
+            DragMode::Header => self
+                .reference_header
+                .as_mut()
+                .and_then(|h| h.cache_mut())
+                .map(|cache| cache.mouse_up())
+                .unwrap_or(false),
         }
     }
 
+    /// Bullets-only emptiness check. Envelope outlines are NEVER
+    /// considered empty — the embedded reference is the cell's anchor
+    /// even when the user hasn't typed anything yet, and the idle
+    /// empty-cell flush in the app layer would otherwise discard a
+    /// freshly-created envelope before the user can use it.
     pub fn is_empty(&self) -> bool {
+        if self.reference_header.is_some() {
+            return false;
+        }
         self.bullets.iter().all(|b| b.textbox.is_empty())
     }
 
@@ -628,8 +769,17 @@ impl OutlineCell {
         }
     }
 
-    /// True if a link in the bullet under `(abs_x, abs_y)` is hit.
+    /// True if a link in the bullet under `(abs_x, abs_y)` (or the
+    /// header cache, for envelope outlines) is hit.
     pub fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        if self.point_in_header_band(abs_y) {
+            return self
+                .reference_header
+                .as_ref()
+                .and_then(|h| h.cache_ref())
+                .map(|cache| cache.link_at_doc_pos(abs_x, abs_y))
+                .unwrap_or(false);
+        }
         if abs_y < self.y_origin || abs_y > self.y_origin + self.height {
             return false;
         }
@@ -641,8 +791,16 @@ impl OutlineCell {
     }
 
     /// True if an inline `#tag` in the bullet under `(abs_x, abs_y)`
-    /// is hit. Sibling of `link_at_doc_pos`.
+    /// (or the header cache, for envelope outlines) is hit.
     pub fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        if self.point_in_header_band(abs_y) {
+            return self
+                .reference_header
+                .as_ref()
+                .and_then(|h| h.cache_ref())
+                .map(|cache| cache.tag_at_doc_pos(abs_x, abs_y))
+                .unwrap_or(false);
+        }
         if abs_y < self.y_origin || abs_y > self.y_origin + self.height {
             return false;
         }
@@ -651,6 +809,15 @@ impl OutlineCell {
             return false;
         }
         self.bullets[idx].textbox.tag_at_doc_pos(abs_x, abs_y)
+    }
+
+    /// True iff `abs_y` falls inside the rendered header band (only
+    /// possible on envelope outlines after at least one render pass).
+    pub fn point_in_header_band(&self, abs_y: f32) -> bool {
+        match self.header_y_band() {
+            Some((top, bot)) => abs_y >= top && abs_y < bot,
+            None => false,
+        }
     }
 
     pub fn replace_in_bullet_with_link(
@@ -862,6 +1029,7 @@ impl OutlineCell {
                 })
                 .collect(),
             focused_bullet: self.focused_bullet,
+            reference_header: self.reference_header.as_ref().map(|h| h.target()),
         }
     }
 
@@ -882,6 +1050,12 @@ impl OutlineCell {
         self.focused_bullet = snap.focused_bullet;
         self.drag = None;
         self.bullet_selection = None;
+        // Restore the header from the snapshot's target (cache is
+        // session-only and rebuilds lazily). Reset the cached
+        // geometry so the next render writes fresh values.
+        self.reference_header = snap.reference_header.map(EmbeddedReference::new);
+        self.header_y_origin = 0.0;
+        self.header_height = 0.0;
     }
 
     // ----- editing operations -----

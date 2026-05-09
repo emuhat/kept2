@@ -147,12 +147,14 @@ impl KeptApp {
             self.hit_tests.cell_menu.delete = None;
             self.hit_tests.cell_menu.surface = None;
             self.hit_tests.cell_menu.surface_subtree = None;
+            self.hit_tests.cell_menu.envelope = None;
             return;
         };
         let Some(cell) = self.cell(menu.cell_id) else {
             self.hit_tests.cell_menu.delete = None;
             self.hit_tests.cell_menu.surface = None;
             self.hit_tests.cell_menu.surface_subtree = None;
+            self.hit_tests.cell_menu.envelope = None;
             return;
         };
         let scale = self.font_scale;
@@ -163,9 +165,17 @@ impl KeptApp {
 
         // Compute action rows. Order matches the visual stack.
         let has_subtree = menu.bullet_id.is_some();
+        // Envelope is offered only when the menu was opened on a
+        // Reference cell (we already capture that via
+        // `source_reference_target`). Wraps the embed in an outline so
+        // the user can write notes around it.
+        let has_envelope = menu.source_reference_target.is_some();
         let mut action_count: usize = 1; // Delete cell
         action_count += 1; // Surface as reference (always)
         if has_subtree {
+            action_count += 1;
+        }
+        if has_envelope {
             action_count += 1;
         }
         let menu_h =
@@ -274,9 +284,24 @@ impl KeptApp {
             None
         };
 
+        // Envelope — only on Reference cells. Replaces the reference
+        // with an outline whose first slot is the original embed
+        // (read-only) and whose body is editable bullets for the user
+        // to write notes around it.
+        let envelope_rect = if has_envelope {
+            Some(emit_row(
+                "Envelope",
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ))
+        } else {
+            None
+        };
+
         self.hit_tests.cell_menu.delete = Some(delete_rect);
         self.hit_tests.cell_menu.surface = Some(surface_rect);
         self.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
+        self.hit_tests.cell_menu.envelope = envelope_rect;
     }
 
     pub(super) fn render_tag_context_menu(

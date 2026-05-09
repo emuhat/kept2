@@ -133,6 +133,10 @@ struct CellMenuHits {
     /// `None` when the right-click didn't hit a bullet (non-outline cell,
     /// or outline whitespace).
     surface_subtree: Option<Rect>,
+    /// "Envelope" row — only populated when the menu's source is a
+    /// Reference cell (turns it into an outline with the original
+    /// embed pinned at the top).
+    envelope: Option<Rect>,
 }
 
 #[derive(Default)]
@@ -452,6 +456,17 @@ enum UndoOp {
         prev: bool,
         new: bool,
     },
+    /// "Envelope" action: replaces a Reference cell in place with an
+    /// Outline cell whose first slot is the original embed. Cell id /
+    /// timestamp are preserved, but the variant changes — `Cell::restore`
+    /// can't round-trip that via `CellEdit`, so envelope gets its own
+    /// op with both snapshots and a kind-rebuild on apply.
+    Envelope {
+        cell_id: Uuid,
+        pre: CellSnapshot,
+        post: CellSnapshot,
+        pre_focused: Option<Uuid>,
+    },
 }
 
 const SEED_TEXTS: &[&str] = &[
@@ -523,6 +538,11 @@ const EMBED_INSET: f32 = 8.0;
 const EMBED_PAD: f32 = 6.0;
 const EMBED_FOOTER_H: f32 = 18.0;
 const EMBED_FOOTER_FONT_SIZE: f32 = 12.0;
+/// Gap between the envelope outline's header embed and the bullet
+/// body underneath. Same shape as `TITLE_BODY_GAP` in `cell/common.rs`
+/// (kept here to avoid re-exporting that constant — they happen to
+/// share a value but their roles are distinct).
+const ENVELOPE_HEADER_GAP: f32 = 6.0;
 
 /// Pane divider (gutter between left and right panes). 6 px wide, painted
 /// in the same separator tone as the sidebar's right edge. Hover within
@@ -1438,7 +1458,7 @@ impl KeptApp {
         focused: bool,
     ) -> f32 {
         let target = match &self.cells[ref_idx].kind {
-            CellKind::Reference(rc) => rc.target,
+            CellKind::Reference(rc) => rc.target(),
             _ => return 0.0,
         };
         let scale = self.font_scale;
@@ -1532,6 +1552,194 @@ impl KeptApp {
         }
         self.cells[ref_idx].set_view_geometry(x, y, width, total_h);
 
+        total_h
+    }
+
+    /// Render an envelope outline: optional title slot at the top,
+    /// then the read-only embed (the original reference target),
+    /// then the editable bullet body underneath. Mirrors
+    /// `Cell::tick`'s title handling because Cell::tick can't see the
+    /// header (no access to `&[Cell]` for cache lookup), and dispatch
+    /// already special-cases envelope outlines at the cell-render
+    /// loop. Returns the total height consumed.
+    fn render_envelope_outline_cell(
+        &mut self,
+        canvas: &Canvas,
+        cell_idx: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+        show_caret: bool,
+    ) -> f32 {
+        // Mirror Cell::tick: drop an empty unfocused title.
+        let title_focused = self.cells[cell_idx].title_focused;
+        if !title_focused
+            && self.cells[cell_idx]
+                .title()
+                .map(|t| t.is_empty())
+                .unwrap_or(false)
+        {
+            self.cells[cell_idx].set_title(None);
+        }
+
+        let mut consumed = 0.0_f32;
+        let mut body_y = y;
+        if let Some(title) = self.cells[cell_idx].title_mut() {
+            let scale = title.font_scale();
+            let pad = cell::TITLE_BODY_GAP * scale;
+            let title_h = title.tick(
+                canvas,
+                x,
+                y,
+                width,
+                focused && title_focused,
+                show_caret && title_focused,
+            );
+            let block = title_h + pad;
+            consumed += block;
+            body_y = y + block;
+        }
+
+        // Resolve the header target. Defensive — caller already
+        // checked `has_reference_header` but tolerate the cell type
+        // shifting under us between dispatch and render.
+        let target = match &self.cells[cell_idx].kind {
+            CellKind::Outline(oc) => oc.reference_header().map(|h| h.target()),
+            _ => None,
+        };
+        let Some(target) = target else {
+            return self.cells[cell_idx]
+                .tick(canvas, x, y, width, focused, show_caret);
+        };
+
+        let scale = self.font_scale;
+        let inset = EMBED_INSET * scale;
+        let pad = EMBED_PAD * scale;
+        let body_x_inner = x + inset;
+        let body_y_inner = body_y + pad;
+        let body_w_inner = (width - 2.0 * inset).max(40.0);
+
+        let target_idx = self.cells.iter().position(|c| c.id == target.cell_id());
+
+        enum PreviewKind {
+            Cached,
+            Placeholder(&'static str),
+        }
+        let preview = match target_idx {
+            None => {
+                if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+                    if let Some(h) = oc.reference_header_mut() {
+                        h.install_cache(None, None);
+                    }
+                }
+                PreviewKind::Placeholder("↗ [referenced cell deleted]")
+            }
+            Some(tidx) => {
+                let source_edited_at = self.cells[tidx].edited_at;
+                let is_stale = match &self.cells[cell_idx].kind {
+                    CellKind::Outline(oc) => oc
+                        .reference_header()
+                        .map(|h| h.cache_is_stale_for(Some(source_edited_at)))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if is_stale {
+                    let new_cache = self.build_reference_cache(tidx, target);
+                    if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+                        if let Some(h) = oc.reference_header_mut() {
+                            h.install_cache(new_cache, Some(source_edited_at));
+                        }
+                    }
+                }
+                let has_cache = matches!(
+                    &self.cells[cell_idx].kind,
+                    CellKind::Outline(oc)
+                        if oc.reference_header()
+                            .and_then(|h| h.cache_ref())
+                            .is_some()
+                );
+                if has_cache {
+                    PreviewKind::Cached
+                } else if matches!(target, ReferenceTarget::Subtree { .. }) {
+                    PreviewKind::Placeholder("↗ [referenced bullet deleted]")
+                } else {
+                    PreviewKind::Placeholder("↗ [reference target unrenderable]")
+                }
+            }
+        };
+
+        let body_h = match preview {
+            PreviewKind::Placeholder(msg) => self.render_embed_placeholder(
+                canvas,
+                msg,
+                body_x_inner,
+                body_y_inner,
+                body_w_inner,
+                scale,
+            ),
+            PreviewKind::Cached => {
+                if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+                    if let Some(h) = oc.reference_header_mut() {
+                        if let Some(cache) = h.cache_mut() {
+                            cache.tick(
+                                canvas,
+                                body_x_inner,
+                                body_y_inner,
+                                body_w_inner,
+                                focused,
+                                false,
+                            )
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
+            }
+        };
+
+        let footer_text = match target_idx {
+            Some(tidx) => {
+                let ts = self.cells[tidx].timestamp;
+                format!("↗ originally {}", format_date_label(local_date_for_ms(ts)))
+            }
+            None => "↗ original deleted".to_string(),
+        };
+        let header_total_h = self.draw_embed_wrapper(
+            canvas,
+            x,
+            body_y,
+            width,
+            body_x_inner,
+            body_h,
+            &footer_text,
+            scale,
+        );
+
+        // Record header band for hit-testing (clicks inside route to
+        // the cache cell).
+        if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+            oc.set_reference_header_geometry(body_y, header_total_h);
+        }
+
+        consumed += header_total_h + ENVELOPE_HEADER_GAP * scale;
+        let after_header_y = y + consumed;
+
+        // Bullet body.
+        let body_focused = focused && !title_focused;
+        let body_caret = show_caret && !title_focused;
+        let bullets_h = if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+            oc.tick(canvas, x, after_header_y, width, body_focused, body_caret)
+        } else {
+            0.0
+        };
+
+        let total_h = consumed + bullets_h;
+        self.cells[cell_idx].set_view_geometry(x, y, width, total_h);
         total_h
     }
 
@@ -2733,6 +2941,10 @@ impl KeptApp {
                     let cell_y = y;
                     let cell_id = self.cells[i].id;
                     let is_reference = matches!(self.cells[i].kind, CellKind::Reference(_));
+                    let is_envelope_outline = matches!(
+                        &self.cells[i].kind,
+                        CellKind::Outline(oc) if oc.has_reference_header()
+                    );
                     let cell_is_focused =
                         focused_id.map(|f| f == cell_id).unwrap_or(false);
 
@@ -2751,6 +2963,20 @@ impl KeptApp {
                             cell_y,
                             content_width,
                             render_focused,
+                        )
+                    } else if is_envelope_outline {
+                        // Envelope outlines: read-only embed at the
+                        // top + editable bullet body. Same reason as
+                        // Reference — needs the cell list to refresh
+                        // the embed cache.
+                        self.render_envelope_outline_cell(
+                            canvas,
+                            i,
+                            cell_x,
+                            cell_y,
+                            content_width,
+                            render_focused,
+                            show_caret,
                         )
                     } else {
                         // Bullet-granular tag filter for non-focused
@@ -3342,7 +3568,7 @@ impl KeptApp {
                     if let Some(id) = self.focused {
                         let target = match self.cell(id) {
                             Some(c) => match &c.kind {
-                                CellKind::Reference(rc) => Some(rc.target),
+                                CellKind::Reference(rc) => Some(rc.target()),
                                 _ => None,
                             },
                             None => None,
@@ -4521,6 +4747,27 @@ impl KeptApp {
                 self.refresh_entities();
                 bump_focused_edited = false;
             }
+            UndoOp::Envelope {
+                cell_id,
+                pre,
+                pre_focused,
+                ..
+            } => {
+                // Rebuild the original Reference cell from the pre-snapshot
+                // and replace in place. Cell::restore can't handle a kind
+                // change; constructing a fresh cell with the same id is
+                // the cleanest path.
+                if let Some(idx) = self.cell_idx(*cell_id) {
+                    let cell = Cell::from_snapshot(
+                        *cell_id,
+                        pre.clone(),
+                        &self.typeface,
+                    );
+                    self.cells[idx] = cell;
+                }
+                self.dirty_cells.insert(*cell_id);
+                self.focused = *pre_focused;
+            }
         }
         self.redo_stack.push(op);
         self.dragging_cell = None;
@@ -4656,6 +4903,18 @@ impl KeptApp {
                 }
                 self.refresh_entities();
                 bump_focused_edited = false;
+            }
+            UndoOp::Envelope { cell_id, post, .. } => {
+                if let Some(idx) = self.cell_idx(*cell_id) {
+                    let cell = Cell::from_snapshot(
+                        *cell_id,
+                        post.clone(),
+                        &self.typeface,
+                    );
+                    self.cells[idx] = cell;
+                }
+                self.dirty_cells.insert(*cell_id);
+                self.focused = Some(*cell_id);
             }
         }
         self.undo_stack.push(op);
@@ -4956,6 +5215,61 @@ impl KeptApp {
         self.redo_stack.clear();
         self.coalesce_break = true;
         self.touch_cell(new_id);
+        true
+    }
+
+    /// Replace a Reference cell with an Outline whose first slot is the
+    /// original embed (read-only) and whose body is one empty bullet
+    /// for the user to start typing notes. Cell id and timestamp are
+    /// preserved — any other Reference cells pointing at this one keep
+    /// resolving. Records `UndoOp::Envelope` so Cmd+Z restores the
+    /// Reference exactly.
+    fn envelope_reference(&mut self, cell_id: Uuid) -> bool {
+        let Some(idx) = self.cell_idx(cell_id) else {
+            return false;
+        };
+        let target = match &self.cells[idx].kind {
+            CellKind::Reference(rc) => rc.target(),
+            _ => return false,
+        };
+        let pre_focused = self.focused;
+        let pre = self.cells[idx].snapshot();
+        let timestamp = self.cells[idx].timestamp;
+        let edited_at = self.cells[idx].edited_at;
+        let context_hint = self.cells[idx].context_hint_id;
+
+        // Build the new Outline cell directly so we can hand-pick the
+        // id / timestamp (replace-in-place semantics). Cell::from_parts
+        // takes everything we need.
+        let mut outline = cell::OutlineCell::with_envelope(self.typeface.clone(), target);
+        outline.set_font_scale(self.font_scale);
+        let mut new_cell = Cell::from_parts(
+            cell_id,
+            CellKind::Outline(outline),
+            None,
+            timestamp,
+            edited_at,
+            context_hint,
+        );
+        new_cell.set_font_scale(self.font_scale);
+        let post = new_cell.snapshot();
+
+        self.cells[idx] = new_cell;
+        self.focused = Some(cell_id);
+        self.editing = true;
+        self.dragging_cell = None;
+        self.pending_caret_scroll = true;
+        self.mark_cell_dirty(cell_id);
+        self.touch_cell(cell_id);
+
+        self.undo_stack.push(UndoOp::Envelope {
+            cell_id,
+            pre,
+            post,
+            pre_focused,
+        });
+        self.redo_stack.clear();
+        self.coalesce_break = true;
         true
     }
 
@@ -5374,6 +5688,18 @@ impl KeptApp {
                                 bullet_id: bid,
                             });
                         }
+                    }
+                    return true;
+                }
+            }
+            // "Envelope" — only present when the menu's source is a
+            // Reference cell. Wraps the embed in an outline so the
+            // user can write notes around it; cell id and timestamp
+            // are preserved (replace-in-place).
+            if let Some(rect) = self.hit_tests.cell_menu.envelope {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        self.envelope_reference(menu.cell_id);
                     }
                     return true;
                 }

@@ -218,7 +218,7 @@ impl Db {
                         *tags = to_records(parse_inline_tags(text));
                     }
                 }
-                CellBody::Outline { blocks } => {
+                CellBody::Outline { blocks, .. } => {
                     for b in blocks {
                         if b.tags.is_empty() {
                             b.tags = to_records(parse_inline_tags(&b.text));
@@ -921,6 +921,13 @@ enum CellBody {
     },
     Outline {
         blocks: Vec<BlockRecord>,
+        /// Pinned reference at the top of the outline ("envelope"
+        /// cells). Default-None for plain outlines and for legacy
+        /// pre-envelope data; never serialized when absent so the
+        /// existing JSON shape doesn't change for any non-envelope
+        /// outline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference_header: Option<ReferenceTargetRecord>,
     },
     #[serde(alias = "pop")]
     PopPop {
@@ -1078,6 +1085,9 @@ fn cell_to_body(cell: &Cell) -> CellBody {
                     tags: tag_records(b.textbox()),
                 })
                 .collect(),
+            reference_header: oc
+                .reference_header()
+                .map(|h| ReferenceTargetRecord::from(h.target())),
         },
         CellKind::PopPop(pc) => CellBody::PopPop {
             text: pc.textbox().text().to_string(),
@@ -1140,7 +1150,7 @@ fn extract_title_from_body_json(body_json: &str) -> Option<String> {
     let extracted = match &mut pc.body {
         CellBody::Plain { text, links, .. } => take_heading_from_inline(text, links),
         CellBody::PopPop { text, links } => take_heading_from_inline(text, links),
-        CellBody::Outline { blocks } => take_heading_from_outline(blocks),
+        CellBody::Outline { blocks, .. } => take_heading_from_outline(blocks),
         CellBody::Table { cells, .. } => take_heading_from_table(cells),
         // Reference cells never had inline headings to migrate from.
         CellBody::Reference { .. } => None,
@@ -1339,7 +1349,7 @@ fn tag_names_from_persisted(pc: &PersistedCell) -> Vec<String> {
         CellBody::Plain { text, tags, .. } => {
             names_from_tag_ranges(text, tags, &mut |n| push(n));
         }
-        CellBody::Outline { blocks } => {
+        CellBody::Outline { blocks, .. } => {
             for b in blocks {
                 names_from_tag_ranges(&b.text, &b.tags, &mut |n| push(n));
             }
@@ -1399,7 +1409,7 @@ fn tag_names_from_persisted_legacy(pc: &PersistedCell) -> Vec<String> {
         CellBody::Plain { text, tags, .. } => {
             body_names(text, tags, &mut |n| push(n));
         }
-        CellBody::Outline { blocks } => {
+        CellBody::Outline { blocks, .. } => {
             for b in blocks {
                 body_names(&b.text, &b.tags, &mut |n| push(n));
             }
@@ -1436,7 +1446,7 @@ fn tag_names_from_body(body: &CellBody) -> Vec<String> {
     };
     match body {
         CellBody::Plain { text, .. } => push_from(text),
-        CellBody::Outline { blocks } => {
+        CellBody::Outline { blocks, .. } => {
             for b in blocks {
                 push_from(&b.text);
             }
@@ -1508,7 +1518,7 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
             load_body_tags(&mut tb, tags);
             CellKind::Plain(tb)
         }
-        CellBody::Outline { blocks } => {
+        CellBody::Outline { blocks, reference_header } => {
             let bullets: Vec<Bullet> = blocks
                 .into_iter()
                 .map(|b| {
@@ -1520,7 +1530,13 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
                     Bullet::new(b.id, tb, b.depth)
                 })
                 .collect();
-            CellKind::Outline(OutlineCell::from_bullets(typeface.clone(), bullets))
+            let header = reference_header
+                .map(|r| crate::cell::EmbeddedReference::new(r.into()));
+            CellKind::Outline(OutlineCell::from_bullets_with_header(
+                typeface.clone(),
+                bullets,
+                header,
+            ))
         }
         CellBody::PopPop { text, links } => {
             let mut pc = PopPopCell::new(typeface.clone());
@@ -1765,6 +1781,62 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_envelope_outline_preserves_header_and_bullets() {
+        let tf = typeface();
+        let target_id = Uuid::now_v7();
+        let mut oc = OutlineCell::with_envelope(
+            tf.clone(),
+            ReferenceTarget::WholeCell(target_id),
+        );
+        // Type something into the seed bullet so we can verify the
+        // bullet body round-trips alongside the header.
+        let bullet_id = oc.bullets()[0].id();
+        oc.replace_in_bullet_with_text(bullet_id, 0..0, "my note".to_string());
+
+        let cell = Cell::from_parts(
+            Uuid::now_v7(),
+            CellKind::Outline(oc),
+            None,
+            now_epoch_ms(),
+            now_epoch_ms(),
+            None,
+        );
+        let back = round_trip(&cell, &tf);
+        match &back.kind {
+            CellKind::Outline(reborn) => {
+                let header = reborn
+                    .reference_header()
+                    .expect("header survives round-trip");
+                match header.target() {
+                    ReferenceTarget::WholeCell(id) => assert_eq!(id, target_id),
+                    _ => panic!("WholeCell target lost"),
+                }
+                assert_eq!(reborn.bullets().len(), 1);
+                assert_eq!(reborn.bullets()[0].textbox().text(), "my note");
+            }
+            _ => panic!("variant must round-trip as Outline"),
+        }
+    }
+
+    #[test]
+    fn legacy_outline_without_header_field_loads_with_no_header() {
+        // JSON shape from before reference_header existed — only
+        // `kind` and `blocks`. serde-default makes the new field
+        // None on load, so old DBs upgrade cleanly.
+        let json = r##"{"kind":"outline","blocks":[{"id":"00000000-0000-7000-8000-000000000001","depth":0,"text":"plain bullet","links":[],"tags":[]}]}"##;
+        let body: CellBody = serde_json::from_str(json).expect("legacy outline parses");
+        let kind = body_to_kind(body, &typeface());
+        match kind {
+            CellKind::Outline(oc) => {
+                assert!(oc.reference_header().is_none());
+                assert_eq!(oc.bullets().len(), 1);
+                assert_eq!(oc.bullets()[0].textbox().text(), "plain bullet");
+            }
+            _ => panic!("expected Outline kind"),
+        }
+    }
+
+    #[test]
     fn round_trip_title_preserves_text_and_tags() {
         // Title round-trip with trailing tags. The title TextBox is rebuilt
         // with force_heading=true on load; both the text and any inline
@@ -1878,7 +1950,7 @@ mod tests {
             Some("Topic #person")
         );
         match &pc.body {
-            CellBody::Outline { blocks } => {
+            CellBody::Outline { blocks, .. } => {
                 assert_eq!(blocks.len(), 1);
                 assert_eq!(blocks[0].text, "first child");
             }
