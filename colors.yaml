@@ -1,0 +1,73 @@
+# kept color palette — edit this file and the running app picks up changes
+# within ~250ms. Hex colors: `#rrggbb` (opaque) or `#rrggbbaa` (with alpha).
+# Lines starting with `#` are comments. Blank lines are fine.
+# Unknown keys are warned about on stderr; malformed lines are skipped.
+
+# Page surfaces
+bg_page: "#fafafa"
+bg_panel: "#003554"
+bg_card: "#ffffff"
+
+# sidebar
+sidebar_text_primary: "#bfcdd4"
+sidebar_section_header: "#2de27d"
+
+# Text
+text_primary: "#1d1c1d"
+text_menu_row: "#0b5b2f"
+text_muted_grey: "#4d4a4d"
+text_muted_warm_deep: "#003554"
+text_muted_warm: "#108946"
+text_muted_warm_soft: "#003554"
+text_section_header: "#15b75e"
+bullet_marker: "#1d1c1d"
+text_ghost: "#a344da"
+text_disabled: "#a6f2bf"
+text_ghost_warm: "#5e5e5e"
+
+# Inline links + Pop-Pop
+link_text: "#1873b4"
+poppop_output: "#125687"
+poppop_comment: "#128747"
+poppop_error: "#9a1e1e"
+
+# Accent (focus / selection)
+accent_blue: "#1f90e0"
+accent_blue_selection: "#1f90e040"
+accent_blue_pane_border: "#1f90e080"
+accent_blue_focus_edit: "#1f90e0"
+
+# Reference embeds
+embed_border: "#183ab4"
+embed_tint: "#183ab40c"
+embed_hover: "#183ab420"
+
+# Destructive
+delete_text: "#c03030"
+delete_hover_bg: "#c0303020"
+
+# Borders / dividers / hairlines
+menu_border: "#a6f2bf"
+panel_border_warm: "#a344da"
+divider_pane: "#a6f2bf"
+divider_pane_hover: "#79ec9f"
+hairline_divider: "#03170c28"
+hover_faint: "#03170c18"
+button_border_faint: "#03170c40"
+
+# Toggles + heading rule
+toggle_off_bg: "#15b75e60"
+toggle_inactive_bg: "#0b5b2f30"
+heading_rule: "#10894680"
+
+# Drop shadows
+shadow_soft: "#00000030"
+shadow_menu: "#00000040"
+
+# Calc grid (Pop-Pop, Table)
+grid_stripe: "#e9f4fc"
+grid_divider: "#10894640"
+
+# Base used by the `dark_alpha(a)` runtime composer (cell outline,
+# scrollbar thumb, button background).
+dark_alpha_base: "#03170c"
