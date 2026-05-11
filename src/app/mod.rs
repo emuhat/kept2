@@ -608,6 +608,23 @@ const ENVELOPE_HEADER_GAP: f32 = 6.0;
 /// jitter — a few px of accidental motion shouldn't yank the doc.
 const ALT_PAN_THRESHOLD: f32 = 6.0;
 
+/// Total visible time before a transient toast pill starts fading.
+/// Sized to read at a glance without lingering. See `Toast`.
+const TOAST_HOLD: Duration = Duration::from_millis(1800);
+/// Fade-out duration following `TOAST_HOLD`. The toast is fully gone
+/// once `shown_at + TOAST_HOLD + TOAST_FADE` has elapsed.
+const TOAST_FADE: Duration = Duration::from_millis(500);
+
+/// Brief on-screen confirmation message ("Surfaced", etc.), rendered
+/// as a pill at the bottom-center of the window with a fade-out
+/// tail. Lives on `KeptApp::toast`; set via `show_toast`. Replaces
+/// any pre-existing toast (no queue — the latest action wins).
+#[derive(Clone)]
+struct Toast {
+    message: String,
+    shown_at: Instant,
+}
+
 /// Maximum nesting depth for embed previews. When an envelope outline
 /// is itself the target of a reference, its header (the inner embed)
 /// is rendered recursively up to this many levels deep. Beyond the
@@ -1288,6 +1305,12 @@ pub struct KeptApp {
     /// dimmed (alpha-blended) instead of being filtered out.
     /// Session-only, mirroring `show_inactive`.
     show_inactive_cells: bool,
+    /// Transient confirmation pill. `Some(t)` while a recent action
+    /// (e.g. "Surface as reference") is showing its toast; cleared
+    /// once `shown_at + TOAST_HOLD + TOAST_FADE` has elapsed.
+    /// `is_animating` reports true while a toast is live so the
+    /// fade re-renders without needing a mouse move.
+    toast: Option<Toast>,
     /// Active right-click menu over a People-page row.
     people_context_menu: Option<PeopleContextMenu>,
     /// True while the user is mouse-dragging inside the search input
@@ -1576,6 +1599,7 @@ impl KeptApp {
             people_add: None,
             show_inactive: false,
             show_inactive_cells: false,
+            toast: None,
             people_context_menu: None,
             search_dragging: false,
             hit_tests: HitTestState::default(),
@@ -3375,7 +3399,40 @@ impl KeptApp {
     /// another frame. main.rs checks this after `tick` to schedule a
     /// redraw. Sidebar coast counts too — it shares the kinetic path.
     pub fn is_animating(&self) -> bool {
-        self.panes.iter().any(|p| p.has_velocity()) || self.sidebar_scroll.has_velocity()
+        self.panes.iter().any(|p| p.has_velocity())
+            || self.sidebar_scroll.has_velocity()
+            || self.toast_alpha() > 0.0
+    }
+
+    /// Show a transient confirmation pill. Replaces any toast already
+    /// on screen — the most recent action wins; no queue. Called from
+    /// actions that succeed silently (e.g. "Surface as reference"
+    /// inserts a cell into today's view but the user is browsing an
+    /// old date, so the visible side-effect of zero would be
+    /// confusing without a confirmation).
+    fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some(Toast {
+            message: message.into(),
+            shown_at: Instant::now(),
+        });
+    }
+
+    /// Current toast alpha in [0.0, 1.0]. 1.0 during the hold window,
+    /// linearly fades to 0.0 over `TOAST_FADE`, 0.0 once expired
+    /// (caller drops the toast on its next render pass).
+    fn toast_alpha(&self) -> f32 {
+        let Some(t) = self.toast.as_ref() else {
+            return 0.0;
+        };
+        let elapsed = t.shown_at.elapsed();
+        if elapsed <= TOAST_HOLD {
+            1.0
+        } else if elapsed >= TOAST_HOLD + TOAST_FADE {
+            0.0
+        } else {
+            let into_fade = elapsed - TOAST_HOLD;
+            1.0 - (into_fade.as_secs_f32() / TOAST_FADE.as_secs_f32())
+        }
     }
 
     /// Halt kinetic coast on every scrollable surface. Called from any
@@ -3438,10 +3495,71 @@ impl KeptApp {
         self.render_tag_context_menu(canvas, width, height);
         self.render_people_context_menu(canvas, width, height);
         self.render_cell_context_menu(canvas, width, height);
+        self.render_toast(canvas, width, height);
 
         // Persistence flush is global (dirty cells aren't per-pane), so it
         // runs once per frame, after all panes have rendered.
         self.maybe_flush_persistence();
+    }
+
+    /// Draw the transient confirmation pill, if active. Bottom-center
+    /// of the window with a 24px bottom margin; rounded rect with a
+    /// semi-transparent dark bg, light-on-dark text. Fades out per
+    /// `toast_alpha`; expired toasts are dropped so future renders
+    /// stop touching the canvas.
+    fn render_toast(&mut self, canvas: &Canvas, width: f32, height: f32) {
+        let alpha = self.toast_alpha();
+        if alpha <= 0.0 {
+            self.toast = None;
+            return;
+        }
+        let Some(t) = self.toast.as_ref() else {
+            return;
+        };
+        let scale = self.font_scale;
+        let font = Font::from_typeface(&self.typeface, 14.0 * scale);
+        let (_, fm) = font.metrics();
+        let text_w = font
+            .measure_str(&t.message, None)
+            .0;
+        let pad_x = 16.0 * scale;
+        let pad_y = 8.0 * scale;
+        let pill_w = text_w + pad_x * 2.0;
+        let pill_h = (-fm.ascent + fm.descent) + pad_y * 2.0;
+        let pill_x = (width - pill_w) * 0.5;
+        let pill_y = height - pill_h - 24.0 * scale;
+        let pill_rect = Rect::new(pill_x, pill_y, pill_x + pill_w, pill_y + pill_h);
+        let radius = pill_h * 0.5;
+
+        // Drop shadow for a bit of depth — soft warm-tan-on-bg.
+        let mut shadow = Paint::default();
+        shadow.set_anti_alias(true);
+        let shadow_alpha = (alpha * 0x40 as f32).round() as u8;
+        shadow.set_color(crate::color::dark_alpha(shadow_alpha));
+        shadow.set_mask_filter(skia_safe::MaskFilter::blur(
+            skia_safe::BlurStyle::Normal,
+            FOCUS_SHADOW_BLUR * 0.5,
+            None,
+        ));
+        canvas.draw_round_rect(pill_rect, radius, radius, &shadow);
+
+        let mut bg = Paint::default();
+        bg.set_anti_alias(true);
+        let bg_alpha = (alpha * 0xe0 as f32).round() as u8;
+        bg.set_color(crate::color::dark_alpha(bg_alpha));
+        canvas.draw_round_rect(pill_rect, radius, radius, &bg);
+
+        let mut text_paint = Paint::default();
+        text_paint.set_anti_alias(true);
+        let text_alpha = (alpha * 0xff as f32).round() as u8;
+        text_paint.set_color(skia_safe::Color::from_argb(text_alpha, 0xff, 0xff, 0xff));
+        let baseline = pill_y + pad_y + (-fm.ascent);
+        canvas.draw_str(
+            &t.message,
+            Point::new(pill_x + pad_x, baseline),
+            &font,
+            &text_paint,
+        );
     }
 
     /// Render a single pane. With `active_pane` swapped to `pane_idx` by
@@ -6109,24 +6227,12 @@ impl KeptApp {
     /// the user has been idle, just like `insert_cell_after_focused`).
     /// Focuses the new reference. Returns true on insert.
     fn surface_as_reference(&mut self, target: ReferenceTarget) -> bool {
-        // If the user is viewing a closed context, jump to the current open
-        // one before inserting — surfacing belongs in "today," not history.
-        let _auto_switched = self.ensure_writable_context();
-        // Idle rotation: same baseline logic as insert_cell_after_focused.
-        let now = now_epoch_ms();
-        let idle_ms = IDLE_CONTEXT_THRESHOLD.as_millis() as i64;
-        let writable_start = self
-            .writable_context_id()
-            .and_then(|id| self.contexts.iter().find(|c| c.id == id))
-            .map(|c| c.start_time)
-            .unwrap_or(i64::MIN);
-        let baseline = self
-            .last_cell_create_ms()
-            .map(|t| t.max(writable_start))
-            .unwrap_or(writable_start);
-        if baseline > i64::MIN && now - baseline >= idle_ms {
-            self.rotate_context_now();
-        }
+        // Surface = drop a reference into "today" *without* yanking
+        // the user's view. The cell goes into the current writable
+        // context if one exists (None is fine — the cell just has no
+        // context_hint and shows up in today's date view anyway).
+        // The user gets a toast as confirmation since the visible
+        // side effect on their current view is zero.
         let pre_focused = self.focused;
         let mut new_cell = Cell::new_reference(self.typeface.clone(), target);
         new_cell.set_font_scale(self.font_scale);
@@ -6134,11 +6240,8 @@ impl KeptApp {
         let new_id = new_cell.id;
         let snapshot = new_cell.snapshot();
         self.insert_cell_sorted(new_cell);
-        self.focused = Some(new_id);
-        // References never enter edit mode; just focus.
-        self.editing = false;
-        self.dragging_cell = None;
-        self.pending_caret_scroll = true;
+        // Don't change focus or scroll — the user is browsing
+        // somewhere else and we want them to stay there.
         self.undo_stack.push(UndoOp::InsertCell {
             cell_id: new_id,
             snapshot,
@@ -6147,6 +6250,7 @@ impl KeptApp {
         self.redo_stack.clear();
         self.coalesce_break = true;
         self.touch_cell(new_id);
+        self.show_toast("Surfaced to today");
         true
     }
 
