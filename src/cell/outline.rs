@@ -262,9 +262,6 @@ impl OutlineCell {
     /// touch every editable surface. Most callers should reach for
     /// the existing tick / edit / split helpers instead — this is
     /// the bulk-mutate escape hatch.
-    pub fn bullets_mut(&mut self) -> &mut [Bullet] {
-        &mut self.bullets
-    }
 
     /// Borrow the optional reference header (envelope outlines).
     pub fn reference_header(&self) -> Option<&EmbeddedReference> {
@@ -1791,5 +1788,17 @@ impl super::body::CellBody for OutlineCell {
 
     fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
         OutlineCell::tag_at_doc_pos(self, abs_x, abs_y)
+    }
+
+    /// Outline drag carries a `DragState` (TextBox / BulletRange /
+    /// Header modes) with rich promotion logic when a drag crosses
+    /// bullet boundaries. The trait's default (loop every textbox) is
+    /// the wrong shape; route to the inherent instead.
+    fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
+        OutlineCell::mouse_drag_to(self, abs_x, abs_y)
+    }
+
+    fn mouse_up(&mut self) -> bool {
+        OutlineCell::mouse_up(self)
     }
 }

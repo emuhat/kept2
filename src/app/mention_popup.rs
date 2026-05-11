@@ -364,14 +364,8 @@ impl KeptApp {
     }
 
     pub(super) fn render_mention_popup(&mut self, canvas: &Canvas, view_w: f32, view_h: f32) {
-        // Hit-test rects are rebuilt every frame the popup renders;
-        // clear stale ones up front so an empty/closed popup leaves
-        // none lingering.
-        self.hit_tests.mention_popup.rows.clear();
-        self.hit_tests.mention_popup.add_row = None;
-
         // Snapshot the popup state into locals so subsequent &mut self
-        // writes (hit_tests) don't fight the popup borrow.
+        // writes (hit_tests_builder) don't fight the popup borrow.
         let (source, kind, anchor_byte, query, selected) = {
             let Some(popup) = self.mention_popup.as_ref() else {
                 return;
@@ -386,11 +380,11 @@ impl KeptApp {
         };
 
         let (anchor_x, anchor_y_below) = match source {
-            MentionSource::Cell { cell_id, bullet_id } => {
+            MentionSource::Cell { cell_id, bullet_id: _ } => {
                 let Some(cell) = self.cell(cell_id) else {
                     return;
                 };
-                let Some((x, y)) = cell.anchor_doc_pos(bullet_id, anchor_byte) else {
+                let Some((x, y)) = cell.anchor_doc_pos(anchor_byte) else {
                     return;
                 };
                 // Doc-space → window-space: subtract scroll.
@@ -527,7 +521,7 @@ impl KeptApp {
                     &body_font,
                     &text_paint,
                 );
-                self.hit_tests.mention_popup.add_row = Some(add_rect);
+                self.hit_tests_builder.mention_popup.add_row = Some(add_rect);
             }
             return;
         }
@@ -577,7 +571,7 @@ impl KeptApp {
                 &match_paint,
                 &dim_paint,
             );
-            self.hit_tests.mention_popup.rows.push(row_rect);
+            self.hit_tests_builder.mention_popup.rows.push(row_rect);
             row_y += row_h;
         }
     }
@@ -713,14 +707,14 @@ impl KeptApp {
         source_id: Uuid,
     ) {
         match source {
-            MentionSource::Cell { cell_id, bullet_id } => {
+            MentionSource::Cell { cell_id, bullet_id: _ } => {
                 let pre = match self.cell(cell_id) {
                     Some(c) => c.snapshot(),
                     None => return,
                 };
                 let url = format!("kept://{}", source_id);
                 if let Some(c) = self.cell_mut(cell_id) {
-                    c.replace_focused_with_link(bullet_id, start..end, chosen_name, url);
+                    c.replace_focused_with_link(start..end, chosen_name, url);
                 }
                 if let Some(c) = self.cell(cell_id) {
                     let post = c.snapshot();
@@ -769,13 +763,13 @@ impl KeptApp {
     ) {
         let replacement = format!("#{chosen_name}");
         match source {
-            MentionSource::Cell { cell_id, bullet_id } => {
+            MentionSource::Cell { cell_id, bullet_id: _ } => {
                 let pre = match self.cell(cell_id) {
                     Some(c) => c.snapshot(),
                     None => return,
                 };
                 if let Some(c) = self.cell_mut(cell_id) {
-                    c.replace_focused_with_tag(bullet_id, start..end, replacement);
+                    c.replace_focused_with_tag(start..end, replacement);
                 }
                 if let Some(c) = self.cell(cell_id) {
                     let post = c.snapshot();
@@ -804,13 +798,13 @@ impl KeptApp {
         replacement: String,
     ) {
         match source {
-            MentionSource::Cell { cell_id, bullet_id } => {
+            MentionSource::Cell { cell_id, bullet_id: _ } => {
                 let pre = match self.cell(cell_id) {
                     Some(c) => c.snapshot(),
                     None => return,
                 };
                 if let Some(c) = self.cell_mut(cell_id) {
-                    c.replace_focused_with_text(bullet_id, start..end, replacement);
+                    c.replace_focused_with_text(start..end, replacement);
                 }
                 if let Some(c) = self.cell(cell_id) {
                     let post = c.snapshot();

@@ -35,7 +35,6 @@ pub(super) struct SearchState {
 impl KeptApp {
     pub(super) fn render_search_popup(&mut self, canvas: &Canvas, width: f32) {
         if self.search.is_none() {
-            self.hit_tests.search.input = None;
             return;
         }
         let scale = self.font_scale;
@@ -106,7 +105,7 @@ impl KeptApp {
         if let Some(state) = self.search.as_mut() {
             state.input.tick(canvas, input_x, input_y, input_w, true, true);
         }
-        self.hit_tests.search.input = Some(Rect::new(
+        self.hit_tests_builder.search.input = Some(Rect::new(
             input_x,
             input_y,
             input_x + input_w,

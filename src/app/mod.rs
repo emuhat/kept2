@@ -1316,9 +1316,16 @@ pub struct KeptApp {
     /// True while the user is mouse-dragging inside the search input
     /// (selecting text). Drives `mouse_drag_to` / `mouse_up` routing.
     search_dragging: bool,
-    /// Last-frame hit-test rects, populated during render and consumed
-    /// by `mouse_down`. See `HitTestState` for per-surface grouping.
+    /// Frozen hit-test snapshot from the most recently completed frame.
+    /// Input handlers (mouse_down, right_click, dispatch_*) read here
+    /// and here only.
     hit_tests: HitTestState,
+    /// Per-frame write surface. Render code accumulates rects into this
+    /// while `tick()` runs; at end-of-frame `std::mem::take` atomically
+    /// swaps it into `hit_tests` so the next mouse event reads a fresh,
+    /// complete snapshot (never a partial one, never a stale one if the
+    /// frame was skipped).
+    hit_tests_builder: HitTestState,
     // ---- Entity caches (invariants #1–#7) ----
     /// All entity rows from the DB. Source of identity (kind, display_name).
     entities: Vec<Entity>,
@@ -1603,6 +1610,7 @@ impl KeptApp {
             people_context_menu: None,
             search_dragging: false,
             hit_tests: HitTestState::default(),
+            hit_tests_builder: HitTestState::default(),
             entities,
             entity_alias_index,
             cell_to_entity,
@@ -3497,6 +3505,14 @@ impl KeptApp {
         self.render_cell_context_menu(canvas, width, height);
         self.render_toast(canvas, width, height);
 
+        // Publish this frame's hit-test rects. Every render method writes
+        // into `hit_tests_builder`; the swap below makes them visible to
+        // mouse_down / right_click / dispatch_* atomically, with no
+        // partial-frame state ever observable. If the next frame is
+        // skipped (window unfocused etc.), `hit_tests` retains this
+        // frame's snapshot — correct, not stale-from-N-frames-ago.
+        self.hit_tests = std::mem::take(&mut self.hit_tests_builder);
+
         // Persistence flush is global (dirty cells aren't per-pane), so it
         // runs once per frame, after all panes have rendered.
         self.maybe_flush_persistence();
@@ -3622,9 +3638,6 @@ impl KeptApp {
         // focused-cell card backdrop + ring. Entity / People views draw
         // bespoke pages and bypass that entire path.
         let view_kind_local = self.view.view_kind.clone();
-        if !matches!(view_kind_local, ViewKind::Ast | ViewKind::Context(_)) {
-            self.hit_tests.entity_page.create_button = None;
-        }
 
         // Card backdrop and focus ring use this. We pull `cells_left` and
         // `content_width` from this frame's pane geometry (so they're always
@@ -4758,8 +4771,6 @@ impl KeptApp {
         mouse_doc_x: f32,
         mouse_doc_y: f32,
     ) -> f32 {
-        self.hit_tests.entity_page.create_button = None;
-
         let entity = match self.entities.iter().find(|e| e.id == entity_id).cloned() {
             Some(e) => e,
             None => {
@@ -4850,7 +4861,7 @@ impl KeptApp {
             && mouse_doc_y >= toggle_rect.top
             && mouse_doc_y <= toggle_rect.bottom;
         draw_toggle(canvas, toggle_rect, entity.is_active, toggle_hovered);
-        self.hit_tests.entity_page.active_toggle = Some(toggle_rect);
+        self.hit_tests_builder.entity_page.active_toggle = Some(toggle_rect);
 
         y += -mm.ascent + mm.descent;
         y += ENTITY_SECTION_GAP * scale;
@@ -4958,7 +4969,7 @@ impl KeptApp {
                 &meta_font,
                 &lp,
             );
-            self.hit_tests.entity_page.create_button = Some(btn_rect);
+            self.hit_tests_builder.entity_page.create_button = Some(btn_rect);
             y += btn_h;
         }
 
@@ -4967,8 +4978,7 @@ impl KeptApp {
         // newest-first by `edited_at`. The previews aren't real cells —
         // they live only as long as this page render. Click an embed →
         // navigate to the source cell; rect-tracked in
-        // `hit_tests.entity_page.refs` for hit-test in `mouse_down`.
-        self.hit_tests.entity_page.refs.clear();
+        // `hit_tests_builder.entity_page.refs` for hit-test in `mouse_down`.
         let kept_url = format!("kept://{}", entity_id);
         let primary = entity.primary_cell_id;
         let mut mentions: Vec<(usize, i64)> = self
@@ -5037,7 +5047,7 @@ impl KeptApp {
                     &footer_text,
                     scale,
                 );
-                self.hit_tests.entity_page.refs.push((
+                self.hit_tests_builder.entity_page.refs.push((
                     target_cell_id,
                     Rect::new(cells_left, y, cells_left + content_width, y + total_h),
                 ));
@@ -5062,10 +5072,6 @@ impl KeptApp {
         mouse_doc_x: f32,
         mouse_doc_y: f32,
     ) -> f32 {
-        self.hit_tests.people_page.rows.clear();
-        self.hit_tests.people_page.add = None;
-        self.hit_tests.people_page.show_inactive_toggle = None;
-
         let mut y = MARGIN_TOP;
 
         // Title + "Show inactive" toggle, sharing a baseline.
@@ -5119,7 +5125,7 @@ impl KeptApp {
             && mouse_doc_y >= toggle_rect.top
             && mouse_doc_y <= toggle_rect.bottom;
         draw_toggle(canvas, toggle_rect, self.show_inactive, toggle_hovered);
-        self.hit_tests.people_page.show_inactive_toggle = Some(toggle_rect);
+        self.hit_tests_builder.people_page.show_inactive_toggle = Some(toggle_rect);
 
         y += -tm.ascent + tm.descent + 24.0 * scale;
 
@@ -5217,7 +5223,7 @@ impl KeptApp {
                 &divider_paint,
             );
 
-            self.hit_tests.people_page.rows.push((*entity_id, row_rect));
+            self.hit_tests_builder.people_page.rows.push((*entity_id, row_rect));
             y += row_h;
         }
 
@@ -5259,7 +5265,7 @@ impl KeptApp {
                 &muted,
             );
         }
-        self.hit_tests.people_page.add = Some(add_rect);
+        self.hit_tests_builder.people_page.add = Some(add_rect);
         y += row_h;
 
         y - MARGIN_TOP

@@ -391,25 +391,13 @@ impl Cell {
     /// Reach into the body for typeface (every CellKind owns at least one
     /// TextBox internally). Used by `ensure_title`.
     fn body_typeface(&self) -> Typeface {
-        match &self.kind {
-            CellKind::Plain(pc) => pc.body().typeface().clone(),
-            CellKind::Outline(oc) => oc.typeface().clone(),
-            CellKind::PopPop(pc) => pc.textbox().typeface().clone(),
-            CellKind::Table(tc) => tc.typeface().clone(),
-            CellKind::Reference(rc) => rc.typeface().clone(),
-        }
+        self.kind.body().typeface().clone()
     }
 
     /// Cell-wide font scale. Pulled from the body since body sets are the
     /// authoritative source via `set_font_scale`.
     fn body_font_scale(&self) -> f32 {
-        match &self.kind {
-            CellKind::Plain(pc) => pc.body().font_scale(),
-            CellKind::Outline(oc) => oc.font_scale(),
-            CellKind::PopPop(pc) => pc.textbox().font_scale(),
-            CellKind::Table(tc) => tc.font_scale(),
-            CellKind::Reference(rc) => rc.font_scale(),
-        }
+        self.kind.body().font_scale()
     }
 
     /// Reconstruct a cell from a snapshot + id, using `typeface` for fresh
@@ -462,18 +450,7 @@ impl Cell {
     /// (outline). Used by seed setup; future link-creation UI will go through
     /// a richer path scoped to the focused textbox.
     pub fn add_link_to_first(&mut self, range: Range<usize>, url: String) {
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().add_link(range, url),
-            CellKind::Outline(oc) => oc.add_link_to_first(range, url),
-            CellKind::PopPop(pc) => pc.textbox_mut().add_link(range, url),
-            CellKind::Table(tc) => {
-                if let Some(entry) = tc.cell_at_mut(0, 0) {
-                    entry.textbox.add_link(range, url);
-                }
-            }
-            // No body text to attach a link to.
-            CellKind::Reference(_) => {}
-        }
+        self.kind.body_mut().add_link_to_first(range, url);
     }
 
     /// True if document-space position `(abs_x, abs_y)` lands on a link in
@@ -484,20 +461,7 @@ impl Cell {
                 return true;
             }
         }
-        match &self.kind {
-            CellKind::Plain(pc) => pc.body().link_at_doc_pos(abs_x, abs_y),
-            CellKind::Outline(oc) => oc.link_at_doc_pos(abs_x, abs_y),
-            CellKind::PopPop(pc) => pc.link_at_doc_pos(abs_x, abs_y),
-            CellKind::Table(tc) => tc.link_at_doc_pos(abs_x, abs_y),
-            // Forward to the cache: links inside an embed body get the
-            // hand cursor on hover, just like inline links anywhere else.
-            // The reference *body itself* (outside any link span) stays
-            // default — clicking blank space focuses, doesn't navigate.
-            CellKind::Reference(rc) => match rc.cache_ref() {
-                Some(cache) => cache.link_at_doc_pos(abs_x, abs_y),
-                None => false,
-            },
-        }
+        self.kind.body().link_at_doc_pos(abs_x, abs_y)
     }
 
     /// True if `(abs_x, abs_y)` lands on an inline `#tag` substring in
@@ -509,24 +473,14 @@ impl Cell {
                 return true;
             }
         }
-        match &self.kind {
-            CellKind::Plain(pc) => pc.body().tag_at_doc_pos(abs_x, abs_y),
-            CellKind::Outline(oc) => oc.tag_at_doc_pos(abs_x, abs_y),
-            CellKind::PopPop(_) => false,
-            CellKind::Table(tc) => tc.tag_at_doc_pos(abs_x, abs_y),
-            CellKind::Reference(rc) => match rc.cache_ref() {
-                Some(cache) => cache.tag_at_doc_pos(abs_x, abs_y),
-                None => false,
-            },
-        }
+        self.kind.body().tag_at_doc_pos(abs_x, abs_y)
     }
 
-    /// Replace `range` with `text` in the focused textbox (the cell itself
-    /// for Plain, or the bullet matching `bullet_id` for Outline) and link
+    /// Replace `range` with `text` in the focused editable slot (title
+    /// when focused, otherwise the kind's focused inner element) and link
     /// the inserted text to `url`.
     pub fn replace_focused_with_link(
         &mut self,
-        bullet_id: Option<Uuid>,
         range: Range<usize>,
         text: String,
         url: String,
@@ -537,96 +491,35 @@ impl Cell {
             }
             return;
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().replace_with_link(range, text, url),
-            CellKind::Outline(oc) => {
-                if let Some(bid) = bullet_id {
-                    oc.replace_in_bullet_with_link(bid, range, text, url);
-                }
-            }
-            CellKind::PopPop(pc) => pc.textbox_mut().replace_with_link(range, text, url),
-            CellKind::Table(tc) => {
-                let (r, c) = tc.focused_index();
-                if let Some(entry) = tc.cell_at_mut(r, c) {
-                    if !entry.readonly {
-                        entry.textbox.replace_with_link(range, text, url);
-                    }
-                }
-            }
-            // Reference cells have no editable text to attach a link to.
-            CellKind::Reference(_) => {}
-        }
+        self.kind.body_mut().replace_at_focused_with_link(range, text, url);
     }
 
     /// Plain-text variant of `replace_focused_with_link` — replaces
-    /// `range` in the focused slot (title, plain body, focused outline
-    /// bullet, etc.) with `text`, with no link span attached. Used by
-    /// `#`-tag autocomplete commit.
-    pub fn replace_focused_with_text(
-        &mut self,
-        bullet_id: Option<Uuid>,
-        range: Range<usize>,
-        text: String,
-    ) {
+    /// `range` in the focused slot with `text`, no link span attached.
+    /// Used by `#`-tag autocomplete commit.
+    pub fn replace_focused_with_text(&mut self, range: Range<usize>, text: String) {
         if self.title_focused {
             if let Some(title) = self.title.as_mut() {
                 title.replace_with_text(range, text);
             }
             return;
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().replace_with_text(range, text),
-            CellKind::Outline(oc) => {
-                if let Some(bid) = bullet_id {
-                    oc.replace_in_bullet_with_text(bid, range, text);
-                }
-            }
-            CellKind::PopPop(pc) => pc.textbox_mut().replace_with_text(range, text),
-            CellKind::Table(tc) => {
-                let (r, c) = tc.focused_index();
-                if let Some(entry) = tc.cell_at_mut(r, c) {
-                    if !entry.readonly {
-                        entry.textbox.replace_with_text(range, text);
-                    }
-                }
-            }
-            CellKind::Reference(_) => {}
-        }
+        self.kind.body_mut().replace_at_focused_with_text(range, text);
     }
 
     /// Replace `range` in the focused editable slot with `text` (which
     /// must start with `#`) and mark the inserted span as a tag — the
     /// committed form of the `#`-mention popup. PopPop is excluded
-    /// since `#` there is the comment marker, not a tag prefix.
-    pub fn replace_focused_with_tag(
-        &mut self,
-        bullet_id: Option<Uuid>,
-        range: Range<usize>,
-        text: String,
-    ) {
+    /// since `#` there is the comment marker, not a tag prefix (its
+    /// `CellBody` impl makes this method a no-op).
+    pub fn replace_focused_with_tag(&mut self, range: Range<usize>, text: String) {
         if self.title_focused {
             if let Some(title) = self.title.as_mut() {
                 title.replace_with_tag(range, text);
             }
             return;
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().replace_with_tag(range, text),
-            CellKind::Outline(oc) => {
-                if let Some(bid) = bullet_id {
-                    oc.replace_in_bullet_with_tag(bid, range, text);
-                }
-            }
-            CellKind::Table(tc) => {
-                let (r, c) = tc.focused_index();
-                if let Some(entry) = tc.cell_at_mut(r, c) {
-                    if !entry.readonly {
-                        entry.textbox.replace_with_tag(range, text);
-                    }
-                }
-            }
-            CellKind::PopPop(_) | CellKind::Reference(_) => {}
-        }
+        self.kind.body_mut().replace_at_focused_with_tag(range, text);
     }
 
     pub fn copy_text(&self) -> String {
@@ -638,18 +531,7 @@ impl Cell {
                 }
             }
         }
-        match &self.kind {
-            CellKind::Plain(pc) => pc.body().copy_primary_selection(),
-            CellKind::Outline(oc) => oc.copy_text(),
-            CellKind::PopPop(pc) => pc.copy_selection(),
-            CellKind::Table(tc) => tc.copy_selection(),
-            // Forward to the cached preview so Cmd+C grabs the selection
-            // the user dragged inside the embed body.
-            CellKind::Reference(rc) => match rc.cache_ref() {
-                Some(cache) => cache.copy_text(),
-                None => String::new(),
-            },
-        }
+        self.kind.body().copy_text()
     }
 
     /// Cell title, if any: the title slot's text with trailing #tags
@@ -703,59 +585,17 @@ impl Cell {
         if let Some(title) = self.title.as_mut() {
             changed |= title.remove_tags_named(name);
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => changed |= pc.body_mut().remove_tags_named(name),
-            CellKind::Outline(oc) => {
-                for b in oc.bullets_mut() {
-                    changed |= b.textbox_mut().remove_tags_named(name);
-                }
-            }
-            CellKind::Table(tc) => {
-                for r in 0..tc.rows() {
-                    for c in 0..tc.cols() {
-                        if let Some(entry) = tc.cell_at_mut(r, c) {
-                            changed |= entry.textbox.remove_tags_named(name);
-                        }
-                    }
-                }
-            }
-            // PopPop body opts out of inline tags; Reference cells own
-            // no editable text. Nothing to strip in either.
-            CellKind::PopPop(_) | CellKind::Reference(_) => {}
-        }
-        changed
+        // The trait default walks textboxes; PopPop/Reference override
+        // to no-op (PopPop opts out of tag semantics; Reference would
+        // mutate cache without dirtying source).
+        changed | self.kind.body_mut().remove_tags_named(name)
     }
 
     pub fn all_tag_names(&self) -> Vec<String> {
         let mut out: Vec<String> = self.heading_tag_names();
-        let mut push = |name: String| {
-            if !name.is_empty() && !out.contains(&name) {
-                out.push(name);
-            }
-        };
-        let mut absorb = |tb: &TextBox| {
-            for n in tb.all_tag_names() {
-                push(n);
-            }
-        };
-        match &self.kind {
-            CellKind::Plain(pc) => absorb(pc.body()),
-            CellKind::Outline(oc) => {
-                for b in oc.bullets() {
-                    absorb(b.textbox());
-                }
-            }
-            CellKind::Table(tc) => {
-                for r in 0..tc.rows() {
-                    for c in 0..tc.cols() {
-                        if let Some(entry) = tc.cell_at(r, c) {
-                            absorb(&entry.textbox);
-                        }
-                    }
-                }
-            }
-            CellKind::PopPop(_) | CellKind::Reference(_) => {}
-        }
+        // Trait default extends `out` with body textbox tags, de-duped.
+        // PopPop / Reference override to no-op so they contribute nothing.
+        self.kind.body().all_tag_names_into(&mut out);
         out
     }
 
@@ -801,17 +641,12 @@ impl Cell {
             };
             return in_tag(title.tags(), caret);
         }
-        if matches!(&self.kind, CellKind::PopPop(_)) {
+        // PopPop opts out of tag semantics (its `focused_textbox()`
+        // returns None); Reference has no editable focus either. Both
+        // bottom out at None here.
+        let Some(tb) = self.kind.body().focused_textbox() else {
             return false;
-        }
-        // Body slot: locate the focused TextBox and check its tags.
-        let tb: Option<&TextBox> = match &self.kind {
-            CellKind::Plain(pc) => Some(pc.body()),
-            CellKind::Outline(oc) => oc.focused_textbox(),
-            CellKind::Table(tc) => tc.focused_textbox(),
-            CellKind::PopPop(_) | CellKind::Reference(_) => None,
         };
-        let Some(tb) = tb else { return false };
         let Some((_, caret)) = tb.primary_caret() else {
             return false;
         };
@@ -823,28 +658,7 @@ impl Cell {
     /// Outline cells join bullets with newlines (indented two spaces per
     /// depth); tables join cells with tabs and rows with newlines.
     pub fn full_text(&self) -> String {
-        let body = match &self.kind {
-            CellKind::Plain(pc) => pc.body().text().to_string(),
-            CellKind::Outline(oc) => {
-                let mut out = String::new();
-                for (i, b) in oc.bullets().iter().enumerate() {
-                    if i > 0 {
-                        out.push('\n');
-                    }
-                    for _ in 0..b.depth() {
-                        out.push_str("  ");
-                    }
-                    out.push_str(b.textbox().text());
-                }
-                out
-            }
-            CellKind::PopPop(pc) => pc.textbox().text().to_string(),
-            CellKind::Table(tc) => tc.full_text(),
-            // Reference cells contribute nothing to search-indexable text;
-            // search would otherwise return the same content twice (once
-            // for the original cell, once for each embed).
-            CellKind::Reference(_) => String::new(),
-        };
+        let body = self.kind.body().full_text();
         match self.title.as_ref() {
             Some(t) if !t.text().is_empty() => {
                 let mut out = String::with_capacity(t.text().len() + body.len() + 1);
@@ -867,18 +681,7 @@ impl Cell {
                 return Some(url);
             }
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().take_pending_link_url(),
-            CellKind::Outline(oc) => oc.take_pending_link_url(),
-            CellKind::PopPop(pc) => pc.take_pending_link_url(),
-            CellKind::Table(tc) => tc.take_pending_link_url(),
-            // Forward to the cache so links inside an embed body are
-            // clickable just like inline links anywhere else.
-            CellKind::Reference(rc) => match rc.cache_mut() {
-                Some(cache) => cache.take_pending_link_url(),
-                None => None,
-            },
-        }
+        self.kind.body_mut().take_pending_link_url()
     }
 
     /// Drain the first inline-tag name (without `#`) stashed by any
@@ -891,22 +694,14 @@ impl Cell {
                 return Some(name);
             }
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().take_pending_tag_name(),
-            CellKind::Outline(oc) => oc.take_pending_tag_name(),
-            CellKind::PopPop(_) => None,
-            CellKind::Table(tc) => tc.take_pending_tag_name(),
-            CellKind::Reference(rc) => match rc.cache_mut() {
-                Some(cache) => cache.take_pending_tag_name(),
-                None => None,
-            },
-        }
+        self.kind.body_mut().take_pending_tag_name()
     }
 
 
-    /// Every link URL in the cell — title (if any), body, all inner
-    /// elements. Used by the query executor to resolve `kept://<uuid>`
-    /// references.
+    /// Every link URL in the cell — title (if any) + body. Used by the
+    /// query executor to resolve `kept://<uuid>` references. Reference
+    /// cells contribute none (their `all_link_urls_into` is overridden
+    /// to no-op so we don't double-count source links).
     pub fn all_link_urls(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         if let Some(t) = self.title.as_ref() {
@@ -914,36 +709,7 @@ impl Cell {
                 out.push(l.url.clone());
             }
         }
-        match &self.kind {
-            CellKind::Plain(pc) => {
-                for l in pc.body().links() {
-                    out.push(l.url.clone());
-                }
-            }
-            CellKind::Outline(oc) => {
-                for b in oc.bullets() {
-                    for l in b.textbox().links() {
-                        out.push(l.url.clone());
-                    }
-                }
-            }
-            CellKind::PopPop(pc) => {
-                for l in pc.textbox().links() {
-                    out.push(l.url.clone());
-                }
-            }
-            CellKind::Table(tc) => {
-                for row in tc.rows_view() {
-                    for entry in row {
-                        for l in entry.textbox.links() {
-                            out.push(l.url.clone());
-                        }
-                    }
-                }
-            }
-            // No links inside a reference embed.
-            CellKind::Reference(_) => {}
-        }
+        self.kind.body().all_link_urls_into(&mut out);
         out
     }
 
@@ -953,13 +719,7 @@ impl Cell {
                 return title.cut_primary_selection();
             }
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().cut_primary_selection(),
-            CellKind::Outline(oc) => oc.cut_text(),
-            CellKind::PopPop(pc) => pc.textbox_mut().cut_primary_selection(),
-            CellKind::Table(tc) => tc.cut_focused(),
-            CellKind::Reference(_) => String::new(),
-        }
+        self.kind.body_mut().cut_text()
     }
 
     pub fn paste_text(&mut self, s: &str) {
@@ -969,14 +729,7 @@ impl Cell {
                 return;
             }
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().paste(s),
-            CellKind::Outline(oc) => oc.paste_text(s),
-            CellKind::PopPop(pc) => pc.textbox_mut().paste(s),
-            CellKind::Table(tc) => tc.paste_focused(s),
-            // Pasting into a reference is a no-op (read-only).
-            CellKind::Reference(_) => {}
-        }
+        self.kind.body_mut().paste_text(s);
     }
 
     pub fn tick(
@@ -1022,17 +775,14 @@ impl Cell {
         }
         let body_focused = focused && !title_focused;
         let body_caret = show_caret && !title_focused;
-        let body_h = match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().tick(canvas, x, body_y, width, body_focused, body_caret),
-            CellKind::Outline(oc) => oc.tick(canvas, x, body_y, width, body_focused, body_caret),
-            CellKind::PopPop(pc) => pc.tick(canvas, x, body_y, width, body_focused, body_caret),
-            CellKind::Table(tc) => tc.tick(canvas, x, body_y, width, body_focused, body_caret),
-            // Reference cells render via the app layer (which can see the
-            // full cell list to look up the target). `Cell::tick` is never
-            // called for them — see the dispatch in app.rs's cell-render
-            // loop. Returning 0 here would corrupt geometry if it ever did.
-            CellKind::Reference(_) => 0.0,
-        };
+        // Reference cells render through the app layer (which has access
+        // to the cell list to look up their target); their `CellBody::tick`
+        // returns 0.0 so this dispatch is safe even though `Cell::tick` is
+        // not normally called on them.
+        let body_h = self
+            .kind
+            .body_mut()
+            .tick(canvas, x, body_y, width, body_focused, body_caret);
         let total_h = consumed + body_h;
         // Record cell-level geometry so focus ring, hit-test, kebab placement,
         // and inter-cell separators see the title + body as a single unit.
@@ -1089,15 +839,7 @@ impl Cell {
             // Stale title_focused with no title — fall through to body.
             self.title_focused = false;
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().handle_key(event, modifiers),
-            CellKind::Outline(oc) => oc.handle_key(event, modifiers),
-            CellKind::PopPop(pc) => pc.handle_key(event, modifiers),
-            CellKind::Table(tc) => tc.handle_key(event, modifiers),
-            // Reference cells consume nothing — keys bubble back up so the
-            // app's cell-level arrow nav can step past them.
-            CellKind::Reference(_) => false,
-        }
+        self.kind.body_mut().handle_key(event, modifiers)
     }
 
     pub fn mouse_down(
@@ -1119,24 +861,7 @@ impl Cell {
             }
         }
         self.unfocus_title_drop_if_empty();
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().mouse_down(abs_x, abs_y, modifiers, editing),
-            CellKind::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers, editing),
-            CellKind::PopPop(pc) => pc.mouse_down(abs_x, abs_y, modifiers, editing),
-            CellKind::Table(tc) => tc.mouse_down(abs_x, abs_y, modifiers, editing),
-            // Reference cells: forward into the cached preview so
-            // drag-select inside the embed works the same as in any
-            // normal cell. `editing=false` regardless of the outer cell's
-            // edit state — the cache is read-only by design (no caret,
-            // selection only). Navigation to the source still fires on
-            // Enter (handled in app.rs::handle_key).
-            CellKind::Reference(rc) => {
-                if let Some(cache) = rc.cache_mut() {
-                    cache.mouse_down(abs_x, abs_y, modifiers, false);
-                }
-                true
-            }
-        }
+        self.kind.body_mut().mouse_down(abs_x, abs_y, modifiers, editing)
     }
 
     pub fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
@@ -1147,18 +872,7 @@ impl Cell {
                 any = true;
             }
         }
-        let body = match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().mouse_drag_to(abs_x, abs_y),
-            CellKind::Outline(oc) => oc.mouse_drag_to(abs_x, abs_y),
-            CellKind::PopPop(pc) => pc.mouse_drag_to(abs_x, abs_y),
-            CellKind::Table(tc) => tc.mouse_drag_to(abs_x, abs_y),
-            // Forward into the cached preview so drag-extend-select works.
-            CellKind::Reference(rc) => match rc.cache_mut() {
-                Some(cache) => cache.mouse_drag_to(abs_x, abs_y),
-                None => false,
-            },
-        };
-        any || body
+        any | self.kind.body_mut().mouse_drag_to(abs_x, abs_y)
     }
 
     pub fn mouse_up(&mut self) -> bool {
@@ -1168,40 +882,14 @@ impl Cell {
                 any = true;
             }
         }
-        let body = match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().mouse_up(),
-            CellKind::Outline(oc) => oc.mouse_up(),
-            CellKind::PopPop(pc) => pc.mouse_up(),
-            CellKind::Table(tc) => tc.mouse_up(),
-            CellKind::Reference(rc) => match rc.cache_mut() {
-                Some(cache) => cache.mouse_up(),
-                None => false,
-            },
-        };
-        any || body
+        any | self.kind.body_mut().mouse_up()
     }
 
     /// True iff the body's keyboard caret is on the body's topmost visual
     /// line. Used by Cell::handle_key to detect "ArrowUp should escape into
-    /// the title slot." Outline / Table delegate to their existing edge
-    /// helpers which already account for inner-cell focus.
+    /// the title slot." Each CellBody impl already knows its own edge rules.
     fn body_at_top_edge(&self) -> bool {
-        match &self.kind {
-            CellKind::Plain(pc) => pc.body().at_top_visual_line(),
-            CellKind::Outline(oc) => oc.at_top_edge(),
-            CellKind::PopPop(pc) => pc.textbox().at_top_visual_line(),
-            CellKind::Table(tc) => {
-                let (r, c) = tc.focused_index();
-                r == 0
-                    && tc
-                        .cell_at(r, c)
-                        .map(|e| e.textbox.at_top_visual_line())
-                        .unwrap_or(true)
-            }
-            // Reference cells have no caret, so "at top edge" is always
-            // true — arrow-up over a Reference cell jumps to the cell above.
-            CellKind::Reference(_) => true,
-        }
+        self.kind.body().at_top_edge()
     }
 
     fn place_caret_at_end_of_title(&mut self) {
@@ -1221,18 +909,7 @@ impl Cell {
     }
 
     fn place_caret_at_start_of_body(&mut self) {
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().set_caret_at(0),
-            CellKind::Outline(oc) => oc.place_caret_at_start(),
-            CellKind::PopPop(pc) => pc.textbox_mut().set_caret_at(0),
-            CellKind::Table(tc) => {
-                if let Some(entry) = tc.cell_at_mut(0, 0) {
-                    entry.textbox.set_caret_at(0);
-                }
-            }
-            // No caret to place.
-            CellKind::Reference(_) => {}
-        }
+        self.kind.body_mut().place_caret_at_start();
     }
 
     pub fn title(&self) -> Option<&TextBox> {
@@ -1278,29 +955,16 @@ impl Cell {
 
     pub fn is_empty(&self) -> bool {
         let title_empty = self.title.as_ref().map(|t| t.is_empty()).unwrap_or(true);
-        let body_empty = match &self.kind {
-            CellKind::Plain(pc) => pc.body().is_empty(),
-            CellKind::Outline(oc) => oc.is_empty(),
-            CellKind::PopPop(pc) => pc.textbox().is_empty(),
-            CellKind::Table(tc) => tc.is_empty(),
-            // Reference cells are never "empty" — they're a pointer, which
-            // is content even when its target is gone.
-            CellKind::Reference(_) => false,
-        };
-        title_empty && body_empty
+        // ReferenceCell overrides is_empty() to false (the pointer is
+        // content); other kinds bottom out at their inner textboxes.
+        title_empty && self.kind.body().is_empty()
     }
 
     pub fn set_font_scale(&mut self, scale: f32) {
         if let Some(title) = self.title.as_mut() {
             title.set_font_scale(scale);
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().set_font_scale(scale),
-            CellKind::Outline(oc) => oc.set_font_scale(scale),
-            CellKind::PopPop(pc) => pc.set_font_scale(scale),
-            CellKind::Table(tc) => tc.set_font_scale(scale),
-            CellKind::Reference(rc) => rc.set_font_scale(scale),
-        }
+        self.kind.body_mut().set_font_scale(scale);
     }
 
     pub fn caret_doc_y_band(&self) -> Option<(f32, f32)> {
@@ -1309,13 +973,7 @@ impl Cell {
                 return title.caret_doc_y_band();
             }
         }
-        match &self.kind {
-            CellKind::Plain(pc) => pc.body().caret_doc_y_band(),
-            CellKind::Outline(oc) => oc.caret_doc_y_band(),
-            CellKind::PopPop(pc) => pc.textbox().caret_doc_y_band(),
-            CellKind::Table(tc) => tc.caret_doc_y_band(),
-            CellKind::Reference(_) => None,
-        }
+        self.kind.body().caret_doc_y_band()
     }
 
     pub fn at_top_edge(&self) -> bool {
@@ -1333,22 +991,7 @@ impl Cell {
         if self.title.is_some() {
             return false;
         }
-        match &self.kind {
-            CellKind::Plain(pc) => pc.body().at_top_visual_line(),
-            CellKind::Outline(oc) => oc.at_top_edge(),
-            CellKind::PopPop(pc) => pc.textbox().at_top_visual_line(),
-            CellKind::Table(tc) => {
-                let (r, c) = tc.focused_index();
-                r == 0
-                    && tc
-                        .cell_at(r, c)
-                        .map(|e| e.textbox.at_top_visual_line())
-                        .unwrap_or(true)
-            }
-            // Reference cells are always at both edges — there's no caret
-            // to hold the focus, so arrow keys should immediately cross out.
-            CellKind::Reference(_) => true,
-        }
+        self.kind.body().at_top_edge()
     }
 
     pub fn at_bottom_edge(&self) -> bool {
@@ -1356,20 +999,7 @@ impl Cell {
         if self.title_focused {
             return false;
         }
-        match &self.kind {
-            CellKind::Plain(pc) => pc.body().at_bottom_visual_line(),
-            CellKind::Outline(oc) => oc.at_bottom_edge(),
-            CellKind::PopPop(pc) => pc.textbox().at_bottom_visual_line(),
-            CellKind::Table(tc) => {
-                let (r, c) = tc.focused_index();
-                r + 1 == tc.rows()
-                    && tc
-                        .cell_at(r, c)
-                        .map(|e| e.textbox.at_bottom_visual_line())
-                        .unwrap_or(true)
-            }
-            CellKind::Reference(_) => true,
-        }
+        self.kind.body().at_bottom_edge()
     }
 
     pub fn place_caret_at_start(&mut self) {
@@ -1379,17 +1009,7 @@ impl Cell {
                 return;
             }
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().set_caret_at(0),
-            CellKind::Outline(oc) => oc.place_caret_at_start(),
-            CellKind::PopPop(pc) => pc.textbox_mut().set_caret_at(0),
-            CellKind::Table(tc) => {
-                if let Some(entry) = tc.cell_at_mut(0, 0) {
-                    entry.textbox.set_caret_at(0);
-                }
-            }
-            CellKind::Reference(_) => {}
-        }
+        self.kind.body_mut().place_caret_at_start();
     }
 
     pub fn place_caret_at_end(&mut self) {
@@ -1400,25 +1020,7 @@ impl Cell {
                 return;
             }
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => {
-                let end = pc.body().text().len();
-                pc.body_mut().set_caret_at(end);
-            }
-            CellKind::Outline(oc) => oc.place_caret_at_end(),
-            CellKind::PopPop(pc) => {
-                let end = pc.textbox().text().len();
-                pc.textbox_mut().set_caret_at(end);
-            }
-            CellKind::Table(tc) => {
-                let (r, c) = tc.focused_index();
-                if let Some(entry) = tc.cell_at_mut(r, c) {
-                    let end = entry.textbox.text().len();
-                    entry.textbox.set_caret_at(end);
-                }
-            }
-            CellKind::Reference(_) => {}
-        }
+        self.kind.body_mut().place_caret_at_end();
     }
 
     /// Drop every visible selection on this cell — title text drag,
@@ -1433,17 +1035,7 @@ impl Cell {
         if let Some(title) = self.title.as_mut() {
             title.clear_selection();
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().clear_selection(),
-            CellKind::Outline(oc) => oc.clear_all_selections(),
-            CellKind::PopPop(pc) => pc.textbox_mut().clear_selection(),
-            CellKind::Table(tc) => tc.clear_all_selections(),
-            CellKind::Reference(rc) => {
-                if let Some(cache) = rc.cache_mut() {
-                    cache.clear_all_selections();
-                }
-            }
-        }
+        self.kind.body_mut().clear_all_selections();
     }
 
     /// Select all text in the cell's active text input — title when focused,
@@ -1455,22 +1047,7 @@ impl Cell {
                 return;
             }
         }
-        match &mut self.kind {
-            CellKind::Plain(pc) => pc.body_mut().select_all(),
-            CellKind::Outline(oc) => oc.select_all_in_focused(),
-            CellKind::PopPop(pc) => pc.textbox_mut().select_all(),
-            CellKind::Table(tc) => {
-                let (r, c) = tc.focused_index();
-                if let Some(entry) = tc.cell_at_mut(r, c) {
-                    entry.textbox.select_all();
-                }
-            }
-            CellKind::Reference(rc) => {
-                if let Some(cache) = rc.cache_mut() {
-                    cache.select_all_focused();
-                }
-            }
-        }
+        self.kind.body_mut().select_all_focused();
     }
 
     /// `(text, caret_byte)` for the active text input — title when focused,
@@ -1482,73 +1059,31 @@ impl Cell {
                 return title.primary_caret().map(|(_, h)| (title.text(), h));
             }
         }
-        match &self.kind {
-            CellKind::Plain(pc) => pc.body().primary_caret().map(|(_, h)| (pc.body().text(), h)),
-            CellKind::Outline(oc) => oc.focused_text_and_caret(),
-            CellKind::PopPop(pc) => pc
-                .textbox()
-                .primary_caret()
-                .map(|(_, h)| (pc.textbox().text(), h)),
-            CellKind::Table(tc) => {
-                let (r, c) = tc.focused_index();
-                let entry = tc.cell_at(r, c)?;
-                entry.textbox.primary_caret().map(|(_, h)| (entry.textbox.text(), h))
-            }
-            CellKind::Reference(_) => None,
-        }
+        self.kind.body().focused_text_and_caret()
     }
 
-    /// Outline cells: ID of the focused bullet (None when title is focused).
-    /// Plain/PopPop/Table: None always.
+    /// Outline cells: ID of the focused bullet. Every other kind returns
+    /// None — including when the title is focused (the focus is on the
+    /// title, not on any bullet).
     pub fn focused_bullet_id(&self) -> Option<Uuid> {
         if self.title_focused {
             return None;
         }
-        match &self.kind {
-            CellKind::Plain(_) => None,
-            CellKind::Outline(oc) => Some(oc.focused_bullet_id()),
-            CellKind::PopPop(_) => None,
-            CellKind::Table(_) => None,
-            CellKind::Reference(_) => None,
-        }
+        self.kind.body().focused_bullet_id()
     }
 
     /// Anchor position for an overlay tied to byte `byte` in this cell's
     /// active textbox (focused bullet for outline; title when focused).
     /// Used by the @-mention popup.
-    pub fn anchor_doc_pos(
-        &self,
-        bullet_id: Option<Uuid>,
-        byte: usize,
-    ) -> Option<(f32, f32)> {
-        if self.title_focused && bullet_id.is_none() {
+    pub fn anchor_doc_pos(&self, byte: usize) -> Option<(f32, f32)> {
+        if self.title_focused {
             if let Some(title) = self.title.as_ref() {
                 let (x, _) = title.doc_position_of_byte(byte)?;
                 let (_, bot) = title.line_y_band_of_byte(byte)?;
                 return Some((x, bot));
             }
         }
-        match (&self.kind, bullet_id) {
-            (CellKind::Plain(pc), None) => {
-                let (x, _) = pc.body().doc_position_of_byte(byte)?;
-                let (_, bot) = pc.body().line_y_band_of_byte(byte)?;
-                Some((x, bot))
-            }
-            (CellKind::Outline(oc), Some(id)) => oc.anchor_doc_pos(id, byte),
-            (CellKind::PopPop(pc), None) => {
-                let (x, _) = pc.textbox().doc_position_of_byte(byte)?;
-                let (_, bot) = pc.textbox().line_y_band_of_byte(byte)?;
-                Some((x, bot))
-            }
-            (CellKind::Table(tc), None) => {
-                let (r, c) = tc.focused_index();
-                let entry = tc.cell_at(r, c)?;
-                let (x, _) = entry.textbox.doc_position_of_byte(byte)?;
-                let (_, bot) = entry.textbox.line_y_band_of_byte(byte)?;
-                Some((x, bot))
-            }
-            _ => None,
-        }
+        self.kind.body().anchor_doc_pos_at_focused(byte)
     }
 
     pub fn snapshot(&self) -> CellSnapshot {

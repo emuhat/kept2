@@ -141,13 +141,6 @@ impl PopPopCell {
         &self.textbox
     }
 
-    /// Drain a pending link URL from either the input or output column.
-    pub fn take_pending_link_url(&mut self) -> Option<String> {
-        self.textbox
-            .take_pending_link_url()
-            .or_else(|| self.output.take_pending_link_url())
-    }
-
     pub fn textbox_mut(&mut self) -> &mut TextBox {
         &mut self.textbox
     }
@@ -322,27 +315,6 @@ impl PopPopCell {
             // thing.
             self.output.mouse_down(abs_x, abs_y, modifiers, false)
         }
-    }
-
-    pub fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
-        // Both textboxes ignore drag-to when they don't have an active
-        // drag, so we can forward to both — only the one that started the
-        // drag does any work.
-        let input_drag = self.textbox.mouse_drag_to(abs_x, abs_y);
-        let output_drag = self.output.mouse_drag_to(abs_x, abs_y);
-        input_drag || output_drag
-    }
-
-    pub fn mouse_up(&mut self) -> bool {
-        let a = self.textbox.mouse_up();
-        let b = self.output.mouse_up();
-        a || b
-    }
-
-    /// True if `(abs_x, abs_y)` lands on a link in the input column. The
-    /// output column has no links by construction, so we only check input.
-    pub fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
-        self.textbox.link_at_doc_pos(abs_x, abs_y)
     }
 
     /// Copy whichever column has a non-empty selection. Output wins ties

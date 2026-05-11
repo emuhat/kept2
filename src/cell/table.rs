@@ -436,64 +436,6 @@ impl TableCell {
         Some((row_idx, col_idx))
     }
 
-    pub fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
-        let mut any = false;
-        for row in &mut self.cells {
-            for entry in row.iter_mut() {
-                if entry.textbox.mouse_drag_to(abs_x, abs_y) {
-                    any = true;
-                }
-            }
-        }
-        any
-    }
-
-    pub fn mouse_up(&mut self) -> bool {
-        let mut any = false;
-        for row in &mut self.cells {
-            for entry in row.iter_mut() {
-                if entry.textbox.mouse_up() {
-                    any = true;
-                }
-            }
-        }
-        any
-    }
-
-    pub fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
-        for row in &self.cells {
-            for entry in row {
-                if entry.textbox.link_at_doc_pos(abs_x, abs_y) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    pub fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
-        for row in &self.cells {
-            for entry in row {
-                if entry.textbox.tag_at_doc_pos(abs_x, abs_y) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Collapse every cell's text selection. Used by the cross-cell
-    /// mouse_down housekeeping pass — when focus leaves this table,
-    /// any drag-select inside one of its entries should retire so it
-    /// doesn't compete with the new click target's highlight.
-    pub fn clear_all_selections(&mut self) {
-        for row in &mut self.cells {
-            for entry in row {
-                entry.textbox.clear_selection();
-            }
-        }
-    }
-
     pub fn copy_selection(&self) -> String {
         for row in &self.cells {
             for entry in row {
@@ -661,30 +603,6 @@ impl TableCell {
         &self.cells
     }
 
-    /// Drain the first pending link URL from any of the inner cells.
-    pub fn take_pending_link_url(&mut self) -> Option<String> {
-        for row in &mut self.cells {
-            for entry in row {
-                if let Some(url) = entry.textbox.take_pending_link_url() {
-                    return Some(url);
-                }
-            }
-        }
-        None
-    }
-
-    /// Drain the first pending inline-tag name from any of the inner
-    /// cells (mirrors `take_pending_link_url`).
-    pub fn take_pending_tag_name(&mut self) -> Option<String> {
-        for row in &mut self.cells {
-            for entry in row {
-                if let Some(name) = entry.textbox.take_pending_tag_name() {
-                    return Some(name);
-                }
-            }
-        }
-        None
-    }
 }
 
 impl super::body::CellBody for TableCell {

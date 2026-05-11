@@ -103,14 +103,6 @@ impl KeptApp {
         header_paint.set_color(crate::color::sidebar_section_header());
         let (_, hm) = header_font.metrics();
 
-        // Row hit-tests are rebuilt every frame; clear stale ones.
-        self.hit_tests.sidebar.contexts.clear();
-        self.hit_tests.sidebar.dates.clear();
-        self.hit_tests.sidebar.tags.clear();
-        self.hit_tests.sidebar.show_inactive_toggle = None;
-        self.hit_tests.sidebar.pages.clear();
-        self.hit_tests.sidebar.weeks.clear();
-
         let row_font =
             Font::from_typeface(&self.typeface, SIDEBAR_DATE_FONT_SIZE * scale);
         let mouse_x = self.mouse_pos.0;
@@ -156,7 +148,7 @@ impl KeptApp {
                 pad_x,
                 &row_font,
             );
-            self.hit_tests.sidebar.weeks.push((filter, week_rect));
+            self.hit_tests_builder.sidebar.weeks.push((filter, week_rect));
             y += date_h + item_gap + date_gap;
         }
 
@@ -217,7 +209,7 @@ impl KeptApp {
                 pad_x,
                 &row_font,
             );
-            self.hit_tests.sidebar.dates.push((d, date_rect));
+            self.hit_tests_builder.sidebar.dates.push((d, date_rect));
             y += date_h + item_gap + date_gap;
         }
 
@@ -251,7 +243,7 @@ impl KeptApp {
                     pad_x,
                     &row_font,
                 );
-                self.hit_tests.sidebar.tags.push((name, row_rect));
+                self.hit_tests_builder.sidebar.tags.push((name, row_rect));
                 y += date_h + item_gap;
             }
         }
@@ -280,7 +272,7 @@ impl KeptApp {
             pad_x,
             &row_font,
         );
-        self.hit_tests.sidebar.pages.push((PageKind::People, people_rect));
+        self.hit_tests_builder.sidebar.pages.push((PageKind::People, people_rect));
         y += date_h + item_gap;
 
         // "Show archived" toggle pill at the very bottom of the
@@ -324,7 +316,7 @@ impl KeptApp {
             &label_paint,
         );
         draw_toggle(canvas, toggle_rect, self.show_inactive_cells, toggle_hovered);
-        self.hit_tests.sidebar.show_inactive_toggle = Some(toggle_rect);
+        self.hit_tests_builder.sidebar.show_inactive_toggle = Some(toggle_rect);
         y = toggle_row_bot + item_gap;
 
         canvas.restore();

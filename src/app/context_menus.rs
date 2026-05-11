@@ -161,23 +161,9 @@ impl KeptApp {
         view_h: f32,
     ) {
         let Some(menu) = self.cell_context_menu.as_ref() else {
-            self.hit_tests.cell_menu.delete = None;
-            self.hit_tests.cell_menu.surface = None;
-            self.hit_tests.cell_menu.surface_subtree = None;
-            self.hit_tests.cell_menu.envelope = None;
-            self.hit_tests.cell_menu.unwrap = None;
-            self.hit_tests.cell_menu.toggle_cell_active = None;
-            self.hit_tests.cell_menu.toggle_bullet_active = None;
             return;
         };
         let Some(cell) = self.cell(menu.cell_id) else {
-            self.hit_tests.cell_menu.delete = None;
-            self.hit_tests.cell_menu.surface = None;
-            self.hit_tests.cell_menu.surface_subtree = None;
-            self.hit_tests.cell_menu.envelope = None;
-            self.hit_tests.cell_menu.unwrap = None;
-            self.hit_tests.cell_menu.toggle_cell_active = None;
-            self.hit_tests.cell_menu.toggle_bullet_active = None;
             return;
         };
         let scale = self.font_scale;
@@ -394,13 +380,13 @@ impl KeptApp {
             None
         };
 
-        self.hit_tests.cell_menu.delete = Some(delete_rect);
-        self.hit_tests.cell_menu.surface = Some(surface_rect);
-        self.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
-        self.hit_tests.cell_menu.envelope = envelope_rect;
-        self.hit_tests.cell_menu.unwrap = unwrap_rect;
-        self.hit_tests.cell_menu.toggle_cell_active = Some(toggle_cell_active_rect);
-        self.hit_tests.cell_menu.toggle_bullet_active = toggle_bullet_active_rect;
+        self.hit_tests_builder.cell_menu.delete = Some(delete_rect);
+        self.hit_tests_builder.cell_menu.surface = Some(surface_rect);
+        self.hit_tests_builder.cell_menu.surface_subtree = surface_subtree_rect;
+        self.hit_tests_builder.cell_menu.envelope = envelope_rect;
+        self.hit_tests_builder.cell_menu.unwrap = unwrap_rect;
+        self.hit_tests_builder.cell_menu.toggle_cell_active = Some(toggle_cell_active_rect);
+        self.hit_tests_builder.cell_menu.toggle_bullet_active = toggle_bullet_active_rect;
     }
 
     pub(super) fn render_tag_context_menu(
@@ -410,7 +396,6 @@ impl KeptApp {
         view_h: f32,
     ) {
         let Some(menu) = self.tag_context_menu.as_ref() else {
-            self.hit_tests.tag_menu.delete = None;
             return;
         };
         let scale = self.font_scale;
@@ -451,7 +436,7 @@ impl KeptApp {
             &font,
             self.mouse_pos,
         );
-        self.hit_tests.tag_menu.delete = Some(row_rect);
+        self.hit_tests_builder.tag_menu.delete = Some(row_rect);
     }
 
     /// Right-click menu rendered over a People-page row. Two actions:
@@ -465,8 +450,6 @@ impl KeptApp {
         view_h: f32,
     ) {
         let Some(menu) = self.people_context_menu.as_ref() else {
-            self.hit_tests.people_menu.rename = None;
-            self.hit_tests.people_menu.delete = None;
             return;
         };
         let scale = self.font_scale;
@@ -510,7 +493,7 @@ impl KeptApp {
             &font,
             mouse,
         );
-        self.hit_tests.people_menu.rename = Some(rename_rect);
+        self.hit_tests_builder.people_menu.rename = Some(rename_rect);
 
         // Delete row. Disabled when not deletable — same label paint
         // path either way (text color differs), but the hover background
@@ -548,9 +531,7 @@ impl KeptApp {
             mouse,
         );
         if menu.deletable {
-            self.hit_tests.people_menu.delete = Some(delete_rect);
-        } else {
-            self.hit_tests.people_menu.delete = None;
+            self.hit_tests_builder.people_menu.delete = Some(delete_rect);
         }
     }
 }
