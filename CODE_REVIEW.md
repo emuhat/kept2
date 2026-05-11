@@ -1,230 +1,264 @@
-# Code review & cleanup plan
+# Code review & cleanup plan (v2)
 
-A walk through what's working, what's not, and a concrete order of operations
-for reshaping the codebase. Synthesizes findings from three parallel audits
-of `cell.rs`, `app.rs`, and tests/persist/cross-cutting.
+A fresh structural read of the codebase, contrasted against the v1 review.
+The v1 plan moved several pieces, but the central debt — a god-object
+`KeptApp` and a hand-rolled 5-arm dispatch over `CellKind` — is still here
+and has compounded as the app gained features (people page, envelope
+outlines, multi-pane, span tags, active/inactive flags, toasts).
+
+Headline: **the structural problems aren't where the file boundaries are.**
+Splitting files without splitting *responsibility* hasn't helped, and in
+two cases made the picture harder to read.
 
 ## Headline numbers
 
-| File | Lines | Structural verdict |
+| File | Lines | Verdict |
 |---|---|---|
-| `src/cell.rs` | 5,934 | Five independent UI body types stuffed into one file. Clear extraction lines. |
-| `src/app.rs` | 6,991 | One God-struct (`KeptApp`, ~135 fields, ~80 methods). Several distinct subsystems intermingled. |
-| `src/persist.rs` | 1,431 | Three concerns (schema, cells, entities) in one impl block. |
-| `src/query.rs` | 731 | Cleanly organized; leave alone. |
-| `src/main.rs` | 327 | Fine as-is. |
-| **Total** | 15,414 | |
+| `src/app/mod.rs` | 7,839 | God object. Grew despite four submodules being broken out. |
+| `src/cell.rs` | 2,654 | Pure dispatcher: 217 `CellKind::` references, 43 match blocks, ~61 tests. |
+| `src/persist.rs` | 2,068 | Schema + cells + entities + contexts + migrations in one `impl Db`. |
+| `src/cell/textbox.rs` | 1,930 | 29-field god widget; one impl block. |
+| `src/cell/outline.rs` | 1,617 | Multi-bullet container; reimplements much of TextBox's selection/copy plumbing. |
+| `src/app/mention_popup.rs` | 914 | `impl KeptApp` block + state struct in the same file. |
+| `src/query.rs` | 887 | Still the role model. Leave alone. |
+| `src/color.rs` | 792 | Live-reload color config. Self-contained. |
+| `src/cell/table.rs` | 688 | Grid container. Parallel boilerplate with outline. |
+| `src/app/context_menus.rs` | 565 | Three menus + shared `draw_menu_card`/`draw_menu_row`. Still `impl KeptApp`. |
+| `src/cell/wrap.rs` | 519 | Pure layout/parse utilities. Clean. |
+| `src/cell/poppop.rs` | 369 | Calc cell. Self-contained. |
+| `src/app/search.rs` | 361 | `impl KeptApp` extension. |
+| `src/main.rs` | 351 | OpenGL/winit setup. Fine. |
+| `src/app/sidebar.rs` | 344 | `impl KeptApp` extension. |
+| `src/cell/common.rs` | 244 | Shared types + helpers. Clean. |
+| `src/cell/reference.rs` | 232 | Pointer + cache forwarder. |
+| `src/cell/grid.rs` | 36 | Shared stripe/divider helpers. |
+| **Total** | **22,410** | (was 15,414 in v1; +45% over ~6 weeks of feature work) |
 
-| Tests | Count | Density |
+| Tests | Count | Notes |
 |---|---|---|
-| `query.rs` | 28 | 3.8% — solid |
-| `cell.rs` | 22 | 0.4% — concentrated on text/link edge cases + PopPop |
-| `app.rs` | 10 | 0.14% — only pure helpers (fuzzy, tag-split) |
-| `persist.rs` | 5 | 0.35% — one round-trip + four migration tests |
-| **Total** | 65 | |
+| `src/cell.rs` | 61 | Strong coverage of TextBox link/tag/edit edge cases, outline split/merge, active-flag round-trips |
+| `src/query.rs` | 33 | Parser + executor |
+| `src/persist.rs` | 17 | Round-trips for every `CellKind` variant — v1 Phase-0 work landed |
+| `src/app/mod.rs` | 5 | Helper-level only |
+| `src/app/mention_popup.rs` | 5 | Fuzzy match |
+| **Total** | **121** | (was 65 in v1; nearly doubled — most of the gain in `cell.rs`) |
 
-## What's good (don't break this stuff)
+## What got done since v1
 
-- **`CellKind` dispatch pattern.** Each body type owns its own state and renders/handles input independently; `Cell::tick`/`handle_key`/`mouse_down` etc. are thin match-and-delegate. Adding `Reference` was a one-arm extension everywhere — that's the test of a good architecture.
-- **`kept://<uuid>` URL convention.** Started for `@`-mentions, transparently generalized to reference cells. Clicking a link, navigating to an entity, navigating to a referenced cell — all the same code path through `handle_link_click`.
-- **Persistence schema versioning.** Five migrations (v2→v5) with thoughtful backfills. The migration helpers (`extract_title_from_body_json`, `backfill_entities_from_persons`) are idempotent and well-commented. Good discipline.
-- **`query.rs` is the role model.** ~730 lines, clear sections (AST → parser → serializer → executor), 28 tests, parser/round-trip coverage tight. When the other modules grow up they should look like this.
-- **Multi-pane via `Deref<Target=Pane>`.** Avoided ~309 call-site rewrites by letting `KeptApp` deref to its active `Pane`. Smart.
-- **Naming consistency.** `*_id`, `*_at_doc_pos`, `last_*_rect`, `is_hovering_*` patterns all hold across files. Easy to scan.
-- **Comments explain *why*, not *what*.** Migrations, multi-pane decisions, focus-mode rationale — the comments that matter are present and load-bearing.
+Concrete progress — worth naming so we don't re-litigate it.
 
-## What's bad
+- **Phase 0 safety net.** Round-trip tests for every persisted CellKind variant landed (persist.rs:1662-2068, ~17 tests). This is the floor that makes the rest of the refactor safe.
+- **Phase 1: `cell.rs` split.** `cell/{common,wrap,textbox,outline,poppop,table,reference,grid}.rs` all exist. Parent `cell.rs` is the dispatcher only.
+- **Phase 3a: `HitTestState`.** The 18 scattered `last_*_rect` fields collapsed into `HitTestState` (app/mod.rs:112).
+- **Phase 3c: context-menu skeleton helpers.** `draw_menu_card` + `draw_menu_row` (context_menus.rs:87, :117) collapsed the duplicated render skeletons across cell / tag / people menus.
+- **Encapsulation cleanup.** `Cell::title` is private with accessors; `CellKind::clone_for_scale` (cell.rs:163) replaced the app's reach-in clone helper.
+- **`grid.rs` shared visual helpers** between Table and PopPop (the "1 source of truth for the calc-blue stripe" line is exactly the right pattern).
+
+## What didn't get done — and why it still matters
+
+These are the v1 items that are still on the table. They've gotten worse, not better, because the app grew around them.
+
+- **Phase 2: `persist.rs` split.** Still one 2,068-line file with schema, cell CRUD, entity CRUD, context CRUD, migrations, helpers all in one `impl Db`. Lower risk than ever now that round-trip tests exist — should be cheap to do.
+- **Phase 3b/3d "submodule" extractions.** `search.rs`, `mention_popup.rs`, `sidebar.rs`, `context_menus.rs` were created — but each file just opens `impl KeptApp { ... }` and bolts more methods onto the same god struct. State is not isolated; method bodies can still touch any field on `self`. **This is the worst-of-both-worlds outcome:** the file is split (you have to jump around to read flow) but the dependency graph isn't reduced (any method can still touch any state).
+- **Phase 3e–g: embeds, pages, subsystems.** None extracted. `tick_pane` (1,105 lines), `render_entity_page` (~305), `render_people_page` (~215), `render_envelope_outline_cell` (~200) all still live on `KeptApp`.
+- **Phase 3h: `mouse_down` rewrite.** Still 15+ hit-test branches in `dispatch_doc_click` (~250 lines) and `dispatch_sidebar_click` (~85 lines).
+- **`all_link_urls()` per-frame allocation.** Still allocates a `Vec<String>` of every URL across every cell each frame on the Entity page. (cell.rs:881; consumers at app/mod.rs:4979, 5353.)
+
+## What's new since v1 — and the debt it added
+
+The feature work between v1 and now landed a lot of value, but several pieces accreted new structural problems:
+
+- **Multi-pane (`Pane`, `KeptApp: Deref<Target=Pane>`).** v1 praised this as smart; six weeks later it's migration scar tissue. 50+ implicit derefs in `tick_pane` alone, and `Pane` itself derefs to `Scroller`. Readers can't tell from a call site which fields are per-pane vs. global without checking the struct. Was right at the time; is friction now.
+- **Entity caches** (`entities`, `entity_alias_index`, `cell_to_entity`, `entity_title_fallback` on KeptApp:1322-1336). Invariants are documented as #1-#7 in a comment but enforced nowhere. `refresh_entities` (app/mod.rs:2691) is called manually from ~15 sites. Forgetting one = silently stale UI.
+- **Span-based tags.** Replaced the parse-from-text approach. Right call architecturally, but `TextBox::apply_edit` (textbox.rs:1784) now has *parallel* transform loops over `links` and `tags` with near-identical gravity logic. Span maintenance is now a 4-concern choke point: text mutate → selections → links → tags → rewrap.
+- **Active/inactive flags.** Three more `UndoOp` variants (`SetCellActive`, `SetBulletActive`, `SetEntityActive`); the `undo`/`redo` match blocks grew to 13 arms each, ~200 lines apiece, fully duplicated in structure.
+- **Envelope outlines & embed depth.** `Reference` cells now sometimes contain a cached `Cell` that contains a `CellKind::Outline` whose `reference_header` is itself a `ReferenceTarget`. Recursive embed depth cap (`MAX_EMBED_DEPTH = 4`) exists, but the cache lifecycle and staleness checks are still repeated across `render_reference_cell` and `render_envelope_outline_cell`.
+- **Toasts, people-rename, people-add, people-context-menu, tag-context-menu.** Five more `Option<...>` fields on `KeptApp` for transient UI overlays.
+
+The pattern across all of these: **new feature → new field on `KeptApp` → new arm in undo/redo → new render code in `tick_pane` → new branch in `mouse_down` dispatch.** Nothing forces (or even encourages) features to land as cohesive units; they smear across the god object.
+
+## What's good (preserve)
+
+- **`query.rs`** is still the role model. AST → parser → serializer → executor, 33 tests, parser/round-trip coverage tight.
+- **`persist.rs` migrations.** Seven versioned, idempotent migrations with thoughtful backfills. The discipline is excellent even if the file got long.
+- **`kept://<uuid>` URL convention.** Started for @-mentions, now generalizes to entity nav, reference cells, embed clicks. One code path.
+- **Persistence round-trip tests** added in Phase 0. They're the safety net the rest of the plan rests on.
+- **Per-cell-type files** post-split. `cell/textbox.rs`, `cell/outline.rs`, etc. are big but self-contained — the body types don't reach into each other.
+- **`cell/grid.rs`** and `cell/common.rs` — the right shape for shared helpers.
+- **`MentionPopup` state struct** (mention_popup.rs:21). Owns its own data; just needs its methods to follow.
+- **Comments explain *why*, not *what*.** Migration intent, multi-pane Deref rationale, focus-mode invariants, embed cache staleness — the load-bearing comments are present.
+
+## What's bad — the current diagnosis
 
 ### Structural
 
-- **`cell.rs` is five files in a trench coat.** TextBox (1,859 LOC), OutlineCell (1,050), Cell aggregator (1,100), TableCell (563), PopPopCell (261), ReferenceCell (95). Each is mostly self-contained. There's no reason they share a file.
-- **`app.rs` is the kitchen sink.** `KeptApp` impl (lines 874–6,587, ~5,700 LOC) blends ~15 distinct responsibilities (pane mgmt, undo, persistence flush, sidebar render, search popup, mention popup, three context menus, two custom pages, embed render, mouse dispatch, key dispatch, navigation). Most of these are independent of each other.
-- **`persist.rs` mixes JSON schema, cell CRUD, entity CRUD, and migrations** in one ~1,400-line file with one big `impl Db`.
-- **18 `last_*_rect(s)` fields scattered on `KeptApp`.** All are "last frame's hit-test rect for UI element X." Zero grouping.
+- **`KeptApp` is a textbook god object.** ~40 fields: cells, contexts, panes, undo/redo, dirty sets, pending deletes (×2), six overlay `Option`s, sidebar scroll, hit-tests, four entity caches, mouse pos, alt-pan state, toast, clipboard, db. (app/mod.rs:1238-1355.)
+- **The `app/` submodule split is cosmetic.** `search.rs:35`, `sidebar.rs:62`, `context_menus.rs:156`, `mention_popup.rs:183` all do `impl KeptApp { ... }`. The file boundary tells you nothing about which state a method touches.
+- **`CellKind` dispatch is hand-coded ~200 times.** `cell.rs`: 217 `CellKind::` references, 43 match blocks. `app/mod.rs`: 50 more references, 30 more matches. v1 considered this acceptable because "adding `Reference` was a one-arm extension"; that's still true *per dispatch site*, but the cost is now spread across hundreds of sites. Adding a sixth kind today is a search-and-replace exercise.
+- **`TextBox` is a 29-field accretion.** Text + multi-cursor selections + wrap cache + geometry + mouse drag + click-count ladder + styling flags (`force_heading`, `enable_comment_coloring`, `text_color`, `line_extra_below`) + link spans + tag spans + undo/redo + pending-click-link/tag buffers. One impl block from textbox.rs:127 to ~1850.
+
+### Weird logic flow
+
+- **Render mutates input state.** `hit_tests` is populated *during* `tick_pane` rendering (30+ mutation sites in a 1,105-line method) and consumed by `mouse_down` next frame. Single biggest "weird flow" smell. No invalidation if rendering is skipped or geometry changes mid-frame.
+- **`TextBox::apply_edit`** (textbox.rs:1784) mutates text → transforms every selection index → transforms every link span (closed-right gravity) → transforms every tag span (closed-right gravity + `#` revalidation) → invalidates wrap cache. Four parallel transform loops; adding a fifth span type means a fifth loop. Should be a single `Vec<Span>` with a kind tag.
+- **`TextBox::paste`** (textbox.rs:736) conflates text insertion with URL auto-detection and link rebase. Edit semantics and content-classification semantics in the same method.
+- **`TextBox::mouse_down`** (textbox.rs:1199, ~105 lines) handles link/tag hit-detection, click-count ladder, drag state setup, AND multi-cursor add — four interaction modes resolved in one function.
+- **Undo and redo are parallel 13-arm beasts.** `undo` (app/mod.rs:5593, 206 lines) and `redo` (5799, 186 lines) each match every `UndoOp` variant and hand-code the inverse mutation across cells, dirty sets, focus, contexts, entities, DB. Adding an op = touching both in lockstep.
+- **Dirty-marking is inconsistent.** Some mutation paths call `mark_cell_dirty` + `touch_cell`; some only one; `insert_cell_after_focused` (app/mod.rs:6150) relies on a side effect of `insert_cell_sorted`. A silent miss = a persistence bug.
+- **Entity cache invariants are documented in a comment, not in types.** `refresh_entities` (app/mod.rs:2691) called from ~15 sites; nothing stops a stale read between mutations and refresh.
 
 ### Duplication
 
-- **Geometry accessor boilerplate, 6× identical.** `x_origin/y_origin/width/height/font_scale` + `set_view_geometry` + `set_font_scale` repeats verbatim across `TextBox`, `OutlineCell`, `PopPopCell`, `TableCell`, `ReferenceCell`, and `Cell`. ~100 LOC of duplication. Begs for a `BodyGeometry` trait.
-- **Three context menus, three near-identical render skeletons.** `render_cell_context_menu` (177 LOC), `render_tag_context_menu` (71), `render_people_context_menu` (127). All do shadow → bg → border → row loop with hover detection. A `draw_context_menu_background` + `draw_context_menu_row` helper would collapse ~250 LOC of skeleton.
-- **Mouse-down hit-test pattern, 15× repeated.** Every overlay (sidebar, search input, three context menus, entity-page buttons, people-page rows, embed cards) has the same `if rect contains point { do action; return true; }` check. Could be a small table-driven helper or at least a `point_in_rect` predicate (the inline version is 4 boolean ANDs).
-- **Cell-render loop is two implementations.** Once in `tick_pane` (timeline cells), once in `render_entity_page`'s "REFERENCED IN" section (entity-page embeds). Different control flow but same shape: layout each item, draw wrapper, capture rect.
+- **Multi-textbox containers reimplement parallel boilerplate** (outline.rs / table.rs / poppop.rs): `mouse_drag_to`, `mouse_up`, `clear_all_selections`, `link_at_doc_pos`, `tag_at_doc_pos`, `take_pending_link_url`, `take_pending_tag_name`. Each is "loop over inner textboxes and OR the results", coded three times. ~150–200 LOC.
+- **Reference cache lifecycle** is hand-rolled in two places: `render_reference_cell` (app/mod.rs:2015) and `render_envelope_outline_cell` (app/mod.rs:2138). Both do staleness check → detach → rebuild → attach. No shared helper.
+- **Hit-test dispatch pattern** repeated ~15× in `dispatch_doc_click` and `dispatch_sidebar_click`: clone-vec-of-rects → iterate → point-in-rect → dispatch. Each overlay surfaces does it independently.
+- **Snapshot/restore loop-and-call** is reimplemented per cell type (bullet vector, row-major grid, etc.) with identical iteration shape.
 
-### Encapsulation breaks
-
-- **`clone_cell_kind_for_cache` in `app.rs` reaches into `cell.rs`'s pub fields.** Walks `TextBox.text()`, `.links()`, `OutlineCell.bullets()`, `TableCell.rows_view()` to build a deep copy. Ought to be a method on `CellKind` (or a trait `BodyClone`) inside cell.rs. App layer should ask for "clone scaled to N" and not care how.
-- **`build_reference_cache` similarly synthesizes `Cell` parts** (kind, title clone, scale propagation) that the cell module should own.
-- **`Cell::title` is a public `Option<TextBox>`.** Mutated by app.rs in several spots. Should be behind methods (`title()`, `title_mut()`, `set_title()`).
-
-### Inefficiencies
-
-- **`Cell::all_link_urls() -> Vec<String>`** clones every URL across every body kind. Used per-frame on the Person page. Replace with `Cell::has_link_url(&str) -> bool` (closure or string predicate) for the hot path.
-- **Per-frame cache rebuild on the Person page.** Each "REFERENCED IN" embed builds a fresh `Box<Cell>` cache via `build_reference_cache` every frame. Cheap but wasteful — and it's why selection inside Person-page embeds doesn't persist (see `FOLLOWUPS.md`). Future: persistent cache map keyed by `target_cell_id`.
-- **`ViewKind::Entity` page rebuilds the mention list per frame** by walking all cells and calling `all_link_urls()` on each. O(cells × links) per frame. Cache the list and invalidate on edit.
-- **Big render functions reallocate `Vec<(Uuid, Rect)>` every frame** for sidebar rects, etc. `Vec::clear` + reuse would skip the allocation.
-
-### Big-function pile-up
+### Big-function pile-up (updated from v1)
 
 | Function | Lines | Verdict |
 |---|---|---|
-| `KeptApp::handle_key` | 607 | Legitimately complex (15+ keybindings, modal interceptors). Split by mode. |
-| `KeptApp::tick_pane` | 381 | Legitimately complex (5 view kinds × focus mode × scrollbar). Split by view kind. |
-| `KeptApp::mouse_down` | 341 | **Worst offender.** ~15 copy-paste hit-test branches. Refactor before splitting. |
-| `KeptApp::render_entity_page` | 309 | Embed sub-loop should extract; rest is layout. |
-| `OutlineCell::handle_key` | ~300 | Selection mode + indent/outdent + split/merge dispatch. Split by sub-mode. |
-| `OutlineCell::tick` | ~270 | Layout + draw decorations + bullet loop. Extract helpers. |
-| `KeptApp::render_sidebar` | 244 | Repetitive rect capture. Extract `SidebarRects` substruct. |
-| `TextBox::tick` | ~220 | Selection highlights + line draw + caret + tags. Extract helpers. |
-| `KeptApp::render_search_popup` | 177 | Result-row loop should extract. |
-| `KeptApp::render_cell_context_menu` | 177 | Skeleton + 3 rows. Helper. |
-| `KeptApp::render_people_page` | 215 | Row loop + inline edit. Extract `render_people_row`. |
+| `KeptApp::tick_pane` | ~1,105 | Was 381 in v1 — has tripled. Now does: doc area, focus card, focus ring, cell loop, sidebar, entity page, people page, toast, context menus, hit-test mutation. **Worst single function in the codebase.** |
+| `KeptApp::handle_key` | ~686 | Was 607. Pane chords + search + mention popup + cell creation + context rotation + focus nav + undo/redo + link navigation, interleaved. |
+| `KeptApp::dispatch_doc_click` | ~250 | The post-`mouse_down`-rewrite-that-wasn't. 15+ branches. |
+| `KeptApp::undo` | 206 | 13-arm match; mirrors `redo`. |
+| `KeptApp::redo` | 186 | Mirror of `undo`. |
+| `KeptApp::render_entity_page` | ~305 | Entity title + meta + references list + toggle buttons + context-menu hit-test recording. |
+| `KeptApp::render_envelope_outline_cell` | ~204 | Embed render + bullet body, mirrors `Cell::tick`. |
+| `KeptApp::render_people_page` | ~215 | Row loop + rename/add inputs + context menus. |
+| `TextBox::tick` | ~210 | Layout + selection paint + link/tag overdraw + caret. |
+| `OutlineCell::tick` | ~135 | Multi-bullet layout + tag filter + active state + overlay. |
+| `KeptApp::delete_cell_by_id` | ~115 | Five-arm CellKind match + three deletion paths + context side effects. |
 
-## What's tested vs. what isn't
+## Recommended structural seams
 
-### Strong coverage
-- **Query parser** — every grammar path; round-trips.
-- **TextBox link mechanics** — typing-after, typing-inside, undo, split-preserves-link, enter-then-backspace.
-- **PopPop calc engine** — eval, comments, errors, variable threading.
-- **Title parsing** — name vs. trailing tags.
-- **Fuzzy match scoring** — camelCase, separators, initials.
+In priority order. The numbering picks up from v1 since some items there are still live.
 
-### Critical gaps
-1. **Persistence round-trips for `Plain`, `Outline`, `PopPop`, `Table`.** Only `Reference` is round-tripped (the test I added with v1). A serialization bug in any other variant silently loses data.
-2. **`ReferenceCell` cache behavior.** Snapshot/restore, staleness detection on `edited_at` change, cache rebuild correctness, dangling-target handling. Untested.
-3. **Query executor (`matches`, `MatchContext`)**. Parser is great; the function that actually filters cells against an AST has zero tests.
-4. **App-level navigation, undo, multi-pane state, embed lifecycle.** Zero tests. Easiest to add as units under extracted modules.
-5. **Title round-trip.** Migration extracts titles (covered); no test verifies edit→save→load round-trips a title.
+### High leverage, low risk
 
-### Test quality
-- Existing tests are well-asserted and well-commented (regression-focused, e.g., `link_survives_enter_then_backspace`).
-- Boilerplate (`typeface()` helper repeated everywhere) could become a fixture.
-- Few negative cases (e.g., "ReferenceCell rejects edits" — that invariant has no test).
+**S1. `CellKind` → `CellBody` trait.** The single highest-ROI move.
 
-## The plan
-
-Three phases. Each phase is a coherent body of work that ends with green tests and a runnable app. **Don't start phase N+1 until N's tests are passing.**
-
-### Phase 0: Safety net (1–2 days)
-
-**Goal**: tests in place before any structural moves. Refactoring without these is gambling.
-
-1. **Persistence round-trip per CellKind variant.** Five new tests in `persist.rs::tests`: build a `Cell` of each variant (Plain, Outline, PopPop, Table, Reference), serialize via `persisted_cell_from`, deserialize via `body_to_kind`, assert deep equality (text, links, depth, bullet ids, table dims, target). Reuse the v1 reference test as the template.
-2. **`ReferenceCell::cache_is_stale_for` + cache lifecycle tests.** Three tests: stale on edited_at bump, stale on missing target, stale on cache absent. Pure unit tests, no DB.
-3. **`query::matches` smoke tests.** Five tests: tag-only, entity-only, time-only, combined include, exclude. Just enough to catch grammar-vs-execution drift.
-4. **Title round-trip.** One test: create a Plain cell with a title, snapshot, restore, assert title text + tags survive.
-
-End state: ~14 new tests, total ~79. Zero structural changes yet.
-
-### Phase 1: Split `cell.rs` (3–5 days)
-
-The cleaner split (lower coupling than app.rs). Bottom-up extraction:
-
-1. **`cell/common.rs`** — `Affinity`, `Selection`, `Selections`, `Edit`, `LinkSpan`, `TextBoxSnapshot`, `primary_mod`/`word_mod`/`line_edge_mod`, transform-index helpers, geometry trait `BodyGeometry { fn x_origin/y_origin/width/height/font_scale + setters }`. ~150 LOC.
-2. **`cell/wrap.rs`** — `wrap_text_styled`, `wrap_paragraph_into`, word-boundary helpers (`char_class`, `find_word_at`, etc.). ~150 LOC.
-3. **`cell/textbox.rs`** — `TextBox` + impl, `DragKind`, `DragState`, `draw_line_with_links`. ~1,860 LOC. Implements `BodyGeometry`.
-4. **`cell/outline.rs`** — `Bullet`, `BulletSnapshot`, `OutlineCell`, `OutlineSnapshot`, `OutlineDrag`, `BulletSelection`. ~1,050 LOC. Implements `BodyGeometry`.
-5. **`cell/poppop.rs`** — `PopPopCell`, `compute_poppop_output`. ~260 LOC.
-6. **`cell/table.rs`** — `TableCell`, `TableEntry`, `TableSnapshot`. ~565 LOC.
-7. **`cell/reference.rs`** — `ReferenceCell`, `ReferenceTarget`. ~95 LOC.
-8. **`cell/cell.rs`** — `Cell`, `CellKind`, `CellSnapshot`, `CellSnapshotKind`, the dispatch impl. ~1,100 LOC. Owns title-slot logic.
-9. **`cell/mod.rs`** — re-exports + module organization. ~50 LOC.
-
-**During the move, also:**
-- Add the `BodyGeometry` trait, replace ~100 LOC of repeated accessors.
-- Add `CellKind::clone_for_scale(typeface, scale) -> Option<CellKind>` so `app.rs` stops reaching into pub fields.
-- Make `Cell::title` private; expose `title()`, `title_mut()`, `take_title()`, `set_title()`.
-
-End state: 9 files in `src/cell/`, average ~700 LOC each. App.rs's coupling to cell.rs internals reduced.
-
-### Phase 2: Split `persist.rs` (1 day)
-
-Smaller, well-bounded:
-
-1. **`persist/schema.rs`** — `CellBody`, `BlockRecord`, `LinkRecord`, `TableEntryRecord`, `ReferenceTargetRecord`, `PersistedCell`, migration helpers (`extract_title_from_body_json`, `take_heading_from_body`, etc.). ~300 LOC.
-2. **`persist/cells.rs`** — `cell_to_body`, `body_to_kind`, cell load/save methods on `Db`. ~400 LOC.
-3. **`persist/entities.rs`** — entity CRUD, alias index, `cell_to_entity_index`. ~300 LOC.
-4. **`persist/contexts.rs`** — context CRUD. ~80 LOC. (Optional split; tiny.)
-5. **`persist/mod.rs`** — `Db` struct + open/migrate, glue. ~350 LOC.
-
-The Phase 0 round-trip tests catch any serialization breakage during the move.
-
-### Phase 3: Tame `app.rs` (~3 weeks, multiple PRs)
-
-The painful one. Bottom-up by isolation:
-
-**3a. HitTestState refactor (1 day, prep work).** Consolidate the 18 `last_*_rect(s)` fields into a `HitTestState` substruct on `KeptApp`, grouped by UI surface. No behavior change; cleans up signatures everywhere.
-
-**3b. Extract isolated overlays (3 days).**
-- `app/search.rs` — `SearchState`, `render_search_popup`, `open/close_search_*`, `search_results`, `search_*_to_clipboard`. Self-contained.
-- `app/mention_popup.rs` — `MentionPopup`, `MentionSource`, `filter_mentions`, render + open/sync/move/commit. Move the 5 fuzzy-matching tests with it.
-
-**3c. Extract context menus (2 days).**
-- `app/context_menus.rs` — three `*ContextMenu` structs, three render methods, common `draw_context_menu_background` + `draw_context_menu_row` helpers. Collapses ~250 LOC of duplication.
-
-**3d. Extract sidebar (2 days).**
-- `app/sidebar.rs` — `render_sidebar` + `SidebarRects`. Hit-test routing stays in mouse_down for now.
-
-**3e. Extract embeds (1 day).**
-- `app/embeds.rs` — `render_reference_cell`, `build_reference_cache`, `draw_embed_wrapper`, `render_embed_placeholder`. Depends on `cell.rs::CellKind::clone_for_scale` from Phase 1.
-
-**3f. Extract pages (4 days).**
-- `app/entity_page.rs` — `render_entity_page` + helpers. Pull the "REFERENCED IN" loop into `render_entity_page_embeds`. Depends on `app/embeds.rs`.
-- `app/people_page.rs` — `render_people_page` + rename/add/delete/toggle helpers. Extract `render_people_row`.
-
-**3g. Extract subsystems (4 days).**
-- `app/nav.rs` — `Query` impl, `push_view`, `nav_back`, `nav_forward`, `restore_history_entry`, `rotate_view_to`. Pure logic, no I/O.
-- `app/undo.rs` — `UndoOp`, `ContextSideEffect`, `record_edit`, `undo`, `redo`. Add tests for round-trips.
-- `app/persistence.rs` — `maybe_flush_persistence`, `flush_persistence`, dirty/pending tracking.
-- `app/cell_stream.rs` — `visible_cell_ids`, `insert_cell_sorted`, `mark_cell_dirty`, `touch_cell`, `prev_visible`, `next_visible`.
-- `app/pane.rs` — `Pane`, `SplitDir`, layout/split/close, pane chord, `set_active_pane`.
-
-**3h. Refactor mouse_down (3 days, hardest).**
-After everything else extracted, rewrite `mouse_down` as a clean dispatch:
 ```rust
-let route = self.hit_test(point);  // returns enum
-match route { HitTest::Sidebar(...) => ..., HitTest::CellMenu(row) => ..., ... }
+trait CellBody {
+    fn tick(&mut self, canvas: &Canvas, x: f32, y: f32, w: f32, focused: bool, show_caret: bool) -> f32;
+    fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool;
+    fn mouse_down(&mut self, abs_x: f32, abs_y: f32, modifiers: &Modifiers, editing: bool) -> bool;
+    fn mouse_drag_to(&mut self, x: f32, y: f32) -> bool;
+    fn mouse_up(&mut self) -> bool;
+    fn copy_text(&self) -> String;
+    fn cut_text(&mut self) -> String;
+    fn paste_text(&mut self, s: &str);
+    fn link_at_doc_pos(&self, x: f32, y: f32) -> bool;
+    fn tag_at_doc_pos(&self, x: f32, y: f32) -> bool;
+    fn take_pending_link_url(&mut self) -> Option<String>;
+    fn take_pending_tag_name(&mut self) -> Option<String>;
+    fn all_link_urls_into(&self, out: &mut Vec<String>); // no Vec allocation
+    fn iter_textboxes<'a>(&'a self) -> Box<dyn Iterator<Item = &'a TextBox> + 'a>;
+    fn iter_textboxes_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut TextBox> + 'a>;
+    fn snapshot(&self) -> CellBodySnapshot;
+    fn restore(&mut self, snap: CellBodySnapshot);
+    // ...
+}
 ```
-Each module exposes its hit-test contribution. Replaces 341 LOC of nested if-let with a flat match.
 
-**3i. Final consolidation (1 day).**
-- `app/mod.rs` keeps `KeptApp` struct, `tick`, `tick_pane`, `handle_key`, `new`, public API.
-- Re-export submodule types.
-- `tick_pane` stays for now (could split by view kind in a later phase but not urgent).
-- `handle_key` stays for now (split by mode is a separate refactor).
+- Default trait methods for `mouse_drag_to`, `mouse_up`, `clear_all_selections`, `link_at_doc_pos`, `tag_at_doc_pos`, `take_pending_link_url`, `take_pending_tag_name` — all expressible in terms of `iter_textboxes_mut`. Collapses ~150–200 LOC of multi-textbox boilerplate.
+- `CellKind` can stay an enum (one match, dispatching to the trait) or become `Box<dyn CellBody>`. Either way, the host stops re-listing five variants per method.
+- `Reference`'s "I wrap a cached Cell" structure works fine — `Reference::iter_textboxes` returns the cache's.
+- Cost: a few weekend's worth of mechanical change; the round-trip tests will catch breakage.
 
-End state: ~12 files in `src/app/`, average ~500 LOC each. `mod.rs` ~1,000 LOC of orchestration.
+**S2. Hit-tests as a frame snapshot, not a render side effect.**
 
-### Phase 4: Polish (ongoing)
+- During `tick_pane`, append rects to a `HitTestBuilder`. At end-of-frame finalize it into a frozen `HitTests` value. `mouse_down` reads only from the frozen value.
+- If a frame's render is skipped, the previous frame's hit-tests are valid (or explicitly cleared on focus loss).
+- Cheap to implement; opens the door to splitting `tick_pane`.
 
-Pull off the smaller smells once the big moves are done:
-- Replace `all_link_urls()` with `has_link_url(&str)` predicate.
-- Cache the entity-page mention list (invalidate on edit).
-- Persistent cache for entity-page embeds (closes the selection gap from `FOLLOWUPS.md`).
-- Test fixtures (drop `typeface()` boilerplate).
-- Split `handle_key` by modal mode (search/mention/menu/normal). Optional.
-- Split `tick_pane` by view kind (Ast/Context/Entity/People). Optional.
-- `OutlineCell::handle_key` and `tick` extractions (helper methods for layout & draw).
+**S3. Unify `TextBox` spans.**
 
-## Order, scope, and risk
+- Replace `links: Vec<LinkSpan>` + `tags: Vec<TagSpan>` with `spans: Vec<Span>` where `Span { range, kind: SpanKind, gravity, payload }`.
+- The four transform loops in `apply_edit` collapse to one. Adding highlights / footnotes / future mention types becomes a kind variant.
+- ~50 LOC reduction; bigger win is conceptual.
 
-| Phase | Risk | Days | What ships |
+**S4. Centralize dirty discipline.**
+
+- A `Document` struct (or just a `DocMut` newtype around `&mut KeptApp`) where every cell mutation goes through a path that flips dirty bits + touches `edited_at` + (optionally) records undo. Today the rules are sprinkled across each call site.
+- One source of the rule is also the right hook to fire entity-cache invalidation (S6) and pending-link-url draining.
+
+### Medium leverage, moderate risk
+
+**S5. Carve `KeptApp` into named subsystems.** The shape from the new review:
+
+- `Document { cells, contexts, dirty_cells, pending_deletes, dirty_contexts, pending_context_deletes }`. Mutation API enforces dirty discipline (S4).
+- `EntityCache { entities, alias_index, cell_to_entity, title_fallback }`. `refresh(&db, &cells)` is the only entry point. Replaces the ~15 manual `refresh_entities` calls with explicit invalidation hooks.
+- `PaneTree { panes, active, split_ratio, dragging_divider, split_dir }`. Pane split/close/layout/focus lives here. **Drops the `Deref<Target=Pane>` magic** — call sites become `panes.active().view` (explicit about scope).
+- `Overlays { mention_popup, search, cell_menu, tag_menu, people_menu, people_rename, people_add, toast }`. Six `Option<...>` fields become one struct field.
+- `UndoLog { undo, redo }` with `record(&mut self, op)` and `apply(&mut self, dir, doc, entities, ...)`. Houses the dispatch.
+- `KeptApp` shrinks to `Document`, `EntityCache`, `PaneTree`, `Overlays`, `UndoLog`, `HitTests`, `Clipboard`, `Db`, plus render/input glue.
+
+**S6. Make undo apply data-driven.**
+
+- Give each `UndoOp` variant an `fn apply(&self, ctx: &mut AppMut, direction: Dir)` (one match, two directions), or define each as a `(do, undo)` pair of named helpers.
+- Today the two 200-line `match` blocks have to be kept in sync by hand. Adding a new op = three places to remember.
+
+**S7. Break up `tick_pane`.**
+
+- Now feasible because hit-tests are decoupled (S2). Split into `render_cell_stream`, `render_focus_card`, `render_scrollbar`, `render_sidebar_pass`, `render_overlay_pass`. Each takes a minimum slice of state.
+- The cell-rendering helper is reused by entity-page and people-page (which today re-derive a lot of the same geometry).
+
+**S8. Move per-subsystem methods off `impl KeptApp` and onto their state structs.**
+
+- The `impl KeptApp for ... ` blocks in `search.rs`, `sidebar.rs`, `context_menus.rs`, `mention_popup.rs` get rewritten as methods on `SearchState`, `MentionPopup`, etc. The state structs already exist (S5 organizes them); this is making the methods follow.
+- Each method then takes only the slice of context it needs (`&Document`, `&EntityCache`, `&mut HitTestBuilder`, etc.). Compile-time enforcement of scope.
+
+### Cleanup (Phase 4 from v1, still relevant)
+
+**S9. `all_link_urls()` → `has_link_url(&str)` predicate.** Hot path on Entity page. Per-frame allocation gone. (Or move to S1's `all_link_urls_into(&mut Vec<String>)`.)
+
+**S10. Entity-page "REFERENCED IN" list cache.** Currently O(cells × links) per frame. Cache + invalidate on edit; entity-cache invalidation already exists post-S6.
+
+**S11. Persistent embed cache.** Closes the selection-doesn't-persist-in-embeds gap noted in FOLLOWUPS.md.
+
+**S12. Stratify `TextBox` styling vs. semantics.** Bundle `force_heading`, `enable_comment_coloring`, `text_color`, `line_extra_below` into a `TextBoxStyle` field — or pass style as a parameter to `tick()` rather than persisting it on the widget. Today setting any of them silently re-wraps.
+
+**S13. `persist.rs` split.** v1 Phase 2 — never done. `schema.rs` / `cells.rs` / `entities.rs` / `contexts.rs` / `mod.rs`. Round-trip tests make it safe.
+
+**S14. Drop the `KeptApp: Deref<Target=Pane>` once subsystems own their methods.** Mechanical sweep at the end of S5+S8.
+
+## The plan (revised)
+
+| Step | Risk | Effort | Unblocks |
 |---|---|---|---|
-| 0: Safety-net tests | Very low | 1–2 | ~14 new tests; no behavior change |
-| 1: Split `cell.rs` | Medium | 3–5 | 9 files; trait extraction; tighter encapsulation |
-| 2: Split `persist.rs` | Low | 1 | 4–5 files |
-| 3a: HitTestState | Low | 1 | One field refactored, signatures cleaner |
-| 3b–3f: Extract overlays/pages/embeds | Medium | ~12 | 7 new modules; context-menu duplication gone |
-| 3g: Extract subsystems | Medium | ~4 | 5 more modules; testable nav/undo/persistence |
-| 3h: Mouse_down rewrite | Higher | 3 | Hit-test dispatch is flat |
-| 3i: Final consolidation | Low | 1 | `app/mod.rs` is 1k of orchestration |
-| 4: Polish | Low | ongoing | Smell removals as opportunity arises |
+| **S1**: CellBody trait | Low (round-trip tests cover) | ~3 days | Cuts 200+ dispatch sites; collapses multi-textbox boilerplate |
+| **S2**: Hit-tests as snapshot | Low | ~1 day | Decouples render from input; prereq for S7 |
+| **S3**: Unify TextBox spans | Low | ~1 day | Simplifies `apply_edit`; future-proofs span types |
+| **S4**: Centralize dirty discipline | Low | ~1 day | Kills inconsistency footgun |
+| **S5**: Carve subsystems | Medium | ~5 days | Foundation for S6/S7/S8; biggest readability win |
+| **S6**: Data-driven undo dispatch | Medium | ~2 days | Halves the undo/redo file size |
+| **S7**: Break up `tick_pane` | Medium | ~3 days | Readable render layer |
+| **S8**: Methods onto subsystem structs | Medium | ~3 days | Actually achieves what the "app/ split" tried to |
+| **S9–S12**: Cleanup pass | Low | ~3 days | Polish |
+| **S13**: `persist.rs` split | Low | ~1 day | Symmetry with cell/ split |
+| **S14**: Drop Deref-to-Pane | Low | ~1 day | Removes residual magic |
 
-**Total**: ~30 working days for a complete restructure. Realistically 3–5 weeks of part-time work.
+Total: ~24 working days. Doable in 3–4 weeks part-time.
 
-## Don't-do list
+**Order matters.** S1+S2+S3+S4 are independent and can land in any order; together they make S5 dramatically easier. S5 unblocks the rest. S7 needs S2; S6 needs S5; S8 needs S5.
 
-A few things the audits flagged that I'm explicitly recommending **against**:
+**Suggested first PR:** S1 alone (CellBody trait). It's the biggest single readability win, has the strongest test coverage backing it, and doesn't touch app.rs at all. Worth doing solo to confirm the trait shape before stacking the rest on top.
 
-- **Don't split `query.rs`.** It's 731 LOC, well-organized, well-tested. Splitting would be over-engineering. Revisit only if the parser grows nested expressions or the executor gains new matchers.
-- **Don't split `handle_key`/`tick_pane` by mode/view in Phase 3.** They're long but legitimately complex; their current shape is readable. Defer to Phase 4 if the file feels heavy after the rest of `app.rs` is gone.
-- **Don't introduce a `BodyClone` trait if `CellKind::clone_for_scale` is enough.** A method is simpler than a trait. Add the trait only if a third caller needs the same operation.
-- **Don't extract a `cell/cell.rs` "aggregator" module separately from `cell/mod.rs`.** Just make `cell/mod.rs` host `Cell` + `CellKind`; the body modules sit beneath. One fewer file.
+## Don't-do list (updated)
+
+- **Don't split `query.rs`.** Still the role model.
+- **Don't split `handle_key` / `tick_pane` by mode/view.** Long but legitimately complex; their shape is readable. Defer if needed.
+- **Don't add new feature surfaces during the refactor.** Each new `Option<...>` overlay field on `KeptApp` (toasts, people-add, people-rename, tag-context-menu, etc.) compounds the god-object problem. Land new features through whatever subsystem they belong to once S5 is in.
+- **Don't refactor `mention_popup.rs` internals.** The 914-line file is busy but the logic is genuinely complex (fuzzy match + sync + commit + render). S8 moves its methods onto `MentionPopup`; that's enough.
+- **Don't introduce a deeper Cell hierarchy.** S1's trait is enough. Resist the urge to make `OutlineCell` and `TableCell` share a `MultiTextBoxContainer` supertype — `iter_textboxes` on the body trait covers 90% of what that would buy.
+
+## Verification checklist
+
+After each step, the safety net to keep green:
+
+- `cargo test` — 121+ tests must pass throughout.
+- Manual smoke: open a date view, type in a cell, undo, redo, search, mention, switch panes, archive a cell, restart and verify it loaded.
+- Compile-time: `cargo clippy` to catch newly-dead code.
+
+The persistence round-trip tests in `persist.rs` are the keystone — any structural move that doesn't break them is almost certainly safe.

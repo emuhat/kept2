@@ -3,6 +3,8 @@
 //! (read-only). Each `\n`-separated input source line gets one output
 //! line. Errors render in red beneath their failing input row.
 
+use std::ops::Range;
+
 use skia_safe::{Canvas, Font, Paint, Point, Typeface};
 use winit::event::{KeyEvent, Modifiers};
 
@@ -365,5 +367,168 @@ impl PopPopCell {
     pub fn set_font_scale(&mut self, scale: f32) {
         self.textbox.set_font_scale(scale);
         self.output.set_font_scale(scale);
+    }
+}
+
+impl super::body::CellBody for PopPopCell {
+    fn tick(
+        &mut self,
+        canvas: &Canvas,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+        show_caret: bool,
+    ) -> f32 {
+        PopPopCell::tick(self, canvas, x, y, width, focused, show_caret)
+    }
+
+    fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        PopPopCell::handle_key(self, event, modifiers)
+    }
+
+    fn mouse_down(
+        &mut self,
+        abs_x: f32,
+        abs_y: f32,
+        modifiers: &Modifiers,
+        editing: bool,
+    ) -> bool {
+        PopPopCell::mouse_down(self, abs_x, abs_y, modifiers, editing)
+    }
+
+    /// Iterates input + output. Tag/link defaults inherit correctly:
+    /// output has no links (its text is computed) so `link_at_doc_pos`
+    /// defaults still match the inherent `link_at_doc_pos` semantics.
+    /// PopPop opts out of inline tags at commit time (the `#` is a
+    /// comment marker), so `all_tag_names_into` over both textboxes
+    /// produces an empty list — same as the prior cell.rs `PopPop(_) =>`
+    /// empty arm.
+    fn for_each_textbox(&self, f: &mut dyn FnMut(&TextBox)) {
+        f(&self.textbox);
+        f(&self.output);
+    }
+
+    fn for_each_textbox_mut(&mut self, f: &mut dyn FnMut(&mut TextBox)) {
+        f(&mut self.textbox);
+        f(&mut self.output);
+    }
+
+    fn typeface(&self) -> &Typeface {
+        &self.typeface
+    }
+
+    fn font_scale(&self) -> f32 {
+        self.textbox.font_scale()
+    }
+
+    fn set_font_scale(&mut self, scale: f32) {
+        PopPopCell::set_font_scale(self, scale);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.textbox.is_empty()
+    }
+
+    fn caret_doc_y_band(&self) -> Option<(f32, f32)> {
+        self.textbox.caret_doc_y_band()
+    }
+
+    fn at_top_edge(&self) -> bool {
+        self.textbox.at_top_visual_line()
+    }
+
+    fn at_bottom_edge(&self) -> bool {
+        self.textbox.at_bottom_visual_line()
+    }
+
+    fn place_caret_at_start(&mut self) {
+        self.textbox.set_caret_at(0);
+    }
+
+    fn place_caret_at_end(&mut self) {
+        let end = self.textbox.text().len();
+        self.textbox.set_caret_at(end);
+    }
+
+    fn select_all_focused(&mut self) {
+        self.textbox.select_all();
+    }
+
+    fn focused_text_and_caret(&self) -> Option<(&str, usize)> {
+        self.textbox
+            .primary_caret()
+            .map(|(_, h)| (self.textbox.text(), h))
+    }
+
+    /// PopPop opts out of tag-aware focus (the input column has comment
+    /// semantics for `#`, not tag semantics). Returning None keeps
+    /// `caret_in_in_progress_tag` etc. from probing tags here.
+    fn focused_textbox(&self) -> Option<&TextBox> {
+        None
+    }
+
+    fn anchor_doc_pos_at_focused(&self, byte: usize) -> Option<(f32, f32)> {
+        let (x, _) = self.textbox.doc_position_of_byte(byte)?;
+        let (_, bot) = self.textbox.line_y_band_of_byte(byte)?;
+        Some((x, bot))
+    }
+
+    /// Input takes precedence on copy unless output has a non-empty selection
+    /// (matches the inherent `copy_selection` tie-break).
+    fn copy_text(&self) -> String {
+        self.copy_selection()
+    }
+
+    fn cut_text(&mut self) -> String {
+        self.textbox.cut_primary_selection()
+    }
+
+    fn paste_text(&mut self, s: &str) {
+        self.textbox.paste(s);
+    }
+
+    fn replace_at_focused_with_link(
+        &mut self,
+        range: Range<usize>,
+        text: String,
+        url: String,
+    ) {
+        self.textbox.replace_with_link(range, text, url);
+    }
+
+    fn replace_at_focused_with_text(&mut self, range: Range<usize>, text: String) {
+        self.textbox.replace_with_text(range, text);
+    }
+
+    /// PopPop has no tag semantics on the input column — `#` is the
+    /// comment marker. The trait's `replace_at_focused_with_tag` is
+    /// called only after the @-mention popup commit, which doesn't
+    /// fire in PopPop in practice; the no-op here matches the prior
+    /// behavior in cell.rs.
+    fn replace_at_focused_with_tag(&mut self, _range: Range<usize>, _text: String) {}
+
+    fn add_link_to_first(&mut self, range: Range<usize>, url: String) {
+        self.textbox.add_link(range, url);
+    }
+
+    fn full_text(&self) -> String {
+        self.textbox.text().to_string()
+    }
+
+    /// PopPop input opts out of inline tag spans. Override the default
+    /// (which would iterate both textboxes) so removing #foo from a
+    /// PopPop body stays a no-op — matches the prior cell.rs behavior.
+    fn remove_tags_named(&mut self, _name: &str) -> bool {
+        false
+    }
+
+    /// Same reasoning as `remove_tags_named`: PopPop contributes no
+    /// tag names to cell-level aggregation.
+    fn all_tag_names_into(&self, _out: &mut Vec<String>) {}
+
+    /// Output column carries no tags or links to hit-test.
+    fn tag_at_doc_pos(&self, _abs_x: f32, _abs_y: f32) -> bool {
+        false
     }
 }

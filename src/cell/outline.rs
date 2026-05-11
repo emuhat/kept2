@@ -1615,3 +1615,181 @@ impl OutlineCell {
         true
     }
 }
+
+impl super::body::CellBody for OutlineCell {
+    fn tick(
+        &mut self,
+        canvas: &Canvas,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+        show_caret: bool,
+    ) -> f32 {
+        OutlineCell::tick(self, canvas, x, y, width, focused, show_caret)
+    }
+
+    fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        OutlineCell::handle_key(self, event, modifiers)
+    }
+
+    fn mouse_down(
+        &mut self,
+        abs_x: f32,
+        abs_y: f32,
+        modifiers: &Modifiers,
+        editing: bool,
+    ) -> bool {
+        OutlineCell::mouse_down(self, abs_x, abs_y, modifiers, editing)
+    }
+
+    /// Iterates the bullets' textboxes only. Does NOT descend into the
+    /// `reference_header` cache — that cache is owned by an
+    /// `EmbeddedReference` and the methods that should see it (e.g.
+    /// `take_pending_link_url`, `clear_all_selections`) are overridden
+    /// below to dispatch the header first, then fall through.
+    fn for_each_textbox(&self, f: &mut dyn FnMut(&TextBox)) {
+        for b in &self.bullets {
+            f(b.textbox());
+        }
+    }
+
+    fn for_each_textbox_mut(&mut self, f: &mut dyn FnMut(&mut TextBox)) {
+        for b in &mut self.bullets {
+            f(b.textbox_mut());
+        }
+    }
+
+    fn typeface(&self) -> &Typeface {
+        OutlineCell::typeface(self)
+    }
+
+    fn font_scale(&self) -> f32 {
+        OutlineCell::font_scale(self)
+    }
+
+    fn set_font_scale(&mut self, scale: f32) {
+        OutlineCell::set_font_scale(self, scale);
+    }
+
+    fn is_empty(&self) -> bool {
+        OutlineCell::is_empty(self)
+    }
+
+    fn caret_doc_y_band(&self) -> Option<(f32, f32)> {
+        OutlineCell::caret_doc_y_band(self)
+    }
+
+    fn at_top_edge(&self) -> bool {
+        OutlineCell::at_top_edge(self)
+    }
+
+    fn at_bottom_edge(&self) -> bool {
+        OutlineCell::at_bottom_edge(self)
+    }
+
+    fn place_caret_at_start(&mut self) {
+        OutlineCell::place_caret_at_start(self);
+    }
+
+    fn place_caret_at_end(&mut self) {
+        OutlineCell::place_caret_at_end(self);
+    }
+
+    fn select_all_focused(&mut self) {
+        self.select_all_in_focused();
+    }
+
+    fn focused_text_and_caret(&self) -> Option<(&str, usize)> {
+        OutlineCell::focused_text_and_caret(self)
+    }
+
+    fn focused_textbox(&self) -> Option<&TextBox> {
+        OutlineCell::focused_textbox(self)
+    }
+
+    fn focused_bullet_id(&self) -> Option<Uuid> {
+        Some(OutlineCell::focused_bullet_id(self))
+    }
+
+    fn anchor_doc_pos_at_focused(&self, byte: usize) -> Option<(f32, f32)> {
+        let bid = OutlineCell::focused_bullet_id(self);
+        OutlineCell::anchor_doc_pos(self, bid, byte)
+    }
+
+    fn copy_text(&self) -> String {
+        OutlineCell::copy_text(self)
+    }
+
+    fn cut_text(&mut self) -> String {
+        OutlineCell::cut_text(self)
+    }
+
+    fn paste_text(&mut self, s: &str) {
+        OutlineCell::paste_text(self, s);
+    }
+
+    fn replace_at_focused_with_link(
+        &mut self,
+        range: Range<usize>,
+        text: String,
+        url: String,
+    ) {
+        let bid = OutlineCell::focused_bullet_id(self);
+        self.replace_in_bullet_with_link(bid, range, text, url);
+    }
+
+    fn replace_at_focused_with_text(&mut self, range: Range<usize>, text: String) {
+        let bid = OutlineCell::focused_bullet_id(self);
+        self.replace_in_bullet_with_text(bid, range, text);
+    }
+
+    fn replace_at_focused_with_tag(&mut self, range: Range<usize>, text: String) {
+        let bid = OutlineCell::focused_bullet_id(self);
+        self.replace_in_bullet_with_tag(bid, range, text);
+    }
+
+    fn add_link_to_first(&mut self, range: Range<usize>, url: String) {
+        OutlineCell::add_link_to_first(self, range, url);
+    }
+
+    fn full_text(&self) -> String {
+        let mut out = String::new();
+        for (i, b) in self.bullets.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            for _ in 0..b.depth() {
+                out.push_str("  ");
+            }
+            out.push_str(b.textbox().text());
+        }
+        out
+    }
+
+    // --- Header-aware overrides ----------------------------------------
+    // Envelope outlines hold a `reference_header` whose cached cell lives
+    // outside `for_each_textbox`'s domain. The methods below descend into
+    // the header cache first, then fall through to the bullets via the
+    // inherent impls (which already do both).
+
+    fn take_pending_link_url(&mut self) -> Option<String> {
+        OutlineCell::take_pending_link_url(self)
+    }
+
+    fn take_pending_tag_name(&mut self) -> Option<String> {
+        OutlineCell::take_pending_tag_name(self)
+    }
+
+    fn clear_all_selections(&mut self) {
+        OutlineCell::clear_all_selections(self);
+    }
+
+    fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        OutlineCell::link_at_doc_pos(self, abs_x, abs_y)
+    }
+
+    fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
+        OutlineCell::tag_at_doc_pos(self, abs_x, abs_y)
+    }
+}

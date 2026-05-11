@@ -738,8 +738,8 @@ mod tests {
         let mut cell = Cell::new(tf.clone(), body.to_string());
         cell.timestamp = ts_ms;
         cell.edited_at = ts_ms;
-        if let CellKind::Plain(tb) = &mut cell.kind {
-            tb.migrate_tags_from_text();
+        if let CellKind::Plain(pc) = &mut cell.kind {
+            pc.body_mut().migrate_tags_from_text();
         }
         if let Some(t) = title {
             let mut tb = TextBox::new(tf, t.to_string());

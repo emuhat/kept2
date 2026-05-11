@@ -686,3 +686,190 @@ impl TableCell {
         None
     }
 }
+
+impl super::body::CellBody for TableCell {
+    fn tick(
+        &mut self,
+        canvas: &Canvas,
+        x: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+        show_caret: bool,
+    ) -> f32 {
+        TableCell::tick(self, canvas, x, y, width, focused, show_caret)
+    }
+
+    fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        TableCell::handle_key(self, event, modifiers)
+    }
+
+    fn mouse_down(
+        &mut self,
+        abs_x: f32,
+        abs_y: f32,
+        modifiers: &Modifiers,
+        editing: bool,
+    ) -> bool {
+        TableCell::mouse_down(self, abs_x, abs_y, modifiers, editing)
+    }
+
+    /// Iterates the grid row-major. Tag/link/drag defaults handle the
+    /// fan-out over all cells correctly.
+    fn for_each_textbox(&self, f: &mut dyn FnMut(&TextBox)) {
+        for row in &self.cells {
+            for entry in row {
+                f(&entry.textbox);
+            }
+        }
+    }
+
+    fn for_each_textbox_mut(&mut self, f: &mut dyn FnMut(&mut TextBox)) {
+        for row in &mut self.cells {
+            for entry in row {
+                f(&mut entry.textbox);
+            }
+        }
+    }
+
+    fn typeface(&self) -> &Typeface {
+        TableCell::typeface(self)
+    }
+
+    fn font_scale(&self) -> f32 {
+        TableCell::font_scale(self)
+    }
+
+    fn set_font_scale(&mut self, scale: f32) {
+        TableCell::set_font_scale(self, scale);
+    }
+
+    fn is_empty(&self) -> bool {
+        TableCell::is_empty(self)
+    }
+
+    fn caret_doc_y_band(&self) -> Option<(f32, f32)> {
+        TableCell::caret_doc_y_band(self)
+    }
+
+    fn at_top_edge(&self) -> bool {
+        let (r, c) = self.focused_index();
+        r == 0
+            && self
+                .cell_at(r, c)
+                .map(|e| e.textbox.at_top_visual_line())
+                .unwrap_or(true)
+    }
+
+    fn at_bottom_edge(&self) -> bool {
+        let (r, c) = self.focused_index();
+        r + 1 == self.rows()
+            && self
+                .cell_at(r, c)
+                .map(|e| e.textbox.at_bottom_visual_line())
+                .unwrap_or(true)
+    }
+
+    fn place_caret_at_start(&mut self) {
+        if let Some(entry) = self.cell_at_mut(0, 0) {
+            entry.textbox.set_caret_at(0);
+        }
+    }
+
+    fn place_caret_at_end(&mut self) {
+        let (r, c) = self.focused_index();
+        if let Some(entry) = self.cell_at_mut(r, c) {
+            let end = entry.textbox.text().len();
+            entry.textbox.set_caret_at(end);
+        }
+    }
+
+    fn select_all_focused(&mut self) {
+        let (r, c) = self.focused_index();
+        if let Some(entry) = self.cell_at_mut(r, c) {
+            entry.textbox.select_all();
+        }
+    }
+
+    fn focused_text_and_caret(&self) -> Option<(&str, usize)> {
+        let (r, c) = self.focused_index();
+        let entry = self.cell_at(r, c)?;
+        entry
+            .textbox
+            .primary_caret()
+            .map(|(_, h)| (entry.textbox.text(), h))
+    }
+
+    fn focused_textbox(&self) -> Option<&TextBox> {
+        TableCell::focused_textbox(self)
+    }
+
+    fn anchor_doc_pos_at_focused(&self, byte: usize) -> Option<(f32, f32)> {
+        let (r, c) = self.focused_index();
+        let entry = self.cell_at(r, c)?;
+        let (x, _) = entry.textbox.doc_position_of_byte(byte)?;
+        let (_, bot) = entry.textbox.line_y_band_of_byte(byte)?;
+        Some((x, bot))
+    }
+
+    fn copy_text(&self) -> String {
+        self.copy_selection()
+    }
+
+    fn cut_text(&mut self) -> String {
+        self.cut_focused()
+    }
+
+    fn paste_text(&mut self, s: &str) {
+        self.paste_focused(s);
+    }
+
+    fn replace_at_focused_with_link(
+        &mut self,
+        range: Range<usize>,
+        text: String,
+        url: String,
+    ) {
+        let (r, c) = self.focused_index();
+        if let Some(entry) = self.cell_at_mut(r, c) {
+            if !entry.readonly {
+                entry.textbox.replace_with_link(range, text, url);
+            }
+        }
+    }
+
+    fn replace_at_focused_with_text(&mut self, range: Range<usize>, text: String) {
+        let (r, c) = self.focused_index();
+        if let Some(entry) = self.cell_at_mut(r, c) {
+            if !entry.readonly {
+                entry.textbox.replace_with_text(range, text);
+            }
+        }
+    }
+
+    fn replace_at_focused_with_tag(&mut self, range: Range<usize>, text: String) {
+        let (r, c) = self.focused_index();
+        if let Some(entry) = self.cell_at_mut(r, c) {
+            if !entry.readonly {
+                entry.textbox.replace_with_tag(range, text);
+            }
+        }
+    }
+
+    fn add_link_to_first(&mut self, range: Range<usize>, url: String) {
+        if let Some(entry) = self.cell_at_mut(0, 0) {
+            entry.textbox.add_link(range, url);
+        }
+    }
+
+    fn full_text(&self) -> String {
+        TableCell::full_text(self)
+    }
+
+    // The inherent take_pending_link_url and take_pending_tag_name on
+    // TableCell short-circuit on the first match by iterating rows. The
+    // trait default does the same via for_each_textbox_mut, so we let
+    // it inherit. Same for link_at_doc_pos / tag_at_doc_pos /
+    // clear_all_selections / mouse_drag_to / mouse_up — all match the
+    // inherent semantics.
+}

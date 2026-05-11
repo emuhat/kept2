@@ -9,6 +9,7 @@ use skia_safe::Typeface;
 use uuid::Uuid;
 
 use super::Cell;
+use super::TextBox;
 
 /// What a reference cell points at — either a whole cell, or a specific
 /// bullet sub-tree within an outline (root bullet + its contiguous deeper-
@@ -228,5 +229,185 @@ impl ReferenceCell {
         self.y_origin = y;
         self.width = width;
         self.height = height;
+    }
+}
+
+impl super::body::CellBody for ReferenceCell {
+    /// References don't render through `Cell::tick` — the app's render
+    /// layer resolves the target and draws the embed wrapper itself. Same
+    /// behavior as the prior cell.rs `Reference(_) => 0.0` arm.
+    fn tick(
+        &mut self,
+        _canvas: &skia_safe::Canvas,
+        _x: f32,
+        _y: f32,
+        _width: f32,
+        _focused: bool,
+        _show_caret: bool,
+    ) -> f32 {
+        0.0
+    }
+
+    /// Keys bubble up so app-level arrow nav can step past a reference
+    /// cell.
+    fn handle_key(
+        &mut self,
+        _event: &winit::event::KeyEvent,
+        _modifiers: &winit::event::Modifiers,
+    ) -> bool {
+        false
+    }
+
+    /// Forward into the cached preview so drag-select inside the embed
+    /// works. `editing=false` regardless of the outer state — the cache
+    /// is read-only by design.
+    fn mouse_down(
+        &mut self,
+        abs_x: f32,
+        abs_y: f32,
+        modifiers: &winit::event::Modifiers,
+        _editing: bool,
+    ) -> bool {
+        if let Some(cache) = self.head.cache_mut() {
+            cache.mouse_down(abs_x, abs_y, modifiers, false);
+        }
+        true
+    }
+
+    /// Descend into the cache's textboxes (title + body). When the cache
+    /// is missing (dangling target), iterate nothing — the placeholder
+    /// has no editable content.
+    fn for_each_textbox(&self, f: &mut dyn FnMut(&TextBox)) {
+        if let Some(cache) = self.head.cache_ref() {
+            if let Some(title) = cache.title() {
+                f(title);
+            }
+            cache.kind.body().for_each_textbox(f);
+        }
+    }
+
+    fn for_each_textbox_mut(&mut self, f: &mut dyn FnMut(&mut TextBox)) {
+        if let Some(cache) = self.head.cache_mut() {
+            if let Some(title) = cache.title_mut() {
+                f(title);
+            }
+            cache.kind.body_mut().for_each_textbox_mut(f);
+        }
+    }
+
+    fn typeface(&self) -> &Typeface {
+        &self.typeface
+    }
+
+    fn font_scale(&self) -> f32 {
+        self.font_scale
+    }
+
+    fn set_font_scale(&mut self, scale: f32) {
+        ReferenceCell::set_font_scale(self, scale);
+    }
+
+    /// References are never "empty" — the pointer itself is content even
+    /// when the target is missing.
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn caret_doc_y_band(&self) -> Option<(f32, f32)> {
+        None
+    }
+
+    /// References hold no caret; both edges always trivially satisfied so
+    /// arrow keys cross out of a reference immediately.
+    fn at_top_edge(&self) -> bool {
+        true
+    }
+
+    fn at_bottom_edge(&self) -> bool {
+        true
+    }
+
+    fn place_caret_at_start(&mut self) {}
+    fn place_caret_at_end(&mut self) {}
+
+    /// Forward to the cache so the user can select-all inside an embed
+    /// preview (read-only selection, not edit).
+    fn select_all_focused(&mut self) {
+        if let Some(cache) = self.head.cache_mut() {
+            cache.select_all_focused();
+        }
+    }
+
+    fn focused_text_and_caret(&self) -> Option<(&str, usize)> {
+        None
+    }
+
+    fn focused_textbox(&self) -> Option<&TextBox> {
+        None
+    }
+
+    fn anchor_doc_pos_at_focused(&self, _byte: usize) -> Option<(f32, f32)> {
+        None
+    }
+
+    /// Copy forwards into the cache's selection so Cmd+C inside an embed
+    /// returns the dragged text.
+    fn copy_text(&self) -> String {
+        match self.head.cache_ref() {
+            Some(cache) => cache.copy_text(),
+            None => String::new(),
+        }
+    }
+
+    fn cut_text(&mut self) -> String {
+        String::new()
+    }
+
+    fn paste_text(&mut self, _s: &str) {}
+
+    fn replace_at_focused_with_link(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _text: String,
+        _url: String,
+    ) {
+    }
+
+    fn replace_at_focused_with_text(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _text: String,
+    ) {
+    }
+
+    fn replace_at_focused_with_tag(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _text: String,
+    ) {
+    }
+
+    fn add_link_to_first(&mut self, _range: std::ops::Range<usize>, _url: String) {}
+
+    /// References contribute nothing to search-indexable text; search
+    /// would otherwise return the same content twice (once for the
+    /// source, once per embed).
+    fn full_text(&self) -> String {
+        String::new()
+    }
+
+    // ----- Overrides that prevent the defaults from leaking cache content
+    // into cell-level metadata queries. Without these, an `all_link_urls`
+    // pass would double-count source links via every Reference pointing
+    // at the source.
+
+    fn all_link_urls_into(&self, _out: &mut Vec<String>) {}
+    fn all_tag_names_into(&self, _out: &mut Vec<String>) {}
+
+    /// Removing tags from a Reference would mutate the cache without
+    /// touching the source. The cache then drifts from the source until
+    /// the next staleness rebuild. Safer to no-op.
+    fn remove_tags_named(&mut self, _name: &str) -> bool {
+        false
     }
 }

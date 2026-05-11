@@ -7,19 +7,23 @@ use winit::{
     keyboard::{Key, NamedKey},
 };
 
+mod body;
 mod common;
 mod grid;
 mod outline;
+mod plain;
 mod poppop;
 mod reference;
 mod table;
 mod textbox;
 mod wrap;
 
+pub use body::CellBody;
 pub use common::{TagSpan, TextBoxSnapshot, now_epoch_ms};
 pub use outline::{Bullet, OutlineCell, OutlineSnapshot};
 #[cfg(test)]
 pub use outline::BulletSnapshot;
+pub use plain::PlainCell;
 pub use poppop::PopPopCell;
 pub use reference::{EmbeddedReference, ReferenceCell, ReferenceTarget};
 pub use table::{TableCell, TableSnapshot};
@@ -140,13 +144,38 @@ pub struct Cell {
 }
 
 pub enum CellKind {
-    Plain(TextBox),
+    Plain(PlainCell),
     Outline(OutlineCell),
     PopPop(PopPopCell),
     Table(TableCell),
     /// Read-only embed of another cell or bullet sub-tree. Has no editable
     /// content of its own; click navigates to the target.
     Reference(ReferenceCell),
+}
+
+impl CellKind {
+    /// Borrow the variant's body as a `CellBody` trait object. This is the
+    /// single 5-arm match — every other dispatch site can go through it
+    /// instead of writing its own per-variant match.
+    pub fn body(&self) -> &dyn CellBody {
+        match self {
+            CellKind::Plain(pc) => pc,
+            CellKind::Outline(oc) => oc,
+            CellKind::PopPop(pc) => pc,
+            CellKind::Table(tc) => tc,
+            CellKind::Reference(rc) => rc,
+        }
+    }
+
+    pub fn body_mut(&mut self) -> &mut dyn CellBody {
+        match self {
+            CellKind::Plain(pc) => pc,
+            CellKind::Outline(oc) => oc,
+            CellKind::PopPop(pc) => pc,
+            CellKind::Table(tc) => tc,
+            CellKind::Reference(rc) => rc,
+        }
+    }
 }
 
 impl CellKind {
@@ -162,9 +191,9 @@ impl CellKind {
     /// selection-only mouse input without touching the original.
     pub fn clone_for_scale(&self, typeface: &Typeface, scale: f32) -> Option<CellKind> {
         match self {
-            CellKind::Plain(tb) => {
-                let new_tb = tb.clone_for_cache(typeface.clone(), scale);
-                Some(CellKind::Plain(new_tb))
+            CellKind::Plain(pc) => {
+                let new_pc = pc.clone_for_cache(typeface.clone(), scale);
+                Some(CellKind::Plain(new_pc))
             }
             CellKind::Outline(oc) => {
                 let bullets: Vec<Bullet> = oc
@@ -228,7 +257,7 @@ impl Cell {
         let now = now_epoch_ms();
         Self {
             id: Uuid::now_v7(),
-            kind: CellKind::Plain(TextBox::new(typeface, initial_text)),
+            kind: CellKind::Plain(PlainCell::new(typeface, initial_text)),
             title: None,
             title_focused: false,
             cell_x: 0.0,
@@ -363,7 +392,7 @@ impl Cell {
     /// TextBox internally). Used by `ensure_title`.
     fn body_typeface(&self) -> Typeface {
         match &self.kind {
-            CellKind::Plain(tb) => tb.typeface().clone(),
+            CellKind::Plain(pc) => pc.body().typeface().clone(),
             CellKind::Outline(oc) => oc.typeface().clone(),
             CellKind::PopPop(pc) => pc.textbox().typeface().clone(),
             CellKind::Table(tc) => tc.typeface().clone(),
@@ -375,7 +404,7 @@ impl Cell {
     /// authoritative source via `set_font_scale`.
     fn body_font_scale(&self) -> f32 {
         match &self.kind {
-            CellKind::Plain(tb) => tb.font_scale(),
+            CellKind::Plain(pc) => pc.body().font_scale(),
             CellKind::Outline(oc) => oc.font_scale(),
             CellKind::PopPop(pc) => pc.textbox().font_scale(),
             CellKind::Table(tc) => tc.font_scale(),
@@ -391,7 +420,7 @@ impl Cell {
             CellSnapshotKind::Plain(tbs) => {
                 let mut tb = TextBox::new(typeface.clone(), String::new());
                 tb.restore(tbs);
-                CellKind::Plain(tb)
+                CellKind::Plain(PlainCell::from_textbox(tb))
             }
             CellSnapshotKind::Outline(os) => {
                 let mut oc = OutlineCell::new(typeface.clone());
@@ -434,7 +463,7 @@ impl Cell {
     /// a richer path scoped to the focused textbox.
     pub fn add_link_to_first(&mut self, range: Range<usize>, url: String) {
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.add_link(range, url),
+            CellKind::Plain(pc) => pc.body_mut().add_link(range, url),
             CellKind::Outline(oc) => oc.add_link_to_first(range, url),
             CellKind::PopPop(pc) => pc.textbox_mut().add_link(range, url),
             CellKind::Table(tc) => {
@@ -456,7 +485,7 @@ impl Cell {
             }
         }
         match &self.kind {
-            CellKind::Plain(tb) => tb.link_at_doc_pos(abs_x, abs_y),
+            CellKind::Plain(pc) => pc.body().link_at_doc_pos(abs_x, abs_y),
             CellKind::Outline(oc) => oc.link_at_doc_pos(abs_x, abs_y),
             CellKind::PopPop(pc) => pc.link_at_doc_pos(abs_x, abs_y),
             CellKind::Table(tc) => tc.link_at_doc_pos(abs_x, abs_y),
@@ -481,7 +510,7 @@ impl Cell {
             }
         }
         match &self.kind {
-            CellKind::Plain(tb) => tb.tag_at_doc_pos(abs_x, abs_y),
+            CellKind::Plain(pc) => pc.body().tag_at_doc_pos(abs_x, abs_y),
             CellKind::Outline(oc) => oc.tag_at_doc_pos(abs_x, abs_y),
             CellKind::PopPop(_) => false,
             CellKind::Table(tc) => tc.tag_at_doc_pos(abs_x, abs_y),
@@ -509,7 +538,7 @@ impl Cell {
             return;
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.replace_with_link(range, text, url),
+            CellKind::Plain(pc) => pc.body_mut().replace_with_link(range, text, url),
             CellKind::Outline(oc) => {
                 if let Some(bid) = bullet_id {
                     oc.replace_in_bullet_with_link(bid, range, text, url);
@@ -546,7 +575,7 @@ impl Cell {
             return;
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.replace_with_text(range, text),
+            CellKind::Plain(pc) => pc.body_mut().replace_with_text(range, text),
             CellKind::Outline(oc) => {
                 if let Some(bid) = bullet_id {
                     oc.replace_in_bullet_with_text(bid, range, text);
@@ -582,7 +611,7 @@ impl Cell {
             return;
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.replace_with_tag(range, text),
+            CellKind::Plain(pc) => pc.body_mut().replace_with_tag(range, text),
             CellKind::Outline(oc) => {
                 if let Some(bid) = bullet_id {
                     oc.replace_in_bullet_with_tag(bid, range, text);
@@ -610,7 +639,7 @@ impl Cell {
             }
         }
         match &self.kind {
-            CellKind::Plain(tb) => tb.copy_primary_selection(),
+            CellKind::Plain(pc) => pc.body().copy_primary_selection(),
             CellKind::Outline(oc) => oc.copy_text(),
             CellKind::PopPop(pc) => pc.copy_selection(),
             CellKind::Table(tc) => tc.copy_selection(),
@@ -675,7 +704,7 @@ impl Cell {
             changed |= title.remove_tags_named(name);
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => changed |= tb.remove_tags_named(name),
+            CellKind::Plain(pc) => changed |= pc.body_mut().remove_tags_named(name),
             CellKind::Outline(oc) => {
                 for b in oc.bullets_mut() {
                     changed |= b.textbox_mut().remove_tags_named(name);
@@ -710,7 +739,7 @@ impl Cell {
             }
         };
         match &self.kind {
-            CellKind::Plain(tb) => absorb(tb),
+            CellKind::Plain(pc) => absorb(pc.body()),
             CellKind::Outline(oc) => {
                 for b in oc.bullets() {
                     absorb(b.textbox());
@@ -777,7 +806,7 @@ impl Cell {
         }
         // Body slot: locate the focused TextBox and check its tags.
         let tb: Option<&TextBox> = match &self.kind {
-            CellKind::Plain(tb) => Some(tb),
+            CellKind::Plain(pc) => Some(pc.body()),
             CellKind::Outline(oc) => oc.focused_textbox(),
             CellKind::Table(tc) => tc.focused_textbox(),
             CellKind::PopPop(_) | CellKind::Reference(_) => None,
@@ -795,7 +824,7 @@ impl Cell {
     /// depth); tables join cells with tabs and rows with newlines.
     pub fn full_text(&self) -> String {
         let body = match &self.kind {
-            CellKind::Plain(tb) => tb.text().to_string(),
+            CellKind::Plain(pc) => pc.body().text().to_string(),
             CellKind::Outline(oc) => {
                 let mut out = String::new();
                 for (i, b) in oc.bullets().iter().enumerate() {
@@ -839,7 +868,7 @@ impl Cell {
             }
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.take_pending_link_url(),
+            CellKind::Plain(pc) => pc.body_mut().take_pending_link_url(),
             CellKind::Outline(oc) => oc.take_pending_link_url(),
             CellKind::PopPop(pc) => pc.take_pending_link_url(),
             CellKind::Table(tc) => tc.take_pending_link_url(),
@@ -863,7 +892,7 @@ impl Cell {
             }
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.take_pending_tag_name(),
+            CellKind::Plain(pc) => pc.body_mut().take_pending_tag_name(),
             CellKind::Outline(oc) => oc.take_pending_tag_name(),
             CellKind::PopPop(_) => None,
             CellKind::Table(tc) => tc.take_pending_tag_name(),
@@ -886,8 +915,8 @@ impl Cell {
             }
         }
         match &self.kind {
-            CellKind::Plain(tb) => {
-                for l in tb.links() {
+            CellKind::Plain(pc) => {
+                for l in pc.body().links() {
                     out.push(l.url.clone());
                 }
             }
@@ -925,7 +954,7 @@ impl Cell {
             }
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.cut_primary_selection(),
+            CellKind::Plain(pc) => pc.body_mut().cut_primary_selection(),
             CellKind::Outline(oc) => oc.cut_text(),
             CellKind::PopPop(pc) => pc.textbox_mut().cut_primary_selection(),
             CellKind::Table(tc) => tc.cut_focused(),
@@ -941,7 +970,7 @@ impl Cell {
             }
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.paste(s),
+            CellKind::Plain(pc) => pc.body_mut().paste(s),
             CellKind::Outline(oc) => oc.paste_text(s),
             CellKind::PopPop(pc) => pc.textbox_mut().paste(s),
             CellKind::Table(tc) => tc.paste_focused(s),
@@ -994,7 +1023,7 @@ impl Cell {
         let body_focused = focused && !title_focused;
         let body_caret = show_caret && !title_focused;
         let body_h = match &mut self.kind {
-            CellKind::Plain(tb) => tb.tick(canvas, x, body_y, width, body_focused, body_caret),
+            CellKind::Plain(pc) => pc.body_mut().tick(canvas, x, body_y, width, body_focused, body_caret),
             CellKind::Outline(oc) => oc.tick(canvas, x, body_y, width, body_focused, body_caret),
             CellKind::PopPop(pc) => pc.tick(canvas, x, body_y, width, body_focused, body_caret),
             CellKind::Table(tc) => tc.tick(canvas, x, body_y, width, body_focused, body_caret),
@@ -1061,7 +1090,7 @@ impl Cell {
             self.title_focused = false;
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.handle_key(event, modifiers),
+            CellKind::Plain(pc) => pc.body_mut().handle_key(event, modifiers),
             CellKind::Outline(oc) => oc.handle_key(event, modifiers),
             CellKind::PopPop(pc) => pc.handle_key(event, modifiers),
             CellKind::Table(tc) => tc.handle_key(event, modifiers),
@@ -1091,7 +1120,7 @@ impl Cell {
         }
         self.unfocus_title_drop_if_empty();
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.mouse_down(abs_x, abs_y, modifiers, editing),
+            CellKind::Plain(pc) => pc.body_mut().mouse_down(abs_x, abs_y, modifiers, editing),
             CellKind::Outline(oc) => oc.mouse_down(abs_x, abs_y, modifiers, editing),
             CellKind::PopPop(pc) => pc.mouse_down(abs_x, abs_y, modifiers, editing),
             CellKind::Table(tc) => tc.mouse_down(abs_x, abs_y, modifiers, editing),
@@ -1119,7 +1148,7 @@ impl Cell {
             }
         }
         let body = match &mut self.kind {
-            CellKind::Plain(tb) => tb.mouse_drag_to(abs_x, abs_y),
+            CellKind::Plain(pc) => pc.body_mut().mouse_drag_to(abs_x, abs_y),
             CellKind::Outline(oc) => oc.mouse_drag_to(abs_x, abs_y),
             CellKind::PopPop(pc) => pc.mouse_drag_to(abs_x, abs_y),
             CellKind::Table(tc) => tc.mouse_drag_to(abs_x, abs_y),
@@ -1140,7 +1169,7 @@ impl Cell {
             }
         }
         let body = match &mut self.kind {
-            CellKind::Plain(tb) => tb.mouse_up(),
+            CellKind::Plain(pc) => pc.body_mut().mouse_up(),
             CellKind::Outline(oc) => oc.mouse_up(),
             CellKind::PopPop(pc) => pc.mouse_up(),
             CellKind::Table(tc) => tc.mouse_up(),
@@ -1158,7 +1187,7 @@ impl Cell {
     /// helpers which already account for inner-cell focus.
     fn body_at_top_edge(&self) -> bool {
         match &self.kind {
-            CellKind::Plain(tb) => tb.at_top_visual_line(),
+            CellKind::Plain(pc) => pc.body().at_top_visual_line(),
             CellKind::Outline(oc) => oc.at_top_edge(),
             CellKind::PopPop(pc) => pc.textbox().at_top_visual_line(),
             CellKind::Table(tc) => {
@@ -1193,7 +1222,7 @@ impl Cell {
 
     fn place_caret_at_start_of_body(&mut self) {
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.set_caret_at(0),
+            CellKind::Plain(pc) => pc.body_mut().set_caret_at(0),
             CellKind::Outline(oc) => oc.place_caret_at_start(),
             CellKind::PopPop(pc) => pc.textbox_mut().set_caret_at(0),
             CellKind::Table(tc) => {
@@ -1250,7 +1279,7 @@ impl Cell {
     pub fn is_empty(&self) -> bool {
         let title_empty = self.title.as_ref().map(|t| t.is_empty()).unwrap_or(true);
         let body_empty = match &self.kind {
-            CellKind::Plain(tb) => tb.is_empty(),
+            CellKind::Plain(pc) => pc.body().is_empty(),
             CellKind::Outline(oc) => oc.is_empty(),
             CellKind::PopPop(pc) => pc.textbox().is_empty(),
             CellKind::Table(tc) => tc.is_empty(),
@@ -1266,7 +1295,7 @@ impl Cell {
             title.set_font_scale(scale);
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.set_font_scale(scale),
+            CellKind::Plain(pc) => pc.body_mut().set_font_scale(scale),
             CellKind::Outline(oc) => oc.set_font_scale(scale),
             CellKind::PopPop(pc) => pc.set_font_scale(scale),
             CellKind::Table(tc) => tc.set_font_scale(scale),
@@ -1281,7 +1310,7 @@ impl Cell {
             }
         }
         match &self.kind {
-            CellKind::Plain(tb) => tb.caret_doc_y_band(),
+            CellKind::Plain(pc) => pc.body().caret_doc_y_band(),
             CellKind::Outline(oc) => oc.caret_doc_y_band(),
             CellKind::PopPop(pc) => pc.textbox().caret_doc_y_band(),
             CellKind::Table(tc) => tc.caret_doc_y_band(),
@@ -1305,7 +1334,7 @@ impl Cell {
             return false;
         }
         match &self.kind {
-            CellKind::Plain(tb) => tb.at_top_visual_line(),
+            CellKind::Plain(pc) => pc.body().at_top_visual_line(),
             CellKind::Outline(oc) => oc.at_top_edge(),
             CellKind::PopPop(pc) => pc.textbox().at_top_visual_line(),
             CellKind::Table(tc) => {
@@ -1328,7 +1357,7 @@ impl Cell {
             return false;
         }
         match &self.kind {
-            CellKind::Plain(tb) => tb.at_bottom_visual_line(),
+            CellKind::Plain(pc) => pc.body().at_bottom_visual_line(),
             CellKind::Outline(oc) => oc.at_bottom_edge(),
             CellKind::PopPop(pc) => pc.textbox().at_bottom_visual_line(),
             CellKind::Table(tc) => {
@@ -1351,7 +1380,7 @@ impl Cell {
             }
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.set_caret_at(0),
+            CellKind::Plain(pc) => pc.body_mut().set_caret_at(0),
             CellKind::Outline(oc) => oc.place_caret_at_start(),
             CellKind::PopPop(pc) => pc.textbox_mut().set_caret_at(0),
             CellKind::Table(tc) => {
@@ -1372,9 +1401,9 @@ impl Cell {
             }
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => {
-                let end = tb.text().len();
-                tb.set_caret_at(end);
+            CellKind::Plain(pc) => {
+                let end = pc.body().text().len();
+                pc.body_mut().set_caret_at(end);
             }
             CellKind::Outline(oc) => oc.place_caret_at_end(),
             CellKind::PopPop(pc) => {
@@ -1405,7 +1434,7 @@ impl Cell {
             title.clear_selection();
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.clear_selection(),
+            CellKind::Plain(pc) => pc.body_mut().clear_selection(),
             CellKind::Outline(oc) => oc.clear_all_selections(),
             CellKind::PopPop(pc) => pc.textbox_mut().clear_selection(),
             CellKind::Table(tc) => tc.clear_all_selections(),
@@ -1427,7 +1456,7 @@ impl Cell {
             }
         }
         match &mut self.kind {
-            CellKind::Plain(tb) => tb.select_all(),
+            CellKind::Plain(pc) => pc.body_mut().select_all(),
             CellKind::Outline(oc) => oc.select_all_in_focused(),
             CellKind::PopPop(pc) => pc.textbox_mut().select_all(),
             CellKind::Table(tc) => {
@@ -1454,7 +1483,7 @@ impl Cell {
             }
         }
         match &self.kind {
-            CellKind::Plain(tb) => tb.primary_caret().map(|(_, h)| (tb.text(), h)),
+            CellKind::Plain(pc) => pc.body().primary_caret().map(|(_, h)| (pc.body().text(), h)),
             CellKind::Outline(oc) => oc.focused_text_and_caret(),
             CellKind::PopPop(pc) => pc
                 .textbox()
@@ -1500,9 +1529,9 @@ impl Cell {
             }
         }
         match (&self.kind, bullet_id) {
-            (CellKind::Plain(tb), None) => {
-                let (x, _) = tb.doc_position_of_byte(byte)?;
-                let (_, bot) = tb.line_y_band_of_byte(byte)?;
+            (CellKind::Plain(pc), None) => {
+                let (x, _) = pc.body().doc_position_of_byte(byte)?;
+                let (_, bot) = pc.body().line_y_band_of_byte(byte)?;
                 Some((x, bot))
             }
             (CellKind::Outline(oc), Some(id)) => oc.anchor_doc_pos(id, byte),
@@ -1529,7 +1558,7 @@ impl Cell {
             context_hint_id: self.context_hint_id,
             title: self.title.as_ref().map(|t| t.snapshot()),
             kind: match &self.kind {
-                CellKind::Plain(tb) => CellSnapshotKind::Plain(tb.snapshot()),
+                CellKind::Plain(pc) => CellSnapshotKind::Plain(pc.body().snapshot()),
                 CellKind::Outline(oc) => CellSnapshotKind::Outline(oc.snapshot()),
                 CellKind::PopPop(pc) => CellSnapshotKind::PopPop(pc.snapshot()),
                 CellKind::Table(tc) => CellSnapshotKind::Table(tc.snapshot()),
@@ -1560,7 +1589,7 @@ impl Cell {
             self.title_focused = false;
         }
         match (&mut self.kind, snap.kind) {
-            (CellKind::Plain(tb), CellSnapshotKind::Plain(tbs)) => tb.restore(tbs),
+            (CellKind::Plain(pc), CellSnapshotKind::Plain(tbs)) => pc.body_mut().restore(tbs),
             (CellKind::Outline(oc), CellSnapshotKind::Outline(os)) => oc.restore(os),
             (CellKind::PopPop(pc), CellSnapshotKind::PopPop(tbs)) => pc.restore(tbs),
             (CellKind::Table(tc), CellSnapshotKind::Table(ts)) => tc.restore(ts),
@@ -2477,8 +2506,8 @@ mod tests {
     #[test]
     fn all_tag_names_aggregates_title_and_body_for_plain() {
         let mut cell = Cell::new(typeface(), "follow up #urgent later".to_string());
-        if let CellKind::Plain(tb) = &mut cell.kind {
-            tb.migrate_tags_from_text();
+        if let CellKind::Plain(pc) = &mut cell.kind {
+            pc.body_mut().migrate_tags_from_text();
         }
         cell.toggle_title_focus();
         let title = cell.title.as_mut().unwrap();
@@ -2519,10 +2548,10 @@ mod tests {
         // Plain cell with `#foo` mid-body, caret right after `o` (inside
         // the tag): predicate fires.
         let mut cell = Cell::new(typeface(), String::new());
-        if let CellKind::Plain(tb) = &mut cell.kind {
-            tb.replace_text("note #foo".to_string());
-            tb.migrate_tags_from_text();
-            tb.set_caret_at(9); // end-of-text, inside `#foo` (5..9)
+        if let CellKind::Plain(pc) = &mut cell.kind {
+            pc.body_mut().replace_text("note #foo".to_string());
+            pc.body_mut().migrate_tags_from_text();
+            pc.body_mut().set_caret_at(9); // end-of-text, inside `#foo` (5..9)
         }
         cell.title_focused = false;
         assert!(cell.caret_in_in_progress_tag());
@@ -2573,9 +2602,9 @@ mod tests {
     fn caret_in_in_progress_tag_false_when_caret_outside_tag() {
         // Caret AFTER the tag's whitespace boundary: not in progress.
         let mut cell = Cell::new(typeface(), String::new());
-        if let CellKind::Plain(tb) = &mut cell.kind {
-            tb.replace_text("note #foo ".to_string());
-            tb.set_caret_at(10); // after the trailing space
+        if let CellKind::Plain(pc) = &mut cell.kind {
+            pc.body_mut().replace_text("note #foo ".to_string());
+            pc.body_mut().set_caret_at(10); // after the trailing space
         }
         cell.title_focused = false;
         assert!(!cell.caret_in_in_progress_tag());

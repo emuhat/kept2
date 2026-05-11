@@ -6,8 +6,8 @@ use skia_safe::Typeface;
 use uuid::Uuid;
 
 use crate::cell::{
-    parse_inline_tags, Bullet, Cell, CellKind, OutlineCell, PopPopCell, ReferenceCell,
-    ReferenceTarget, TableCell, TextBox,
+    parse_inline_tags, Bullet, Cell, CellKind, OutlineCell, PlainCell, PopPopCell,
+    ReferenceCell, ReferenceTarget, TableCell, TextBox,
 };
 
 /// Resolved database path: env override → OS data dir → CWD fallback.
@@ -1076,9 +1076,10 @@ fn cell_to_body(cell: &Cell) -> CellBody {
             .collect()
     };
     match &cell.kind {
-        CellKind::Plain(tb) => CellBody::Plain {
-            text: tb.text().to_string(),
-            links: tb
+        CellKind::Plain(pc) => CellBody::Plain {
+            text: pc.body().text().to_string(),
+            links: pc
+                .body()
                 .links()
                 .iter()
                 .map(|l| LinkRecord {
@@ -1087,7 +1088,7 @@ fn cell_to_body(cell: &Cell) -> CellBody {
                     url: l.url.clone(),
                 })
                 .collect(),
-            tags: tag_records(tb),
+            tags: tag_records(pc.body()),
         },
         CellKind::Outline(oc) => CellBody::Outline {
             blocks: oc
@@ -1543,7 +1544,7 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
                 tb.add_link(l.start..l.end, l.url);
             }
             load_body_tags(&mut tb, tags);
-            CellKind::Plain(tb)
+            CellKind::Plain(PlainCell::from_textbox(tb))
         }
         CellBody::Outline { blocks, reference_header } => {
             let bullets: Vec<Bullet> = blocks
@@ -1666,11 +1667,12 @@ mod tests {
         let back = round_trip(&cell, &tf);
         match (&cell.kind, &back.kind) {
             (CellKind::Plain(orig), CellKind::Plain(reborn)) => {
-                assert_eq!(orig.text(), reborn.text());
-                assert_eq!(orig.links().len(), reborn.links().len(), "link count");
-                let (o, r) = (&orig.links()[0], &reborn.links()[0]);
-                assert_eq!(o.range, r.range);
-                assert_eq!(o.url, r.url);
+                let (o, r) = (orig.body(), reborn.body());
+                assert_eq!(o.text(), r.text());
+                assert_eq!(o.links().len(), r.links().len(), "link count");
+                let (ol, rl) = (&o.links()[0], &r.links()[0]);
+                assert_eq!(ol.range, rl.range);
+                assert_eq!(ol.url, rl.url);
             }
             _ => panic!("variant must round-trip as Plain"),
         }
