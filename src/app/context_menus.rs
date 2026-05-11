@@ -1,11 +1,23 @@
 use skia_safe::{
-    BlurStyle, Canvas, Color, Font, MaskFilter, Paint, PaintStyle, Point, Rect,
+    BlurStyle, Canvas, Color, Font, MaskFilter, Paint, PaintStyle, Point, Rect, Typeface,
 };
 use uuid::Uuid;
 
-use crate::cell::{CellKind, ReferenceTarget};
+use crate::cell::{Cell, CellKind, ReferenceTarget};
 
-use super::{KeptApp, clamp_rect_to_viewport, fit_text_ellipsized};
+use super::{HitTestState, clamp_rect_to_viewport, fit_text_ellipsized};
+
+/// Per-frame context the menu render methods need from `KeptApp`. Pure
+/// data slice — the menus take this by mutable reference instead of
+/// reaching into the whole app, which makes the scope of each render
+/// pass explicit at the type level (S8).
+pub(super) struct MenuRenderCtx<'a> {
+    pub(super) font_scale: f32,
+    pub(super) typeface: &'a Typeface,
+    pub(super) mouse_pos: (f32, f32),
+    /// Per-frame hit-test write surface (see S2).
+    pub(super) hit_tests: &'a mut HitTestState,
+}
 
 /// Cell context menu (right-click). Two muted timestamp lines + a
 /// "Delete cell" action separated by a hairline.
@@ -153,36 +165,32 @@ fn draw_menu_row(
     canvas.draw_str(&text, Point::new(text_left, baseline), font, &paint);
 }
 
-impl KeptApp {
-    pub(super) fn render_cell_context_menu(
-        &mut self,
+impl CellContextMenu {
+    pub(super) fn render(
+        &self,
         canvas: &Canvas,
         view_w: f32,
         view_h: f32,
+        cell: &Cell,
+        ctx: &mut MenuRenderCtx<'_>,
     ) {
-        let Some(menu) = self.cell_context_menu.as_ref() else {
-            return;
-        };
-        let Some(cell) = self.cell(menu.cell_id) else {
-            return;
-        };
-        let scale = self.font_scale;
+        let scale = ctx.font_scale;
         let pad = CELL_MENU_PAD * scale;
         let info_h = CELL_MENU_INFO_H * scale;
         let action_h = CELL_MENU_ACTION_H * scale;
         let menu_w = CELL_MENU_WIDTH * scale;
 
         // Compute action rows. Order matches the visual stack.
-        let has_subtree = menu.bullet_id.is_some();
+        let has_subtree = self.bullet_id.is_some();
         // Envelope is offered only when the menu was opened on a
         // Reference cell (we already capture that via
         // `source_reference_target`). Wraps the embed in an outline so
         // the user can write notes around it.
-        let has_envelope = menu.source_reference_target.is_some();
+        let has_envelope = self.source_reference_target.is_some();
         // Unwrap is the inverse — only on envelope outlines. Mutually
         // exclusive with `has_envelope` since one targets Reference
         // sources and the other targets Outline sources.
-        let has_unwrap = menu.source_is_envelope;
+        let has_unwrap = self.source_is_envelope;
         // Bullet-active toggle: only shown when the clicked bullet
         // lives in *this* cell's outline. For clicks inside a nested
         // embed (Reference cache, envelope header), the bullet's
@@ -190,7 +198,7 @@ impl KeptApp {
         // here would cross-mutate, which we don't want from a menu
         // anchored on the wrapping cell.
         let has_bullet_toggle =
-            menu.bullet_id.is_some() && menu.bullet_origin_cell_id == Some(menu.cell_id);
+            self.bullet_id.is_some() && self.bullet_origin_cell_id == Some(self.cell_id);
         let mut action_count: usize = 1; // Delete cell
         action_count += 1; // Surface as reference (always)
         if has_subtree {
@@ -210,10 +218,10 @@ impl KeptApp {
             pad + info_h * 2.0 + 1.0 + action_h * action_count as f32 + pad;
         let rect = clamp_rect_to_viewport(
             Rect::new(
-                menu.anchor_x,
-                menu.anchor_y,
-                menu.anchor_x + menu_w,
-                menu.anchor_y + menu_h,
+                self.anchor_x,
+                self.anchor_y,
+                self.anchor_x + menu_w,
+                self.anchor_y + menu_h,
             ),
             view_w,
             view_h,
@@ -223,7 +231,7 @@ impl KeptApp {
         draw_menu_card(canvas, rect, scale);
 
         // Two muted info lines.
-        let info_font = Font::from_typeface(&self.typeface, 12.0 * scale);
+        let info_font = Font::from_typeface(ctx.typeface, 12.0 * scale);
         let mut info_paint = Paint::default();
         info_paint.set_anti_alias(true);
         info_paint.set_color(crate::color::text_muted_grey());
@@ -255,8 +263,8 @@ impl KeptApp {
             &divider,
         );
 
-        let action_font = Font::from_typeface(&self.typeface, 13.0 * scale);
-        let mouse = self.mouse_pos;
+        let action_font = Font::from_typeface(ctx.typeface, 13.0 * scale);
+        let mouse = ctx.mouse_pos;
         let mut row_top = rect.top + pad + info_h * 2.0 + 1.0;
         let mut emit_row = |label: &str, color: Color, hover_bg: Color| -> Rect {
             let r = Rect::new(
@@ -301,7 +309,7 @@ impl KeptApp {
         // Surface bullet sub-tree as reference — only when right-click hit
         // a bullet inside an outline.
         let surface_subtree_rect = if has_subtree {
-            let snip = menu.bullet_snippet.as_deref().unwrap_or("[empty]");
+            let snip = self.bullet_snippet.as_deref().unwrap_or("[empty]");
             let label = format!("Surface '{}' as reference", snip);
             Some(emit_row(
                 &label,
@@ -358,7 +366,7 @@ impl KeptApp {
         // via the ancestor cascade (`compute_effective_active`).
         let toggle_bullet_active_rect = if has_bullet_toggle {
             // Look up the bullet's current state for the label.
-            let bullet_active = menu.bullet_id.and_then(|bid| match &cell.kind {
+            let bullet_active = self.bullet_id.and_then(|bid| match &cell.kind {
                 CellKind::Outline(oc) => oc
                     .bullets()
                     .iter()
@@ -380,35 +388,35 @@ impl KeptApp {
             None
         };
 
-        self.hit_tests_builder.cell_menu.delete = Some(delete_rect);
-        self.hit_tests_builder.cell_menu.surface = Some(surface_rect);
-        self.hit_tests_builder.cell_menu.surface_subtree = surface_subtree_rect;
-        self.hit_tests_builder.cell_menu.envelope = envelope_rect;
-        self.hit_tests_builder.cell_menu.unwrap = unwrap_rect;
-        self.hit_tests_builder.cell_menu.toggle_cell_active = Some(toggle_cell_active_rect);
-        self.hit_tests_builder.cell_menu.toggle_bullet_active = toggle_bullet_active_rect;
+        ctx.hit_tests.cell_menu.delete = Some(delete_rect);
+        ctx.hit_tests.cell_menu.surface = Some(surface_rect);
+        ctx.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
+        ctx.hit_tests.cell_menu.envelope = envelope_rect;
+        ctx.hit_tests.cell_menu.unwrap = unwrap_rect;
+        ctx.hit_tests.cell_menu.toggle_cell_active = Some(toggle_cell_active_rect);
+        ctx.hit_tests.cell_menu.toggle_bullet_active = toggle_bullet_active_rect;
     }
+}
 
-    pub(super) fn render_tag_context_menu(
-        &mut self,
+impl TagContextMenu {
+    pub(super) fn render(
+        &self,
         canvas: &Canvas,
         view_w: f32,
         view_h: f32,
+        ctx: &mut MenuRenderCtx<'_>,
     ) {
-        let Some(menu) = self.tag_context_menu.as_ref() else {
-            return;
-        };
-        let scale = self.font_scale;
+        let scale = ctx.font_scale;
         let pad = 6.0 * scale;
         let row_h = 26.0 * scale;
         let menu_w = 160.0 * scale;
         let menu_h = row_h + pad * 2.0;
         let rect = clamp_rect_to_viewport(
             Rect::new(
-                menu.anchor_x,
-                menu.anchor_y,
-                menu.anchor_x + menu_w,
-                menu.anchor_y + menu_h,
+                self.anchor_x,
+                self.anchor_y,
+                self.anchor_x + menu_w,
+                self.anchor_y + menu_h,
             ),
             view_w,
             view_h,
@@ -422,11 +430,11 @@ impl KeptApp {
             rect.right - pad * 0.5,
             rect.top + pad + row_h,
         );
-        let font = Font::from_typeface(&self.typeface, 13.0 * scale);
+        let font = Font::from_typeface(ctx.typeface, 13.0 * scale);
         draw_menu_row(
             canvas,
             row_rect,
-            &format!("Delete tag #{}", menu.name),
+            &format!("Delete tag #{}", self.name),
             crate::color::delete_text(),
             crate::color::delete_hover_bg(),
             true,
@@ -434,35 +442,35 @@ impl KeptApp {
             false,
             scale,
             &font,
-            self.mouse_pos,
+            ctx.mouse_pos,
         );
-        self.hit_tests_builder.tag_menu.delete = Some(row_rect);
+        ctx.hit_tests.tag_menu.delete = Some(row_rect);
     }
+}
 
+impl PeopleContextMenu {
     /// Right-click menu rendered over a People-page row. Two actions:
     /// Rename (always enabled) and Delete person (disabled when the
     /// entity has a backing cell or any `kept://` references; the row
     /// shows the count so the user knows what's blocking).
-    pub(super) fn render_people_context_menu(
-        &mut self,
+    pub(super) fn render(
+        &self,
         canvas: &Canvas,
         view_w: f32,
         view_h: f32,
+        ctx: &mut MenuRenderCtx<'_>,
     ) {
-        let Some(menu) = self.people_context_menu.as_ref() else {
-            return;
-        };
-        let scale = self.font_scale;
+        let scale = ctx.font_scale;
         let pad = 6.0 * scale;
         let row_h = 26.0 * scale;
         let menu_w = 200.0 * scale;
         let menu_h = row_h * 2.0 + pad * 2.0;
         let rect = clamp_rect_to_viewport(
             Rect::new(
-                menu.anchor_x,
-                menu.anchor_y,
-                menu.anchor_x + menu_w,
-                menu.anchor_y + menu_h,
+                self.anchor_x,
+                self.anchor_y,
+                self.anchor_x + menu_w,
+                self.anchor_y + menu_h,
             ),
             view_w,
             view_h,
@@ -470,8 +478,8 @@ impl KeptApp {
         );
         draw_menu_card(canvas, rect, scale);
 
-        let font = Font::from_typeface(&self.typeface, 13.0 * scale);
-        let mouse = self.mouse_pos;
+        let font = Font::from_typeface(ctx.typeface, 13.0 * scale);
+        let mouse = ctx.mouse_pos;
 
         // Rename row.
         let rename_rect = Rect::new(
@@ -493,7 +501,7 @@ impl KeptApp {
             &font,
             mouse,
         );
-        self.hit_tests_builder.people_menu.rename = Some(rename_rect);
+        ctx.hit_tests.people_menu.rename = Some(rename_rect);
 
         // Delete row. Disabled when not deletable — same label paint
         // path either way (text color differs), but the hover background
@@ -504,15 +512,15 @@ impl KeptApp {
             rect.right - pad * 0.5,
             rect.top + pad + row_h * 2.0,
         );
-        let label = if menu.deletable {
+        let label = if self.deletable {
             "Delete person".to_string()
         } else {
-            match menu.ref_count {
+            match self.ref_count {
                 Some(n) if n > 0 => format!("Delete person ({n} refs)"),
                 _ => "Delete person (in use)".to_string(),
             }
         };
-        let text_color = if menu.deletable {
+        let text_color = if self.deletable {
             crate::color::delete_text()
         } else {
             crate::color::text_disabled()
@@ -523,15 +531,15 @@ impl KeptApp {
             &label,
             text_color,
             crate::color::delete_hover_bg(),
-            menu.deletable,
+            self.deletable,
             pad,
             false,
             scale,
             &font,
             mouse,
         );
-        if menu.deletable {
-            self.hit_tests_builder.people_menu.delete = Some(delete_rect);
+        if self.deletable {
+            ctx.hit_tests.people_menu.delete = Some(delete_rect);
         }
     }
 }

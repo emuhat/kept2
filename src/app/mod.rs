@@ -24,7 +24,7 @@ mod context_menus;
 mod mention_popup;
 mod search;
 mod sidebar;
-use context_menus::{CellContextMenu, PeopleContextMenu, TagContextMenu};
+use context_menus::{CellContextMenu, MenuRenderCtx, PeopleContextMenu, TagContextMenu};
 use mention_popup::{MentionKind, MentionPopup};
 use search::SearchState;
 
@@ -563,6 +563,314 @@ enum UndoOp {
         post: CellSnapshot,
         pre_focused: Option<Uuid>,
     },
+}
+
+/// Which direction an `UndoOp::apply` is going. Undo restores the pre
+/// state; Redo restores the post. For asymmetric ops (InsertCell vs
+/// DeleteCell, Create vs Delete entity, rotate) the apply method
+/// branches on this internally; for symmetric ops it just picks
+/// between pre/post fields.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UndoDir {
+    Undo,
+    Redo,
+}
+
+impl UndoOp {
+    /// Replay this op against `app` in `dir`. The single dispatch
+    /// surface that replaces the previously-parallel `undo` and `redo`
+    /// 13-arm match blocks (S6).
+    ///
+    /// Symmetric variants (CellEdit, ResetContextStart, Rename,
+    /// SetEntityActive, SetCellActive, SetBulletActive, Envelope,
+    /// Unwrap) read `pre` vs `post` based on `dir`. Asymmetric
+    /// variants (InsertCell ↔ DeleteCell, Create ↔ Delete cell-less
+    /// entity, RotateContext) branch on `dir` inside the arm because
+    /// the inverse direction calls a different helper rather than
+    /// just swapping a snapshot.
+    fn apply(&self, app: &mut KeptApp, dir: UndoDir) {
+        match self {
+            Self::CellEdit { cell_id, pre, post } => {
+                let snap = match dir {
+                    UndoDir::Undo => pre,
+                    UndoDir::Redo => post,
+                };
+                app.focused = Some(*cell_id);
+                if let Some(c) = app.cell_mut(*cell_id) {
+                    c.restore(snap.clone());
+                }
+            }
+            Self::InsertCell {
+                cell_id,
+                snapshot,
+                pre_focused,
+            } => match dir {
+                UndoDir::Undo => {
+                    app.document.queue_cell_delete(*cell_id);
+                    app.focused = *pre_focused;
+                }
+                UndoDir::Redo => {
+                    let cell = Cell::from_snapshot(*cell_id, snapshot.clone(), &app.typeface);
+                    app.insert_cell_sorted(cell);
+                    app.document.pending_deletes.remove(cell_id);
+                    app.focused = Some(*cell_id);
+                }
+            },
+            Self::DeleteCell {
+                cell_id,
+                snapshot,
+                pre_focused,
+                post_focused,
+                side_effect,
+            } => match dir {
+                UndoDir::Undo => {
+                    let cell = Cell::from_snapshot(*cell_id, snapshot.clone(), &app.typeface);
+                    app.insert_cell_sorted(cell);
+                    app.document.dirty_cells.insert(*cell_id);
+                    app.document.pending_deletes.remove(cell_id);
+                    if let Some(se) = side_effect {
+                        app.reverse_context_side_effect(se);
+                    }
+                    app.focused = *pre_focused;
+                }
+                UndoDir::Redo => {
+                    app.document.queue_cell_delete(*cell_id);
+                    if let Some(se) = side_effect {
+                        app.apply_context_side_effect(se);
+                    }
+                    app.focused = *post_focused;
+                }
+            },
+            Self::RotateContext {
+                closed_id,
+                prev_end_time,
+                new_end_time,
+                new_context,
+                prev_view,
+                new_view,
+                pre_focused,
+                pre_scroll_y,
+            } => match dir {
+                UndoDir::Undo => {
+                    app.inverse_rotation(
+                        *closed_id,
+                        *prev_end_time,
+                        new_context.id,
+                        prev_view.clone(),
+                        *pre_focused,
+                        *pre_scroll_y,
+                    );
+                }
+                UndoDir::Redo => {
+                    app.apply_rotation(
+                        *closed_id,
+                        *new_end_time,
+                        new_context,
+                        new_view.clone(),
+                    );
+                }
+            },
+            Self::ResetContextStart {
+                context_id,
+                prev_start,
+                new_start,
+                prev_view,
+                new_view,
+            } => {
+                let (start, view) = match dir {
+                    UndoDir::Undo => (*prev_start, prev_view),
+                    UndoDir::Redo => (*new_start, new_view),
+                };
+                if let Some(c) = app.document.contexts.iter_mut().find(|c| c.id == *context_id) {
+                    c.start_time = start;
+                }
+                app.document.mark_context_dirty(*context_id);
+                app.view = view.clone();
+            }
+            Self::RenamePersonEntity {
+                entity_id,
+                prev_name,
+                new_name,
+                cell_title_change,
+            } => {
+                let name = match dir {
+                    UndoDir::Undo => prev_name,
+                    UndoDir::Redo => new_name,
+                };
+                if let Some(db) = app.db.as_mut() {
+                    if let Err(e) = db.rename_person_entity(*entity_id, name) {
+                        eprintln!("kept: {dir:?} rename_person_entity failed: {e}");
+                    }
+                }
+                if let Some((cell_id, prev_title, new_title)) = cell_title_change {
+                    let title_text = match dir {
+                        UndoDir::Undo => prev_title,
+                        UndoDir::Redo => new_title,
+                    };
+                    if let Some(cell) = app.cell_mut(*cell_id) {
+                        if let Some(title) = cell.title_mut() {
+                            title.replace_text(title_text.clone());
+                        }
+                    }
+                    app.mark_cell_dirty(*cell_id);
+                }
+                app.refresh_entities();
+            }
+            Self::CreateCelllessEntity {
+                entity_id,
+                name,
+                created_at,
+            } => {
+                match dir {
+                    UndoDir::Undo => {
+                        if let Some(db) = app.db.as_mut() {
+                            if let Err(e) = db.delete_entity(*entity_id) {
+                                eprintln!("kept: undo create-entity (delete) failed: {e}");
+                            }
+                        }
+                    }
+                    UndoDir::Redo => {
+                        if let Some(db) = app.db.as_mut() {
+                            // Add Person always creates an active entity, so a
+                            // redo restores it active. (If the user toggled it
+                            // inactive between create and undo, that's a
+                            // separate SetEntityActive op on the stack with
+                            // its own redo.)
+                            if let Err(e) = db.insert_person_entity_with_id(
+                                *entity_id,
+                                name,
+                                true,
+                                *created_at,
+                            ) {
+                                eprintln!("kept: redo create-entity failed: {e}");
+                            }
+                        }
+                    }
+                }
+                app.refresh_entities();
+            }
+            Self::DeleteCelllessEntity {
+                entity_id,
+                name,
+                is_active,
+                created_at,
+            } => {
+                match dir {
+                    UndoDir::Undo => {
+                        if let Some(db) = app.db.as_mut() {
+                            if let Err(e) = db.insert_person_entity_with_id(
+                                *entity_id,
+                                name,
+                                *is_active,
+                                *created_at,
+                            ) {
+                                eprintln!("kept: undo delete-entity (insert) failed: {e}");
+                            }
+                        }
+                    }
+                    UndoDir::Redo => {
+                        if let Some(db) = app.db.as_mut() {
+                            if let Err(e) = db.delete_entity(*entity_id) {
+                                eprintln!("kept: redo delete-entity failed: {e}");
+                            }
+                        }
+                    }
+                }
+                app.refresh_entities();
+            }
+            Self::SetEntityActive { entity_id, prev, new } => {
+                let target = match dir {
+                    UndoDir::Undo => *prev,
+                    UndoDir::Redo => *new,
+                };
+                if let Some(db) = app.db.as_mut() {
+                    let _ = db.set_entity_active(*entity_id, target);
+                }
+                app.refresh_entities();
+            }
+            Self::SetCellActive { cell_id, prev, new } => {
+                let target = match dir {
+                    UndoDir::Undo => *prev,
+                    UndoDir::Redo => *new,
+                };
+                if let Some(idx) = app.cell_idx(*cell_id) {
+                    app.document.cells[idx].active = target;
+                    app.mark_cell_dirty(*cell_id);
+                    app.touch_cell(*cell_id);
+                }
+            }
+            Self::SetBulletActive {
+                cell_id,
+                bullet_id,
+                prev,
+                new,
+            } => {
+                let target = match dir {
+                    UndoDir::Undo => *prev,
+                    UndoDir::Redo => *new,
+                };
+                if let Some(idx) = app.cell_idx(*cell_id) {
+                    if let CellKind::Outline(oc) = &mut app.document.cells[idx].kind {
+                        oc.set_bullet_active(*bullet_id, target);
+                    }
+                    app.mark_cell_dirty(*cell_id);
+                    app.touch_cell(*cell_id);
+                }
+            }
+            Self::Envelope {
+                cell_id,
+                pre,
+                post,
+                pre_focused,
+            }
+            | Self::Unwrap {
+                cell_id,
+                pre,
+                post,
+                pre_focused,
+            } => {
+                // Kind-changing ops: Cell::restore can't round-trip a
+                // variant change, so rebuild from snapshot at the same
+                // id. Both directions share the same shape; only the
+                // snapshot and focus target swap.
+                let (snap, focused) = match dir {
+                    UndoDir::Undo => (pre, *pre_focused),
+                    UndoDir::Redo => (post, Some(*cell_id)),
+                };
+                if let Some(idx) = app.cell_idx(*cell_id) {
+                    let cell = Cell::from_snapshot(*cell_id, snap.clone(), &app.typeface);
+                    app.document.cells[idx] = cell;
+                }
+                app.document.dirty_cells.insert(*cell_id);
+                app.focused = focused;
+            }
+        }
+    }
+
+    /// True when applying this op should bump the focused cell's
+    /// `edited_at` afterward — i.e., the op is a content edit, not
+    /// metadata. The post-apply hook in `undo` / `redo` uses this to
+    /// gate the `touch_cell(focused)` call (so e.g. an undo of "mark
+    /// inactive" doesn't make the cell look freshly edited).
+    fn bumps_focused_edited(&self) -> bool {
+        matches!(
+            self,
+            Self::CellEdit { .. }
+                | Self::InsertCell { .. }
+                | Self::DeleteCell { .. }
+                | Self::Envelope { .. }
+                | Self::Unwrap { .. }
+        )
+    }
+}
+
+impl std::fmt::Debug for UndoDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UndoDir::Undo => f.write_str("undo"),
+            UndoDir::Redo => f.write_str("redo"),
+        }
+    }
 }
 
 const SEED_TEXTS: &[&str] = &[
@@ -3470,9 +3778,7 @@ impl KeptApp {
         // Overlays (window space, drawn last so they layer on top).
         self.render_search_popup(canvas, width);
         self.render_mention_popup(canvas, width, height);
-        self.render_tag_context_menu(canvas, width, height);
-        self.render_people_context_menu(canvas, width, height);
-        self.render_cell_context_menu(canvas, width, height);
+        self.render_context_menus(canvas, width, height);
         self.render_toast(canvas, width, height);
 
         // Publish this frame's hit-test rects. Every render method writes
@@ -3486,6 +3792,46 @@ impl KeptApp {
         // Persistence flush is global (dirty cells aren't per-pane), so it
         // runs once per frame, after all panes have rendered.
         self.maybe_flush_persistence();
+    }
+
+    /// Render the three right-click context menus (tag / people /
+    /// cell). Builds a `MenuRenderCtx` from the slim slice of self the
+    /// menus actually need (S8: per-subsystem context instead of
+    /// `&mut KeptApp`) and delegates to each menu's `render` method.
+    fn render_context_menus(&mut self, canvas: &Canvas, width: f32, height: f32) {
+        // Tag menu: stateless beyond the menu struct itself.
+        if let Some(menu) = self.tag_context_menu.as_ref() {
+            let mut ctx = MenuRenderCtx {
+                font_scale: self.font_scale,
+                typeface: &self.typeface,
+                mouse_pos: self.mouse_pos,
+                hit_tests: &mut self.hit_tests_builder,
+            };
+            menu.render(canvas, width, height, &mut ctx);
+        }
+        // People menu: same.
+        if let Some(menu) = self.people_context_menu.as_ref() {
+            let mut ctx = MenuRenderCtx {
+                font_scale: self.font_scale,
+                typeface: &self.typeface,
+                mouse_pos: self.mouse_pos,
+                hit_tests: &mut self.hit_tests_builder,
+            };
+            menu.render(canvas, width, height, &mut ctx);
+        }
+        // Cell menu: needs the cell the menu was opened on to format
+        // its info rows + the active-toggle labels.
+        if let Some(menu) = self.cell_context_menu.as_ref() {
+            if let Some(cell) = self.document.cell(menu.cell_id) {
+                let mut ctx = MenuRenderCtx {
+                    font_scale: self.font_scale,
+                    typeface: &self.typeface,
+                    mouse_pos: self.mouse_pos,
+                    hit_tests: &mut self.hit_tests_builder,
+                };
+                menu.render(canvas, width, height, cell, &mut ctx);
+            }
+        }
     }
 
     /// Draw the transient confirmation pill, if active. Bottom-center
@@ -5645,197 +5991,13 @@ impl KeptApp {
         let Some(op) = self.undo_stack.pop() else {
             return false;
         };
-        let mut bump_focused_edited = true;
-        match &op {
-            UndoOp::CellEdit { cell_id, pre, .. } => {
-                self.focused = Some(*cell_id);
-                if let Some(c) = self.cell_mut(*cell_id) {
-                    c.restore(pre.clone());
-                }
-            }
-            UndoOp::InsertCell {
-                cell_id,
-                pre_focused,
-                ..
-            } => {
-                self.document.queue_cell_delete(*cell_id);
-                self.focused = *pre_focused;
-            }
-            UndoOp::DeleteCell {
-                cell_id,
-                snapshot,
-                pre_focused,
-                side_effect,
-                ..
-            } => {
-                let cell = Cell::from_snapshot(*cell_id, snapshot.clone(), &self.typeface);
-                self.insert_cell_sorted(cell);
-                self.document.dirty_cells.insert(*cell_id);
-                self.document.pending_deletes.remove(cell_id);
-                if let Some(se) = side_effect {
-                    self.reverse_context_side_effect(se);
-                }
-                self.focused = *pre_focused;
-            }
-            UndoOp::RotateContext {
-                closed_id,
-                prev_end_time,
-                new_context,
-                prev_view,
-                pre_focused,
-                pre_scroll_y,
-                ..
-            } => {
-                self.inverse_rotation(
-                    *closed_id,
-                    *prev_end_time,
-                    new_context.id,
-                    prev_view.clone(),
-                    *pre_focused,
-                    *pre_scroll_y,
-                );
-                bump_focused_edited = false;
-            }
-            UndoOp::ResetContextStart {
-                context_id,
-                prev_start,
-                prev_view,
-                ..
-            } => {
-                if let Some(c) = self.document.contexts.iter_mut().find(|c| c.id == *context_id) {
-                    c.start_time = *prev_start;
-                }
-                self.document.mark_context_dirty(*context_id);
-                self.view = prev_view.clone();
-                bump_focused_edited = false;
-            }
-            UndoOp::RenamePersonEntity {
-                entity_id,
-                prev_name,
-                cell_title_change,
-                ..
-            } => {
-                if let Some(db) = self.db.as_mut() {
-                    if let Err(e) = db.rename_person_entity(*entity_id, prev_name) {
-                        eprintln!("kept: undo rename_person_entity failed: {e}");
-                    }
-                }
-                if let Some((cell_id, prev_title, _)) = cell_title_change {
-                    if let Some(cell) = self.cell_mut(*cell_id) {
-                        if let Some(title) = cell.title_mut() {
-                            title.replace_text(prev_title.clone());
-                        }
-                    }
-                    self.mark_cell_dirty(*cell_id);
-                }
-                self.refresh_entities();
-                bump_focused_edited = false;
-            }
-            UndoOp::CreateCelllessEntity { entity_id, .. } => {
-                if let Some(db) = self.db.as_mut() {
-                    if let Err(e) = db.delete_entity(*entity_id) {
-                        eprintln!("kept: undo create-entity (delete) failed: {e}");
-                    }
-                }
-                self.refresh_entities();
-                bump_focused_edited = false;
-            }
-            UndoOp::DeleteCelllessEntity {
-                entity_id,
-                name,
-                is_active,
-                created_at,
-            } => {
-                if let Some(db) = self.db.as_mut() {
-                    if let Err(e) = db.insert_person_entity_with_id(
-                        *entity_id,
-                        name,
-                        *is_active,
-                        *created_at,
-                    ) {
-                        eprintln!("kept: undo delete-entity (insert) failed: {e}");
-                    }
-                }
-                self.refresh_entities();
-                bump_focused_edited = false;
-            }
-            UndoOp::SetEntityActive { entity_id, prev, .. } => {
-                if let Some(db) = self.db.as_mut() {
-                    let _ = db.set_entity_active(*entity_id, *prev);
-                }
-                self.refresh_entities();
-                bump_focused_edited = false;
-            }
-            UndoOp::SetCellActive { cell_id, prev, .. } => {
-                if let Some(idx) = self.cell_idx(*cell_id) {
-                    self.document.cells[idx].active = *prev;
-                    self.mark_cell_dirty(*cell_id);
-                    self.touch_cell(*cell_id);
-                }
-                bump_focused_edited = false;
-            }
-            UndoOp::SetBulletActive {
-                cell_id,
-                bullet_id,
-                prev,
-                ..
-            } => {
-                if let Some(idx) = self.cell_idx(*cell_id) {
-                    if let CellKind::Outline(oc) = &mut self.document.cells[idx].kind {
-                        oc.set_bullet_active(*bullet_id, *prev);
-                    }
-                    self.mark_cell_dirty(*cell_id);
-                    self.touch_cell(*cell_id);
-                }
-                bump_focused_edited = false;
-            }
-            UndoOp::Envelope {
-                cell_id,
-                pre,
-                pre_focused,
-                ..
-            } => {
-                // Rebuild the original Reference cell from the pre-snapshot
-                // and replace in place. Cell::restore can't handle a kind
-                // change; constructing a fresh cell with the same id is
-                // the cleanest path.
-                if let Some(idx) = self.cell_idx(*cell_id) {
-                    let cell = Cell::from_snapshot(
-                        *cell_id,
-                        pre.clone(),
-                        &self.typeface,
-                    );
-                    self.document.cells[idx] = cell;
-                }
-                self.document.dirty_cells.insert(*cell_id);
-                self.focused = *pre_focused;
-            }
-            UndoOp::Unwrap {
-                cell_id,
-                pre,
-                pre_focused,
-                ..
-            } => {
-                // Mirror Envelope's undo: rebuild the pre-snapshot
-                // (which is the envelope outline including the
-                // user's notes) at the same cell id.
-                if let Some(idx) = self.cell_idx(*cell_id) {
-                    let cell = Cell::from_snapshot(
-                        *cell_id,
-                        pre.clone(),
-                        &self.typeface,
-                    );
-                    self.document.cells[idx] = cell;
-                }
-                self.document.dirty_cells.insert(*cell_id);
-                self.focused = *pre_focused;
-            }
-        }
+        op.apply(self, UndoDir::Undo);
+        let bumps = op.bumps_focused_edited();
         self.redo_stack.push(op);
         self.dragging_cell = None;
         self.pending_caret_scroll = true;
         self.coalesce_break = true;
-        if bump_focused_edited {
+        if bumps {
             if let Some(id) = self.focused {
                 self.touch_cell(id);
             }
@@ -5847,174 +6009,13 @@ impl KeptApp {
         let Some(op) = self.redo_stack.pop() else {
             return false;
         };
-        let mut bump_focused_edited = true;
-        match &op {
-            UndoOp::CellEdit {
-                cell_id, post, ..
-            } => {
-                self.focused = Some(*cell_id);
-                if let Some(c) = self.cell_mut(*cell_id) {
-                    c.restore(post.clone());
-                }
-            }
-            UndoOp::InsertCell {
-                cell_id, snapshot, ..
-            } => {
-                let cell = Cell::from_snapshot(*cell_id, snapshot.clone(), &self.typeface);
-                self.insert_cell_sorted(cell);
-                self.document.dirty_cells.insert(*cell_id);
-                self.document.pending_deletes.remove(cell_id);
-                self.focused = Some(*cell_id);
-            }
-            UndoOp::DeleteCell {
-                cell_id,
-                post_focused,
-                side_effect,
-                ..
-            } => {
-                self.document.queue_cell_delete(*cell_id);
-                if let Some(se) = side_effect {
-                    self.apply_context_side_effect(se);
-                }
-                self.focused = *post_focused;
-            }
-            UndoOp::RotateContext {
-                closed_id,
-                new_end_time,
-                new_context,
-                new_view,
-                ..
-            } => {
-                self.apply_rotation(*closed_id, *new_end_time, new_context, new_view.clone());
-                bump_focused_edited = false;
-            }
-            UndoOp::ResetContextStart {
-                context_id,
-                new_start,
-                new_view,
-                ..
-            } => {
-                if let Some(c) = self.document.contexts.iter_mut().find(|c| c.id == *context_id) {
-                    c.start_time = *new_start;
-                }
-                self.document.mark_context_dirty(*context_id);
-                self.view = new_view.clone();
-                bump_focused_edited = false;
-            }
-            UndoOp::RenamePersonEntity {
-                entity_id,
-                new_name,
-                cell_title_change,
-                ..
-            } => {
-                if let Some(db) = self.db.as_mut() {
-                    if let Err(e) = db.rename_person_entity(*entity_id, new_name) {
-                        eprintln!("kept: redo rename_person_entity failed: {e}");
-                    }
-                }
-                if let Some((cell_id, _, new_title)) = cell_title_change {
-                    if let Some(cell) = self.cell_mut(*cell_id) {
-                        if let Some(title) = cell.title_mut() {
-                            title.replace_text(new_title.clone());
-                        }
-                    }
-                    self.mark_cell_dirty(*cell_id);
-                }
-                self.refresh_entities();
-                bump_focused_edited = false;
-            }
-            UndoOp::CreateCelllessEntity {
-                entity_id,
-                name,
-                created_at,
-            } => {
-                if let Some(db) = self.db.as_mut() {
-                    // Add Person always creates an active entity, so a
-                    // redo restores it active. (If the user toggled it
-                    // inactive between create and undo, that's a separate
-                    // SetEntityActive op on the stack and stays around
-                    // for its own redo.)
-                    if let Err(e) = db.insert_person_entity_with_id(
-                        *entity_id,
-                        name,
-                        true,
-                        *created_at,
-                    ) {
-                        eprintln!("kept: redo create-entity failed: {e}");
-                    }
-                }
-                self.refresh_entities();
-                bump_focused_edited = false;
-            }
-            UndoOp::DeleteCelllessEntity { entity_id, .. } => {
-                if let Some(db) = self.db.as_mut() {
-                    if let Err(e) = db.delete_entity(*entity_id) {
-                        eprintln!("kept: redo delete-entity failed: {e}");
-                    }
-                }
-                self.refresh_entities();
-                bump_focused_edited = false;
-            }
-            UndoOp::SetEntityActive { entity_id, new, .. } => {
-                if let Some(db) = self.db.as_mut() {
-                    let _ = db.set_entity_active(*entity_id, *new);
-                }
-                self.refresh_entities();
-                bump_focused_edited = false;
-            }
-            UndoOp::SetCellActive { cell_id, new, .. } => {
-                if let Some(idx) = self.cell_idx(*cell_id) {
-                    self.document.cells[idx].active = *new;
-                    self.mark_cell_dirty(*cell_id);
-                    self.touch_cell(*cell_id);
-                }
-                bump_focused_edited = false;
-            }
-            UndoOp::SetBulletActive {
-                cell_id,
-                bullet_id,
-                new,
-                ..
-            } => {
-                if let Some(idx) = self.cell_idx(*cell_id) {
-                    if let CellKind::Outline(oc) = &mut self.document.cells[idx].kind {
-                        oc.set_bullet_active(*bullet_id, *new);
-                    }
-                    self.mark_cell_dirty(*cell_id);
-                    self.touch_cell(*cell_id);
-                }
-                bump_focused_edited = false;
-            }
-            UndoOp::Envelope { cell_id, post, .. } => {
-                if let Some(idx) = self.cell_idx(*cell_id) {
-                    let cell = Cell::from_snapshot(
-                        *cell_id,
-                        post.clone(),
-                        &self.typeface,
-                    );
-                    self.document.cells[idx] = cell;
-                }
-                self.document.dirty_cells.insert(*cell_id);
-                self.focused = Some(*cell_id);
-            }
-            UndoOp::Unwrap { cell_id, post, .. } => {
-                if let Some(idx) = self.cell_idx(*cell_id) {
-                    let cell = Cell::from_snapshot(
-                        *cell_id,
-                        post.clone(),
-                        &self.typeface,
-                    );
-                    self.document.cells[idx] = cell;
-                }
-                self.document.dirty_cells.insert(*cell_id);
-                self.focused = Some(*cell_id);
-            }
-        }
+        op.apply(self, UndoDir::Redo);
+        let bumps = op.bumps_focused_edited();
         self.undo_stack.push(op);
         self.dragging_cell = None;
         self.pending_caret_scroll = true;
         self.coalesce_break = true;
-        if bump_focused_edited {
+        if bumps {
             if let Some(id) = self.focused {
                 self.touch_cell(id);
             }
