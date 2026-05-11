@@ -223,6 +223,44 @@ struct PeoplePageHits {
     show_inactive_toggle: Option<Rect>,
 }
 
+/// Per-pane window-space + doc-space geometry computed once per frame
+/// by `prepare_pane_layout`. Every sub-render-pass inside `tick_pane`
+/// takes this by reference; nothing in here is mutated after the
+/// `prepare_pane_layout` call returns.
+struct PaneLayout {
+    /// Pane index in `KeptApp::panes`. Currently unused by the sub-render
+    /// passes (they read state via Deref-to-active-pane), but kept for
+    /// future passes that need to address the pane explicitly without
+    /// relying on `active_pane` being swapped.
+    #[allow(dead_code)]
+    pane_idx: usize,
+    pane_rect: Rect,
+    pane_h: f32,
+    /// Left edge of the cell column (after MARGIN_X or FOCUS_MODE_PAD).
+    cells_left: f32,
+    /// Outer width of a cell card (used as the right edge for the
+    /// section-header rule).
+    outer_cell_width: f32,
+    /// Usable content width inside a cell card.
+    content_width: f32,
+    /// Doc-space focused-cell geometry. `Some` iff a cell is focused,
+    /// renders with non-zero height, passes the current view's
+    /// visibility filter, AND the view is Ast/Context (Entity / People
+    /// pages bypass the focus card + ring entirely).
+    focused_geom: Option<FocusedCellGeom>,
+}
+
+/// Doc-space rectangle for the focused cell. Used by the card backdrop
+/// (drawn before body content) and the focus ring (drawn after); both
+/// read from the same struct so they stay in lockstep.
+#[derive(Clone, Copy)]
+struct FocusedCellGeom {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
 /// Which kind of cell to spawn from a "new cell" hotkey.
 #[derive(Clone, Copy)]
 enum NewCellKind {
@@ -3578,11 +3616,12 @@ impl KeptApp {
         );
     }
 
-    /// Render a single pane. With `active_pane` swapped to `pane_idx` by
-    /// the caller, all `self.X` field accesses (Deref) resolve to this
-    /// pane. Pane geometry comes from `self.panes[pane_idx].last_rect`,
-    /// populated by `layout_panes`.
-    fn tick_pane(&mut self, canvas: &Canvas, pane_idx: usize, _height: f32) {
+    /// Compute this frame's `PaneLayout` for `pane_idx`. Runs the
+    /// per-pane kinetic-scroll step and the pre-render scroll clamp as
+    /// a side-effect (both touch the active pane's `Scroller`). No
+    /// canvas mutation — the caller wraps the rendering in
+    /// `canvas.save / clip / translate`.
+    fn prepare_pane_layout(&mut self, pane_idx: usize) -> PaneLayout {
         // Kinetic decay step (no-op when wheel is still active or
         // velocity is below the floor).
         self.step_kinetic(pane_idx);
@@ -3594,17 +3633,6 @@ impl KeptApp {
         let pane_left = pane_rect.left;
         let pane_right = pane_rect.right;
         let pane_h = pane_rect.height();
-
-        let mut text_paint = Paint::default();
-        text_paint.set_anti_alias(true);
-        text_paint.set_color(crate::color::text_primary());
-
-        // Clip to this pane's rect so over-wide content / focus shadows
-        // can't bleed across the divider into the other pane.
-        canvas.save();
-        canvas.clip_rect(pane_rect, None, true);
-        // Document space — translate so doc y=0 lands at window y = -scroll_y.
-        canvas.translate((0.0, -self.scroll_y));
 
         let scale = self.font_scale;
         // Focus mode pulls the cell out near the pane's left edge with
@@ -3621,368 +3649,134 @@ impl KeptApp {
         };
         let content_width = outer_cell_width.max(60.0);
 
-        // Capture focused-cell geometry up front. The card backdrop (drawn
-        // *before* cell content) and the focus ring (drawn after) both use
-        // this so they stay in lockstep — at most one frame of lag when the
-        // cell grows from typing, but they always match each other.
-        // In focus mode we override the x/width to match the wider focus
-        // layout (otherwise the card would draw at last frame's normal-mode
-        // size); the ring is suppressed since there's nothing to compare to.
-        let mut y = MARGIN_TOP;
-        let mouse_doc_x = self.mouse_pos.0;
-        let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
-        let focused_id = self.focused;
-        let editing_local = self.editing;
-
-        // Cell-loop views (Ast / Context) draw the cell stream with the
-        // focused-cell card backdrop + ring. Entity / People views draw
-        // bespoke pages and bypass that entire path.
-        let view_kind_local = self.view.view_kind.clone();
-
-        // Card backdrop and focus ring use this. We pull `cells_left` and
-        // `content_width` from this frame's pane geometry (so they're always
-        // correct for the pane being rendered, not stale from another pane's
-        // last render). y/height come from the cell's last-rendered values
-        // — at most one frame stale when content size changes.
+        // Capture focused-cell geometry. Card backdrop + focus ring both
+        // read from it so they stay in lockstep — at most one frame of
+        // lag when the cell grows from typing, but they always match.
         //
-        // Also gate on the focused cell still passing the current view's
-        // visibility filter. Without this, a cell that just dropped out of
-        // a tag-filtered view (because the user finished renaming its
-        // `#tag` and it no longer matches) would leave its focus card
-        // behind as a ghost rectangle since `self.focused` still points
-        // at the now-hidden cell.
+        // Gate on the focused cell still passing the current view's
+        // visibility filter — a cell that just dropped out of a
+        // tag-filtered view (because the user finished renaming its
+        // `#tag` so it no longer matches) shouldn't leave its focus card
+        // behind as a ghost rectangle.
+        //
+        // In focus mode we override y to MARGIN_TOP (the cell renders at
+        // the top of the pane) and suppress the ring elsewhere.
+        let view_kind_local = self.view.view_kind.clone();
         let match_ctx = self.match_context();
         let focused_geom = if matches!(view_kind_local, ViewKind::Ast | ViewKind::Context(_)) {
             self.focused
                 .and_then(|id| self.cell(id))
                 .filter(|c| c.height() > 0.0 && self.is_visible_for_view(c, &match_ctx))
                 .map(|c| {
-                    if self.focus_mode {
-                        (cells_left, MARGIN_TOP, content_width, c.height())
-                    } else {
-                        (cells_left, c.y_origin(), content_width, c.height())
+                    let y = if self.focus_mode { MARGIN_TOP } else { c.y_origin() };
+                    FocusedCellGeom {
+                        x: cells_left,
+                        y,
+                        w: content_width,
+                        h: c.height(),
                     }
                 })
         } else {
             None
         };
 
-        if let Some((cx, cy, cw, ch)) = focused_geom {
-            let card_rect = Rect::new(
-                cx - FOCUS_PAD,
-                cy - FOCUS_PAD,
-                cx + cw + FOCUS_PAD,
-                cy + ch + FOCUS_PAD,
-            );
-            // Drop shadow: blurred dark rect, offset down a few px.
-            let mut shadow_paint = Paint::default();
-            shadow_paint.set_anti_alias(true);
-            shadow_paint.set_color(crate::color::black_alpha(FOCUS_SHADOW_ALPHA));
-            shadow_paint.set_mask_filter(MaskFilter::blur(
-                BlurStyle::Normal,
-                FOCUS_SHADOW_BLUR,
-                false,
-            ));
-            let shadow_rect = Rect::new(
-                card_rect.left,
-                card_rect.top + FOCUS_SHADOW_DY,
-                card_rect.right,
-                card_rect.bottom + FOCUS_SHADOW_DY,
-            );
-            canvas.draw_round_rect(shadow_rect, FOCUS_RADIUS, FOCUS_RADIUS, &shadow_paint);
-            // White card fill.
-            let mut fill_paint = Paint::default();
-            fill_paint.set_anti_alias(true);
-            fill_paint.set_color(crate::color::bg_card());
-            canvas.draw_round_rect(card_rect, FOCUS_RADIUS, FOCUS_RADIUS, &fill_paint);
+        PaneLayout {
+            pane_idx,
+            pane_rect,
+            pane_h,
+            cells_left,
+            outer_cell_width,
+            content_width,
+            focused_geom,
         }
+    }
 
-        match view_kind_local {
-            ViewKind::Ast | ViewKind::Context(_) => {
-                // Precompute per-cell visibility and section headers (Date view only)
-                // so the mutable cell loop below doesn't have to re-borrow self.
-                // In focus mode only the focused cell is visible — everything else
-                // is suppressed regardless of the current view's filters.
-                let visible: Vec<bool> = if self.focus_mode {
-                    self.cells
-                        .iter()
-                        .map(|c| Some(c.id) == focused_id)
-                        .collect()
-                } else {
-                    let match_ctx = self.match_context();
-                    self.cells
-                        .iter()
-                        .map(|c| self.is_visible_for_view(c, &match_ctx))
-                        .collect()
-                };
-                // Headers are aligned to self.cells indices but computed in DISPLAY
-                // order (descending) so a header lands above the first cell of each
-                // group as the user scrolls top-down.
-                //
-                // Date view groups by context (multiple contexts can land in one day).
-                // Any other AST view (tag, search query, multi-filter, free-text)
-                // groups by local date since cells can span days. Context view and
-                // focus mode have no inter-group headers.
-                #[derive(PartialEq, Eq)]
-                enum HeaderMode {
-                    ByContext,
-                    ByDate,
-                    None,
-                }
-                let header_mode = if self.focus_mode {
-                    HeaderMode::None
-                } else if !matches!(self.view.view_kind, ViewKind::Ast) {
-                    HeaderMode::None
-                } else if matches!(
-                    self.view.ast.include.time,
-                    Some(query::TimeFilter::Day(_))
-                ) && self.view.ast.include.tags.is_empty()
-                    && self.view.ast.include.entities.is_empty()
-                    && self.view.ast.exclude.tags.is_empty()
-                    && self.view.ast.exclude.entities.is_empty()
-                    && self.view.ast.text.is_empty()
-                {
-                    // Pure date view — show context-section headers within the day.
-                    HeaderMode::ByContext
-                } else {
-                    // Tag / search / multi-filter — group by date across the result set.
-                    HeaderMode::ByDate
-                };
-                let headers: Vec<Option<String>> = if header_mode == HeaderMode::None {
-                    vec![None; self.cells.len()]
-                } else {
-                    let mut hs: Vec<Option<String>> = vec![None; self.cells.len()];
-                    let mut last_label: Option<String> = None;
-                    for i in (0..self.cells.len()).rev() {
-                        if !visible[i] {
-                            continue;
-                        }
-                        let cell = &self.cells[i];
-                        let label: String = match header_mode {
-                            HeaderMode::ByContext => self
-                                .context_for_timestamp(cell.timestamp)
-                                .map(|c| format_context_time(c.start_time))
-                                .unwrap_or_default(),
-                            HeaderMode::ByDate => {
-                                format_date_label(local_date_for_ms(cell.timestamp))
-                            }
-                            HeaderMode::None => unreachable!(),
-                        };
-                        if last_label.as_deref() != Some(label.as_str()) {
-                            last_label = Some(label.clone());
-                            hs[i] = Some(label);
-                        }
-                    }
-                    hs
-                };
+    /// Drop shadow + white rounded card painted behind the focused
+    /// cell. No-op when no cell is focused (or when the focused cell
+    /// failed the view's visibility filter — `prepare_pane_layout`
+    /// leaves `focused_geom` as `None` in that case).
+    fn render_focus_card_backdrop(&self, canvas: &Canvas, layout: &PaneLayout) {
+        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch }) = layout.focused_geom
+        else {
+            return;
+        };
+        let card_rect = Rect::new(
+            cx - FOCUS_PAD,
+            cy - FOCUS_PAD,
+            cx + cw + FOCUS_PAD,
+            cy + ch + FOCUS_PAD,
+        );
+        // Drop shadow: blurred dark rect, offset down a few px.
+        let mut shadow_paint = Paint::default();
+        shadow_paint.set_anti_alias(true);
+        shadow_paint.set_color(crate::color::black_alpha(FOCUS_SHADOW_ALPHA));
+        shadow_paint.set_mask_filter(MaskFilter::blur(
+            BlurStyle::Normal,
+            FOCUS_SHADOW_BLUR,
+            false,
+        ));
+        let shadow_rect = Rect::new(
+            card_rect.left,
+            card_rect.top + FOCUS_SHADOW_DY,
+            card_rect.right,
+            card_rect.bottom + FOCUS_SHADOW_DY,
+        );
+        canvas.draw_round_rect(shadow_rect, FOCUS_RADIUS, FOCUS_RADIUS, &shadow_paint);
+        // White card fill.
+        let mut fill_paint = Paint::default();
+        fill_paint.set_anti_alias(true);
+        fill_paint.set_color(crate::color::bg_card());
+        canvas.draw_round_rect(card_rect, FOCUS_RADIUS, FOCUS_RADIUS, &fill_paint);
+    }
 
-                let header_font = Font::from_typeface(
-                    &self.typeface,
-                    CONTEXT_HEADER_FONT_SIZE * scale,
-                );
-                let (_, hm) = header_font.metrics();
-                let header_h = CONTEXT_HEADER_H * scale;
-                let header_pad_top = CONTEXT_HEADER_PAD_TOP * scale;
+    /// Blue accent ring around the focused cell — subtle when viewing,
+    /// brighter and thicker when editing. Suppressed in focus mode
+    /// where the white card backdrop alone marks the active area (no
+    /// other cells to compete with). No-op when `focused_geom` is None.
+    fn render_focus_ring(&self, canvas: &Canvas, layout: &PaneLayout) {
+        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch }) =
+            layout.focused_geom.filter(|_| !self.focus_mode)
+        else {
+            return;
+        };
+        let (stroke, alpha) = if self.editing {
+            (FOCUS_STROKE_EDIT, FOCUS_RING_ALPHA_EDIT)
+        } else {
+            (FOCUS_STROKE, FOCUS_RING_ALPHA)
+        };
+        let mut focus_paint = Paint::default();
+        focus_paint.set_anti_alias(true);
+        focus_paint.set_style(PaintStyle::Stroke);
+        focus_paint.set_stroke_width(stroke);
+        focus_paint.set_color(crate::color::accent_blue_alpha(alpha));
+        let rect = Rect::new(
+            cx - FOCUS_PAD,
+            cy - FOCUS_PAD,
+            cx + cw + FOCUS_PAD,
+            cy + ch + FOCUS_PAD,
+        );
+        canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &focus_paint);
+    }
 
-                // Render cells newest-first (descending) — index walked in reverse so
-                // self.cells (asc) iterates from end to start.
-                let total_cells = self.cells.len();
-                for i in (0..total_cells).rev() {
-                    if !visible[i] {
-                        continue;
-                    }
-                    if let Some(label) = &headers[i] {
-                        let header_y = y + header_pad_top;
-                        let baseline = header_y + (-hm.ascent);
-                        let mut hp = Paint::default();
-                        hp.set_anti_alias(true);
-                        hp.set_color(crate::color::text_muted_warm());
-                        canvas.draw_str(
-                            label,
-                            Point::new(cells_left, baseline),
-                            &header_font,
-                            &hp,
-                        );
-                        let label_w = header_font.measure_str(label, Some(&hp)).0;
-                        let line_y = baseline - hm.ascent / 3.0;
-                        let mut lp = Paint::default();
-                        lp.set_anti_alias(true);
-                        lp.set_color(crate::color::heading_rule());
-                        lp.set_stroke_width(1.5);
-                        canvas.draw_line(
-                            Point::new(cells_left + label_w + 8.0 * scale, line_y),
-                            Point::new(cells_left + outer_cell_width, line_y),
-                            &lp,
-                        );
-                        y += header_h;
-                    }
-                    let cell_x = cells_left;
-                    let cell_y = y;
-                    let cell_id = self.cells[i].id;
-                    let is_reference = matches!(self.cells[i].kind, CellKind::Reference(_));
-                    let is_envelope_outline = matches!(
-                        &self.cells[i].kind,
-                        CellKind::Outline(oc) if oc.has_reference_header()
-                    );
-                    let cell_is_focused =
-                        focused_id.map(|f| f == cell_id).unwrap_or(false);
-
-                    // Selection highlights are visible whenever the cell is focused
-                    // (so view-mode users can drag-select). Caret only renders in
-                    // edit mode.
-                    let render_focused = cell_is_focused;
-                    let show_caret = cell_is_focused && editing_local;
-                    // Inactive ("archived") cells reach this point only
-                    // when the global toggle is on (otherwise the
-                    // visibility filter dropped them earlier). Wrap
-                    // their entire render — body, post-tick outline,
-                    // and any embed chrome — in an alpha layer so the
-                    // dim treatment composites uniformly without
-                    // threading a paint color through every primitive.
-                    let cell_inactive = !self.cells[i].active;
-                    if cell_inactive {
-                        canvas.save_layer_alpha(None, cell::INACTIVE_ALPHA as u32);
-                    }
-                    let h = if is_reference {
-                        // Reference cells render via the app layer (which can
-                        // see the full cell list to look up the target).
-                        self.render_reference_cell(
-                            canvas,
-                            i,
-                            cell_x,
-                            cell_y,
-                            content_width,
-                            render_focused,
-                        )
-                    } else if is_envelope_outline {
-                        // Envelope outlines: read-only embed at the
-                        // top + editable bullet body. Same reason as
-                        // Reference — needs the cell list to refresh
-                        // the embed cache.
-                        self.render_envelope_outline_cell(
-                            canvas,
-                            i,
-                            cell_x,
-                            cell_y,
-                            content_width,
-                            render_focused,
-                            show_caret,
-                        )
-                    } else {
-                        // Bullet-granular tag filter for non-focused
-                        // outline cells: when the active view filters by
-                        // `#tag` and this outline matches via body
-                        // bullets only (title doesn't carry the tag),
-                        // restrict the render to matching bullets +
-                        // their subtree descendants. Cleared (None) for
-                        // focused cells so interaction always sees the
-                        // full outline.
-                        // Clone the include-tag list so we can take a
-                        // mutable borrow on `self.cells` without keeping
-                        // an outstanding immutable borrow on `self.view`.
-                        let include_tags = self.view.ast.include.tags.clone();
-                        let show_inactive = self.show_inactive_cells;
-                        let cell = &mut self.cells[i];
-                        let filter = compute_outline_bullet_filter(
-                            cell,
-                            &include_tags,
-                            cell_is_focused,
-                        );
-                        if let CellKind::Outline(oc) = &mut cell.kind {
-                            oc.set_bullet_filter(filter);
-                            oc.set_show_inactive(show_inactive);
-                        }
-                        cell.tick(
-                            canvas,
-                            cell_x,
-                            cell_y,
-                            content_width,
-                            render_focused,
-                            show_caret,
-                        )
-                    };
-
-                    // Faint outline around non-focused cells so each one reads as a
-                    // distinct unit. Drawn in the same position the focus ring would
-                    // occupy so cells don't visually shift when focus moves.
-                    // Reference cells have their own dashed warm-tan border —
-                    // skip the standard outline so the two don't compete.
-                    if !cell_is_focused && !is_reference {
-                        let mut outline = Paint::default();
-                        outline.set_anti_alias(true);
-                        outline.set_style(PaintStyle::Stroke);
-                        outline.set_stroke_width(CELL_OUTLINE_STROKE);
-                        outline.set_color(crate::color::dark_alpha(CELL_OUTLINE_ALPHA));
-                        let rect = Rect::new(
-                            cell_x - FOCUS_PAD,
-                            cell_y - FOCUS_PAD,
-                            cell_x + content_width + FOCUS_PAD,
-                            cell_y + h + FOCUS_PAD,
-                        );
-                        canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
-                    }
-                    if cell_inactive {
-                        canvas.restore();
-                    }
-
-                    y += h + CELL_GAP;
-                }
-            }
-            ViewKind::Entity(eid) => {
-                let h = self.render_entity_page(
-                    canvas,
-                    eid,
-                    cells_left,
-                    content_width,
-                    scale,
-                    mouse_doc_x,
-                    mouse_doc_y,
-                );
-                // +CELL_GAP so the doc_height formula (`y - CELL_GAP +
-                // DOC_BOTTOM_PAD`) matches the cell-loop convention.
-                y = MARGIN_TOP + h + CELL_GAP;
-            }
-            ViewKind::People => {
-                let h = self.render_people_page(
-                    canvas,
-                    cells_left,
-                    content_width,
-                    scale,
-                    mouse_doc_x,
-                    mouse_doc_y,
-                );
-                y = MARGIN_TOP + h + CELL_GAP;
-            }
-        }
-
-        // Focus ring — subtle when viewing, brighter and thicker when editing.
-        // Suppressed in focus mode where the white card backdrop alone marks
-        // the active area (no other cells to compete with).
-        if let Some((cx, cy, cw, ch)) = focused_geom.filter(|_| !self.focus_mode) {
-            let (stroke, alpha) = if self.editing {
-                (FOCUS_STROKE_EDIT, FOCUS_RING_ALPHA_EDIT)
-            } else {
-                (FOCUS_STROKE, FOCUS_RING_ALPHA)
-            };
-            let mut focus_paint = Paint::default();
-            focus_paint.set_anti_alias(true);
-            focus_paint.set_style(PaintStyle::Stroke);
-            focus_paint.set_stroke_width(stroke);
-            focus_paint.set_color(crate::color::accent_blue_alpha(alpha));
-            let rect = Rect::new(
-                cx - FOCUS_PAD,
-                cy - FOCUS_PAD,
-                cx + cw + FOCUS_PAD,
-                cy + ch + FOCUS_PAD,
-            );
-            canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &focus_paint);
-        }
-
-        canvas.restore();
-
-        // Update bookkeeping for scroll math + clamp again in case content shrank.
-        self.doc_height = y - CELL_GAP + DOC_BOTTOM_PAD;
-        self.viewport_height = pane_h.max(0.0);
+    /// Post-body bookkeeping: publish this frame's `doc_height` /
+    /// `viewport_height` / `max_scroll`, re-clamp `scroll_y` in case
+    /// content shrank, honor a pending caret-into-view request, then
+    /// draw the scrollbar in window space. Called AFTER `canvas.restore`
+    /// — the scrollbar is window-coord, not doc-coord.
+    ///
+    /// `final_y` is the y cursor accumulated by the view body (cell
+    /// stream / entity page / people page); `doc_height` is computed as
+    /// `final_y - CELL_GAP + DOC_BOTTOM_PAD` to match the cell-loop
+    /// convention (each cell adds CELL_GAP after itself; the last gap
+    /// is replaced by the bottom pad).
+    fn finalize_pane_scroll(
+        &mut self,
+        canvas: &Canvas,
+        layout: &PaneLayout,
+        final_y: f32,
+    ) {
+        self.doc_height = final_y - CELL_GAP + DOC_BOTTOM_PAD;
+        self.viewport_height = layout.pane_h.max(0.0);
         self.max_scroll = (self.doc_height - self.viewport_height).max(0.0);
         self.scroll_y = self.scroll_y.min(self.max_scroll);
 
@@ -3995,7 +3789,318 @@ impl KeptApp {
         // Per-pane scrollbar in window coords, anchored at the pane's right edge.
         let viewport_h = self.viewport_height;
         let doc_h = self.doc_height;
-        self.scroller.draw_bar(canvas, pane_right, viewport_h, doc_h);
+        self.scroller
+            .draw_bar(canvas, layout.pane_rect.right, viewport_h, doc_h);
+    }
+
+    /// Render a single pane. With `active_pane` swapped to `pane_idx` by
+    /// the caller, all `self.X` field accesses (Deref) resolve to this
+    /// pane. Pane geometry comes from `self.panes[pane_idx].last_rect`,
+    /// populated by `layout_panes`.
+    fn tick_pane(&mut self, canvas: &Canvas, pane_idx: usize, _height: f32) {
+        let layout = self.prepare_pane_layout(pane_idx);
+
+        // Clip to this pane's rect so over-wide content / focus shadows
+        // can't bleed across the divider into the other pane. Translate
+        // into document space (doc y=0 → window y = -scroll_y) so all
+        // sub-render passes paint in doc-coords.
+        canvas.save();
+        canvas.clip_rect(layout.pane_rect, None, true);
+        canvas.translate((0.0, -self.scroll_y));
+
+        self.render_focus_card_backdrop(canvas, &layout);
+        let final_y = self.render_pane_body(canvas, &layout);
+        self.render_focus_ring(canvas, &layout);
+
+        canvas.restore();
+
+        self.finalize_pane_scroll(canvas, &layout, final_y);
+    }
+
+    /// View-kind dispatcher: routes to `render_cell_stream` (Ast /
+    /// Context), `render_entity_page` (Entity), or `render_people_page`
+    /// (People). Returns the final `y` cursor used by
+    /// `finalize_pane_scroll` to compute `doc_height`.
+    ///
+    /// The `+ CELL_GAP` on the entity / people branches matches the
+    /// cell-loop convention (each cell adds CELL_GAP after itself; the
+    /// post-body formula in `finalize_pane_scroll` subtracts one
+    /// CELL_GAP and adds DOC_BOTTOM_PAD).
+    fn render_pane_body(&mut self, canvas: &Canvas, layout: &PaneLayout) -> f32 {
+        let scale = self.font_scale;
+        let mouse_doc_x = self.mouse_pos.0;
+        let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
+        match self.view.view_kind.clone() {
+            ViewKind::Ast | ViewKind::Context(_) => self.render_cell_stream(canvas, layout),
+            ViewKind::Entity(eid) => {
+                let h = self.render_entity_page(
+                    canvas,
+                    eid,
+                    layout.cells_left,
+                    layout.content_width,
+                    scale,
+                    mouse_doc_x,
+                    mouse_doc_y,
+                );
+                MARGIN_TOP + h + CELL_GAP
+            }
+            ViewKind::People => {
+                let h = self.render_people_page(
+                    canvas,
+                    layout.cells_left,
+                    layout.content_width,
+                    scale,
+                    mouse_doc_x,
+                    mouse_doc_y,
+                );
+                MARGIN_TOP + h + CELL_GAP
+            }
+        }
+    }
+
+    /// The cell-stream view body (Ast / Context). Pre-computes per-cell
+    /// visibility + section headers, then loops visible cells
+    /// newest-first, drawing context/date headers and delegating each
+    /// cell to `cell.tick()` / `render_reference_cell()` /
+    /// `render_envelope_outline_cell()`. Returns the final y cursor.
+    fn render_cell_stream(&mut self, canvas: &Canvas, layout: &PaneLayout) -> f32 {
+        let cells_left = layout.cells_left;
+        let outer_cell_width = layout.outer_cell_width;
+        let content_width = layout.content_width;
+        let scale = self.font_scale;
+        let focused_id = self.focused;
+        let editing_local = self.editing;
+        let mut y = MARGIN_TOP;
+
+        // Precompute per-cell visibility and section headers so the
+        // mutable cell loop below doesn't have to re-borrow self.
+        // In focus mode only the focused cell is visible — everything else
+        // is suppressed regardless of the current view's filters.
+        let visible: Vec<bool> = if self.focus_mode {
+            self.cells
+                .iter()
+                .map(|c| Some(c.id) == focused_id)
+                .collect()
+        } else {
+            let match_ctx = self.match_context();
+            self.cells
+                .iter()
+                .map(|c| self.is_visible_for_view(c, &match_ctx))
+                .collect()
+        };
+        // Headers are aligned to self.cells indices but computed in DISPLAY
+        // order (descending) so a header lands above the first cell of each
+        // group as the user scrolls top-down.
+        //
+        // Date view groups by context (multiple contexts can land in one day).
+        // Any other AST view (tag, search query, multi-filter, free-text)
+        // groups by local date since cells can span days. Context view and
+        // focus mode have no inter-group headers.
+        #[derive(PartialEq, Eq)]
+        enum HeaderMode {
+            ByContext,
+            ByDate,
+            None,
+        }
+        let header_mode = if self.focus_mode {
+            HeaderMode::None
+        } else if !matches!(self.view.view_kind, ViewKind::Ast) {
+            HeaderMode::None
+        } else if matches!(
+            self.view.ast.include.time,
+            Some(query::TimeFilter::Day(_))
+        ) && self.view.ast.include.tags.is_empty()
+            && self.view.ast.include.entities.is_empty()
+            && self.view.ast.exclude.tags.is_empty()
+            && self.view.ast.exclude.entities.is_empty()
+            && self.view.ast.text.is_empty()
+        {
+            // Pure date view — show context-section headers within the day.
+            HeaderMode::ByContext
+        } else {
+            // Tag / search / multi-filter — group by date across the result set.
+            HeaderMode::ByDate
+        };
+        let headers: Vec<Option<String>> = if header_mode == HeaderMode::None {
+            vec![None; self.cells.len()]
+        } else {
+            let mut hs: Vec<Option<String>> = vec![None; self.cells.len()];
+            let mut last_label: Option<String> = None;
+            for i in (0..self.cells.len()).rev() {
+                if !visible[i] {
+                    continue;
+                }
+                let cell = &self.cells[i];
+                let label: String = match header_mode {
+                    HeaderMode::ByContext => self
+                        .context_for_timestamp(cell.timestamp)
+                        .map(|c| format_context_time(c.start_time))
+                        .unwrap_or_default(),
+                    HeaderMode::ByDate => {
+                        format_date_label(local_date_for_ms(cell.timestamp))
+                    }
+                    HeaderMode::None => unreachable!(),
+                };
+                if last_label.as_deref() != Some(label.as_str()) {
+                    last_label = Some(label.clone());
+                    hs[i] = Some(label);
+                }
+            }
+            hs
+        };
+
+        let header_font = Font::from_typeface(
+            &self.typeface,
+            CONTEXT_HEADER_FONT_SIZE * scale,
+        );
+        let (_, hm) = header_font.metrics();
+        let header_h = CONTEXT_HEADER_H * scale;
+        let header_pad_top = CONTEXT_HEADER_PAD_TOP * scale;
+
+        // Render cells newest-first (descending) — index walked in reverse so
+        // self.cells (asc) iterates from end to start.
+        let total_cells = self.cells.len();
+        for i in (0..total_cells).rev() {
+            if !visible[i] {
+                continue;
+            }
+            if let Some(label) = &headers[i] {
+                let header_y = y + header_pad_top;
+                let baseline = header_y + (-hm.ascent);
+                let mut hp = Paint::default();
+                hp.set_anti_alias(true);
+                hp.set_color(crate::color::text_muted_warm());
+                canvas.draw_str(
+                    label,
+                    Point::new(cells_left, baseline),
+                    &header_font,
+                    &hp,
+                );
+                let label_w = header_font.measure_str(label, Some(&hp)).0;
+                let line_y = baseline - hm.ascent / 3.0;
+                let mut lp = Paint::default();
+                lp.set_anti_alias(true);
+                lp.set_color(crate::color::heading_rule());
+                lp.set_stroke_width(1.5);
+                canvas.draw_line(
+                    Point::new(cells_left + label_w + 8.0 * scale, line_y),
+                    Point::new(cells_left + outer_cell_width, line_y),
+                    &lp,
+                );
+                y += header_h;
+            }
+            let cell_x = cells_left;
+            let cell_y = y;
+            let cell_id = self.cells[i].id;
+            let is_reference = matches!(self.cells[i].kind, CellKind::Reference(_));
+            let is_envelope_outline = matches!(
+                &self.cells[i].kind,
+                CellKind::Outline(oc) if oc.has_reference_header()
+            );
+            let cell_is_focused =
+                focused_id.map(|f| f == cell_id).unwrap_or(false);
+
+            // Selection highlights are visible whenever the cell is focused
+            // (so view-mode users can drag-select). Caret only renders in
+            // edit mode.
+            let render_focused = cell_is_focused;
+            let show_caret = cell_is_focused && editing_local;
+            // Inactive ("archived") cells reach this point only
+            // when the global toggle is on (otherwise the
+            // visibility filter dropped them earlier). Wrap
+            // their entire render — body, post-tick outline,
+            // and any embed chrome — in an alpha layer so the
+            // dim treatment composites uniformly without
+            // threading a paint color through every primitive.
+            let cell_inactive = !self.cells[i].active;
+            if cell_inactive {
+                canvas.save_layer_alpha(None, cell::INACTIVE_ALPHA as u32);
+            }
+            let h = if is_reference {
+                // Reference cells render via the app layer (which can
+                // see the full cell list to look up the target).
+                self.render_reference_cell(
+                    canvas,
+                    i,
+                    cell_x,
+                    cell_y,
+                    content_width,
+                    render_focused,
+                )
+            } else if is_envelope_outline {
+                // Envelope outlines: read-only embed at the
+                // top + editable bullet body. Same reason as
+                // Reference — needs the cell list to refresh
+                // the embed cache.
+                self.render_envelope_outline_cell(
+                    canvas,
+                    i,
+                    cell_x,
+                    cell_y,
+                    content_width,
+                    render_focused,
+                    show_caret,
+                )
+            } else {
+                // Bullet-granular tag filter for non-focused
+                // outline cells: when the active view filters by
+                // `#tag` and this outline matches via body
+                // bullets only (title doesn't carry the tag),
+                // restrict the render to matching bullets +
+                // their subtree descendants. Cleared (None) for
+                // focused cells so interaction always sees the
+                // full outline.
+                // Clone the include-tag list so we can take a
+                // mutable borrow on `self.cells` without keeping
+                // an outstanding immutable borrow on `self.view`.
+                let include_tags = self.view.ast.include.tags.clone();
+                let show_inactive = self.show_inactive_cells;
+                let cell = &mut self.cells[i];
+                let filter = compute_outline_bullet_filter(
+                    cell,
+                    &include_tags,
+                    cell_is_focused,
+                );
+                if let CellKind::Outline(oc) = &mut cell.kind {
+                    oc.set_bullet_filter(filter);
+                    oc.set_show_inactive(show_inactive);
+                }
+                cell.tick(
+                    canvas,
+                    cell_x,
+                    cell_y,
+                    content_width,
+                    render_focused,
+                    show_caret,
+                )
+            };
+
+            // Faint outline around non-focused cells so each one reads as a
+            // distinct unit. Drawn in the same position the focus ring would
+            // occupy so cells don't visually shift when focus moves.
+            // Reference cells have their own dashed warm-tan border —
+            // skip the standard outline so the two don't compete.
+            if !cell_is_focused && !is_reference {
+                let mut outline = Paint::default();
+                outline.set_anti_alias(true);
+                outline.set_style(PaintStyle::Stroke);
+                outline.set_stroke_width(CELL_OUTLINE_STROKE);
+                outline.set_color(crate::color::dark_alpha(CELL_OUTLINE_ALPHA));
+                let rect = Rect::new(
+                    cell_x - FOCUS_PAD,
+                    cell_y - FOCUS_PAD,
+                    cell_x + content_width + FOCUS_PAD,
+                    cell_y + h + FOCUS_PAD,
+                );
+                canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
+            }
+            if cell_inactive {
+                canvas.restore();
+            }
+
+            y += h + CELL_GAP;
+        }
+        y
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
