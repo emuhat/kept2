@@ -290,13 +290,13 @@ impl KeptApp {
             today: local_date_for_ms(now_epoch_ms()),
             person_targets: query::resolve_persons(
                 &ast.include.entities,
-                &self.entity_alias_index,
-                &self.entity_title_fallback,
+                &self.entities.alias_index,
+                &self.entities.title_fallback,
             ),
             person_excludes: query::resolve_persons(
                 &ast.exclude.entities,
-                &self.entity_alias_index,
-                &self.entity_title_fallback,
+                &self.entities.alias_index,
+                &self.entities.title_fallback,
             ),
         };
         // Inactive cells drop out of search results unless the
@@ -308,6 +308,7 @@ impl KeptApp {
         // returns whole cells; the cell-level gate is enough).
         let show_inactive_cells = self.show_inactive_cells;
         let mut hits: Vec<&Cell> = self
+            .document
             .cells
             .iter()
             .filter(|c| (c.active || show_inactive_cells) && query::matches(&ast, c, &ctx))

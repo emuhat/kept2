@@ -1,6 +1,8 @@
 mod app;
 mod cell;
 mod color;
+mod document;
+mod entity_cache;
 mod persist;
 mod query;
 

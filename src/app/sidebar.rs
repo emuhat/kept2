@@ -163,7 +163,7 @@ impl KeptApp {
         // so a date with only inactive cells doesn't leave a clickable
         // row that lands on an empty timeline.
         let show_inactive_cells = self.show_inactive_cells;
-        for c in &self.cells {
+        for c in &self.document.cells {
             if !c.active && !show_inactive_cells {
                 continue;
             }

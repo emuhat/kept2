@@ -15,7 +15,9 @@ use winit::{
 use crate::cell::{
     self, Cell, CellKind, CellSnapshot, ReferenceTarget, TextBox, now_epoch_ms, primary_mod,
 };
-use crate::persist::{ContextRef, Db, Entity, db_path};
+use crate::document::{Context, Document};
+use crate::entity_cache::EntityCache;
+use crate::persist::{ContextRef, Db, db_path};
 use crate::query;
 
 mod context_menus;
@@ -575,14 +577,6 @@ only feature this app commits to is keeping.",
     "Third cell. Selections in one cell don't bleed into another. Try double-click and triple-click \
 in here while a different cell is focused — the click count is per-cell.",
 ];
-
-#[derive(Clone)]
-pub struct Context {
-    pub id: Uuid,
-    pub start_time: i64,
-    pub end_time: Option<i64>,
-    pub title: Option<String>,
-}
 
 const SEED_CONTEXT_ID: Uuid = uuid!("01900000-0000-7000-8000-000000000001");
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -1275,11 +1269,13 @@ impl Pane {
 
 pub struct KeptApp {
     typeface: Typeface,
-    /// Global, append-only stream of cells. Source of truth.
-    /// Always sorted ascending by `Cell.timestamp`.
-    cells: Vec<Cell>,
-    /// Time-window overlays. Membership is derived (timestamp-based), not stored.
-    contexts: Vec<Context>,
+    /// Source-of-truth cell stream + contexts + dirty/pending sets.
+    /// Every mutation that needs to round-trip to the DB goes through
+    /// `Document`'s API (insert_cell_sorted, touch_cell,
+    /// queue_cell_delete, etc.) — those methods are the single place
+    /// the dirty / pending sets get touched (S4: centralized dirty
+    /// discipline).
+    document: Document,
     /// Viewports. Length 1 in Stage 1; length 2 starting Stage 2. Future
     /// i3-style nesting replaces this with a Layout tree.
     panes: Vec<Pane>,
@@ -1307,10 +1303,6 @@ pub struct KeptApp {
     search: Option<SearchState>,
     clipboard: Option<Clipboard>,
     db: Option<Db>,
-    dirty_cells: HashSet<Uuid>,
-    pending_deletes: HashSet<Uuid>,
-    dirty_contexts: HashSet<Uuid>,
-    pending_context_deletes: HashSet<Uuid>,
     /// Right-click context menu over a cell. While `Some`, render a
     /// floating card at the anchor; clicks inside dispatch the action,
     /// clicks elsewhere dismiss.
@@ -1364,21 +1356,12 @@ pub struct KeptApp {
     /// complete snapshot (never a partial one, never a stale one if the
     /// frame was skipped).
     hit_tests_builder: HitTestState,
-    // ---- Entity caches (invariants #1–#7) ----
-    /// All entity rows from the DB. Source of identity (kind, display_name).
-    entities: Vec<Entity>,
-    /// `(alias, entity_id, kind)` index. Built from the DB; rebuilt on
-    /// save/delete via `refresh_entities`.
-    entity_alias_index: Vec<(String, Uuid, String)>,
-    /// `cell_id → entity_id` for entities that have a backing cell. Gates
-    /// the title fallback (invariant #2) and lets the @-popup speak in
-    /// entity-id space without scanning entities each time.
-    cell_to_entity: std::collections::HashMap<Uuid, Uuid>,
-    /// `(entity_id, normalize(display_name))` for entities with a backing
-    /// cell. The title-fallback corpus — entirely entity-derived. Cells
-    /// without a corresponding entity are *not* here, even if their title
-    /// matches (invariant #2). Rebuilt with the other entity caches.
-    entity_title_fallback: Vec<(Uuid, String)>,
+    /// In-memory mirror of the DB's entity tables (entities + alias
+    /// index + cell→entity index + title-fallback corpus). Repopulated
+    /// in lockstep via `entities.refresh(db)` after any entity
+    /// mutation — the single invalidation entry point. Invariants
+    /// #1–#7 documented at the EntityCache definition site.
+    entities: EntityCache,
     /// Most recent cursor position in window (logical) coords, used for hover.
     mouse_pos: (f32, f32),
     /// Tentative Alt-drag pan. Set at `mouse_down` when Alt is held +
@@ -1508,39 +1491,10 @@ impl KeptApp {
             None => Vec::new(),
         };
 
-        // Initial entity load. The migration backfilled `entities` from
-        // `#person` cells in v4→v5, so this should be populated.
-        let entities: Vec<Entity> = match db.as_ref().map(|d| d.all_entities()) {
-            Some(Ok(rows)) => rows,
-            Some(Err(e)) => {
-                eprintln!("kept: failed to load entities: {e}");
-                Vec::new()
-            }
-            None => Vec::new(),
-        };
-        let entity_alias_index: Vec<(String, Uuid, String)> =
-            match db.as_ref().map(|d| d.entity_alias_index()) {
-                Some(Ok(rows)) => rows,
-                Some(Err(e)) => {
-                    eprintln!("kept: failed to load entity alias index: {e}");
-                    Vec::new()
-                }
-                None => Vec::new(),
-            };
-        let cell_to_entity: std::collections::HashMap<Uuid, Uuid> =
-            match db.as_ref().map(|d| d.cell_to_entity_index()) {
-                Some(Ok(rows)) => rows.into_iter().collect(),
-                Some(Err(e)) => {
-                    eprintln!("kept: failed to load cell→entity index: {e}");
-                    std::collections::HashMap::new()
-                }
-                None => std::collections::HashMap::new(),
-            };
-        let entity_title_fallback: Vec<(Uuid, String)> = entities
-            .iter()
-            .filter(|e| e.primary_cell_id.is_some())
-            .map(|e| (e.id, normalize_title_for_fallback(&e.display_name)))
-            .collect();
+        // Initial entity load. The migration backfilled the entity
+        // tables from `#person` cells in v4→v5, so this populates the
+        // cache from the existing data.
+        let entities = EntityCache::load(db.as_ref());
 
         // Sweep: drop any closed context whose window contains no cells.
         // These are leftovers from earlier rotations on already-empty
@@ -1617,8 +1571,14 @@ impl KeptApp {
 
         Self {
             typeface,
-            cells,
-            contexts,
+            document: Document {
+                cells,
+                contexts,
+                dirty_cells: HashSet::new(),
+                pending_deletes: HashSet::new(),
+                dirty_contexts: HashSet::new(),
+                pending_context_deletes: HashSet::new(),
+            },
             panes: vec![Pane::new(view, focused)],
             active_pane: 0,
             split_ratio: 0.5,
@@ -1633,10 +1593,6 @@ impl KeptApp {
             search: None,
             clipboard: Clipboard::new().ok(),
             db,
-            dirty_cells: HashSet::new(),
-            pending_deletes: HashSet::new(),
-            dirty_contexts: HashSet::new(),
-            pending_context_deletes: HashSet::new(),
             cell_context_menu: None,
             tag_context_menu: None,
             sidebar_scroll: Scroller::new(),
@@ -1650,9 +1606,6 @@ impl KeptApp {
             hit_tests: HitTestState::default(),
             hit_tests_builder: HitTestState::default(),
             entities,
-            entity_alias_index,
-            cell_to_entity,
-            entity_title_fallback,
             mouse_pos: (-1.0, -1.0),
             tentative_pan: None,
             pan_drag: false,
@@ -1925,7 +1878,7 @@ impl KeptApp {
     /// cell's date view, then writes focus / focus_mode directly to
     /// the destination pane (the active pane is preserved by
     /// `open_in_other_pane`, so deref-writes go to the wrong pane).
-    /// Returns false when the cell isn't in `self.cells` or the
+    /// Returns false when the cell isn't in `self.document.cells` or the
     /// destination pane was already on the same view.
     fn open_cell_in_other_pane(&mut self, cell_id: Uuid) -> bool {
         let target_date = match self.cell(cell_id) {
@@ -2053,7 +2006,7 @@ impl KeptApp {
     }
 
     /// Render a reference cell at `(x, y)` with `width`. Returns the height
-    /// drawn. Looks up the target out of `self.cells`, dispatches to the
+    /// drawn. Looks up the target out of `self.document.cells`, dispatches to the
     /// appropriate body's `render_view`, and wraps it in the embed visual
     /// (warm-tan dashed border + faint background tint + footer line).
     /// Dangling targets (deleted source) render as a placeholder line.
@@ -2067,7 +2020,7 @@ impl KeptApp {
         width: f32,
         focused: bool,
     ) -> f32 {
-        let target = match &self.cells[ref_idx].kind {
+        let target = match &self.document.cells[ref_idx].kind {
             CellKind::Reference(rc) => rc.target(),
             _ => return 0.0,
         };
@@ -2078,7 +2031,7 @@ impl KeptApp {
         let body_y = y + pad;
         let body_w = (width - 2.0 * inset).max(40.0);
 
-        let target_idx = self.cells.iter().position(|c| c.id == target.cell_id());
+        let target_idx = self.document.cells.iter().position(|c| c.id == target.cell_id());
 
         // Decide what kind of preview to render and refresh the cache on
         // the reference cell if the source's edited_at has changed.
@@ -2089,27 +2042,27 @@ impl KeptApp {
         let preview = match target_idx {
             None => {
                 // Target gone — clear any stale cache and show placeholder.
-                if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
+                if let CellKind::Reference(rc) = &mut self.document.cells[ref_idx].kind {
                     rc.install_cache(None, None);
                 }
                 PreviewKind::Placeholder("↗ [referenced cell deleted]")
             }
             Some(tidx) => {
-                let source_edited_at = self.cells[tidx].edited_at;
-                let is_stale = match &self.cells[ref_idx].kind {
+                let source_edited_at = self.document.cells[tidx].edited_at;
+                let is_stale = match &self.document.cells[ref_idx].kind {
                     CellKind::Reference(rc) => rc.cache_is_stale_for(Some(source_edited_at)),
                     _ => false,
                 };
                 if is_stale {
                     let new_cache = self.build_reference_cache(tidx, target, 0);
-                    if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
+                    if let CellKind::Reference(rc) = &mut self.document.cells[ref_idx].kind {
                         rc.install_cache(new_cache, Some(source_edited_at));
                     }
                 }
                 // If the build returned None (e.g., subtree's bullet missing),
                 // surface a placeholder. Otherwise tick the cache.
                 let has_cache = matches!(
-                    &self.cells[ref_idx].kind,
+                    &self.document.cells[ref_idx].kind,
                     CellKind::Reference(rc) if rc.cache_ref().is_some()
                 );
                 if has_cache {
@@ -2128,12 +2081,12 @@ impl KeptApp {
             ),
             PreviewKind::Cached => {
                 // Detach the cache from the host so the &mut borrow on
-                // `self.cells` ends, then route through
+                // `self.document.cells` ends, then route through
                 // `tick_embedded_cell` (which needs &self for the
                 // wrapper / placeholder helpers and recurses on
                 // envelope-outline caches). Re-attach afterwards.
                 let detached = if let CellKind::Reference(rc) =
-                    &mut self.cells[ref_idx].kind
+                    &mut self.document.cells[ref_idx].kind
                 {
                     rc.detach_cache()
                 } else {
@@ -2144,7 +2097,7 @@ impl KeptApp {
                     h = self.tick_embedded_cell(
                         canvas, &mut cache, body_x, body_y, body_w, focused,
                     );
-                    if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
+                    if let CellKind::Reference(rc) = &mut self.document.cells[ref_idx].kind {
                         rc.attach_cache(Some(cache));
                     }
                 }
@@ -2154,7 +2107,7 @@ impl KeptApp {
 
         let footer_text = match target_idx {
             Some(tidx) => {
-                let ts = self.cells[tidx].timestamp;
+                let ts = self.document.cells[tidx].timestamp;
                 format!("↗ originally {}", format_date_label(local_date_for_ms(ts)))
             }
             None => "↗ original deleted".to_string(),
@@ -2166,10 +2119,10 @@ impl KeptApp {
         // Record geometry on the embed: both on the inner ReferenceCell
         // (for symmetry / future use) and on the outer Cell (which is what
         // `find_cell_at` reads via Cell::x_origin/width/height).
-        if let CellKind::Reference(rc) = &mut self.cells[ref_idx].kind {
+        if let CellKind::Reference(rc) = &mut self.document.cells[ref_idx].kind {
             rc.set_view_geometry(x, y, width, total_h);
         }
-        self.cells[ref_idx].set_view_geometry(x, y, width, total_h);
+        self.document.cells[ref_idx].set_view_geometry(x, y, width, total_h);
 
         total_h
     }
@@ -2192,19 +2145,19 @@ impl KeptApp {
         show_caret: bool,
     ) -> f32 {
         // Mirror Cell::tick: drop an empty unfocused title.
-        let title_focused = self.cells[cell_idx].title_focused;
+        let title_focused = self.document.cells[cell_idx].title_focused;
         if !title_focused
-            && self.cells[cell_idx]
+            && self.document.cells[cell_idx]
                 .title()
                 .map(|t| t.is_empty())
                 .unwrap_or(false)
         {
-            self.cells[cell_idx].set_title(None);
+            self.document.cells[cell_idx].set_title(None);
         }
 
         let mut consumed = 0.0_f32;
         let mut body_y = y;
-        if let Some(title) = self.cells[cell_idx].title_mut() {
+        if let Some(title) = self.document.cells[cell_idx].title_mut() {
             let scale = title.font_scale();
             let pad = cell::TITLE_BODY_GAP * scale;
             let title_h = title.tick(
@@ -2223,12 +2176,12 @@ impl KeptApp {
         // Resolve the header target. Defensive — caller already
         // checked `has_reference_header` but tolerate the cell type
         // shifting under us between dispatch and render.
-        let target = match &self.cells[cell_idx].kind {
+        let target = match &self.document.cells[cell_idx].kind {
             CellKind::Outline(oc) => oc.reference_header().map(|h| h.target()),
             _ => None,
         };
         let Some(target) = target else {
-            return self.cells[cell_idx]
+            return self.document.cells[cell_idx]
                 .tick(canvas, x, y, width, focused, show_caret);
         };
 
@@ -2239,7 +2192,7 @@ impl KeptApp {
         let body_y_inner = body_y + pad;
         let body_w_inner = (width - 2.0 * inset).max(40.0);
 
-        let target_idx = self.cells.iter().position(|c| c.id == target.cell_id());
+        let target_idx = self.document.cells.iter().position(|c| c.id == target.cell_id());
 
         enum PreviewKind {
             Cached,
@@ -2247,7 +2200,7 @@ impl KeptApp {
         }
         let preview = match target_idx {
             None => {
-                if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+                if let CellKind::Outline(oc) = &mut self.document.cells[cell_idx].kind {
                     if let Some(h) = oc.reference_header_mut() {
                         h.install_cache(None, None);
                     }
@@ -2255,8 +2208,8 @@ impl KeptApp {
                 PreviewKind::Placeholder("↗ [referenced cell deleted]")
             }
             Some(tidx) => {
-                let source_edited_at = self.cells[tidx].edited_at;
-                let is_stale = match &self.cells[cell_idx].kind {
+                let source_edited_at = self.document.cells[tidx].edited_at;
+                let is_stale = match &self.document.cells[cell_idx].kind {
                     CellKind::Outline(oc) => oc
                         .reference_header()
                         .map(|h| h.cache_is_stale_for(Some(source_edited_at)))
@@ -2265,14 +2218,14 @@ impl KeptApp {
                 };
                 if is_stale {
                     let new_cache = self.build_reference_cache(tidx, target, 0);
-                    if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+                    if let CellKind::Outline(oc) = &mut self.document.cells[cell_idx].kind {
                         if let Some(h) = oc.reference_header_mut() {
                             h.install_cache(new_cache, Some(source_edited_at));
                         }
                     }
                 }
                 let has_cache = matches!(
-                    &self.cells[cell_idx].kind,
+                    &self.document.cells[cell_idx].kind,
                     CellKind::Outline(oc)
                         if oc.reference_header()
                             .and_then(|h| h.cache_ref())
@@ -2302,7 +2255,7 @@ impl KeptApp {
                 // nested envelope inside this header renders
                 // recursively. Re-attach afterwards.
                 let detached = if let CellKind::Outline(oc) =
-                    &mut self.cells[cell_idx].kind
+                    &mut self.document.cells[cell_idx].kind
                 {
                     oc.reference_header_mut()
                         .and_then(|h| h.detach_cache())
@@ -2319,7 +2272,7 @@ impl KeptApp {
                         body_w_inner,
                         focused,
                     );
-                    if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+                    if let CellKind::Outline(oc) = &mut self.document.cells[cell_idx].kind {
                         if let Some(href) = oc.reference_header_mut() {
                             href.attach_cache(Some(cache));
                         }
@@ -2331,7 +2284,7 @@ impl KeptApp {
 
         let footer_text = match target_idx {
             Some(tidx) => {
-                let ts = self.cells[tidx].timestamp;
+                let ts = self.document.cells[tidx].timestamp;
                 format!("↗ originally {}", format_date_label(local_date_for_ms(ts)))
             }
             None => "↗ original deleted".to_string(),
@@ -2349,7 +2302,7 @@ impl KeptApp {
 
         // Record header band for hit-testing (clicks inside route to
         // the cache cell).
-        if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+        if let CellKind::Outline(oc) = &mut self.document.cells[cell_idx].kind {
             oc.set_reference_header_geometry(body_y, header_total_h);
         }
 
@@ -2360,7 +2313,7 @@ impl KeptApp {
         let body_focused = focused && !title_focused;
         let body_caret = show_caret && !title_focused;
         let show_inactive = self.show_inactive_cells;
-        let bullets_h = if let CellKind::Outline(oc) = &mut self.cells[cell_idx].kind {
+        let bullets_h = if let CellKind::Outline(oc) = &mut self.document.cells[cell_idx].kind {
             oc.set_show_inactive(show_inactive);
             oc.tick(canvas, x, after_header_y, width, body_focused, body_caret)
         } else {
@@ -2368,7 +2321,7 @@ impl KeptApp {
         };
 
         let total_h = consumed + bullets_h;
-        self.cells[cell_idx].set_view_geometry(x, y, width, total_h);
+        self.document.cells[cell_idx].set_view_geometry(x, y, width, total_h);
         total_h
     }
 
@@ -2395,7 +2348,7 @@ impl KeptApp {
         if depth >= MAX_EMBED_DEPTH {
             return None;
         }
-        let source = &self.cells[target_idx];
+        let source = &self.document.cells[target_idx];
         let scale = self.font_scale;
         let typeface = &self.typeface;
         let mut cache = match target {
@@ -2412,7 +2365,7 @@ impl KeptApp {
                     source.edited_at,
                     source.context_hint_id,
                     // Cache cells are internal to the embed render; they
-                    // never enter `self.cells`, so the active flag here
+                    // never enter `self.document.cells`, so the active flag here
                     // is unused for visibility. Default to true so the
                     // embed renders normally regardless of source's
                     // active state (embeds always render in v1).
@@ -2465,11 +2418,12 @@ impl KeptApp {
             if let Some(h) = oc.reference_header_mut() {
                 let nested_target = h.target();
                 let nested_idx = self
+                    .document
                     .cells
                     .iter()
                     .position(|c| c.id == nested_target.cell_id());
                 if let Some(ni) = nested_idx {
-                    let nested_edited_at = self.cells[ni].edited_at;
+                    let nested_edited_at = self.document.cells[ni].edited_at;
                     let nested_cache =
                         self.build_reference_cache(ni, nested_target, depth + 1);
                     h.install_cache(nested_cache, Some(nested_edited_at));
@@ -2672,10 +2626,10 @@ impl KeptApp {
     /// Debounced persistence flush. Called once per frame from `tick`,
     /// outside the per-pane loop (dirty cells are global, not per-pane).
     fn maybe_flush_persistence(&mut self) {
-        let any_dirty = !self.dirty_cells.is_empty()
-            || !self.pending_deletes.is_empty()
-            || !self.dirty_contexts.is_empty()
-            || !self.pending_context_deletes.is_empty();
+        let any_dirty = !self.document.dirty_cells.is_empty()
+            || !self.document.pending_deletes.is_empty()
+            || !self.document.dirty_contexts.is_empty()
+            || !self.document.pending_context_deletes.is_empty();
         if !any_dirty {
             return;
         }
@@ -2706,7 +2660,7 @@ impl KeptApp {
         }
         let doc_y = y + self.scroll_y;
         let ctx = self.match_context();
-        for cell in &self.cells {
+        for cell in &self.document.cells {
             if !self.is_visible_for_view(cell, &ctx) {
                 continue;
             }
@@ -2717,47 +2671,30 @@ impl KeptApp {
         false
     }
 
-    // ----- cell access helpers -----
+    // ----- cell access helpers (thin proxies to `Document`) -----
 
     fn cell_idx(&self, id: Uuid) -> Option<usize> {
-        self.cells.iter().position(|c| c.id == id)
+        self.document.cell_idx(id)
     }
 
     fn cell(&self, id: Uuid) -> Option<&Cell> {
-        self.cells.iter().find(|c| c.id == id)
+        self.document.cell(id)
     }
 
     fn cell_mut(&mut self, id: Uuid) -> Option<&mut Cell> {
-        self.cells.iter_mut().find(|c| c.id == id)
+        self.document.cell_mut(id)
     }
 
     /// Reload the entity caches from the DB. Called after every
-    /// `save_cell` / `delete_cell` so the in-memory state stays in lockstep
-    /// with the persistence layer's authoritative entity table.
+    /// `save_cell` / `delete_cell` so the in-memory state stays in
+    /// lockstep with the persistence layer's authoritative entity
+    /// table. Thin proxy — see `EntityCache::refresh`.
     fn refresh_entities(&mut self) {
-        let Some(db) = self.db.as_ref() else { return };
-        match db.all_entities() {
-            Ok(rows) => self.entities = rows,
-            Err(e) => eprintln!("kept: refresh_entities failed: {e}"),
-        }
-        match db.entity_alias_index() {
-            Ok(rows) => self.entity_alias_index = rows,
-            Err(e) => eprintln!("kept: entity_alias_index reload failed: {e}"),
-        }
-        match db.cell_to_entity_index() {
-            Ok(rows) => self.cell_to_entity = rows.into_iter().collect(),
-            Err(e) => eprintln!("kept: cell_to_entity_index reload failed: {e}"),
-        }
-        self.entity_title_fallback = self
-            .entities
-            .iter()
-            .filter(|e| e.primary_cell_id.is_some())
-            .map(|e| (e.id, normalize_title_for_fallback(&e.display_name)))
-            .collect();
+        self.entities.refresh(self.db.as_ref());
     }
 
     fn writable_context_id(&self) -> Option<Uuid> {
-        self.contexts
+        self.document.contexts
             .iter()
             .filter(|c| c.end_time.is_none())
             .max_by_key(|c| c.start_time)
@@ -2799,11 +2736,12 @@ impl KeptApp {
         match self.view.view_kind {
             ViewKind::Context(id) => {
                 let cell_ts = cell.timestamp;
-                self.contexts.iter().find(|c| c.id == id).map_or(false, |c| {
+                self.document.contexts.iter().find(|c| c.id == id).map_or(false, |c| {
                     cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
                 })
             }
             ViewKind::Entity(eid) => self
+                .entities
                 .entities
                 .iter()
                 .find(|e| e.id == eid)
@@ -2831,7 +2769,7 @@ impl KeptApp {
     /// debounced save fires.
     fn delete_tag_globally(&mut self, name: &str) {
         let mut affected: Vec<Uuid> = Vec::new();
-        for cell in &mut self.cells {
+        for cell in &mut self.document.cells {
             if cell.remove_tags_named(name) {
                 affected.push(cell.id);
             }
@@ -2850,7 +2788,7 @@ impl KeptApp {
 
     fn all_tag_names_in_memory(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for cell in &self.cells {
+        for cell in &self.document.cells {
             for name in cell.all_tag_names() {
                 if !name.is_empty() && !out.contains(&name) {
                     out.push(name);
@@ -2869,13 +2807,13 @@ impl KeptApp {
         let today = local_date_for_ms(now_epoch_ms());
         let person_targets = query::resolve_persons(
             &self.view.ast.include.entities,
-            &self.entity_alias_index,
-            &self.entity_title_fallback,
+            &self.entities.alias_index,
+            &self.entities.title_fallback,
         );
         let person_excludes = query::resolve_persons(
             &self.view.ast.exclude.entities,
-            &self.entity_alias_index,
-            &self.entity_title_fallback,
+            &self.entities.alias_index,
+            &self.entities.title_fallback,
         );
         query::MatchContext {
             today,
@@ -2887,7 +2825,7 @@ impl KeptApp {
     /// Find the context whose window contains `cell_ts`. Used for rendering
     /// per-context section headers in Date view.
     fn context_for_timestamp(&self, cell_ts: i64) -> Option<&Context> {
-        self.contexts.iter().find(|c| {
+        self.document.contexts.iter().find(|c| {
             cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
         })
     }
@@ -2895,7 +2833,7 @@ impl KeptApp {
     /// Timestamp (epoch ms) of the most recently created cell anywhere in the
     /// stream, used for idle detection. None if no cells exist.
     fn last_cell_create_ms(&self) -> Option<i64> {
-        self.cells.iter().map(|c| c.timestamp).max()
+        self.document.cells.iter().map(|c| c.timestamp).max()
     }
 
     /// Close the writable (open) context and open a new one whose window
@@ -2914,6 +2852,7 @@ impl KeptApp {
         // Empty writable: bump its start_time instead of creating a new context.
         if !self.writable_has_cells() {
             let prev_start = self
+                .document
                 .contexts
                 .iter()
                 .find(|c| c.id == writable)
@@ -2922,10 +2861,10 @@ impl KeptApp {
             if prev_start == now {
                 return;
             }
-            if let Some(ctx) = self.contexts.iter_mut().find(|c| c.id == writable) {
+            if let Some(ctx) = self.document.contexts.iter_mut().find(|c| c.id == writable) {
                 ctx.start_time = now;
             }
-            self.dirty_contexts.insert(writable);
+            self.document.mark_context_dirty(writable);
             // View update: Context view follows to the bumped one; Date and
             // tag views keep their filters/time-bound unchanged.
             let new_view = rotate_view_to(&prev_view, writable);
@@ -2943,6 +2882,7 @@ impl KeptApp {
         }
 
         let prev_end_time = self
+            .document
             .contexts
             .iter()
             .find(|c| c.id == writable)
@@ -2978,12 +2918,12 @@ impl KeptApp {
         let Some(id) = self.writable_context_id() else {
             return false;
         };
-        let Some(ctx) = self.contexts.iter().find(|c| c.id == id) else {
+        let Some(ctx) = self.document.contexts.iter().find(|c| c.id == id) else {
             return false;
         };
         let start = ctx.start_time;
         let end = ctx.end_time;
-        self.cells
+        self.document.cells
             .iter()
             .any(|c| c.timestamp >= start && end.map(|e| c.timestamp < e).unwrap_or(true))
     }
@@ -2997,16 +2937,16 @@ impl KeptApp {
         new_context: &Context,
         new_view: Query,
     ) {
-        if let Some(ctx) = self.contexts.iter_mut().find(|c| c.id == closed_id) {
+        if let Some(ctx) = self.document.contexts.iter_mut().find(|c| c.id == closed_id) {
             ctx.end_time = Some(new_end_time);
         }
-        self.dirty_contexts.insert(closed_id);
+        self.document.mark_context_dirty(closed_id);
         let new_id = new_context.id;
-        if !self.contexts.iter().any(|c| c.id == new_id) {
-            self.contexts.push(new_context.clone());
+        if !self.document.contexts.iter().any(|c| c.id == new_id) {
+            self.document.contexts.push(new_context.clone());
         }
-        self.dirty_contexts.insert(new_id);
-        self.pending_context_deletes.remove(&new_id);
+        self.document.mark_context_dirty(new_id);
+        self.document.pending_context_deletes.remove(&new_id);
         self.view = new_view;
         self.focused = None;
         self.editing = false;
@@ -3026,13 +2966,11 @@ impl KeptApp {
         pre_focused: Option<Uuid>,
         pre_scroll_y: f32,
     ) {
-        if let Some(ctx) = self.contexts.iter_mut().find(|c| c.id == closed_id) {
+        if let Some(ctx) = self.document.contexts.iter_mut().find(|c| c.id == closed_id) {
             ctx.end_time = prev_end_time;
         }
-        self.dirty_contexts.insert(closed_id);
-        self.contexts.retain(|c| c.id != new_context_id);
-        self.dirty_contexts.remove(&new_context_id);
-        self.pending_context_deletes.insert(new_context_id);
+        self.document.mark_context_dirty(closed_id);
+        self.document.queue_context_delete(new_context_id);
         self.view = prev_view;
         self.focused = pre_focused;
         self.editing = false;
@@ -3045,7 +2983,7 @@ impl KeptApp {
     /// viewed one. None when not in Context view.
     fn prev_context(&self) -> Option<Uuid> {
         let current = self.view.context_view()?;
-        let mut sorted: Vec<&Context> = self.contexts.iter().collect();
+        let mut sorted: Vec<&Context> = self.document.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
         if pos == 0 {
@@ -3058,7 +2996,7 @@ impl KeptApp {
     /// Next context (newer `start_time`). None when not in Context view.
     fn next_context(&self) -> Option<Uuid> {
         let current = self.view.context_view()?;
-        let mut sorted: Vec<&Context> = self.contexts.iter().collect();
+        let mut sorted: Vec<&Context> = self.document.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
         sorted.get(pos + 1).map(|c| c.id)
@@ -3067,7 +3005,7 @@ impl KeptApp {
     fn context_has_cells(&self, ctx: &Context) -> bool {
         let start = ctx.start_time;
         let end = ctx.end_time;
-        self.cells
+        self.document.cells
             .iter()
             .any(|c| c.timestamp >= start && end.map(|e| c.timestamp < e).unwrap_or(true))
     }
@@ -3077,7 +3015,7 @@ impl KeptApp {
     /// doesn't trap the cursor.
     fn next_context_with_cells(&self) -> Option<Uuid> {
         let current = self.view.context_view()?;
-        let mut sorted: Vec<&Context> = self.contexts.iter().collect();
+        let mut sorted: Vec<&Context> = self.document.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
         sorted
@@ -3090,7 +3028,7 @@ impl KeptApp {
     /// Walk contexts backward in time, skipping empties.
     fn prev_context_with_cells(&self) -> Option<Uuid> {
         let current = self.view.context_view()?;
-        let mut sorted: Vec<&Context> = self.contexts.iter().collect();
+        let mut sorted: Vec<&Context> = self.document.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
         sorted
@@ -3113,6 +3051,7 @@ impl KeptApp {
         let today = local_date_for_ms(now_epoch_ms());
         if let Some(id) = self.view.context_view() {
             let active_is_open = self
+                .document
                 .contexts
                 .iter()
                 .find(|c| c.id == id)
@@ -3138,7 +3077,7 @@ impl KeptApp {
         if self.view == next {
             return false;
         }
-        if !self.contexts.iter().any(|c| c.id == id) {
+        if !self.document.contexts.iter().any(|c| c.id == id) {
             return false;
         }
         self.view = next;
@@ -3277,6 +3216,7 @@ impl KeptApp {
     fn visible_cell_ids(&self) -> Vec<Uuid> {
         let ctx = self.match_context();
         let mut ids: Vec<Uuid> = self
+            .document
             .cells
             .iter()
             .filter(|c| self.is_visible_for_view(c, &ctx))
@@ -3286,28 +3226,20 @@ impl KeptApp {
         ids
     }
 
-    /// Insert a cell into the stream maintaining ascending timestamp order.
+    /// Insert a cell into the stream maintaining ascending timestamp
+    /// order. Thin proxy to `Document::insert_cell_sorted`, which
+    /// auto-dirties the new cell (S4: a freshly inserted cell needs
+    /// to reach disk on the next flush).
     fn insert_cell_sorted(&mut self, cell: Cell) {
-        let pos = self
-            .cells
-            .binary_search_by(|c| c.timestamp.cmp(&cell.timestamp).then(c.id.cmp(&cell.id)));
-        let at = match pos {
-            Ok(i) => i,
-            Err(i) => i,
-        };
-        self.cells.insert(at, cell);
+        self.document.insert_cell_sorted(cell);
     }
 
     fn mark_cell_dirty(&mut self, id: Uuid) {
-        self.dirty_cells.insert(id);
+        self.document.mark_cell_dirty(id);
     }
 
     fn touch_cell(&mut self, id: Uuid) {
-        let now = now_epoch_ms();
-        if let Some(cell) = self.cell_mut(id) {
-            cell.edited_at = now;
-        }
-        self.mark_cell_dirty(id);
+        self.document.touch_cell(id);
     }
 
     /// Previous visible cell relative to `id` in timestamp order. None if
@@ -3335,18 +3267,18 @@ impl KeptApp {
         let editing_snapshot = self.editing;
         let focused_snapshot = self.focused;
         let Some(db) = self.db.as_mut() else {
-            self.dirty_cells.clear();
-            self.pending_deletes.clear();
-            self.dirty_contexts.clear();
-            self.pending_context_deletes.clear();
+            self.document.dirty_cells.clear();
+            self.document.pending_deletes.clear();
+            self.document.dirty_contexts.clear();
+            self.document.pending_context_deletes.clear();
             return;
         };
-        for id in self.pending_deletes.drain() {
+        for id in self.document.pending_deletes.drain() {
             if let Err(e) = db.delete_cell(id) {
                 eprintln!("kept: delete_cell failed for {id}: {e}");
             }
         }
-        let dirty: Vec<Uuid> = self.dirty_cells.drain().collect();
+        let dirty: Vec<Uuid> = self.document.dirty_cells.drain().collect();
         for id in dirty {
             // Defer this cell's save while a title `#tag` is mid-edit
             // (popup-driven typing OR plain in-place rename). Otherwise
@@ -3363,9 +3295,9 @@ impl KeptApp {
             // — otherwise the dirty cell would languish until something
             // else broke the predicate (re-focus, click elsewhere, …).
             let actively_editing = editing_snapshot && focused_snapshot == Some(id);
-            if let Some(cell) = self.cells.iter().find(|c| c.id == id) {
+            if let Some(cell) = self.document.cells.iter().find(|c| c.id == id) {
                 if actively_editing && cell.caret_in_in_progress_tag() {
-                    self.dirty_cells.insert(id);
+                    self.document.dirty_cells.insert(id);
                     continue;
                 }
                 if let Err(e) = db.save_cell(cell) {
@@ -3373,14 +3305,14 @@ impl KeptApp {
                 }
             }
         }
-        for id in self.pending_context_deletes.drain() {
+        for id in self.document.pending_context_deletes.drain() {
             if let Err(e) = db.delete_context(id) {
                 eprintln!("kept: delete_context failed for {id}: {e}");
             }
         }
-        let ctx_dirty: Vec<Uuid> = self.dirty_contexts.drain().collect();
+        let ctx_dirty: Vec<Uuid> = self.document.dirty_contexts.drain().collect();
         for id in ctx_dirty {
-            if let Some(ctx) = self.contexts.iter().find(|c| c.id == id) {
+            if let Some(ctx) = self.document.contexts.iter().find(|c| c.id == id) {
                 if let Err(e) = db.save_context(&context_ref(ctx)) {
                     eprintln!("kept: save_context failed for {id}: {e}");
                 }
@@ -3397,7 +3329,7 @@ impl KeptApp {
             return false;
         }
         self.font_scale = s;
-        for cell in &mut self.cells {
+        for cell in &mut self.document.cells {
             cell.set_font_scale(s);
         }
         self.pending_caret_scroll = true;
@@ -3877,18 +3809,18 @@ impl KeptApp {
         // In focus mode only the focused cell is visible — everything else
         // is suppressed regardless of the current view's filters.
         let visible: Vec<bool> = if self.focus_mode {
-            self.cells
+            self.document.cells
                 .iter()
                 .map(|c| Some(c.id) == focused_id)
                 .collect()
         } else {
             let match_ctx = self.match_context();
-            self.cells
+            self.document.cells
                 .iter()
                 .map(|c| self.is_visible_for_view(c, &match_ctx))
                 .collect()
         };
-        // Headers are aligned to self.cells indices but computed in DISPLAY
+        // Headers are aligned to self.document.cells indices but computed in DISPLAY
         // order (descending) so a header lands above the first cell of each
         // group as the user scrolls top-down.
         //
@@ -3922,15 +3854,15 @@ impl KeptApp {
             HeaderMode::ByDate
         };
         let headers: Vec<Option<String>> = if header_mode == HeaderMode::None {
-            vec![None; self.cells.len()]
+            vec![None; self.document.cells.len()]
         } else {
-            let mut hs: Vec<Option<String>> = vec![None; self.cells.len()];
+            let mut hs: Vec<Option<String>> = vec![None; self.document.cells.len()];
             let mut last_label: Option<String> = None;
-            for i in (0..self.cells.len()).rev() {
+            for i in (0..self.document.cells.len()).rev() {
                 if !visible[i] {
                     continue;
                 }
-                let cell = &self.cells[i];
+                let cell = &self.document.cells[i];
                 let label: String = match header_mode {
                     HeaderMode::ByContext => self
                         .context_for_timestamp(cell.timestamp)
@@ -3958,8 +3890,8 @@ impl KeptApp {
         let header_pad_top = CONTEXT_HEADER_PAD_TOP * scale;
 
         // Render cells newest-first (descending) — index walked in reverse so
-        // self.cells (asc) iterates from end to start.
-        let total_cells = self.cells.len();
+        // self.document.cells (asc) iterates from end to start.
+        let total_cells = self.document.cells.len();
         for i in (0..total_cells).rev() {
             if !visible[i] {
                 continue;
@@ -3991,10 +3923,10 @@ impl KeptApp {
             }
             let cell_x = cells_left;
             let cell_y = y;
-            let cell_id = self.cells[i].id;
-            let is_reference = matches!(self.cells[i].kind, CellKind::Reference(_));
+            let cell_id = self.document.cells[i].id;
+            let is_reference = matches!(self.document.cells[i].kind, CellKind::Reference(_));
             let is_envelope_outline = matches!(
-                &self.cells[i].kind,
+                &self.document.cells[i].kind,
                 CellKind::Outline(oc) if oc.has_reference_header()
             );
             let cell_is_focused =
@@ -4012,7 +3944,7 @@ impl KeptApp {
             // and any embed chrome — in an alpha layer so the
             // dim treatment composites uniformly without
             // threading a paint color through every primitive.
-            let cell_inactive = !self.cells[i].active;
+            let cell_inactive = !self.document.cells[i].active;
             if cell_inactive {
                 canvas.save_layer_alpha(None, cell::INACTIVE_ALPHA as u32);
             }
@@ -4051,11 +3983,11 @@ impl KeptApp {
                 // focused cells so interaction always sees the
                 // full outline.
                 // Clone the include-tag list so we can take a
-                // mutable borrow on `self.cells` without keeping
+                // mutable borrow on `self.document.cells` without keeping
                 // an outstanding immutable borrow on `self.view`.
                 let include_tags = self.view.ast.include.tags.clone();
                 let show_inactive = self.show_inactive_cells;
-                let cell = &mut self.cells[i];
+                let cell = &mut self.document.cells[i];
                 let filter = compute_outline_bullet_filter(
                     cell,
                     &include_tags,
@@ -4876,7 +4808,7 @@ impl KeptApp {
         mouse_doc_x: f32,
         mouse_doc_y: f32,
     ) -> f32 {
-        let entity = match self.entities.iter().find(|e| e.id == entity_id).cloned() {
+        let entity = match self.entities.entities.iter().find(|e| e.id == entity_id).cloned() {
             Some(e) => e,
             None => {
                 let font = Font::from_typeface(&self.typeface, ENTITY_META_FONT_SIZE * scale);
@@ -4913,7 +4845,8 @@ impl KeptApp {
         // Metadata: "<kind> · @<alias>". Alias may be missing for very old
         // entity rows or fresh inserts; render just the kind in that case.
         let alias = self
-            .entity_alias_index
+            .entities
+            .alias_index
             .iter()
             .find(|(_, eid, _)| *eid == entity.id)
             .map(|(a, _, _)| a.clone());
@@ -4988,10 +4921,10 @@ impl KeptApp {
 
         // Backing-cell body.
         if let Some(pid) = entity.primary_cell_id {
-            if let Some(cell_idx) = self.cells.iter().position(|c| c.id == pid) {
+            if let Some(cell_idx) = self.document.cells.iter().position(|c| c.id == pid) {
                 let focused_id = self.focused;
                 let editing = self.editing;
-                let cell = &mut self.cells[cell_idx];
+                let cell = &mut self.document.cells[cell_idx];
                 let cell_is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
                 let render_focused = cell_is_focused;
                 let show_caret = cell_is_focused && editing;
@@ -5087,6 +5020,7 @@ impl KeptApp {
         let kept_url = format!("kept://{}", entity_id);
         let primary = entity.primary_cell_id;
         let mut mentions: Vec<(usize, i64)> = self
+            .document
             .cells
             .iter()
             .enumerate()
@@ -5115,8 +5049,8 @@ impl KeptApp {
             let body_w = (content_width - 2.0 * inset).max(40.0);
 
             for (target_idx, _) in mentions {
-                let target_cell_id = self.cells[target_idx].id;
-                let target_ts = self.cells[target_idx].timestamp;
+                let target_cell_id = self.document.cells[target_idx].id;
+                let target_ts = self.document.cells[target_idx].timestamp;
                 // Fresh cache per frame — no selection persistence on the
                 // entity page (acceptable for v1; click-to-navigate covers
                 // the main interaction).
@@ -5239,6 +5173,7 @@ impl KeptApp {
         // they stay in alphabetical order but render in muted color.
         let show_inactive = self.show_inactive;
         let mut people: Vec<(String, Uuid, bool)> = self
+            .entities
             .entities
             .iter()
             .filter(|e| e.kind == PERSON_TAG)
@@ -5383,6 +5318,7 @@ impl KeptApp {
         self.people_add = None;
         let display_name = self
             .entities
+            .entities
             .iter()
             .find(|e| e.id == entity_id)
             .map(|e| e.display_name.clone())
@@ -5408,7 +5344,7 @@ impl KeptApp {
         let entity_id = rs.entity_id;
 
         // Snapshot pre-rename state for undo.
-        let entity_pre = self.entities.iter().find(|e| e.id == entity_id).cloned();
+        let entity_pre = self.entities.entities.iter().find(|e| e.id == entity_id).cloned();
         let Some(entity_pre) = entity_pre else { return };
         let prev_name = entity_pre.display_name.clone();
         if prev_name == new_text {
@@ -5460,7 +5396,7 @@ impl KeptApp {
     fn count_entity_references(&self, entity_id: Uuid) -> usize {
         let target = format!("kept://{}", entity_id);
         let mut n = 0usize;
-        for cell in &self.cells {
+        for cell in &self.document.cells {
             for url in cell.all_link_urls() {
                 if url == target {
                     n += 1;
@@ -5476,6 +5412,7 @@ impl KeptApp {
     /// subsequent click or Esc.
     fn open_people_context_menu(&mut self, entity_id: Uuid, x: f32, y: f32) {
         let primary = self
+            .entities
             .entities
             .iter()
             .find(|e| e.id == entity_id)
@@ -5497,6 +5434,7 @@ impl KeptApp {
     /// when the entity is missing.
     fn toggle_entity_active(&mut self, entity_id: Uuid) {
         let prev = self
+            .entities
             .entities
             .iter()
             .find(|e| e.id == entity_id)
@@ -5529,9 +5467,9 @@ impl KeptApp {
         let Some(idx) = self.cell_idx(cell_id) else {
             return false;
         };
-        let prev = self.cells[idx].active;
+        let prev = self.document.cells[idx].active;
         let new = !prev;
-        self.cells[idx].active = new;
+        self.document.cells[idx].active = new;
         self.mark_cell_dirty(cell_id);
         self.touch_cell(cell_id);
         self.undo_stack.push(UndoOp::SetCellActive {
@@ -5555,7 +5493,7 @@ impl KeptApp {
         let Some(idx) = self.cell_idx(cell_id) else {
             return false;
         };
-        let prev = match &self.cells[idx].kind {
+        let prev = match &self.document.cells[idx].kind {
             CellKind::Outline(oc) => oc
                 .bullets()
                 .iter()
@@ -5567,7 +5505,7 @@ impl KeptApp {
             return false;
         };
         let new = !prev;
-        let mutated = match &mut self.cells[idx].kind {
+        let mutated = match &mut self.document.cells[idx].kind {
             CellKind::Outline(oc) => oc.set_bullet_active(bullet_id, new),
             _ => false,
         };
@@ -5596,6 +5534,7 @@ impl KeptApp {
     /// faithfully.
     fn delete_person_entity(&mut self, entity_id: Uuid) {
         let snapshot = self
+            .entities
             .entities
             .iter()
             .find(|e| e.id == entity_id)
@@ -5654,6 +5593,7 @@ impl KeptApp {
         // Pull the just-inserted row's `created_at` so undo→redo
         // round-trips preserve the stable timestamp.
         let created_at = self
+            .entities
             .entities
             .iter()
             .find(|e| e.id == new_id)
@@ -5718,11 +5658,7 @@ impl KeptApp {
                 pre_focused,
                 ..
             } => {
-                if let Some(idx) = self.cell_idx(*cell_id) {
-                    self.cells.remove(idx);
-                }
-                self.pending_deletes.insert(*cell_id);
-                self.dirty_cells.remove(cell_id);
+                self.document.queue_cell_delete(*cell_id);
                 self.focused = *pre_focused;
             }
             UndoOp::DeleteCell {
@@ -5734,8 +5670,8 @@ impl KeptApp {
             } => {
                 let cell = Cell::from_snapshot(*cell_id, snapshot.clone(), &self.typeface);
                 self.insert_cell_sorted(cell);
-                self.dirty_cells.insert(*cell_id);
-                self.pending_deletes.remove(cell_id);
+                self.document.dirty_cells.insert(*cell_id);
+                self.document.pending_deletes.remove(cell_id);
                 if let Some(se) = side_effect {
                     self.reverse_context_side_effect(se);
                 }
@@ -5766,10 +5702,10 @@ impl KeptApp {
                 prev_view,
                 ..
             } => {
-                if let Some(c) = self.contexts.iter_mut().find(|c| c.id == *context_id) {
+                if let Some(c) = self.document.contexts.iter_mut().find(|c| c.id == *context_id) {
                     c.start_time = *prev_start;
                 }
-                self.dirty_contexts.insert(*context_id);
+                self.document.mark_context_dirty(*context_id);
                 self.view = prev_view.clone();
                 bump_focused_edited = false;
             }
@@ -5832,7 +5768,7 @@ impl KeptApp {
             }
             UndoOp::SetCellActive { cell_id, prev, .. } => {
                 if let Some(idx) = self.cell_idx(*cell_id) {
-                    self.cells[idx].active = *prev;
+                    self.document.cells[idx].active = *prev;
                     self.mark_cell_dirty(*cell_id);
                     self.touch_cell(*cell_id);
                 }
@@ -5845,7 +5781,7 @@ impl KeptApp {
                 ..
             } => {
                 if let Some(idx) = self.cell_idx(*cell_id) {
-                    if let CellKind::Outline(oc) = &mut self.cells[idx].kind {
+                    if let CellKind::Outline(oc) = &mut self.document.cells[idx].kind {
                         oc.set_bullet_active(*bullet_id, *prev);
                     }
                     self.mark_cell_dirty(*cell_id);
@@ -5869,9 +5805,9 @@ impl KeptApp {
                         pre.clone(),
                         &self.typeface,
                     );
-                    self.cells[idx] = cell;
+                    self.document.cells[idx] = cell;
                 }
-                self.dirty_cells.insert(*cell_id);
+                self.document.dirty_cells.insert(*cell_id);
                 self.focused = *pre_focused;
             }
             UndoOp::Unwrap {
@@ -5889,9 +5825,9 @@ impl KeptApp {
                         pre.clone(),
                         &self.typeface,
                     );
-                    self.cells[idx] = cell;
+                    self.document.cells[idx] = cell;
                 }
-                self.dirty_cells.insert(*cell_id);
+                self.document.dirty_cells.insert(*cell_id);
                 self.focused = *pre_focused;
             }
         }
@@ -5926,8 +5862,8 @@ impl KeptApp {
             } => {
                 let cell = Cell::from_snapshot(*cell_id, snapshot.clone(), &self.typeface);
                 self.insert_cell_sorted(cell);
-                self.dirty_cells.insert(*cell_id);
-                self.pending_deletes.remove(cell_id);
+                self.document.dirty_cells.insert(*cell_id);
+                self.document.pending_deletes.remove(cell_id);
                 self.focused = Some(*cell_id);
             }
             UndoOp::DeleteCell {
@@ -5936,11 +5872,7 @@ impl KeptApp {
                 side_effect,
                 ..
             } => {
-                if let Some(idx) = self.cell_idx(*cell_id) {
-                    self.cells.remove(idx);
-                }
-                self.pending_deletes.insert(*cell_id);
-                self.dirty_cells.remove(cell_id);
+                self.document.queue_cell_delete(*cell_id);
                 if let Some(se) = side_effect {
                     self.apply_context_side_effect(se);
                 }
@@ -5962,10 +5894,10 @@ impl KeptApp {
                 new_view,
                 ..
             } => {
-                if let Some(c) = self.contexts.iter_mut().find(|c| c.id == *context_id) {
+                if let Some(c) = self.document.contexts.iter_mut().find(|c| c.id == *context_id) {
                     c.start_time = *new_start;
                 }
-                self.dirty_contexts.insert(*context_id);
+                self.document.mark_context_dirty(*context_id);
                 self.view = new_view.clone();
                 bump_focused_edited = false;
             }
@@ -6032,7 +5964,7 @@ impl KeptApp {
             }
             UndoOp::SetCellActive { cell_id, new, .. } => {
                 if let Some(idx) = self.cell_idx(*cell_id) {
-                    self.cells[idx].active = *new;
+                    self.document.cells[idx].active = *new;
                     self.mark_cell_dirty(*cell_id);
                     self.touch_cell(*cell_id);
                 }
@@ -6045,7 +5977,7 @@ impl KeptApp {
                 ..
             } => {
                 if let Some(idx) = self.cell_idx(*cell_id) {
-                    if let CellKind::Outline(oc) = &mut self.cells[idx].kind {
+                    if let CellKind::Outline(oc) = &mut self.document.cells[idx].kind {
                         oc.set_bullet_active(*bullet_id, *new);
                     }
                     self.mark_cell_dirty(*cell_id);
@@ -6060,9 +5992,9 @@ impl KeptApp {
                         post.clone(),
                         &self.typeface,
                     );
-                    self.cells[idx] = cell;
+                    self.document.cells[idx] = cell;
                 }
-                self.dirty_cells.insert(*cell_id);
+                self.document.dirty_cells.insert(*cell_id);
                 self.focused = Some(*cell_id);
             }
             UndoOp::Unwrap { cell_id, post, .. } => {
@@ -6072,9 +6004,9 @@ impl KeptApp {
                         post.clone(),
                         &self.typeface,
                     );
-                    self.cells[idx] = cell;
+                    self.document.cells[idx] = cell;
                 }
-                self.dirty_cells.insert(*cell_id);
+                self.document.dirty_cells.insert(*cell_id);
                 self.focused = Some(*cell_id);
             }
         }
@@ -6103,6 +6035,7 @@ impl KeptApp {
 
         // Find the context whose window contains this cell (by timestamp).
         let containing_ctx: Option<Context> = self
+            .document
             .contexts
             .iter()
             .find(|c| {
@@ -6113,6 +6046,7 @@ impl KeptApp {
         // Will deleting this cell leave its containing context empty?
         let side_effect = if let Some(ctx) = containing_ctx {
             let others_in_ctx = self
+                .document
                 .cells
                 .iter()
                 .filter(|c| c.id != id)
@@ -6127,6 +6061,7 @@ impl KeptApp {
                     // become active; if none exists, skip the side effect to
                     // preserve the "always one open context" invariant.
                     let new_active = self
+                        .document
                         .contexts
                         .iter()
                         .filter(|c| c.id != ctx.id && c.end_time.is_none())
@@ -6174,10 +6109,10 @@ impl KeptApp {
 
         // Remove the cell.
         if let Some(idx) = self.cell_idx(id) {
-            self.cells.remove(idx);
+            self.document.cells.remove(idx);
         }
-        self.pending_deletes.insert(id);
-        self.dirty_cells.remove(&id);
+        self.document.pending_deletes.insert(id);
+        self.document.dirty_cells.remove(&id);
 
         // Apply the context-level side effect.
         if let Some(se) = &side_effect {
@@ -6213,9 +6148,9 @@ impl KeptApp {
             ContextSideEffect::ContextRemoved {
                 context, new_view, ..
             } => {
-                self.contexts.retain(|c| c.id != context.id);
-                self.dirty_contexts.remove(&context.id);
-                self.pending_context_deletes.insert(context.id);
+                self.document.contexts.retain(|c| c.id != context.id);
+                self.document.dirty_contexts.remove(&context.id);
+                self.document.pending_context_deletes.insert(context.id);
                 self.view = new_view.clone();
             }
             ContextSideEffect::StartReset {
@@ -6223,10 +6158,10 @@ impl KeptApp {
                 new_start,
                 ..
             } => {
-                if let Some(c) = self.contexts.iter_mut().find(|c| c.id == *context_id) {
+                if let Some(c) = self.document.contexts.iter_mut().find(|c| c.id == *context_id) {
                     c.start_time = *new_start;
                 }
-                self.dirty_contexts.insert(*context_id);
+                self.document.mark_context_dirty(*context_id);
             }
         }
     }
@@ -6238,11 +6173,11 @@ impl KeptApp {
                 prev_view,
                 ..
             } => {
-                if !self.contexts.iter().any(|c| c.id == context.id) {
-                    self.contexts.push(context.clone());
+                if !self.document.contexts.iter().any(|c| c.id == context.id) {
+                    self.document.contexts.push(context.clone());
                 }
-                self.dirty_contexts.insert(context.id);
-                self.pending_context_deletes.remove(&context.id);
+                self.document.mark_context_dirty(context.id);
+                self.document.pending_context_deletes.remove(&context.id);
                 self.view = prev_view.clone();
             }
             ContextSideEffect::StartReset {
@@ -6250,10 +6185,10 @@ impl KeptApp {
                 prev_start,
                 ..
             } => {
-                if let Some(c) = self.contexts.iter_mut().find(|c| c.id == *context_id) {
+                if let Some(c) = self.document.contexts.iter_mut().find(|c| c.id == *context_id) {
                     c.start_time = *prev_start;
                 }
-                self.dirty_contexts.insert(*context_id);
+                self.document.mark_context_dirty(*context_id);
             }
         }
     }
@@ -6286,7 +6221,7 @@ impl KeptApp {
         // the user's view selection — date-view doesn't affect rotation.
         let writable_start = self
             .writable_context_id()
-            .and_then(|id| self.contexts.iter().find(|c| c.id == id))
+            .and_then(|id| self.document.contexts.iter().find(|c| c.id == id))
             .map(|c| c.start_time)
             .unwrap_or(i64::MIN);
         let baseline = self
@@ -6375,16 +6310,16 @@ impl KeptApp {
         let Some(idx) = self.cell_idx(cell_id) else {
             return false;
         };
-        let target = match &self.cells[idx].kind {
+        let target = match &self.document.cells[idx].kind {
             CellKind::Reference(rc) => rc.target(),
             _ => return false,
         };
         let pre_focused = self.focused;
-        let pre = self.cells[idx].snapshot();
-        let timestamp = self.cells[idx].timestamp;
-        let edited_at = self.cells[idx].edited_at;
-        let context_hint = self.cells[idx].context_hint_id;
-        let active = self.cells[idx].active;
+        let pre = self.document.cells[idx].snapshot();
+        let timestamp = self.document.cells[idx].timestamp;
+        let edited_at = self.document.cells[idx].edited_at;
+        let context_hint = self.document.cells[idx].context_hint_id;
+        let active = self.document.cells[idx].active;
 
         // Build the new Outline cell directly so we can hand-pick the
         // id / timestamp (replace-in-place semantics). Cell::from_parts
@@ -6403,7 +6338,7 @@ impl KeptApp {
         new_cell.set_font_scale(self.font_scale);
         let post = new_cell.snapshot();
 
-        self.cells[idx] = new_cell;
+        self.document.cells[idx] = new_cell;
         self.focused = Some(cell_id);
         self.editing = true;
         self.dragging_cell = None;
@@ -6431,7 +6366,7 @@ impl KeptApp {
         let Some(idx) = self.cell_idx(cell_id) else {
             return false;
         };
-        let target = match &self.cells[idx].kind {
+        let target = match &self.document.cells[idx].kind {
             CellKind::Outline(oc) => match oc.reference_header() {
                 Some(h) => h.target(),
                 None => return false,
@@ -6439,11 +6374,11 @@ impl KeptApp {
             _ => return false,
         };
         let pre_focused = self.focused;
-        let pre = self.cells[idx].snapshot();
-        let timestamp = self.cells[idx].timestamp;
-        let edited_at = self.cells[idx].edited_at;
-        let context_hint = self.cells[idx].context_hint_id;
-        let active = self.cells[idx].active;
+        let pre = self.document.cells[idx].snapshot();
+        let timestamp = self.document.cells[idx].timestamp;
+        let edited_at = self.document.cells[idx].edited_at;
+        let context_hint = self.document.cells[idx].context_hint_id;
+        let active = self.document.cells[idx].active;
 
         let mut new_cell = Cell::from_parts(
             cell_id,
@@ -6460,7 +6395,7 @@ impl KeptApp {
         new_cell.set_font_scale(self.font_scale);
         let post = new_cell.snapshot();
 
-        self.cells[idx] = new_cell;
+        self.document.cells[idx] = new_cell;
         self.focused = Some(cell_id);
         // References don't have an edit mode.
         self.editing = false;
@@ -7229,7 +7164,7 @@ impl KeptApp {
         // a stale highlight inside a Reference cell or envelope header
         // doesn't linger when focus moves elsewhere. The target cell's
         // own selection state is reset by its `mouse_down` below.
-        for other in &mut self.cells {
+        for other in &mut self.document.cells {
             if other.id != target {
                 other.clear_all_selections();
             }
@@ -7311,7 +7246,7 @@ impl KeptApp {
     fn handle_link_click(&mut self, url: &str, alt: bool) {
         if let Some(rest) = url.strip_prefix("kept://") {
             if let Ok(uuid) = Uuid::parse_str(rest) {
-                let q = if self.entities.iter().any(|e| e.id == uuid) {
+                let q = if self.entities.entities.iter().any(|e| e.id == uuid) {
                     Some((Query::entity(uuid), None))
                 } else if let Some(cell) = self.cell(uuid) {
                     Some((Query::date(local_date_for_ms(cell.timestamp)), Some(uuid)))
@@ -7590,16 +7525,6 @@ fn local_date_for_ms(epoch_ms: i64) -> chrono::NaiveDate {
 /// match. If `query`'s residual text appears, show ~40 chars before + the
 /// match + ~40 after. Falls back to the leading window for queries that are
 /// entirely structured (`#tag`, `today`, etc. — no text to find).
-/// Normalize an entity's `display_name` into the form the resolver's
-/// title fallback substring-matches against. Same shape as
-/// `query::normalize_entity_token` — lowercase, strip whitespace and
-/// underscores — so a query token and a fallback entry compare cleanly.
-fn normalize_title_for_fallback(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_whitespace() && *c != '_')
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
-}
 
 /// Per-frame bullet filter for an outline cell rendered under a tag-
 /// filtered view. Returns Some(set of bullet IDs) iff:

@@ -188,6 +188,7 @@ impl KeptApp {
     fn person_entries(&self) -> Vec<(String, Uuid)> {
         let mut out: Vec<(String, Uuid)> = self
             .entities
+            .entities
             .iter()
             .filter(|e| e.kind == "person")
             .map(|e| (e.display_name.clone(), e.id))
@@ -201,6 +202,7 @@ impl KeptApp {
     /// so the popup can downweight inactive matches without losing them.
     fn person_mention_candidates(&self) -> Vec<(String, bool)> {
         let mut out: Vec<(String, bool)> = self
+            .entities
             .entities
             .iter()
             .filter(|e| e.kind == "person")
@@ -675,6 +677,7 @@ impl KeptApp {
                 };
                 self.refresh_entities();
                 let created_at = self
+                    .entities
                     .entities
                     .iter()
                     .find(|e| e.id == new_id)
