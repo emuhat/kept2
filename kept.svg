@@ -27,7 +27,7 @@
      inkscape:deskcolor="#d1d1d1"
      inkscape:document-units="mm"
      inkscape:zoom="0.78484147"
-     inkscape:cx="395.6213"
+     inkscape:cx="396.25837"
      inkscape:cy="326.81759"
      inkscape:window-width="1854"
      inkscape:window-height="1131"
@@ -77,10 +77,10 @@
        style="color-interpolation-filters:sRGB;"
        inkscape:label="Blur"
        id="filter1"
-       x="-0.079238062"
-       y="-0.079238062"
-       width="1.1584761"
-       height="1.1584761">
+       x="-0.093155866"
+       y="-0.093155866"
+       width="1.1863117"
+       height="1.1863117">
       <feGaussianBlur
          stdDeviation="2 2"
          result="fbSourceGraphic"
@@ -116,28 +116,25 @@
      id="layer1">
     <g
        id="g6"
-       transform="translate(17.867196,-17.333912)">
+       transform="translate(17.867196,-17.333912)"
+       style="display:inline;stroke-width:10;stroke-dasharray:none">
       <circle
-         style="display:inline;opacity:0.499637;fill:#f4eed7;stroke:#000000;stroke-width:8.97107;stroke-dasharray:none;stroke-opacity:1;filter:url(#filter1)"
+         style="display:inline;opacity:0.499637;fill:#f4eed7;stroke:#000000;stroke-width:13.91919058;stroke-dasharray:none;stroke-opacity:1;filter:url(#filter1)"
          id="circle1"
          cx="100.47637"
          cy="102.93851"
          r="88.881119"
          inkscape:label="path3"
          transform="matrix(0.71843258,0,0,0.71843258,10.760792,44.491507)" />
-      <circle
-         style="fill:#eff1f6;fill-opacity:1;stroke:#a344da;stroke-width:6.44511;stroke-dasharray:none;stroke-opacity:1"
+      <ellipse
+         style="fill:#eff1f6;fill-opacity:1;stroke:#a344da;stroke-width:10;stroke-dasharray:none;stroke-opacity:1"
          id="path3"
          cx="82.185951"
          cy="117.68554"
          inkscape:label="path3"
-         r="63.855091" />
+         rx="63.855"
+         ry="63.855091" />
     </g>
-    <text
-       xml:space="preserve"
-       transform="matrix(0.3671452,0,0,0.3671452,-33.655509,-52.345405)"
-       id="text1"
-       style="writing-mode:lr-tb;direction:ltr;white-space:pre;shape-inside:url(#rect1);display:inline;fill:#ac4620;stroke-width:3.64724" />
     <text
        xml:space="preserve"
        style="font-size:226.891px;writing-mode:lr-tb;direction:ltr;display:inline;opacity:0.500413;fill:#000000;fill-opacity:1;stroke-width:6.20649;filter:url(#filter3)"
@@ -148,23 +145,18 @@
          sodipodi:role="line"
          id="tspan4"
          style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:226.891px;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';fill:#000000;fill-opacity:1;stroke-width:6.2065"
-         x="45.31168"
-         y="170.51082">k</tspan></text>
+         x="0"
+         y="0">k</tspan></text>
     <text
        xml:space="preserve"
-       style="font-size:226.891px;writing-mode:lr-tb;direction:ltr;display:inline;fill:#2de27d;fill-opacity:1;stroke:#003554;stroke-width:6.20649;stroke-opacity:1"
+       style="font-size:226.891px;writing-mode:lr-tb;direction:ltr;display:inline;fill:#2de27d;fill-opacity:1;stroke:#003554;stroke-width:6.506;stroke-opacity:1;stroke-dasharray:none"
        x="43.288979"
        y="168.82526"
        id="text2"><tspan
          sodipodi:role="line"
          id="tspan2"
-         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:226.891px;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';fill:#2de27d;fill-opacity:1;stroke:#003554;stroke-width:6.2065;stroke-opacity:1"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:226.891px;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';fill:#2de27d;fill-opacity:1;stroke:#003554;stroke-width:6.506;stroke-opacity:1;stroke-dasharray:none"
          x="0"
          y="0">k</tspan></text>
-    <text
-       xml:space="preserve"
-       transform="scale(0.26458333)"
-       id="text7"
-       style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';writing-mode:lr-tb;direction:ltr;white-space:pre;shape-inside:url(#rect7);display:inline;opacity:0.500413;fill:#003554;fill-opacity:1;stroke:#a344da;stroke-width:3.64724;stroke-opacity:1" />
   </g>
 </svg>
