@@ -38,49 +38,14 @@
      showgrid="false" />
   <defs
      id="defs1">
-    <rect
-       x="-303.24595"
-       y="-291.77867"
-       width="415.37051"
-       height="625.60405"
-       id="rect7" />
-    <rect
-       x="254.82853"
-       y="294.32695"
-       width="168.18683"
-       height="87.915844"
-       id="rect1" />
     <filter
-       style="color-interpolation-filters:sRGB;"
-       inkscape:label="Blur"
-       id="filter4"
-       x="-0.19567484"
-       y="-0.15455294"
-       width="1.3913497"
-       height="1.3091059">
-      <feGaussianBlur
-         stdDeviation="4 4"
-         result="fbSourceGraphic"
-         id="feGaussianBlur4" />
-      <feColorMatrix
-         result="fbSourceGraphicAlpha"
-         in="fbSourceGraphic"
-         values="0 0 0 -1 0 0 0 0 -1 0 0 0 0 -1 0 0 0 0 1 0"
-         id="feColorMatrix4" />
-      <feGaussianBlur
-         id="feGaussianBlur5"
-         stdDeviation="4 4"
-         result="blur"
-         in="fbSourceGraphic" />
-    </filter>
-    <filter
-       style="color-interpolation-filters:sRGB;"
+       style="color-interpolation-filters:sRGB"
        inkscape:label="Blur"
        id="filter1"
-       x="-0.093155866"
-       y="-0.093155866"
-       width="1.1863117"
-       height="1.1863117">
+       x="-0.093155893"
+       y="-0.093155893"
+       width="1.1863118"
+       height="1.1863118">
       <feGaussianBlur
          stdDeviation="2 2"
          result="fbSourceGraphic"
@@ -97,13 +62,13 @@
          in="fbSourceGraphic" />
     </filter>
     <filter
-       style="color-interpolation-filters:sRGB;"
+       style="color-interpolation-filters:sRGB"
        inkscape:label="Blur"
        id="filter3"
-       x="-0.044537927"
-       y="-0.030222156"
+       x="-0.044537963"
+       y="-0.030222189"
        width="1.0890759"
-       height="1.0604443">
+       height="1.0604444">
       <feGaussianBlur
          stdDeviation="2 2"
          result="blur"
@@ -119,7 +84,7 @@
        transform="translate(17.867196,-17.333912)"
        style="display:inline;stroke-width:10;stroke-dasharray:none">
       <circle
-         style="display:inline;opacity:0.499637;fill:#f4eed7;stroke:#000000;stroke-width:13.91919058;stroke-dasharray:none;stroke-opacity:1;filter:url(#filter1)"
+         style="display:inline;opacity:0.499637;fill:#f4eed7;stroke:#000000;stroke-width:13.9192;stroke-dasharray:none;stroke-opacity:1;filter:url(#filter1)"
          id="circle1"
          cx="100.47637"
          cy="102.93851"
@@ -145,18 +110,18 @@
          sodipodi:role="line"
          id="tspan4"
          style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:226.891px;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';fill:#000000;fill-opacity:1;stroke-width:6.2065"
-         x="0"
-         y="0">k</tspan></text>
+         x="45.31168"
+         y="170.51082">k</tspan></text>
     <text
        xml:space="preserve"
-       style="font-size:226.891px;writing-mode:lr-tb;direction:ltr;display:inline;fill:#2de27d;fill-opacity:1;stroke:#003554;stroke-width:6.506;stroke-opacity:1;stroke-dasharray:none"
+       style="font-size:226.891px;writing-mode:lr-tb;direction:ltr;display:inline;fill:#2de27d;fill-opacity:1;stroke:#003554;stroke-width:6.506;stroke-dasharray:none;stroke-opacity:1"
        x="43.288979"
        y="168.82526"
        id="text2"><tspan
          sodipodi:role="line"
          id="tspan2"
-         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:226.891px;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';fill:#2de27d;fill-opacity:1;stroke:#003554;stroke-width:6.506;stroke-opacity:1;stroke-dasharray:none"
-         x="0"
-         y="0">k</tspan></text>
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:226.891px;font-family:Figtree;-inkscape-font-specification:'Figtree Bold';fill:#2de27d;fill-opacity:1;stroke:#003554;stroke-width:6.506;stroke-dasharray:none;stroke-opacity:1"
+         x="43.288979"
+         y="168.82526">k</tspan></text>
   </g>
 </svg>
