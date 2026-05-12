@@ -335,7 +335,7 @@ impl KeptApp {
     pub(super) fn close_search_cancel(&mut self) {
         if self.search.take().is_some() {
             // Doc area was never replaced; nothing to restore.
-            self.coalesce_break = true;
+            self.pane_mut().coalesce_break = true;
         }
     }
 
@@ -352,7 +352,7 @@ impl KeptApp {
             self.show_inactive_cells,
         );
         let Some(&id) = results.get(state.selected) else {
-            self.coalesce_break = true;
+            self.pane_mut().coalesce_break = true;
             return;
         };
         if let Some(cell) = self.cell(id) {
@@ -379,7 +379,7 @@ impl KeptApp {
         }
         // Fallback (cell vanished): no focus changes; just break
         // coalesce so the next edit starts a fresh undo entry.
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
     }
 
     pub(super) fn search_move(&mut self, delta: i32) {

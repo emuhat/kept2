@@ -464,7 +464,7 @@ impl KeptApp {
             });
             return;
         }
-        let Some(focused_id) = self.focused else {
+        let Some(focused_id) = self.pane_mut().focused else {
             return;
         };
         let Some(cell) = self.cell(focused_id) else {
@@ -501,15 +501,19 @@ impl KeptApp {
     }
 
     pub(super) fn sync_mention_popup(&mut self) {
-        let Some(popup) = self.mention_popup.as_ref() else {
-            return;
+        // Snapshot the popup state up front so subsequent `self.cell` /
+        // `self.pane()` accesses don't fight the `self.mention_popup`
+        // borrow.
+        let (anchor_byte, source, kind) = {
+            let Some(popup) = self.mention_popup.as_ref() else {
+                return;
+            };
+            (popup.anchor_byte, popup.source, popup.kind)
         };
-        let anchor_byte = popup.anchor_byte;
-        let source = popup.source;
         // Pull the current `(text, caret)` from whichever source is anchored.
         let cur: Option<(String, usize)> = match source {
             MentionSource::Cell { cell_id, bullet_id } => {
-                if self.focused != Some(cell_id) {
+                if self.pane().focused != Some(cell_id) {
                     None
                 } else if let Some(cell) = self.cell(cell_id) {
                     if cell.focused_bullet_id() != bullet_id {
@@ -532,7 +536,7 @@ impl KeptApp {
             return;
         };
         // The trigger character must still be at anchor_byte.
-        let trigger = popup.kind.trigger();
+        let trigger = kind.trigger();
         if text
             .get(anchor_byte..)
             .map_or(true, |s| !s.starts_with(trigger))
@@ -556,7 +560,6 @@ impl KeptApp {
             return;
         }
         let query = q.to_string();
-        let kind = popup.kind;
         let candidates = self.mention_candidates_for(kind);
         if let Some(p) = self.mention_popup.as_mut() {
             let count = filter_mentions(&candidates, &query)
@@ -574,7 +577,7 @@ impl KeptApp {
     pub(super) fn render_mention_popup(&mut self, canvas: &Canvas, view_w: f32, view_h: f32) {
         // Phase 1: pull the bits we need to compute anchor + candidates,
         // dropping the popup borrow before reaching for `self.cell` /
-        // `self.scroll_y` (which borrow self in conflicting shapes).
+        // `self.pane_mut().scroll_y` (which borrow self in conflicting shapes).
         let (source, kind, anchor_byte) = {
             let Some(popup) = self.mention_popup.as_ref() else {
                 return;
@@ -677,7 +680,7 @@ impl KeptApp {
                 self.commit_tag_mention(popup.source, start, end, chosen_name);
             }
         }
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
         true
     }
 
@@ -740,7 +743,7 @@ impl KeptApp {
                 self.commit_tag_mention(popup.source, start, end, query);
             }
         }
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
         true
     }
 
@@ -767,10 +770,10 @@ impl KeptApp {
                 if let Some(c) = self.cell(cell_id) {
                     let post = c.snapshot();
                     if !pre.doc_eq(&post) {
-                        let saved_focused = self.focused;
-                        self.focused = Some(cell_id);
+                        let saved_focused = self.pane_mut().focused;
+                        self.pane_mut().focused = Some(cell_id);
                         self.record_edit(pre, post);
-                        self.focused = saved_focused.or(Some(cell_id));
+                        self.pane_mut().focused = saved_focused.or(Some(cell_id));
                     }
                 }
             }
@@ -822,10 +825,10 @@ impl KeptApp {
                 if let Some(c) = self.cell(cell_id) {
                     let post = c.snapshot();
                     if !pre.doc_eq(&post) {
-                        let saved_focused = self.focused;
-                        self.focused = Some(cell_id);
+                        let saved_focused = self.pane_mut().focused;
+                        self.pane_mut().focused = Some(cell_id);
                         self.record_edit(pre, post);
-                        self.focused = saved_focused.or(Some(cell_id));
+                        self.pane_mut().focused = saved_focused.or(Some(cell_id));
                     }
                 }
             }
@@ -857,10 +860,10 @@ impl KeptApp {
                 if let Some(c) = self.cell(cell_id) {
                     let post = c.snapshot();
                     if !pre.doc_eq(&post) {
-                        let saved_focused = self.focused;
-                        self.focused = Some(cell_id);
+                        let saved_focused = self.pane_mut().focused;
+                        self.pane_mut().focused = Some(cell_id);
                         self.record_edit(pre, post);
-                        self.focused = saved_focused.or(Some(cell_id));
+                        self.pane_mut().focused = saved_focused.or(Some(cell_id));
                     }
                 }
             }

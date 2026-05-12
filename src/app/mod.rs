@@ -595,7 +595,7 @@ impl UndoOp {
                     UndoDir::Undo => pre,
                     UndoDir::Redo => post,
                 };
-                app.focused = Some(*cell_id);
+                app.pane_mut().focused = Some(*cell_id);
                 if let Some(c) = app.cell_mut(*cell_id) {
                     c.restore(snap.clone());
                 }
@@ -607,13 +607,13 @@ impl UndoOp {
             } => match dir {
                 UndoDir::Undo => {
                     app.document.queue_cell_delete(*cell_id);
-                    app.focused = *pre_focused;
+                    app.pane_mut().focused = *pre_focused;
                 }
                 UndoDir::Redo => {
                     let cell = Cell::from_snapshot(*cell_id, snapshot.clone(), &app.typeface);
                     app.insert_cell_sorted(cell);
                     app.document.pending_deletes.remove(cell_id);
-                    app.focused = Some(*cell_id);
+                    app.pane_mut().focused = Some(*cell_id);
                 }
             },
             Self::DeleteCell {
@@ -631,14 +631,14 @@ impl UndoOp {
                     if let Some(se) = side_effect {
                         app.reverse_context_side_effect(se);
                     }
-                    app.focused = *pre_focused;
+                    app.pane_mut().focused = *pre_focused;
                 }
                 UndoDir::Redo => {
                     app.document.queue_cell_delete(*cell_id);
                     if let Some(se) = side_effect {
                         app.apply_context_side_effect(se);
                     }
-                    app.focused = *post_focused;
+                    app.pane_mut().focused = *post_focused;
                 }
             },
             Self::RotateContext {
@@ -685,7 +685,7 @@ impl UndoOp {
                     c.start_time = start;
                 }
                 app.document.mark_context_dirty(*context_id);
-                app.view = view.clone();
+                app.pane_mut().view = view.clone();
             }
             Self::RenamePersonEntity {
                 entity_id,
@@ -842,7 +842,7 @@ impl UndoOp {
                     app.document.cells[idx] = cell;
                 }
                 app.document.dirty_cells.insert(*cell_id);
-                app.focused = focused;
+                app.pane_mut().focused = focused;
             }
         }
     }
@@ -1736,17 +1736,21 @@ struct HistoryEntry {
 const NAV_HISTORY_CAP: usize = 100;
 
 /// `KeptApp` derefs to its active `Pane` so existing call sites — which
-/// say `self.view`, `self.focused`, `self.scroll_y`, etc. — keep working
+/// say `self.pane_mut().view`, `self.pane_mut().focused`, `self.pane_mut().scroll_y`, etc. — keep working
 /// without rewriting every one. New per-pane access (Stage 2+) goes
 /// through `self.panes[i].field` directly.
-impl std::ops::Deref for KeptApp {
-    type Target = Pane;
-    fn deref(&self) -> &Pane {
+impl KeptApp {
+    /// Active pane (the pane that owns keyboard input). Replaces the
+    /// previous `Deref<Target=Pane>` magic: every per-pane field access
+    /// is now an explicit `self.pane().X` or `self.pane_mut().X`
+    /// call. Sub-render passes inside `tick_pane` rely on the caller
+    /// (`tick`) having set `active_pane = pane_idx` before invocation,
+    /// so `pane()` resolves to the pane being rendered.
+    fn pane(&self) -> &Pane {
         &self.panes[self.active_pane]
     }
-}
-impl std::ops::DerefMut for KeptApp {
-    fn deref_mut(&mut self) -> &mut Pane {
+
+    fn pane_mut(&mut self) -> &mut Pane {
         &mut self.panes[self.active_pane]
     }
 }
@@ -2008,7 +2012,7 @@ impl KeptApp {
         // state without committing additional side effects. Sidebar
         // targets never set `dragging_cell`, so the `take()` is a
         // no-op there.
-        if let Some(id) = self.dragging_cell.take() {
+        if let Some(id) = self.pane_mut().dragging_cell.take() {
             if let Some(cell) = self.cell_mut(id) {
                 cell.mouse_up();
             }
@@ -2044,7 +2048,7 @@ impl KeptApp {
     /// Space-drag pan is suppressed while text inputs are focused
     /// because Space types a character there.
     fn is_text_input_focused(&self) -> bool {
-        self.editing
+        self.pane().editing
             || self.search.is_some()
             || self.people_rename.is_some()
             || self.people_add.is_some()
@@ -2966,7 +2970,7 @@ impl KeptApp {
         if x < SIDEBAR_WIDTH * self.font_scale || x < 0.0 || y < 0.0 {
             return false;
         }
-        let doc_y = y + self.scroll_y;
+        let doc_y = y + self.pane().scroll_y;
         let ctx = self.match_context();
         for cell in &self.document.cells {
             if !self.is_visible_for_view(cell, &ctx) {
@@ -3035,13 +3039,13 @@ impl KeptApp {
         // filtering by. Gated on edit mode: outside editing no
         // keystrokes can change the text, so the filter should re-
         // evaluate normally (matches the persistence-flush gate).
-        if self.editing
-            && self.focused == Some(cell.id)
+        if self.pane().editing
+            && self.pane().focused == Some(cell.id)
             && cell.caret_in_in_progress_tag()
         {
             return true;
         }
-        match self.view.view_kind {
+        match self.pane().view.view_kind {
             ViewKind::Context(id) => {
                 let cell_ts = cell.timestamp;
                 self.document.contexts.iter().find(|c| c.id == id).map_or(false, |c| {
@@ -3056,7 +3060,7 @@ impl KeptApp {
                 .and_then(|e| e.primary_cell_id)
                 .map_or(false, |pid| pid == cell.id),
             ViewKind::People => false,
-            ViewKind::Ast => query::matches(&self.view.ast, cell, ctx),
+            ViewKind::Ast => query::matches(&self.pane().view.ast, cell, ctx),
         }
     }
 
@@ -3091,7 +3095,7 @@ impl KeptApp {
                 eprintln!("kept: delete_tag failed for {name}: {e}");
             }
         }
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
     }
 
     fn all_tag_names_in_memory(&self) -> Vec<String> {
@@ -3114,12 +3118,12 @@ impl KeptApp {
     fn match_context(&self) -> query::MatchContext {
         let today = local_date_for_ms(now_epoch_ms());
         let person_targets = query::resolve_persons(
-            &self.view.ast.include.entities,
+            &self.pane().view.ast.include.entities,
             &self.entities.alias_index,
             &self.entities.title_fallback,
         );
         let person_excludes = query::resolve_persons(
-            &self.view.ast.exclude.entities,
+            &self.pane().view.ast.exclude.entities,
             &self.entities.alias_index,
             &self.entities.title_fallback,
         );
@@ -3155,7 +3159,7 @@ impl KeptApp {
             Some(id) => id,
             None => return, // Invariant violated; bail safely.
         };
-        let prev_view = self.view.clone();
+        let prev_view = self.pane_mut().view.clone();
 
         // Empty writable: bump its start_time instead of creating a new context.
         if !self.writable_has_cells() {
@@ -3176,7 +3180,7 @@ impl KeptApp {
             // View update: Context view follows to the bumped one; Date and
             // tag views keep their filters/time-bound unchanged.
             let new_view = rotate_view_to(&prev_view, writable);
-            self.view = new_view.clone();
+            self.pane_mut().view = new_view.clone();
             self.undo_stack.push(UndoOp::ResetContextStart {
                 context_id: writable,
                 prev_start,
@@ -3185,7 +3189,7 @@ impl KeptApp {
                 new_view,
             });
             self.redo_stack.clear();
-            self.coalesce_break = true;
+            self.pane_mut().coalesce_break = true;
             return;
         }
 
@@ -3201,8 +3205,8 @@ impl KeptApp {
             end_time: None,
             title: None,
         };
-        let pre_focused = self.focused;
-        let pre_scroll_y = self.scroll_y;
+        let pre_focused = self.pane_mut().focused;
+        let pre_scroll_y = self.pane_mut().scroll_y;
         let new_view = rotate_view_to(&prev_view, new_context.id);
 
         self.apply_rotation(writable, now, &new_context, new_view.clone());
@@ -3218,7 +3222,7 @@ impl KeptApp {
             pre_scroll_y,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
     }
 
     /// Does the writable (most-recent-open) context have any cells in its window?
@@ -3255,12 +3259,12 @@ impl KeptApp {
         }
         self.document.mark_context_dirty(new_id);
         self.document.pending_context_deletes.remove(&new_id);
-        self.view = new_view;
-        self.focused = None;
-        self.editing = false;
-        self.dragging_cell = None;
+        self.pane_mut().view = new_view;
+        self.pane_mut().focused = None;
+        self.pane_mut().editing = false;
+        self.pane_mut().dragging_cell = None;
         self.cell_context_menu = None;
-        self.scroll_y = 0.0;
+        self.pane_mut().scroll_y = 0.0;
     }
 
     /// Inverse of `apply_rotation`: restore the closed context's `end_time`,
@@ -3279,18 +3283,18 @@ impl KeptApp {
         }
         self.document.mark_context_dirty(closed_id);
         self.document.queue_context_delete(new_context_id);
-        self.view = prev_view;
-        self.focused = pre_focused;
-        self.editing = false;
-        self.dragging_cell = None;
+        self.pane_mut().view = prev_view;
+        self.pane_mut().focused = pre_focused;
+        self.pane_mut().editing = false;
+        self.pane_mut().dragging_cell = None;
         self.cell_context_menu = None;
-        self.scroll_y = pre_scroll_y;
+        self.pane_mut().scroll_y = pre_scroll_y;
     }
 
     /// Previous context (older `start_time`) relative to the currently
     /// viewed one. None when not in Context view.
     fn prev_context(&self) -> Option<Uuid> {
-        let current = self.view.context_view()?;
+        let current = self.pane().view.context_view()?;
         let mut sorted: Vec<&Context> = self.document.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
@@ -3303,7 +3307,7 @@ impl KeptApp {
 
     /// Next context (newer `start_time`). None when not in Context view.
     fn next_context(&self) -> Option<Uuid> {
-        let current = self.view.context_view()?;
+        let current = self.pane().view.context_view()?;
         let mut sorted: Vec<&Context> = self.document.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
@@ -3322,7 +3326,7 @@ impl KeptApp {
     /// Used for arrow-nav cross-context jumps so an empty newer context
     /// doesn't trap the cursor.
     fn next_context_with_cells(&self) -> Option<Uuid> {
-        let current = self.view.context_view()?;
+        let current = self.pane().view.context_view()?;
         let mut sorted: Vec<&Context> = self.document.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
@@ -3335,7 +3339,7 @@ impl KeptApp {
 
     /// Walk contexts backward in time, skipping empties.
     fn prev_context_with_cells(&self) -> Option<Uuid> {
-        let current = self.view.context_view()?;
+        let current = self.pane().view.context_view()?;
         let mut sorted: Vec<&Context> = self.document.contexts.iter().collect();
         sorted.sort_by_key(|c| c.start_time);
         let pos = sorted.iter().position(|c| c.id == current)?;
@@ -3357,7 +3361,7 @@ impl KeptApp {
     /// Returns true if the view changed.
     fn ensure_writable_context(&mut self) -> bool {
         let today = local_date_for_ms(now_epoch_ms());
-        if let Some(id) = self.view.context_view() {
+        if let Some(id) = self.pane_mut().view.context_view() {
             let active_is_open = self
                 .document
                 .contexts
@@ -3373,7 +3377,7 @@ impl KeptApp {
             };
         }
         // AST view. Jump to today unless the AST is already exactly Day(today).
-        if self.view.is_solo_date(today) {
+        if self.pane_mut().view.is_solo_date(today) {
             return false;
         }
         self.set_active_date(today)
@@ -3382,38 +3386,38 @@ impl KeptApp {
     /// Switch the view to a single existing context.
     fn set_active_context(&mut self, id: Uuid) -> bool {
         let next = Query::context(id);
-        if self.view == next {
+        if self.pane_mut().view == next {
             return false;
         }
         if !self.document.contexts.iter().any(|c| c.id == id) {
             return false;
         }
-        self.view = next;
+        self.pane_mut().view = next;
         // Focus the first visible cell in the new window (if any).
-        self.focused = self.visible_cell_ids().first().copied();
-        self.editing = false;
-        self.dragging_cell = None;
+        self.pane_mut().focused = self.visible_cell_ids().first().copied();
+        self.pane_mut().editing = false;
+        self.pane_mut().dragging_cell = None;
         self.cell_context_menu = None;
-        self.scroll_y = 0.0;
-        self.coalesce_break = true;
-        self.pending_caret_scroll = true;
+        self.pane_mut().scroll_y = 0.0;
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().pending_caret_scroll = true;
         true
     }
 
     /// Switch the view to "everything from this local date" mode.
     fn set_active_date(&mut self, d: chrono::NaiveDate) -> bool {
         let next = Query::date(d);
-        if self.view == next {
+        if self.pane_mut().view == next {
             return false;
         }
-        self.view = next;
-        self.focused = self.visible_cell_ids().first().copied();
-        self.editing = false;
-        self.dragging_cell = None;
+        self.pane_mut().view = next;
+        self.pane_mut().focused = self.visible_cell_ids().first().copied();
+        self.pane_mut().editing = false;
+        self.pane_mut().dragging_cell = None;
         self.cell_context_menu = None;
-        self.scroll_y = 0.0;
-        self.coalesce_break = true;
-        self.pending_caret_scroll = true;
+        self.pane_mut().scroll_y = 0.0;
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().pending_caret_scroll = true;
         true
     }
 
@@ -3421,17 +3425,17 @@ impl KeptApp {
     #[allow(dead_code)]
     fn set_active_tag(&mut self, name: String) -> bool {
         let next = Query::tag(name);
-        if self.view == next {
+        if self.pane_mut().view == next {
             return false;
         }
-        self.view = next;
-        self.focused = self.visible_cell_ids().first().copied();
-        self.editing = false;
-        self.dragging_cell = None;
+        self.pane_mut().view = next;
+        self.pane_mut().focused = self.visible_cell_ids().first().copied();
+        self.pane_mut().editing = false;
+        self.pane_mut().dragging_cell = None;
         self.cell_context_menu = None;
-        self.scroll_y = 0.0;
-        self.coalesce_break = true;
-        self.pending_caret_scroll = true;
+        self.pane_mut().scroll_y = 0.0;
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().pending_caret_scroll = true;
         true
     }
 
@@ -3443,27 +3447,27 @@ impl KeptApp {
     /// (rotation, ensure_writable_context, undo) bypass this and mutate
     /// the view directly.
     fn push_view(&mut self, new: Query) -> bool {
-        if self.view == new {
+        if self.pane_mut().view == new {
             return false;
         }
         let entry = HistoryEntry {
-            query: self.view.clone(),
-            focused: self.focused,
-            scroll_y: self.scroll_y,
+            query: self.pane_mut().view.clone(),
+            focused: self.pane_mut().focused,
+            scroll_y: self.pane_mut().scroll_y,
         };
-        self.nav_back.push(entry);
-        if self.nav_back.len() > NAV_HISTORY_CAP {
-            self.nav_back.remove(0);
+        self.pane_mut().nav_back.push(entry);
+        if self.pane_mut().nav_back.len() > NAV_HISTORY_CAP {
+            self.pane_mut().nav_back.remove(0);
         }
-        self.nav_forward.clear();
-        self.view = new;
-        self.focused = self.visible_cell_ids().first().copied();
-        self.editing = false;
-        self.dragging_cell = None;
+        self.pane_mut().nav_forward.clear();
+        self.pane_mut().view = new;
+        self.pane_mut().focused = self.visible_cell_ids().first().copied();
+        self.pane_mut().editing = false;
+        self.pane_mut().dragging_cell = None;
         self.cell_context_menu = None;
-        self.scroll_y = 0.0;
-        self.coalesce_break = true;
-        self.pending_caret_scroll = true;
+        self.pane_mut().scroll_y = 0.0;
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().pending_caret_scroll = true;
         true
     }
 
@@ -3471,15 +3475,15 @@ impl KeptApp {
     /// current view onto the forward stack first. No-op when the back
     /// stack is empty.
     fn nav_back(&mut self) -> bool {
-        let Some(prev) = self.nav_back.pop() else { return false };
+        let Some(prev) = self.pane_mut().nav_back.pop() else { return false };
         let entry = HistoryEntry {
-            query: self.view.clone(),
-            focused: self.focused,
-            scroll_y: self.scroll_y,
+            query: self.pane_mut().view.clone(),
+            focused: self.pane_mut().focused,
+            scroll_y: self.pane_mut().scroll_y,
         };
-        self.nav_forward.push(entry);
-        if self.nav_forward.len() > NAV_HISTORY_CAP {
-            self.nav_forward.remove(0);
+        self.pane_mut().nav_forward.push(entry);
+        if self.pane_mut().nav_forward.len() > NAV_HISTORY_CAP {
+            self.pane_mut().nav_forward.remove(0);
         }
         self.restore_history_entry(prev);
         true
@@ -3489,33 +3493,33 @@ impl KeptApp {
     /// empty (which is the case until the user has gone back at least
     /// once and not yet pushed a new view).
     fn nav_forward(&mut self) -> bool {
-        let Some(next) = self.nav_forward.pop() else { return false };
+        let Some(next) = self.pane_mut().nav_forward.pop() else { return false };
         let entry = HistoryEntry {
-            query: self.view.clone(),
-            focused: self.focused,
-            scroll_y: self.scroll_y,
+            query: self.pane_mut().view.clone(),
+            focused: self.pane_mut().focused,
+            scroll_y: self.pane_mut().scroll_y,
         };
-        self.nav_back.push(entry);
-        if self.nav_back.len() > NAV_HISTORY_CAP {
-            self.nav_back.remove(0);
+        self.pane_mut().nav_back.push(entry);
+        if self.pane_mut().nav_back.len() > NAV_HISTORY_CAP {
+            self.pane_mut().nav_back.remove(0);
         }
         self.restore_history_entry(next);
         true
     }
 
     fn restore_history_entry(&mut self, e: HistoryEntry) {
-        self.view = e.query;
-        self.focused = e.focused;
-        self.scroll_y = e.scroll_y;
-        self.editing = false;
-        self.dragging_cell = None;
+        self.pane_mut().view = e.query;
+        self.pane_mut().focused = e.focused;
+        self.pane_mut().scroll_y = e.scroll_y;
+        self.pane_mut().editing = false;
+        self.pane_mut().dragging_cell = None;
         self.cell_context_menu = None;
-        self.coalesce_break = true;
-        self.pending_caret_scroll = true;
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().pending_caret_scroll = true;
         // Drop focus mode — the new view's focused cell may not be the
         // same; "fullscreen on a different cell" is jarring after a
         // back-nav. The user can re-enter focus mode with Ctrl+F.
-        self.focus_mode = false;
+        self.pane_mut().focus_mode = false;
     }
 
     /// IDs of cells visible under the active view, in DISPLAY order — newest
@@ -3572,8 +3576,8 @@ impl KeptApp {
         // Snapshot before grabbing `&mut self.db` (else borrow conflict).
         // The deferral predicate only matters for the cell currently
         // being typed into; both flags get re-read fresh next flush.
-        let editing_snapshot = self.editing;
-        let focused_snapshot = self.focused;
+        let editing_snapshot = self.pane_mut().editing;
+        let focused_snapshot = self.pane_mut().focused;
         let Some(db) = self.db.as_mut() else {
             self.document.dirty_cells.clear();
             self.document.pending_deletes.clear();
@@ -3640,7 +3644,7 @@ impl KeptApp {
         for cell in &mut self.document.cells {
             cell.set_font_scale(s);
         }
-        self.pending_caret_scroll = true;
+        self.pane_mut().pending_caret_scroll = true;
         true
     }
 
@@ -3739,7 +3743,7 @@ impl KeptApp {
         self.layout_panes(width, height);
 
         // Render each pane. We swap `active_pane` for the duration of each
-        // pane's tick so Deref-based field access (self.scroll_y, self.view,
+        // pane's tick so Deref-based field access (self.pane_mut().scroll_y, self.pane_mut().view,
         // etc.) resolves to the pane currently being rendered. The truly
         // active pane (saved_active) is restored before global UI is drawn
         // so sidebar highlight / overlays anchor correctly.
@@ -3905,7 +3909,7 @@ impl KeptApp {
         self.step_kinetic(pane_idx);
 
         // Clamp scroll using last frame's max_scroll before drawing this frame.
-        self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll);
+        self.pane_mut().scroll_y = self.pane_mut().scroll_y.clamp(0.0, self.pane_mut().max_scroll);
 
         let pane_rect = self.panes[pane_idx].last_rect;
         let pane_left = pane_rect.left;
@@ -3916,7 +3920,7 @@ impl KeptApp {
         // Focus mode pulls the cell out near the pane's left edge with
         // smaller pad so it visually expands to fill the pane; normal mode
         // uses MARGIN_X on both sides.
-        let (cells_left, outer_cell_width) = if self.focus_mode {
+        let (cells_left, outer_cell_width) = if self.pane_mut().focus_mode {
             let left = pane_left + FOCUS_MODE_PAD * scale;
             let outer = (pane_right - left - FOCUS_MODE_PAD * scale).max(80.0);
             (left, outer)
@@ -3939,14 +3943,15 @@ impl KeptApp {
         //
         // In focus mode we override y to MARGIN_TOP (the cell renders at
         // the top of the pane) and suppress the ring elsewhere.
-        let view_kind_local = self.view.view_kind.clone();
+        let view_kind_local = self.pane().view.view_kind.clone();
         let match_ctx = self.match_context();
+        let focus_mode = self.pane().focus_mode;
         let focused_geom = if matches!(view_kind_local, ViewKind::Ast | ViewKind::Context(_)) {
-            self.focused
+            self.pane().focused
                 .and_then(|id| self.cell(id))
                 .filter(|c| c.height() > 0.0 && self.is_visible_for_view(c, &match_ctx))
                 .map(|c| {
-                    let y = if self.focus_mode { MARGIN_TOP } else { c.y_origin() };
+                    let y = if focus_mode { MARGIN_TOP } else { c.y_origin() };
                     FocusedCellGeom {
                         x: cells_left,
                         y,
@@ -4013,11 +4018,11 @@ impl KeptApp {
     /// other cells to compete with). No-op when `focused_geom` is None.
     fn render_focus_ring(&self, canvas: &Canvas, layout: &PaneLayout) {
         let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch }) =
-            layout.focused_geom.filter(|_| !self.focus_mode)
+            layout.focused_geom.filter(|_| !self.pane().focus_mode)
         else {
             return;
         };
-        let (stroke, alpha) = if self.editing {
+        let (stroke, alpha) = if self.pane().editing {
             (FOCUS_STROKE_EDIT, FOCUS_RING_ALPHA_EDIT)
         } else {
             (FOCUS_STROKE, FOCUS_RING_ALPHA)
@@ -4053,21 +4058,22 @@ impl KeptApp {
         layout: &PaneLayout,
         final_y: f32,
     ) {
-        self.doc_height = final_y - CELL_GAP + DOC_BOTTOM_PAD;
-        self.viewport_height = layout.pane_h.max(0.0);
-        self.max_scroll = (self.doc_height - self.viewport_height).max(0.0);
-        self.scroll_y = self.scroll_y.min(self.max_scroll);
+        self.pane_mut().doc_height = final_y - CELL_GAP + DOC_BOTTOM_PAD;
+        self.pane_mut().viewport_height = layout.pane_h.max(0.0);
+        self.pane_mut().max_scroll = (self.pane_mut().doc_height - self.pane_mut().viewport_height).max(0.0);
+        self.pane_mut().scroll_y = self.pane_mut().scroll_y.min(self.pane_mut().max_scroll);
 
         // After cells are laid out (y_origin/height fresh), honor any caret-into-view
         // request from this tick's events. Effect lands on the next frame.
-        if std::mem::take(&mut self.pending_caret_scroll) {
+        if std::mem::take(&mut self.pane_mut().pending_caret_scroll) {
             self.scroll_caret_into_view();
         }
 
         // Per-pane scrollbar in window coords, anchored at the pane's right edge.
-        let viewport_h = self.viewport_height;
-        let doc_h = self.doc_height;
-        self.scroller
+        let viewport_h = self.pane_mut().viewport_height;
+        let doc_h = self.pane_mut().doc_height;
+        self.pane_mut()
+            .scroller
             .draw_bar(canvas, layout.pane_rect.right, viewport_h, doc_h);
     }
 
@@ -4084,7 +4090,7 @@ impl KeptApp {
         // sub-render passes paint in doc-coords.
         canvas.save();
         canvas.clip_rect(layout.pane_rect, None, true);
-        canvas.translate((0.0, -self.scroll_y));
+        canvas.translate((0.0, -self.pane_mut().scroll_y));
 
         self.render_focus_card_backdrop(canvas, &layout);
         let final_y = self.render_pane_body(canvas, &layout);
@@ -4107,8 +4113,8 @@ impl KeptApp {
     fn render_pane_body(&mut self, canvas: &Canvas, layout: &PaneLayout) -> f32 {
         let scale = self.font_scale;
         let mouse_doc_x = self.mouse_pos.0;
-        let mouse_doc_y = self.mouse_pos.1 + self.scroll_y;
-        match self.view.view_kind.clone() {
+        let mouse_doc_y = self.mouse_pos.1 + self.pane_mut().scroll_y;
+        match self.pane_mut().view.view_kind.clone() {
             ViewKind::Ast | ViewKind::Context(_) => self.render_cell_stream(canvas, layout),
             ViewKind::Entity(eid) => {
                 let h = self.render_entity_page(
@@ -4146,15 +4152,15 @@ impl KeptApp {
         let outer_cell_width = layout.outer_cell_width;
         let content_width = layout.content_width;
         let scale = self.font_scale;
-        let focused_id = self.focused;
-        let editing_local = self.editing;
+        let focused_id = self.pane_mut().focused;
+        let editing_local = self.pane_mut().editing;
         let mut y = MARGIN_TOP;
 
         // Precompute per-cell visibility and section headers so the
         // mutable cell loop below doesn't have to re-borrow self.
         // In focus mode only the focused cell is visible — everything else
         // is suppressed regardless of the current view's filters.
-        let visible: Vec<bool> = if self.focus_mode {
+        let visible: Vec<bool> = if self.pane_mut().focus_mode {
             self.document.cells
                 .iter()
                 .map(|c| Some(c.id) == focused_id)
@@ -4180,18 +4186,18 @@ impl KeptApp {
             ByDate,
             None,
         }
-        let header_mode = if self.focus_mode {
+        let header_mode = if self.pane_mut().focus_mode {
             HeaderMode::None
-        } else if !matches!(self.view.view_kind, ViewKind::Ast) {
+        } else if !matches!(self.pane_mut().view.view_kind, ViewKind::Ast) {
             HeaderMode::None
         } else if matches!(
-            self.view.ast.include.time,
+            self.pane_mut().view.ast.include.time,
             Some(query::TimeFilter::Day(_))
-        ) && self.view.ast.include.tags.is_empty()
-            && self.view.ast.include.entities.is_empty()
-            && self.view.ast.exclude.tags.is_empty()
-            && self.view.ast.exclude.entities.is_empty()
-            && self.view.ast.text.is_empty()
+        ) && self.pane_mut().view.ast.include.tags.is_empty()
+            && self.pane_mut().view.ast.include.entities.is_empty()
+            && self.pane_mut().view.ast.exclude.tags.is_empty()
+            && self.pane_mut().view.ast.exclude.entities.is_empty()
+            && self.pane_mut().view.ast.text.is_empty()
         {
             // Pure date view — show context-section headers within the day.
             HeaderMode::ByContext
@@ -4330,8 +4336,8 @@ impl KeptApp {
                 // full outline.
                 // Clone the include-tag list so we can take a
                 // mutable borrow on `self.document.cells` without keeping
-                // an outstanding immutable borrow on `self.view`.
-                let include_tags = self.view.ast.include.tags.clone();
+                // an outstanding immutable borrow on `self.pane_mut().view`.
+                let include_tags = self.pane_mut().view.ast.include.tags.clone();
                 let show_inactive = self.show_inactive_cells;
                 let cell = &mut self.document.cells[i];
                 let filter = compute_outline_bullet_filter(
@@ -4675,11 +4681,11 @@ impl KeptApp {
                         }
                         return false;
                     }
-                    if let Some(focused) = self.focused {
+                    if let Some(focused) = self.pane_mut().focused {
                         if let Some(prev) = self.prev_visible(focused) {
-                            self.focused = Some(prev);
-                            self.editing = false;
-                            self.coalesce_break = true;
+                            self.pane_mut().focused = Some(prev);
+                            self.pane_mut().editing = false;
+                            self.pane_mut().coalesce_break = true;
                             self.scroll_to_focused();
                             return true;
                         }
@@ -4695,11 +4701,11 @@ impl KeptApp {
                         }
                         return false;
                     }
-                    if let Some(focused) = self.focused {
+                    if let Some(focused) = self.pane_mut().focused {
                         if let Some(next) = self.next_visible(focused) {
-                            self.focused = Some(next);
-                            self.editing = false;
-                            self.coalesce_break = true;
+                            self.pane_mut().focused = Some(next);
+                            self.pane_mut().editing = false;
+                            self.pane_mut().coalesce_break = true;
                             self.scroll_to_focused();
                             return true;
                         }
@@ -4720,11 +4726,11 @@ impl KeptApp {
                     };
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("a") => {
-                    if let Some(id) = self.focused {
+                    if let Some(id) = self.pane_mut().focused {
                         if let Some(cell) = self.cell_mut(id) {
                             cell.select_all_focused();
                         }
-                        self.coalesce_break = true;
+                        self.pane_mut().coalesce_break = true;
                         return true;
                     }
                     return false;
@@ -4766,15 +4772,15 @@ impl KeptApp {
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("f") => {
                     // Ctrl+F: enter "focus mode" — render only the focused
                     // cell at full width. Esc or any sidebar click exits.
-                    if self.focused.is_none() {
+                    if self.pane_mut().focused.is_none() {
                         return false;
                     }
-                    if self.focus_mode {
+                    if self.pane_mut().focus_mode {
                         return false;
                     }
-                    self.focus_mode = true;
-                    self.scroll_y = 0.0;
-                    self.coalesce_break = true;
+                    self.pane_mut().focus_mode = true;
+                    self.pane_mut().scroll_y = 0.0;
+                    self.pane_mut().coalesce_break = true;
                     return true;
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("e") => {
@@ -4783,7 +4789,7 @@ impl KeptApp {
                     // applies to references. Unwrap is menu-only on
                     // purpose (so the user can't accidentally drop
                     // notes by hitting the same combo twice).
-                    let Some(id) = self.focused else {
+                    let Some(id) = self.pane_mut().focused else {
                         return false;
                     };
                     let is_reference = matches!(
@@ -4800,15 +4806,15 @@ impl KeptApp {
                     // focused cell. Idempotent — focuses an existing title.
                     // (Cmd+H is reserved by macOS for "hide app," so title
                     // gets T and tables move to J.)
-                    let Some(id) = self.focused else { return false };
+                    let Some(id) = self.pane_mut().focused else { return false };
                     let changed = self
                         .cell_mut(id)
                         .map(|c| c.toggle_title_focus())
                         .unwrap_or(false);
                     if changed {
-                        self.editing = true;
-                        self.coalesce_break = true;
-                        self.pending_caret_scroll = true;
+                        self.pane_mut().editing = true;
+                        self.pane_mut().coalesce_break = true;
+                        self.pane_mut().pending_caret_scroll = true;
                         self.mark_cell_dirty(id);
                     }
                     return changed;
@@ -4843,27 +4849,27 @@ impl KeptApp {
                 }
                 // Esc exits focus mode first; if it wasn't on, fall through
                 // to the edit→view exit below.
-                Key::Named(NamedKey::Escape) if self.focus_mode => {
-                    self.focus_mode = false;
-                    self.coalesce_break = true;
-                    self.pending_caret_scroll = true;
+                Key::Named(NamedKey::Escape) if self.pane_mut().focus_mode => {
+                    self.pane_mut().focus_mode = false;
+                    self.pane_mut().coalesce_break = true;
+                    self.pane_mut().pending_caret_scroll = true;
                     return true;
                 }
-                Key::Named(NamedKey::Escape) if self.editing => {
-                    self.editing = false;
+                Key::Named(NamedKey::Escape) if self.pane_mut().editing => {
+                    self.pane_mut().editing = false;
                     self.mention_popup = None;
-                    self.coalesce_break = true;
+                    self.pane_mut().coalesce_break = true;
                     return true;
                 }
                 Key::Named(NamedKey::Enter)
-                    if !self.editing
+                    if !self.pane_mut().editing
                         && !modifiers.state().shift_key()
-                        && self.focused.is_some() =>
+                        && self.pane_mut().focused.is_some() =>
                 {
                     // Reference cells are read-only — Enter on a focused
                     // reference navigates to the original instead of
                     // entering edit mode.
-                    if let Some(id) = self.focused {
+                    if let Some(id) = self.pane_mut().focused {
                         let target = match self.cell(id) {
                             Some(c) => match &c.kind {
                                 CellKind::Reference(rc) => Some(rc.target()),
@@ -4876,14 +4882,14 @@ impl KeptApp {
                             return true;
                         }
                     }
-                    self.editing = true;
+                    self.pane_mut().editing = true;
                     // Position caret at the end so typing appends to the cell.
-                    if let Some(id) = self.focused {
+                    if let Some(id) = self.pane_mut().focused {
                         if let Some(c) = self.cell_mut(id) {
                             c.place_caret_at_end();
                         }
                     }
-                    self.pending_caret_scroll = true;
+                    self.pane_mut().pending_caret_scroll = true;
                     return true;
                 }
                 _ => {}
@@ -4892,7 +4898,7 @@ impl KeptApp {
 
         // View mode: cell-level operations only. Text input is dropped —
         // Enter is the way back to edit; Backspace/Delete delete the cell.
-        if !self.editing {
+        if !self.pane_mut().editing {
             if event.state == ElementState::Pressed
                 && !modifiers.state().shift_key()
                 && !primary_mod(modifiers.state())
@@ -4900,16 +4906,16 @@ impl KeptApp {
             {
                 match &event.logical_key {
                     Key::Named(NamedKey::ArrowUp) => {
-                        if let Some(focused) = self.focused {
+                        if let Some(focused) = self.pane_mut().focused {
                             if let Some(prev) = self.prev_visible(focused) {
-                                self.focused = Some(prev);
-                                self.coalesce_break = true;
+                                self.pane_mut().focused = Some(prev);
+                                self.pane_mut().coalesce_break = true;
                                 self.scroll_to_focused();
                                 return true;
                             }
                             if let Some(next_ctx) = self.next_context_with_cells() {
                                 if self.set_active_context(next_ctx) {
-                                    self.focused = self.visible_cell_ids().last().copied();
+                                    self.pane_mut().focused = self.visible_cell_ids().last().copied();
                                     return true;
                                 }
                             }
@@ -4917,16 +4923,16 @@ impl KeptApp {
                         return false;
                     }
                     Key::Named(NamedKey::ArrowDown) => {
-                        if let Some(focused) = self.focused {
+                        if let Some(focused) = self.pane_mut().focused {
                             if let Some(next) = self.next_visible(focused) {
-                                self.focused = Some(next);
-                                self.coalesce_break = true;
+                                self.pane_mut().focused = Some(next);
+                                self.pane_mut().coalesce_break = true;
                                 self.scroll_to_focused();
                                 return true;
                             }
                             if let Some(prev_ctx) = self.prev_context_with_cells() {
                                 if self.set_active_context(prev_ctx) {
-                                    self.focused = self.visible_cell_ids().first().copied();
+                                    self.pane_mut().focused = self.visible_cell_ids().first().copied();
                                     return true;
                                 }
                             }
@@ -4949,17 +4955,17 @@ impl KeptApp {
         {
             match &event.logical_key {
                 Key::Named(NamedKey::ArrowUp) => {
-                    if let Some(focused) = self.focused {
+                    if let Some(focused) = self.pane_mut().focused {
                         let at_top = self.cell(focused).map_or(false, |c| c.at_top_edge());
                         if at_top {
                             if let Some(prev) = self.prev_visible(focused) {
-                                self.focused = Some(prev);
+                                self.pane_mut().focused = Some(prev);
                                 if let Some(c) = self.cell_mut(prev) {
                                     c.place_caret_at_end();
                                 }
-                                self.editing = false;
-                                self.coalesce_break = true;
-                                self.pending_caret_scroll = true;
+                                self.pane_mut().editing = false;
+                                self.pane_mut().coalesce_break = true;
+                                self.pane_mut().pending_caret_scroll = true;
                                 return true;
                             }
                             // No more cells in this view going up — cross to
@@ -4970,15 +4976,15 @@ impl KeptApp {
                             if let Some(next_ctx) = self.next_context_with_cells() {
                                 if self.set_active_context(next_ctx) {
                                     let landing = self.visible_cell_ids().last().copied();
-                                    self.focused = landing;
+                                    self.pane_mut().focused = landing;
                                     if let Some(id) = landing {
                                         if let Some(c) = self.cell_mut(id) {
                                             c.place_caret_at_end();
                                         }
                                     }
-                                    self.editing = false;
-                                    self.coalesce_break = true;
-                                    self.pending_caret_scroll = true;
+                                    self.pane_mut().editing = false;
+                                    self.pane_mut().coalesce_break = true;
+                                    self.pane_mut().pending_caret_scroll = true;
                                     return true;
                                 }
                             }
@@ -4986,17 +4992,17 @@ impl KeptApp {
                     }
                 }
                 Key::Named(NamedKey::ArrowDown) => {
-                    if let Some(focused) = self.focused {
+                    if let Some(focused) = self.pane_mut().focused {
                         let at_bot = self.cell(focused).map_or(false, |c| c.at_bottom_edge());
                         if at_bot {
                             if let Some(next) = self.next_visible(focused) {
-                                self.focused = Some(next);
+                                self.pane_mut().focused = Some(next);
                                 if let Some(c) = self.cell_mut(next) {
                                     c.place_caret_at_start();
                                 }
-                                self.editing = false;
-                                self.coalesce_break = true;
-                                self.pending_caret_scroll = true;
+                                self.pane_mut().editing = false;
+                                self.pane_mut().coalesce_break = true;
+                                self.pane_mut().pending_caret_scroll = true;
                                 return true;
                             }
                             // Bottom of the view — cross to the older context
@@ -5005,15 +5011,15 @@ impl KeptApp {
                             if let Some(prev_ctx) = self.prev_context_with_cells() {
                                 if self.set_active_context(prev_ctx) {
                                     let landing = self.visible_cell_ids().first().copied();
-                                    self.focused = landing;
+                                    self.pane_mut().focused = landing;
                                     if let Some(id) = landing {
                                         if let Some(c) = self.cell_mut(id) {
                                             c.place_caret_at_start();
                                         }
                                     }
-                                    self.editing = false;
-                                    self.coalesce_break = true;
-                                    self.pending_caret_scroll = true;
+                                    self.pane_mut().editing = false;
+                                    self.pane_mut().coalesce_break = true;
+                                    self.pane_mut().pending_caret_scroll = true;
                                     return true;
                                 }
                             }
@@ -5024,7 +5030,7 @@ impl KeptApp {
             }
         }
 
-        let focused_id = self.focused;
+        let focused_id = self.pane_mut().focused;
         let pre = focused_id.and_then(|id| self.cell(id)).map(|c| c.snapshot());
         let popup_was_open = self.mention_popup.is_some();
         let handled = if let Some(id) = focused_id {
@@ -5045,11 +5051,11 @@ impl KeptApp {
                     } else {
                         // Cursor-only event: break coalescing so the next text edit
                         // starts a fresh undo entry.
-                        self.coalesce_break = true;
+                        self.pane_mut().coalesce_break = true;
                     }
                 }
             }
-            self.pending_caret_scroll = true;
+            self.pane_mut().pending_caret_scroll = true;
 
             // Maybe open the mention popup (if user just typed a trigger
             // character: `@` for persons, `#` for tags), then sync against
@@ -5067,12 +5073,12 @@ impl KeptApp {
     }
 
     fn copy_to_clipboard(&mut self) -> bool {
-        let Some(id) = self.focused else { return false };
+        let Some(id) = self.pane_mut().focused else { return false };
         let mut text = self.cell(id).map(|c| c.copy_text()).unwrap_or_default();
         // View mode + no selection → copy the whole cell. Edit mode keeps
         // the selection-or-nothing behavior so an accidental Ctrl+C with no
         // selection doesn't dump the whole cell.
-        if text.is_empty() && !self.editing {
+        if text.is_empty() && !self.pane_mut().editing {
             text = self.cell(id).map(|c| c.full_text()).unwrap_or_default();
         }
         if text.is_empty() {
@@ -5085,7 +5091,7 @@ impl KeptApp {
     }
 
     fn cut_to_clipboard(&mut self) -> bool {
-        let Some(id) = self.focused else { return false };
+        let Some(id) = self.pane_mut().focused else { return false };
         let pre = self.cell(id).map(|c| c.snapshot());
         let cut = match self.cell_mut(id) {
             Some(c) => c.cut_text(),
@@ -5103,13 +5109,13 @@ impl KeptApp {
                 self.record_edit(pre, post);
             }
         }
-        self.coalesce_break = true;
-        self.pending_caret_scroll = true;
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().pending_caret_scroll = true;
         true
     }
 
     fn paste_from_clipboard(&mut self) -> bool {
-        let Some(id) = self.focused else { return false };
+        let Some(id) = self.pane_mut().focused else { return false };
         let Some(cb) = self.clipboard.as_mut() else {
             return false;
         };
@@ -5132,8 +5138,8 @@ impl KeptApp {
                 self.record_edit(pre, post);
             }
         }
-        self.coalesce_break = true;
-        self.pending_caret_scroll = true;
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().pending_caret_scroll = true;
         true
     }
 
@@ -5268,8 +5274,8 @@ impl KeptApp {
         // Backing-cell body.
         if let Some(pid) = entity.primary_cell_id {
             if let Some(cell_idx) = self.document.cells.iter().position(|c| c.id == pid) {
-                let focused_id = self.focused;
-                let editing = self.editing;
+                let focused_id = self.pane_mut().focused;
+                let editing = self.pane_mut().editing;
                 let cell = &mut self.document.cells[cell_idx];
                 let cell_is_focused = focused_id.map(|f| f == cell.id).unwrap_or(false);
                 let render_focused = cell_is_focused;
@@ -5732,7 +5738,7 @@ impl KeptApp {
             cell_title_change,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
     }
 
     /// Count `kept://<entity_id>` mentions across every cell's links.
@@ -5800,7 +5806,7 @@ impl KeptApp {
             new,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
     }
 
     /// Flip a cell's `active` flag (the "archive" gesture from the
@@ -5824,8 +5830,8 @@ impl KeptApp {
             new,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
-        self.pending_caret_scroll = true;
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().pending_caret_scroll = true;
         true
     }
 
@@ -5867,8 +5873,8 @@ impl KeptApp {
             new,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
-        self.pending_caret_scroll = true;
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().pending_caret_scroll = true;
         true
     }
 
@@ -5901,7 +5907,7 @@ impl KeptApp {
             });
             self.redo_stack.clear();
         }
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
     }
 
     /// Begin inline "Add person" mode. The footer row's prompt is
@@ -5951,14 +5957,14 @@ impl KeptApp {
             created_at,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
     }
 
     fn record_edit(&mut self, pre: CellSnapshot, post: CellSnapshot) {
-        let Some(cell_id) = self.focused else { return };
+        let Some(cell_id) = self.pane_mut().focused else { return };
         let now = Instant::now();
 
-        let can_coalesce = !self.coalesce_break
+        let can_coalesce = !self.pane_mut().coalesce_break
             && self
                 .last_edit_time
                 .map(|t| now.duration_since(t) < COALESCE_INTERVAL)
@@ -5982,7 +5988,7 @@ impl KeptApp {
 
         self.last_edit_time = Some(now);
         self.redo_stack.clear();
-        self.coalesce_break = false;
+        self.pane_mut().coalesce_break = false;
 
         self.touch_cell(cell_id);
     }
@@ -5994,11 +6000,11 @@ impl KeptApp {
         op.apply(self, UndoDir::Undo);
         let bumps = op.bumps_focused_edited();
         self.redo_stack.push(op);
-        self.dragging_cell = None;
-        self.pending_caret_scroll = true;
-        self.coalesce_break = true;
+        self.pane_mut().dragging_cell = None;
+        self.pane_mut().pending_caret_scroll = true;
+        self.pane_mut().coalesce_break = true;
         if bumps {
-            if let Some(id) = self.focused {
+            if let Some(id) = self.pane_mut().focused {
                 self.touch_cell(id);
             }
         }
@@ -6012,11 +6018,11 @@ impl KeptApp {
         op.apply(self, UndoDir::Redo);
         let bumps = op.bumps_focused_edited();
         self.undo_stack.push(op);
-        self.dragging_cell = None;
-        self.pending_caret_scroll = true;
-        self.coalesce_break = true;
+        self.pane_mut().dragging_cell = None;
+        self.pane_mut().pending_caret_scroll = true;
+        self.pane_mut().coalesce_break = true;
         if bumps {
-            if let Some(id) = self.focused {
+            if let Some(id) = self.pane_mut().focused {
                 self.touch_cell(id);
             }
         }
@@ -6072,7 +6078,7 @@ impl KeptApp {
                         // If user was viewing this closed context, follow to
                         // the new open one; otherwise leave the view alone
                         // (e.g., AST views stay put).
-                        let prev_view = self.view.clone();
+                        let prev_view = self.pane_mut().view.clone();
                         let new_view = if prev_view.context_view() == Some(ctx.id) {
                             Query::context(nid)
                         } else {
@@ -6127,10 +6133,10 @@ impl KeptApp {
             };
         }
 
-        self.focused = new_focus;
-        self.editing = false;
-        self.dragging_cell = None;
-        self.pending_caret_scroll = true;
+        self.pane_mut().focused = new_focus;
+        self.pane_mut().editing = false;
+        self.pane_mut().dragging_cell = None;
+        self.pane_mut().pending_caret_scroll = true;
 
         self.undo_stack.push(UndoOp::DeleteCell {
             cell_id: id,
@@ -6140,7 +6146,7 @@ impl KeptApp {
             side_effect,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
         true
     }
 
@@ -6152,7 +6158,7 @@ impl KeptApp {
                 self.document.contexts.retain(|c| c.id != context.id);
                 self.document.dirty_contexts.remove(&context.id);
                 self.document.pending_context_deletes.insert(context.id);
-                self.view = new_view.clone();
+                self.pane_mut().view = new_view.clone();
             }
             ContextSideEffect::StartReset {
                 context_id,
@@ -6179,7 +6185,7 @@ impl KeptApp {
                 }
                 self.document.mark_context_dirty(context.id);
                 self.document.pending_context_deletes.remove(&context.id);
-                self.view = prev_view.clone();
+                self.pane_mut().view = prev_view.clone();
             }
             ContextSideEffect::StartReset {
                 context_id,
@@ -6202,7 +6208,7 @@ impl KeptApp {
         // pile up empties. Skip when we just auto-switched: the destination's focused
         // cell is incidental, the user's intent was clearly to write.
         if !auto_switched {
-            if let Some(id) = self.focused {
+            if let Some(id) = self.pane_mut().focused {
                 if let Some(cell) = self.cell(id) {
                     if cell.is_empty() {
                         return false;
@@ -6232,7 +6238,7 @@ impl KeptApp {
         if baseline > i64::MIN && now - baseline >= idle_ms {
             self.rotate_context_now();
         }
-        let pre_focused = self.focused;
+        let pre_focused = self.pane_mut().focused;
         let mut new_cell = match kind {
             NewCellKind::Plain => Cell::new(self.typeface.clone(), String::new()),
             NewCellKind::Outline => Cell::new_outline(self.typeface.clone()),
@@ -6251,11 +6257,11 @@ impl KeptApp {
         let new_id = new_cell.id;
         let snapshot = new_cell.snapshot();
         self.insert_cell_sorted(new_cell);
-        self.focused = Some(new_id);
+        self.pane_mut().focused = Some(new_id);
         // Creating a cell is an explicit "I want to type" action.
-        self.editing = true;
-        self.dragging_cell = None;
-        self.pending_caret_scroll = true;
+        self.pane_mut().editing = true;
+        self.pane_mut().dragging_cell = None;
+        self.pane_mut().pending_caret_scroll = true;
 
         self.undo_stack.push(UndoOp::InsertCell {
             cell_id: new_id,
@@ -6263,7 +6269,7 @@ impl KeptApp {
             pre_focused,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
         self.touch_cell(new_id);
         true
     }
@@ -6280,7 +6286,7 @@ impl KeptApp {
         // context_hint and shows up in today's date view anyway).
         // The user gets a toast as confirmation since the visible
         // side effect on their current view is zero.
-        let pre_focused = self.focused;
+        let pre_focused = self.pane_mut().focused;
         let mut new_cell = Cell::new_reference(self.typeface.clone(), target);
         new_cell.set_font_scale(self.font_scale);
         new_cell.context_hint_id = self.writable_context_id();
@@ -6295,7 +6301,7 @@ impl KeptApp {
             pre_focused,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
         self.touch_cell(new_id);
         self.show_toast("Surfaced to today");
         true
@@ -6315,7 +6321,7 @@ impl KeptApp {
             CellKind::Reference(rc) => rc.target(),
             _ => return false,
         };
-        let pre_focused = self.focused;
+        let pre_focused = self.pane_mut().focused;
         let pre = self.document.cells[idx].snapshot();
         let timestamp = self.document.cells[idx].timestamp;
         let edited_at = self.document.cells[idx].edited_at;
@@ -6340,10 +6346,10 @@ impl KeptApp {
         let post = new_cell.snapshot();
 
         self.document.cells[idx] = new_cell;
-        self.focused = Some(cell_id);
-        self.editing = true;
-        self.dragging_cell = None;
-        self.pending_caret_scroll = true;
+        self.pane_mut().focused = Some(cell_id);
+        self.pane_mut().editing = true;
+        self.pane_mut().dragging_cell = None;
+        self.pane_mut().pending_caret_scroll = true;
         self.mark_cell_dirty(cell_id);
         self.touch_cell(cell_id);
 
@@ -6354,7 +6360,7 @@ impl KeptApp {
             pre_focused,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
         true
     }
 
@@ -6374,7 +6380,7 @@ impl KeptApp {
             },
             _ => return false,
         };
-        let pre_focused = self.focused;
+        let pre_focused = self.pane_mut().focused;
         let pre = self.document.cells[idx].snapshot();
         let timestamp = self.document.cells[idx].timestamp;
         let edited_at = self.document.cells[idx].edited_at;
@@ -6397,11 +6403,11 @@ impl KeptApp {
         let post = new_cell.snapshot();
 
         self.document.cells[idx] = new_cell;
-        self.focused = Some(cell_id);
+        self.pane_mut().focused = Some(cell_id);
         // References don't have an edit mode.
-        self.editing = false;
-        self.dragging_cell = None;
-        self.pending_caret_scroll = true;
+        self.pane_mut().editing = false;
+        self.pane_mut().dragging_cell = None;
+        self.pane_mut().pending_caret_scroll = true;
         self.mark_cell_dirty(cell_id);
         self.touch_cell(cell_id);
 
@@ -6412,56 +6418,56 @@ impl KeptApp {
             pre_focused,
         });
         self.redo_stack.clear();
-        self.coalesce_break = true;
+        self.pane_mut().coalesce_break = true;
         true
     }
 
     /// Bring the primary caret of the focused cell into view if it's outside
     /// the viewport. Used after edits, caret movement, and zoom changes.
     fn scroll_caret_into_view(&mut self) {
-        let Some(id) = self.focused else { return };
+        let Some(id) = self.pane_mut().focused else { return };
         let Some(cell) = self.cell(id) else { return };
         let Some((top, bot)) = cell.caret_doc_y_band() else {
             return;
         };
         let pad = 8.0_f32;
-        let view_top = self.scroll_y;
-        let view_bot = self.scroll_y + self.viewport_height;
+        let view_top = self.pane_mut().scroll_y;
+        let view_bot = self.pane_mut().scroll_y + self.pane_mut().viewport_height;
         let new_scroll = if top < view_top + pad {
             (top - pad).max(0.0)
         } else if bot > view_bot - pad {
-            (bot + pad - self.viewport_height).max(0.0)
+            (bot + pad - self.pane_mut().viewport_height).max(0.0)
         } else {
             return;
         };
         // Don't clamp to current max_scroll: a just-grown doc has a stale
         // max_scroll and the next tick will recompute it.
-        self.scroll_y = new_scroll.max(0.0);
-        self.last_scroll_time = Some(Instant::now());
+        self.pane_mut().scroll_y = new_scroll.max(0.0);
+        self.pane_mut().last_scroll_time = Some(Instant::now());
     }
 
     /// Bring the focused cell into view if it's outside the current viewport.
     /// Uses last frame's cell geometry; on the first frame everything is at 0
     /// which results in scroll_y = 0, which is correct.
     fn scroll_to_focused(&mut self) {
-        let Some(id) = self.focused else { return };
+        let Some(id) = self.pane_mut().focused else { return };
         let Some(cell) = self.cell(id) else { return };
         let pad = 8.0_f32;
         let cell_top = cell.y_origin();
         let cell_bot = cell.y_origin() + cell.height();
-        let view_top = self.scroll_y;
-        let view_bot = self.scroll_y + self.viewport_height;
+        let view_top = self.pane_mut().scroll_y;
+        let view_bot = self.pane_mut().scroll_y + self.pane_mut().viewport_height;
 
         let new_scroll = if cell_top < view_top + pad {
             (cell_top - pad).max(0.0)
         } else if cell_bot > view_bot - pad {
-            (cell_bot + pad - self.viewport_height).max(0.0)
+            (cell_bot + pad - self.pane_mut().viewport_height).max(0.0)
         } else {
             return;
         };
-        self.scroll_y = new_scroll.clamp(0.0, self.max_scroll);
+        self.pane_mut().scroll_y = new_scroll.clamp(0.0, self.pane_mut().max_scroll);
         // Briefly show the scrollbar so the jump is visible.
-        self.last_scroll_time = Some(Instant::now());
+        self.pane_mut().last_scroll_time = Some(Instant::now());
     }
 
     /// Right-click handler. Sidebar tag rows offer a "Delete tag"
@@ -6503,8 +6509,8 @@ impl KeptApp {
         if let Some(idx) = self.pane_at(x, y) {
             self.set_active_pane(idx);
         }
-        if matches!(self.view.view_kind, ViewKind::People) {
-            let doc_y = y + self.scroll_y;
+        if matches!(self.pane_mut().view.view_kind, ViewKind::People) {
+            let doc_y = y + self.pane_mut().scroll_y;
             for (entity_id, rect) in self.hit_tests.people_page.rows.clone() {
                 if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     self.open_people_context_menu(entity_id, x, y);
@@ -6514,10 +6520,10 @@ impl KeptApp {
             return was_open;
         }
         if matches!(
-            self.view.view_kind,
+            self.pane_mut().view.view_kind,
             ViewKind::Ast | ViewKind::Context(_) | ViewKind::Entity(_)
         ) {
-            let doc_y = y + self.scroll_y;
+            let doc_y = y + self.pane_mut().scroll_y;
             if let Some(cell_id) = self.find_cell_at(x, doc_y) {
                 // Right-click on a bullet captures (id, snippet) AND
                 // visually highlights its sub-tree, descending through
@@ -6531,7 +6537,7 @@ impl KeptApp {
                     .cell_mut(cell_id)
                     .and_then(|c| select_subtree_at_doc_y(c, cell_id, doc_y));
                 if hit.is_some() {
-                    self.focused = Some(cell_id);
+                    self.pane_mut().focused = Some(cell_id);
                 }
                 let (bullet_origin_cell_id, bullet_id, bullet_snippet) = match hit.as_ref() {
                     Some((origin, id, text)) => (Some(*origin), Some(*id), Some(snippet(text))),
@@ -6743,7 +6749,7 @@ impl KeptApp {
                 self.set_active_pane(pi);
             }
         }
-        let doc_y = y + self.scroll_y;
+        let doc_y = y + self.pane_mut().scroll_y;
 
         // Alt-drag pan deferral. Held Alt + click in any pane area
         // *might* be the start of a pan, but the click might also be
@@ -6780,7 +6786,7 @@ impl KeptApp {
         y: f32,
         modifiers: &Modifiers,
     ) -> bool {
-        self.focus_mode = false;
+        self.pane_mut().focus_mode = false;
         // Sidebar rects are stored in content-space; map mouse to
         // match (sidebar can scroll independently of the doc area).
         let y = y + self.sidebar_scroll.scroll_y;
@@ -6987,7 +6993,7 @@ impl KeptApp {
 
         // Entity-page active/inactive toggle (always present in entity
         // view; rect is None outside it).
-        if let ViewKind::Entity(eid) = self.view.view_kind {
+        if let ViewKind::Entity(eid) = self.pane_mut().view.view_kind {
             if let Some(rect) = self.hit_tests.entity_page.active_toggle {
                 if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     self.toggle_entity_active(eid);
@@ -7012,7 +7018,7 @@ impl KeptApp {
         // Snapshotted into a local first to avoid the &self borrow on
         // `hit_tests.entity_page.refs` outliving the &mut self call to
         // `navigate_to_reference`.
-        if matches!(self.view.view_kind, ViewKind::Entity(_)) {
+        if matches!(self.pane_mut().view.view_kind, ViewKind::Entity(_)) {
             let hit = self
                 .hit_tests.entity_page.refs
                 .iter()
@@ -7034,7 +7040,7 @@ impl KeptApp {
         // is active, then continues processing the click. Clicking the
         // "Add person" footer (when no input is active) starts an Add.
         // Plain row click navigates to that entity's page.
-        if matches!(self.view.view_kind, ViewKind::People) {
+        if matches!(self.pane_mut().view.view_kind, ViewKind::People) {
             // "Show inactive" header toggle wins over everything else
             // on the People page, including any in-progress rename
             // / add input — toggling the filter shouldn't lose typed
@@ -7156,9 +7162,9 @@ impl KeptApp {
         // click preserves whatever mode the user was in. To start editing a new
         // cell, click it (selects), then hit Enter — or just keep typing once
         // already editing the same cell.
-        if Some(target) != self.focused {
-            self.focused = Some(target);
-            self.editing = false;
+        if Some(target) != self.pane_mut().focused {
+            self.pane_mut().focused = Some(target);
+            self.pane_mut().editing = false;
         }
         // Retire any visible selection on cells that aren't the click
         // target. Includes embedded-reference caches (recursively), so
@@ -7172,9 +7178,9 @@ impl KeptApp {
         }
         // Any click moves/replaces the caret — break coalescing so the next
         // text edit starts a fresh undo entry.
-        self.coalesce_break = true;
-        self.dragging_cell = Some(target);
-        let editing = self.editing;
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().dragging_cell = Some(target);
+        let editing = self.pane_mut().editing;
         let result = match self.cell_mut(target) {
             Some(cell) => cell.mouse_down(x, doc_y, modifiers, editing),
             None => false,
@@ -7221,9 +7227,9 @@ impl KeptApp {
             None => return,
         };
         self.push_view(Query::date(target_date));
-        self.focused = Some(cell_id);
-        self.editing = false;
-        self.pending_caret_scroll = true;
+        self.pane_mut().focused = Some(cell_id);
+        self.pane_mut().editing = false;
+        self.pane_mut().pending_caret_scroll = true;
         // Subtree target: drill into the outline cell, focus the
         // specific bullet, AND select its subtree (bullet + descendants)
         // so the original chunk the embed pointed at is visually
@@ -7322,8 +7328,8 @@ impl KeptApp {
                 return state.input.mouse_drag_to(x, y);
             }
         }
-        let doc_y = y + self.scroll_y;
-        if let Some(id) = self.dragging_cell {
+        let doc_y = y + self.pane_mut().scroll_y;
+        if let Some(id) = self.pane_mut().dragging_cell {
             match self.cell_mut(id) {
                 Some(cell) => cell.mouse_drag_to(x, doc_y),
                 None => false,
@@ -7400,7 +7406,7 @@ impl KeptApp {
                 return state.input.mouse_up();
             }
         }
-        if let Some(id) = self.dragging_cell.take() {
+        if let Some(id) = self.pane_mut().dragging_cell.take() {
             match self.cell_mut(id) {
                 Some(cell) => cell.mouse_up(),
                 None => false,
