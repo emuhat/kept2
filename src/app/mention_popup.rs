@@ -1,7 +1,20 @@
-use skia_safe::{Canvas, Font, Paint, PaintStyle, Point, Rect};
+use skia_safe::{Canvas, Font, Paint, PaintStyle, Point, Rect, Typeface};
 use uuid::Uuid;
 
-use super::{KeptApp, clamp_rect_to_viewport};
+use super::{HitTestState, KeptApp, clamp_rect_to_viewport};
+
+/// Per-frame context the mention-popup render needs from `KeptApp`.
+/// Used by `MentionPopup::render` (S8: explicit subsystem scope). The
+/// anchor position and the candidate list are computed by the caller
+/// and passed in as parameters — they involve borrows of cell /
+/// search / entity state that the popup itself doesn't need to hold.
+pub(super) struct MentionRenderCtx<'a> {
+    pub(super) font_scale: f32,
+    pub(super) typeface: &'a Typeface,
+    pub(super) mouse_pos: (f32, f32),
+    /// Per-frame hit-test write surface (see S2).
+    pub(super) hit_tests: &'a mut HitTestState,
+}
 
 const MENTION_POPUP_WIDTH: f32 = 220.0;
 const MENTION_POPUP_ROW_H: f32 = 28.0;
@@ -177,6 +190,199 @@ fn draw_runs_with_matches(
         canvas.draw_str(segment, Point::new(x, origin.y), font, paint);
         x += font.measure_str(segment, Some(paint)).0;
         i = j;
+    }
+}
+
+impl MentionPopup {
+    /// Render the popup card + its rows. Caller pre-computes
+    /// `anchor_pos` (window-space `(x, y_below_trigger)`) and the
+    /// `candidates` list — both involve borrows of cell / search /
+    /// entity state that the popup itself doesn't need to hold.
+    pub(super) fn render(
+        &self,
+        canvas: &Canvas,
+        view_w: f32,
+        view_h: f32,
+        anchor_pos: (f32, f32),
+        candidates: &[(String, bool)],
+        ctx: &mut MentionRenderCtx<'_>,
+    ) {
+        let (anchor_x, anchor_y_below) = anchor_pos;
+        let kind = self.kind;
+        let query = &self.query;
+        let selected = self.selected;
+
+        let scale = ctx.font_scale;
+        let popup_w = MENTION_POPUP_WIDTH * scale;
+        let row_h = MENTION_POPUP_ROW_H * scale;
+        let pad = MENTION_POPUP_PAD * scale;
+        let radius = MENTION_POPUP_RADIUS * scale;
+
+        let items = filter_mentions(candidates, query);
+        let visible = items.len().min(MENTION_POPUP_MAX_VISIBLE);
+        // The "Add @X" / "Add #X" row appears at the bottom only when
+        // the user typed something AND nothing matched. Mouse-only —
+        // see commit_mention_via_keyboard for why.
+        let show_add_row = items.is_empty() && !query.is_empty();
+        let row_count = if items.is_empty() {
+            // Hint row ("No matches…" / "Type to search…") plus the
+            // optional Add row.
+            if show_add_row { 2 } else { 1 }
+        } else {
+            visible
+        };
+        let popup_h = (row_count as f32) * row_h + pad * 2.0;
+
+        // Anchor below the trigger char, then clamp into the viewport
+        // so a popup near the right or bottom edge doesn't paint past
+        // the window.
+        let initial_top = anchor_y_below + 4.0 * scale;
+        let clamped = clamp_rect_to_viewport(
+            Rect::new(anchor_x, initial_top, anchor_x + popup_w, initial_top + popup_h),
+            view_w,
+            view_h,
+            4.0,
+        );
+        let popup_x = clamped.left;
+        let popup_y = clamped.top;
+
+        // Drop shadow (drawn first, slightly offset).
+        let mut shadow_paint = Paint::default();
+        shadow_paint.set_anti_alias(true);
+        shadow_paint.set_color(crate::color::shadow_soft());
+        canvas.draw_round_rect(
+            Rect::new(
+                popup_x + 1.0,
+                popup_y + 2.0,
+                popup_x + popup_w + 1.0,
+                popup_y + popup_h + 2.0,
+            ),
+            radius,
+            radius,
+            &shadow_paint,
+        );
+
+        // Background.
+        let mut bg_paint = Paint::default();
+        bg_paint.set_anti_alias(true);
+        bg_paint.set_color(crate::color::bg_card());
+        let popup_rect = Rect::new(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h);
+        canvas.draw_round_rect(popup_rect, radius, radius, &bg_paint);
+
+        // Border.
+        let mut border_paint = Paint::default();
+        border_paint.set_anti_alias(true);
+        border_paint.set_style(PaintStyle::Stroke);
+        border_paint.set_stroke_width(1.0);
+        border_paint.set_color(crate::color::menu_border());
+        canvas.draw_round_rect(popup_rect, radius, radius, &border_paint);
+
+        let body_font = Font::from_typeface(ctx.typeface, MENTION_BODY_FONT_SIZE * scale);
+        let (_, m) = body_font.metrics();
+        let row_text_height = -m.ascent + m.descent;
+        let text_offset_in_row = (row_h - row_text_height) * 0.5 + (-m.ascent);
+
+        if items.is_empty() {
+            // Hint row.
+            let mut hint_paint = Paint::default();
+            hint_paint.set_anti_alias(true);
+            hint_paint.set_color(crate::color::text_muted_grey());
+            let hint_y = popup_y + pad;
+            let baseline = hint_y + text_offset_in_row;
+            let label = if query.is_empty() {
+                "Type to search…".to_string()
+            } else {
+                format!("No matches for \"{}\"", query)
+            };
+            canvas.draw_str(
+                label,
+                Point::new(popup_x + 12.0 * scale, baseline),
+                &body_font,
+                &hint_paint,
+            );
+
+            if show_add_row {
+                let add_y = hint_y + row_h;
+                let add_rect = Rect::new(
+                    popup_x + 4.0 * scale,
+                    add_y,
+                    popup_x + popup_w - 4.0 * scale,
+                    add_y + row_h,
+                );
+                let mouse = ctx.mouse_pos;
+                let hovered = mouse.0 >= add_rect.left
+                    && mouse.0 <= add_rect.right
+                    && mouse.1 >= add_rect.top
+                    && mouse.1 <= add_rect.bottom;
+                if hovered {
+                    let mut hp = Paint::default();
+                    hp.set_anti_alias(true);
+                    hp.set_color(crate::color::accent_blue_selection());
+                    canvas.draw_round_rect(add_rect, 4.0 * scale, 4.0 * scale, &hp);
+                }
+                let mut text_paint = Paint::default();
+                text_paint.set_anti_alias(true);
+                text_paint.set_color(crate::color::text_primary());
+                let baseline = add_y + text_offset_in_row;
+                canvas.draw_str(
+                    format!("Add {}{}", kind.trigger(), query),
+                    Point::new(popup_x + 12.0 * scale, baseline),
+                    &body_font,
+                    &text_paint,
+                );
+                ctx.hit_tests.mention_popup.add_row = Some(add_rect);
+            }
+            return;
+        }
+
+        let mut dim_paint = Paint::default();
+        dim_paint.set_anti_alias(true);
+        dim_paint.set_color(crate::color::text_muted_grey());
+
+        let mut match_paint = Paint::default();
+        match_paint.set_anti_alias(true);
+        match_paint.set_color(crate::color::text_primary());
+
+        let mut hl_paint = Paint::default();
+        hl_paint.set_anti_alias(true);
+        hl_paint.set_color(crate::color::accent_blue_selection());
+
+        let sel_idx = selected.min(visible - 1);
+        let mut row_y = popup_y + pad;
+        for (i, (item, matches)) in items.iter().take(visible).enumerate() {
+            let row_rect = Rect::new(
+                popup_x + 4.0 * scale,
+                row_y,
+                popup_x + popup_w - 4.0 * scale,
+                row_y + row_h,
+            );
+            let mouse = ctx.mouse_pos;
+            let mouse_hover = mouse.0 >= row_rect.left
+                && mouse.0 <= row_rect.right
+                && mouse.1 >= row_rect.top
+                && mouse.1 <= row_rect.bottom;
+            if i == sel_idx || mouse_hover {
+                canvas.draw_round_rect(row_rect, 4.0 * scale, 4.0 * scale, &hl_paint);
+            }
+            let baseline = row_y + text_offset_in_row;
+            let text_x = popup_x + 12.0 * scale;
+            // Render the trigger in dim, then alternate dim / match-paint
+            // runs across the suggestion's letters.
+            let trigger = kind.trigger();
+            let trigger_w = body_font.measure_str(trigger, Some(&dim_paint)).0;
+            canvas.draw_str(trigger, Point::new(text_x, baseline), &body_font, &dim_paint);
+            draw_runs_with_matches(
+                canvas,
+                item,
+                matches,
+                Point::new(text_x + trigger_w, baseline),
+                &body_font,
+                &match_paint,
+                &dim_paint,
+            );
+            ctx.hit_tests.mention_popup.rows.push(row_rect);
+            row_y += row_h;
+        }
     }
 }
 
@@ -366,22 +572,17 @@ impl KeptApp {
     }
 
     pub(super) fn render_mention_popup(&mut self, canvas: &Canvas, view_w: f32, view_h: f32) {
-        // Snapshot the popup state into locals so subsequent &mut self
-        // writes (hit_tests_builder) don't fight the popup borrow.
-        let (source, kind, anchor_byte, query, selected) = {
+        // Phase 1: pull the bits we need to compute anchor + candidates,
+        // dropping the popup borrow before reaching for `self.cell` /
+        // `self.scroll_y` (which borrow self in conflicting shapes).
+        let (source, kind, anchor_byte) = {
             let Some(popup) = self.mention_popup.as_ref() else {
                 return;
             };
-            (
-                popup.source,
-                popup.kind,
-                popup.anchor_byte,
-                popup.query.clone(),
-                popup.selected,
-            )
+            (popup.source, popup.kind, popup.anchor_byte)
         };
 
-        let (anchor_x, anchor_y_below) = match source {
+        let anchor_pos = match source {
             MentionSource::Cell { cell_id, bullet_id: _ } => {
                 let Some(cell) = self.cell(cell_id) else {
                     return;
@@ -389,8 +590,11 @@ impl KeptApp {
                 let Some((x, y)) = cell.anchor_doc_pos(anchor_byte) else {
                     return;
                 };
-                // Doc-space → window-space: subtract scroll.
-                (x, y - self.scroll_y)
+                // Doc-space → window-space: subtract scroll. Use direct
+                // field path to disjoin from the later `self.mention_popup`
+                // re-borrow.
+                let scroll_y = self.panes[self.active_pane].scroller.scroll_y;
+                (x, y - scroll_y)
             }
             MentionSource::SearchBar => {
                 let Some(state) = self.search.as_ref() else { return };
@@ -404,178 +608,19 @@ impl KeptApp {
             }
         };
 
-        let scale = self.font_scale;
-        let popup_w = MENTION_POPUP_WIDTH * scale;
-        let row_h = MENTION_POPUP_ROW_H * scale;
-        let pad = MENTION_POPUP_PAD * scale;
-        let radius = MENTION_POPUP_RADIUS * scale;
-
         let candidates = self.mention_candidates_for(kind);
-        let items = filter_mentions(&candidates, &query);
-        let visible = items.len().min(MENTION_POPUP_MAX_VISIBLE);
-        // The "Add @X" / "Add #X" row appears at the bottom only when
-        // the user typed something AND nothing matched. Mouse-only —
-        // see commit_mention_via_keyboard for why.
-        let show_add_row = items.is_empty() && !query.is_empty();
-        let row_count = if items.is_empty() {
-            // Hint row ("No matches…" / "Type to search…") plus the
-            // optional Add row.
-            if show_add_row { 2 } else { 1 }
-        } else {
-            visible
-        };
-        let popup_h = (row_count as f32) * row_h + pad * 2.0;
 
-        // Anchor below the trigger char, then clamp into the viewport
-        // so a popup near the right or bottom edge doesn't paint past
-        // the window.
-        let initial_top = anchor_y_below + 4.0 * scale;
-        let clamped = clamp_rect_to_viewport(
-            Rect::new(anchor_x, initial_top, anchor_x + popup_w, initial_top + popup_h),
-            view_w,
-            view_h,
-            4.0,
-        );
-        let popup_x = clamped.left;
-        let popup_y = clamped.top;
-
-        // Drop shadow (drawn first, slightly offset).
-        let mut shadow_paint = Paint::default();
-        shadow_paint.set_anti_alias(true);
-        shadow_paint.set_color(crate::color::shadow_soft());
-        canvas.draw_round_rect(
-            Rect::new(
-                popup_x + 1.0,
-                popup_y + 2.0,
-                popup_x + popup_w + 1.0,
-                popup_y + popup_h + 2.0,
-            ),
-            radius,
-            radius,
-            &shadow_paint,
-        );
-
-        // Background.
-        let mut bg_paint = Paint::default();
-        bg_paint.set_anti_alias(true);
-        bg_paint.set_color(crate::color::bg_card());
-        let popup_rect = Rect::new(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h);
-        canvas.draw_round_rect(popup_rect, radius, radius, &bg_paint);
-
-        // Border.
-        let mut border_paint = Paint::default();
-        border_paint.set_anti_alias(true);
-        border_paint.set_style(PaintStyle::Stroke);
-        border_paint.set_stroke_width(1.0);
-        border_paint.set_color(crate::color::menu_border());
-        canvas.draw_round_rect(popup_rect, radius, radius, &border_paint);
-
-        let body_font = Font::from_typeface(&self.typeface, MENTION_BODY_FONT_SIZE * scale);
-        let (_, m) = body_font.metrics();
-        let row_text_height = -m.ascent + m.descent;
-        let text_offset_in_row = (row_h - row_text_height) * 0.5 + (-m.ascent);
-
-        if items.is_empty() {
-            // Hint row.
-            let mut hint_paint = Paint::default();
-            hint_paint.set_anti_alias(true);
-            hint_paint.set_color(crate::color::text_muted_grey());
-            let hint_y = popup_y + pad;
-            let baseline = hint_y + text_offset_in_row;
-            let label = if query.is_empty() {
-                "Type to search…".to_string()
-            } else {
-                format!("No matches for \"{}\"", query)
-            };
-            canvas.draw_str(
-                label,
-                Point::new(popup_x + 12.0 * scale, baseline),
-                &body_font,
-                &hint_paint,
-            );
-
-            if show_add_row {
-                let add_y = hint_y + row_h;
-                let add_rect = Rect::new(
-                    popup_x + 4.0 * scale,
-                    add_y,
-                    popup_x + popup_w - 4.0 * scale,
-                    add_y + row_h,
-                );
-                let mouse = self.mouse_pos;
-                let hovered = mouse.0 >= add_rect.left
-                    && mouse.0 <= add_rect.right
-                    && mouse.1 >= add_rect.top
-                    && mouse.1 <= add_rect.bottom;
-                if hovered {
-                    let mut hp = Paint::default();
-                    hp.set_anti_alias(true);
-                    hp.set_color(crate::color::accent_blue_selection());
-                    canvas.draw_round_rect(add_rect, 4.0 * scale, 4.0 * scale, &hp);
-                }
-                let mut text_paint = Paint::default();
-                text_paint.set_anti_alias(true);
-                text_paint.set_color(crate::color::text_primary());
-                let baseline = add_y + text_offset_in_row;
-                canvas.draw_str(
-                    format!("Add {}{}", kind.trigger(), query),
-                    Point::new(popup_x + 12.0 * scale, baseline),
-                    &body_font,
-                    &text_paint,
-                );
-                self.hit_tests_builder.mention_popup.add_row = Some(add_rect);
-            }
+        // Phase 2: re-borrow the popup and delegate to its render method.
+        let Some(popup) = self.mention_popup.as_ref() else {
             return;
-        }
-
-        let mut dim_paint = Paint::default();
-        dim_paint.set_anti_alias(true);
-        dim_paint.set_color(crate::color::text_muted_grey());
-
-        let mut match_paint = Paint::default();
-        match_paint.set_anti_alias(true);
-        match_paint.set_color(crate::color::text_primary());
-
-        let mut hl_paint = Paint::default();
-        hl_paint.set_anti_alias(true);
-        hl_paint.set_color(crate::color::accent_blue_selection());
-
-        let sel_idx = selected.min(visible - 1);
-        let mut row_y = popup_y + pad;
-        for (i, (item, matches)) in items.iter().take(visible).enumerate() {
-            let row_rect = Rect::new(
-                popup_x + 4.0 * scale,
-                row_y,
-                popup_x + popup_w - 4.0 * scale,
-                row_y + row_h,
-            );
-            let mouse = self.mouse_pos;
-            let mouse_hover = mouse.0 >= row_rect.left
-                && mouse.0 <= row_rect.right
-                && mouse.1 >= row_rect.top
-                && mouse.1 <= row_rect.bottom;
-            if i == sel_idx || mouse_hover {
-                canvas.draw_round_rect(row_rect, 4.0 * scale, 4.0 * scale, &hl_paint);
-            }
-            let baseline = row_y + text_offset_in_row;
-            let text_x = popup_x + 12.0 * scale;
-            // Render the trigger in dim, then alternate dim / match-paint
-            // runs across the suggestion's letters.
-            let trigger = kind.trigger();
-            let trigger_w = body_font.measure_str(trigger, Some(&dim_paint)).0;
-            canvas.draw_str(trigger, Point::new(text_x, baseline), &body_font, &dim_paint);
-            draw_runs_with_matches(
-                canvas,
-                item,
-                matches,
-                Point::new(text_x + trigger_w, baseline),
-                &body_font,
-                &match_paint,
-                &dim_paint,
-            );
-            self.hit_tests_builder.mention_popup.rows.push(row_rect);
-            row_y += row_h;
-        }
+        };
+        let mut ctx = MentionRenderCtx {
+            font_scale: self.font_scale,
+            typeface: &self.typeface,
+            mouse_pos: self.mouse_pos,
+            hit_tests: &mut self.hit_tests_builder,
+        };
+        popup.render(canvas, view_w, view_h, anchor_pos, &candidates, &mut ctx);
     }
 
     pub(super) fn mention_popup_move(&mut self, delta: i32) {

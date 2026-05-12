@@ -1,12 +1,33 @@
 use skia_safe::{
-    BlurStyle, Canvas, Font, MaskFilter, Paint, PaintStyle, Point, Rect,
+    BlurStyle, Canvas, Font, MaskFilter, Paint, PaintStyle, Point, Rect, Typeface,
 };
 use uuid::Uuid;
 
 use crate::cell::{Cell, TextBox, now_epoch_ms};
+use crate::document::Document;
+use crate::entity_cache::EntityCache;
 use crate::query;
 
-use super::{KeptApp, Query, fit_text_ellipsized, format_date_label, local_date_for_ms};
+use super::{HitTestState, KeptApp, Query, fit_text_ellipsized, format_date_label, local_date_for_ms};
+
+/// Per-frame context the search render path needs from `KeptApp`.
+/// Pure data slice — `SearchState::render` takes this instead of
+/// reaching into the whole app (S8: explicit subsystem scope).
+pub(super) struct SearchRenderCtx<'a> {
+    pub(super) font_scale: f32,
+    pub(super) typeface: &'a Typeface,
+    pub(super) document: &'a Document,
+    pub(super) entities: &'a EntityCache,
+    pub(super) show_inactive_cells: bool,
+    /// True while the @-mention popup is showing. Render skips the
+    /// per-frame `search_results` recompute in that case so the result
+    /// list doesn't churn on every keystroke of the in-progress
+    /// `@<query>` token; the cached results from `SearchState` are
+    /// shown instead.
+    pub(super) mention_popup_active: bool,
+    /// Per-frame hit-test write surface (see S2).
+    pub(super) hit_tests: &'a mut HitTestState,
+}
 
 /// Search popup (Ctrl/Cmd+K).
 const SEARCH_WIDTH: f32 = 520.0;
@@ -32,12 +53,24 @@ pub(super) struct SearchState {
     pub(super) cached_results: Vec<Uuid>,
 }
 
-impl KeptApp {
-    pub(super) fn render_search_popup(&mut self, canvas: &Canvas, width: f32) {
-        if self.search.is_none() {
-            return;
+impl SearchState {
+    pub(super) fn new(typeface: Typeface, font_scale: f32) -> Self {
+        let mut input = TextBox::new(typeface, String::new());
+        input.set_font_scale(font_scale);
+        Self {
+            input,
+            selected: 0,
+            cached_results: Vec::new(),
         }
-        let scale = self.font_scale;
+    }
+
+    pub(super) fn render(
+        &mut self,
+        canvas: &Canvas,
+        width: f32,
+        ctx: &mut SearchRenderCtx<'_>,
+    ) {
+        let scale = ctx.font_scale;
         let pad = SEARCH_PAD * scale;
         let radius = SEARCH_RADIUS * scale;
         let popup_w = (SEARCH_WIDTH * scale).min(width - pad * 2.0).max(200.0);
@@ -46,27 +79,19 @@ impl KeptApp {
 
         let input_h = SEARCH_INPUT_H * scale;
         let result_h = SEARCH_RESULT_H * scale;
-        let query = self
-            .search
-            .as_ref()
-            .map(|s| s.input.text().to_string())
-            .unwrap_or_default();
+        let query = self.input.text().to_string();
         // Only recompute results when the @-mention popup is closed —
         // otherwise the in-progress `@<query>` token would churn the list
         // on every keystroke. Cache survives until the mention popup
         // closes (commit or cancel), at which point the next render
         // refreshes against the now-final query text.
-        let results: Vec<Uuid> = if self.mention_popup.is_none() {
-            let fresh = self.search_results(&query);
-            if let Some(state) = self.search.as_mut() {
-                state.cached_results = fresh.clone();
-            }
+        let results: Vec<Uuid> = if !ctx.mention_popup_active {
+            let fresh =
+                search_results(&query, ctx.document, ctx.entities, ctx.show_inactive_cells);
+            self.cached_results = fresh.clone();
             fresh
         } else {
-            self.search
-                .as_ref()
-                .map(|s| s.cached_results.clone())
-                .unwrap_or_default()
+            self.cached_results.clone()
         };
         let visible = results.len().min(SEARCH_MAX_VISIBLE);
         let popup_h = input_h + (visible as f32) * result_h + pad * 2.0;
@@ -102,10 +127,8 @@ impl KeptApp {
         let input_x = popup_x + pad;
         let input_y = popup_y + pad;
         let input_w = popup_w - pad * 2.0;
-        if let Some(state) = self.search.as_mut() {
-            state.input.tick(canvas, input_x, input_y, input_w, true, true);
-        }
-        self.hit_tests_builder.search.input = Some(Rect::new(
+        self.input.tick(canvas, input_x, input_y, input_w, true, true);
+        ctx.hit_tests.search.input = Some(Rect::new(
             input_x,
             input_y,
             input_x + input_w,
@@ -115,7 +138,7 @@ impl KeptApp {
         // Placeholder text rendered ON TOP only when the input is empty.
         if query.is_empty() {
             let input_font =
-                Font::from_typeface(&self.typeface, SEARCH_INPUT_FONT_SIZE * scale);
+                Font::from_typeface(ctx.typeface, SEARCH_INPUT_FONT_SIZE * scale);
             let (_, im) = input_font.metrics();
             let baseline = input_y + (-im.ascent);
             let mut hint = Paint::default();
@@ -142,9 +165,9 @@ impl KeptApp {
 
         // Result rows.
         let result_font =
-            Font::from_typeface(&self.typeface, SEARCH_RESULT_FONT_SIZE * scale);
+            Font::from_typeface(ctx.typeface, SEARCH_RESULT_FONT_SIZE * scale);
         let date_font =
-            Font::from_typeface(&self.typeface, SEARCH_DATE_FONT_SIZE * scale);
+            Font::from_typeface(ctx.typeface, SEARCH_DATE_FONT_SIZE * scale);
         let (_, rm) = result_font.metrics();
         let mut date_paint = Paint::default();
         date_paint.set_anti_alias(true);
@@ -153,7 +176,7 @@ impl KeptApp {
         row_paint.set_anti_alias(true);
         row_paint.set_color(crate::color::text_primary());
 
-        let selected = self.search.as_ref().map(|s| s.selected).unwrap_or(0);
+        let selected = self.selected;
         let mut row_y = popup_y + pad + input_h;
         for (i, &id) in results.iter().take(SEARCH_MAX_VISIBLE).enumerate() {
             let is_selected = i == selected.min(visible.saturating_sub(1));
@@ -172,7 +195,7 @@ impl KeptApp {
                 );
             }
 
-            if let Some(cell) = self.cell(id) {
+            if let Some(cell) = ctx.document.cell(id) {
                 let date_label = format_date_label(local_date_for_ms(cell.timestamp));
                 let baseline = row_y + (result_h + (-rm.ascent) - rm.descent) * 0.5;
                 let date_w = date_font
@@ -218,17 +241,92 @@ impl KeptApp {
         }
     }
 
+    /// Move the highlight up/down within the current result list.
+    /// `delta = -1` is up, `+1` is down. Wraps modulo result count.
+    pub(super) fn move_selection(
+        &mut self,
+        delta: i32,
+        document: &Document,
+        entities: &EntityCache,
+        show_inactive_cells: bool,
+    ) {
+        let query = self.input.text().to_string();
+        let results = search_results(&query, document, entities, show_inactive_cells);
+        let count = results.len().min(SEARCH_MAX_VISIBLE);
+        if count == 0 {
+            return;
+        }
+        let cur = self.selected.min(count - 1) as i32;
+        self.selected = ((cur + delta).rem_euclid(count as i32)) as usize;
+    }
+}
+
+/// Top-N matching cell IDs for the popup result list. Parses `query`
+/// through the language, runs the executor, and sorts most-recent first.
+/// Free function (not a method on KeptApp) — the search subsystem owns
+/// it and renders / commit / move-selection all call here.
+pub(super) fn search_results(
+    query: &str,
+    document: &Document,
+    entities: &EntityCache,
+    show_inactive_cells: bool,
+) -> Vec<Uuid> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    let ast = query::parse(query);
+    let ctx = query::MatchContext {
+        today: local_date_for_ms(now_epoch_ms()),
+        person_targets: query::resolve_persons(
+            &ast.include.entities,
+            &entities.alias_index,
+            &entities.title_fallback,
+        ),
+        person_excludes: query::resolve_persons(
+            &ast.exclude.entities,
+            &entities.alias_index,
+            &entities.title_fallback,
+        ),
+    };
+    // Inactive cells drop out of search results unless the global
+    // "Show archived" toggle is on, mirroring the visibility gate in
+    // `is_visible_for_view`. Otherwise an archived cell could surface
+    // here, the user clicks it, and navigates to a date view that has
+    // it filtered out — a dead-end click. Bullet-level cascade isn't
+    // applied (search returns whole cells; the cell-level gate is
+    // enough).
+    let mut hits: Vec<&Cell> = document
+        .cells
+        .iter()
+        .filter(|c| (c.active || show_inactive_cells) && query::matches(&ast, c, &ctx))
+        .collect();
+    hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    hits.into_iter().map(|c| c.id).collect()
+}
+
+impl KeptApp {
+    pub(super) fn render_search_popup(&mut self, canvas: &Canvas, width: f32) {
+        let mention_popup_active = self.mention_popup.is_some();
+        let Some(state) = self.search.as_mut() else {
+            return;
+        };
+        let mut ctx = SearchRenderCtx {
+            font_scale: self.font_scale,
+            typeface: &self.typeface,
+            document: &self.document,
+            entities: &self.entities,
+            show_inactive_cells: self.show_inactive_cells,
+            mention_popup_active,
+            hit_tests: &mut self.hit_tests_builder,
+        };
+        state.render(canvas, width, &mut ctx);
+    }
+
     pub(super) fn open_search(&mut self) {
         if self.search.is_some() {
             return;
         }
-        let mut input = TextBox::new(self.typeface.clone(), String::new());
-        input.set_font_scale(self.font_scale);
-        self.search = Some(SearchState {
-            input,
-            selected: 0,
-            cached_results: Vec::new(),
-        });
+        self.search = Some(SearchState::new(self.typeface.clone(), self.font_scale));
         // Drop other transient overlays so they don't compete for input.
         self.mention_popup = None;
         self.cell_context_menu = None;
@@ -247,7 +345,12 @@ impl KeptApp {
     pub(super) fn close_search_commit(&mut self, in_other_pane: bool) {
         let Some(state) = self.search.take() else { return };
         let query = state.input.text().to_string();
-        let results = self.search_results(&query);
+        let results = search_results(
+            &query,
+            &self.document,
+            &self.entities,
+            self.show_inactive_cells,
+        );
         let Some(&id) = results.get(state.selected) else {
             self.coalesce_break = true;
             return;
@@ -279,59 +382,16 @@ impl KeptApp {
         self.coalesce_break = true;
     }
 
-    /// Top-N matching cell IDs for the popup result list. Parses `query`
-    /// through the language, runs the executor, and sorts most-recent first.
-    pub(super) fn search_results(&self, query: &str) -> Vec<Uuid> {
-        if query.trim().is_empty() {
-            return Vec::new();
-        }
-        let ast = query::parse(query);
-        let ctx = query::MatchContext {
-            today: local_date_for_ms(now_epoch_ms()),
-            person_targets: query::resolve_persons(
-                &ast.include.entities,
-                &self.entities.alias_index,
-                &self.entities.title_fallback,
-            ),
-            person_excludes: query::resolve_persons(
-                &ast.exclude.entities,
-                &self.entities.alias_index,
-                &self.entities.title_fallback,
-            ),
-        };
-        // Inactive cells drop out of search results unless the
-        // global "Show archived" toggle is on, mirroring the
-        // visibility gate in `is_visible_for_view`. Otherwise an
-        // archived cell could surface here, the user clicks it, and
-        // navigates to a date view that has it filtered out — a
-        // dead-end click. Bullet-level cascade isn't applied (search
-        // returns whole cells; the cell-level gate is enough).
-        let show_inactive_cells = self.show_inactive_cells;
-        let mut hits: Vec<&Cell> = self
-            .document
-            .cells
-            .iter()
-            .filter(|c| (c.active || show_inactive_cells) && query::matches(&ast, c, &ctx))
-            .collect();
-        hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        hits.into_iter().map(|c| c.id).collect()
-    }
-
     pub(super) fn search_move(&mut self, delta: i32) {
-        let Some(state) = self.search.as_ref() else { return };
-        let query = state.input.text().to_string();
-        let results = self.search_results(&query);
-        let count = results.len().min(SEARCH_MAX_VISIBLE);
-        if count == 0 {
-            return;
-        }
-        let cur = state.selected.min(count - 1) as i32;
-        let new = ((cur + delta).rem_euclid(count as i32)) as usize;
-        if let Some(s) = self.search.as_mut() {
-            s.selected = new;
+        if let Some(state) = self.search.as_mut() {
+            state.move_selection(
+                delta,
+                &self.document,
+                &self.entities,
+                self.show_inactive_cells,
+            );
         }
     }
-
 }
 
 fn result_snippet(text: &str, query: &str) -> String {
