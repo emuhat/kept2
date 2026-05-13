@@ -438,10 +438,18 @@ impl Db {
                 }
                 tb
             });
-            let active = pc.active;
+            // Back-compat: legacy rows store an `active` bool. New
+            // rows store `closed_at`. Prefer the explicit timestamp;
+            // fall back to "close happened at edited_at" for legacy
+            // archived rows so the imprecise migration still produces
+            // a sensible timestamp.
+            let closed_at = pc.closed_at.or_else(|| {
+                if !pc.active { Some(edited_at) } else { None }
+            });
+            let resurface_after = pc.resurface_after;
             let kind = body_to_kind(pc.body, typeface);
             cells.push(Cell::from_parts(
-                id, kind, title, timestamp, edited_at, hint, active,
+                id, kind, title, timestamp, edited_at, hint, closed_at, resurface_after,
             ));
         }
         Ok(cells)
@@ -897,12 +905,23 @@ impl Db {
 struct PersistedCell {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<TitleRecord>,
-    /// "Archived" status. Default true (active) so legacy JSON
-    /// without this field — every cell saved before this feature
-    /// landed — loads as active. Skip-if-default keeps the JSON
-    /// shape identical for the common case.
+    /// LEGACY archived flag. Reads only — newer code stores the
+    /// equivalent state in `closed_at`. We accept old JSON via the
+    /// default and we still serialize `true` (the common case) with
+    /// skip-if-default so untouched data stays byte-identical. When
+    /// `closed_at.is_some()` we deliberately write `active = false`
+    /// so a downgrade still hides the cell in views.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     active: bool,
+    /// `Some(t)` when the cell was closed at epoch ms `t`; `None`
+    /// when open. Backfilled on load from legacy `active=false`
+    /// rows (using `edited_at` as the imprecise close time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    closed_at: Option<i64>,
+    /// `Some(t)` schedules the cell to appear in the Current view
+    /// at epoch ms `t`. Absent for non-snoozed cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resurface_after: Option<i64>,
     #[serde(flatten)]
     body: CellBody,
 }
@@ -1010,12 +1029,18 @@ struct BlockRecord {
     links: Vec<LinkRecord>,
     #[serde(default)]
     tags: Vec<TagRecord>,
-    /// Per-bullet "archived" flag. Default true so legacy JSON
-    /// loads bullets as active; serializer skips the field for the
-    /// common active case so the JSON shape stays identical for
-    /// existing data.
+    /// LEGACY per-bullet archived flag. Same back-compat pattern as
+    /// `PersistedCell::active` — accepted on read, derived from
+    /// `closed_at` on write for downgrade-safety.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     active: bool,
+    /// `Some(t)` when the bullet was closed at epoch ms `t`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    closed_at: Option<i64>,
+    /// `Some(t)` schedules the bullet to appear in the Current view
+    /// at epoch ms `t`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resurface_after: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1060,7 +1085,11 @@ fn persisted_cell_from(cell: &Cell) -> PersistedCell {
     });
     PersistedCell {
         title,
-        active: cell.active,
+        // Derive the legacy bool from the new `closed_at` field so a
+        // downgrade still treats closed cells as archived.
+        active: cell.is_open(),
+        closed_at: cell.closed_at,
+        resurface_after: cell.resurface_after,
         body: cell_to_body(cell),
     }
 }
@@ -1109,7 +1138,9 @@ fn cell_to_body(cell: &Cell) -> CellBody {
                         })
                         .collect(),
                     tags: tag_records(b.textbox()),
-                    active: b.active(),
+                    active: b.is_open(),
+                    closed_at: b.closed_at(),
+                    resurface_after: b.resurface_after(),
                 })
                 .collect(),
             reference_header: oc
@@ -1264,6 +1295,8 @@ fn take_heading_from_outline(blocks: &mut Vec<BlockRecord>) -> Option<TitleRecor
             links: Vec::new(),
             tags: Vec::new(),
             active: true,
+            closed_at: None,
+            resurface_after: None,
         });
     }
     Some(TitleRecord {
@@ -1556,7 +1589,18 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
                     }
                     load_body_tags(&mut tb, b.tags);
                     let mut bullet = Bullet::new(b.id, tb, b.depth);
-                    bullet.set_active(b.active);
+                    // Back-compat: same migration shape as PersistedCell.
+                    // Prefer explicit `closed_at`; fall back to "close at edited_at"
+                    // (or "now-ish 0") for legacy `active=false` bullets. Outline
+                    // rows don't carry their own edited_at, so the cell's
+                    // edited_at would be ideal — but it's not in scope here.
+                    // 0 is acceptable: legacy archived bullets just sort
+                    // to the bottom of any future closed-bullet view.
+                    let closed_at = b.closed_at.or_else(|| {
+                        if !b.active { Some(0) } else { None }
+                    });
+                    bullet.set_closed_at(closed_at);
+                    bullet.set_resurface_after(b.resurface_after);
                     bullet
                 })
                 .collect();
@@ -1646,7 +1690,10 @@ mod tests {
             }
             tb
         });
-        let active = pc.active;
+        let closed_at = pc.closed_at.or_else(|| {
+            if !pc.active { Some(cell.edited_at) } else { None }
+        });
+        let resurface_after = pc.resurface_after;
         let kind = body_to_kind(pc.body, typeface);
         Cell::from_parts(
             cell.id,
@@ -1655,7 +1702,8 @@ mod tests {
             cell.timestamp,
             cell.edited_at,
             cell.context_hint_id,
-            active,
+            closed_at,
+            resurface_after,
         )
     }
 
@@ -1773,7 +1821,8 @@ mod tests {
             now_epoch_ms(),
             now_epoch_ms(),
             None,
-            true,
+            None,
+            None,
         );
         let back = round_trip(&cell, &tf);
         match (&cell.kind, &back.kind) {
@@ -1834,7 +1883,8 @@ mod tests {
             now_epoch_ms(),
             now_epoch_ms(),
             None,
-            true,
+            None,
+            None,
         );
         let back = round_trip(&cell, &tf);
         match &back.kind {
@@ -1854,34 +1904,72 @@ mod tests {
     }
 
     #[test]
-    fn cell_active_round_trips_through_persistence() {
-        // Mark a cell inactive, run it through serialize / deserialize,
-        // and assert the flag survives. Mirrors the snapshot test but
-        // exercises the JSON path (PersistedCell.active +
-        // body-to-kind) the on-disk DB uses.
+    fn cell_closed_at_round_trips_through_persistence() {
+        // Close a cell, run it through serialize / deserialize, and
+        // assert the timestamp survives. Mirrors the snapshot test
+        // but exercises the JSON path (PersistedCell.closed_at) the
+        // on-disk DB uses.
         let tf = typeface();
         let mut cell = Cell::new(tf.clone(), "archived note".to_string());
-        cell.active = false;
+        cell.closed_at = Some(987_654);
         let back = round_trip(&cell, &tf);
-        assert!(!back.active, "active=false survives round-trip");
+        assert_eq!(back.closed_at, Some(987_654), "closed_at survives round-trip");
+        assert!(!back.is_open());
+    }
+
+    #[test]
+    fn cell_resurface_after_round_trips_through_persistence() {
+        let tf = typeface();
+        let mut cell = Cell::new(tf.clone(), "snoozed note".to_string());
+        cell.resurface_after = Some(2_000_000);
+        let back = round_trip(&cell, &tf);
+        assert_eq!(back.resurface_after, Some(2_000_000));
+    }
+
+    #[test]
+    fn legacy_active_false_backfills_closed_at_to_edited_at() {
+        // JSON from before this feature with `active=false` should
+        // produce a `closed_at = Some(edited_at)` on load — the
+        // imprecise migration explicitly approved at planning time.
+        let tf = typeface();
+        let mut cell = Cell::new(tf.clone(), "legacy archived".to_string());
+        let edited = cell.edited_at;
+        // Simulate legacy on-disk form: serialize, then mutate JSON
+        // to remove closed_at and force active=false.
+        let pc = persisted_cell_from(&cell);
+        let mut json: serde_json::Value = serde_json::to_value(&pc).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("closed_at");
+        obj.insert("active".to_string(), serde_json::Value::Bool(false));
+        let json_str = serde_json::to_string(&json).unwrap();
+        let pc: PersistedCell = serde_json::from_str(&json_str).expect("parses");
+        // Replay the load-time backfill from `round_trip`.
+        let closed_at = pc.closed_at.or_else(|| {
+            if !pc.active { Some(cell.edited_at) } else { None }
+        });
+        assert_eq!(
+            closed_at,
+            Some(edited),
+            "legacy active=false rows produce closed_at = edited_at"
+        );
     }
 
     #[test]
     fn legacy_persisted_cell_without_active_loads_as_active() {
         // JSON shape from before this feature — no `active` field on
         // PersistedCell. serde-default = "default_true" so legacy data
-        // deserializes as active. Without that the upgrade path would
-        // mark every existing cell archived on first load.
+        // deserializes as active.
         let json = r##"{"kind":"plain","text":"legacy","links":[],"tags":[]}"##;
         let pc: PersistedCell = serde_json::from_str(json).expect("legacy plain parses");
         assert!(pc.active, "missing field defaults to true (active)");
+        assert!(pc.closed_at.is_none());
     }
 
     #[test]
     fn legacy_block_record_without_active_loads_as_active() {
         // BlockRecord (outline bullet) has the same default-true
         // shape. Legacy outlines saved before this feature should
-        // load with every bullet active.
+        // load with every bullet open.
         let json = r##"{"kind":"outline","blocks":[{"id":"00000000-0000-7000-8000-000000000001","depth":0,"text":"legacy bullet","links":[],"tags":[]}]}"##;
         let body: CellBody = serde_json::from_str(json).expect("legacy outline parses");
         let kind = body_to_kind(body, &typeface());
@@ -1889,8 +1977,8 @@ mod tests {
             CellKind::Outline(oc) => {
                 assert_eq!(oc.bullets().len(), 1);
                 assert!(
-                    oc.bullets()[0].active(),
-                    "legacy bullet defaults to active"
+                    oc.bullets()[0].is_open(),
+                    "legacy bullet defaults to open"
                 );
             }
             _ => panic!("expected Outline kind"),
@@ -1898,11 +1986,11 @@ mod tests {
     }
 
     #[test]
-    fn bullet_active_round_trips_through_persistence() {
+    fn bullet_closed_at_round_trips_through_persistence() {
         let tf = typeface();
         let mut oc = OutlineCell::new(tf.clone());
         let bid = oc.bullets()[0].id();
-        oc.set_bullet_active(bid, false);
+        oc.set_bullet_closed_at(bid, Some(123));
         let cell = Cell::from_parts(
             Uuid::now_v7(),
             CellKind::Outline(oc),
@@ -1910,14 +1998,16 @@ mod tests {
             now_epoch_ms(),
             now_epoch_ms(),
             None,
-            true,
+            None,
+            None,
         );
         let back = round_trip(&cell, &tf);
         match &back.kind {
             CellKind::Outline(oc) => {
-                assert!(
-                    !oc.bullets()[0].active(),
-                    "bullet active flag survives round-trip"
+                assert_eq!(
+                    oc.bullets()[0].closed_at(),
+                    Some(123),
+                    "bullet closed_at survives round-trip"
                 );
             }
             _ => panic!("variant lost"),

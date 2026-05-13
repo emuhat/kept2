@@ -210,12 +210,41 @@ impl CellContextMenu {
         if has_unwrap {
             action_count += 1;
         }
-        action_count += 1; // Mark (cell) inactive / active
+        action_count += 1; // Close / Reopen (cell)
         if has_bullet_toggle {
+            action_count += 1; // Close / Reopen (bullet)
+        }
+        action_count += super::SNOOZE_PRESETS.len(); // 6 Snooze rows
+        // "Unsnooze" — present iff the target (bullet if clicking
+        // landed on one, else cell) is currently snoozed. Compute the
+        // target's `resurface_after` to size the menu correctly; the
+        // emit loop further down recomputes it for the actual row.
+        let target_resurface_present = if has_bullet_toggle {
+            self.bullet_id.and_then(|bid| match &cell.kind {
+                CellKind::Outline(oc) => oc
+                    .bullets()
+                    .iter()
+                    .find(|b| b.id() == bid)
+                    .map(|b| b.resurface_after()),
+                _ => None,
+            }).flatten().is_some()
+        } else {
+            cell.resurface_after.is_some()
+        };
+        if target_resurface_present {
             action_count += 1;
         }
-        let menu_h =
-            pad + info_h * 2.0 + 1.0 + action_h * action_count as f32 + pad;
+        // Three group separators (Surface | Snooze | Close/Mutate |
+        // Delete). Each is a hairline with a small breathing band
+        // top + bottom — `pad` total per separator.
+        let separator_h = pad;
+        let separator_count: usize = 3;
+        let menu_h = pad
+            + info_h * 2.0
+            + 1.0
+            + action_h * action_count as f32
+            + separator_h * separator_count as f32
+            + pad;
         let rect = clamp_rect_to_viewport(
             Rect::new(
                 self.anchor_x,
@@ -266,13 +295,14 @@ impl CellContextMenu {
         let action_font = Font::from_typeface(ctx.typeface, 13.0 * scale);
         let mouse = ctx.mouse_pos;
         let mut row_top = rect.top + pad + info_h * 2.0 + 1.0;
-        let mut emit_row = |label: &str, color: Color, hover_bg: Color| -> Rect {
-            let r = Rect::new(
-                rect.left + pad * 0.5,
-                row_top,
-                rect.right - pad * 0.5,
-                row_top + action_h,
-            );
+        let row_left = rect.left + pad * 0.5;
+        let row_right = rect.right - pad * 0.5;
+        let emit_row = |row_top_ref: &mut f32,
+                            label: &str,
+                            color: Color,
+                            hover_bg: Color|
+         -> Rect {
+            let r = Rect::new(row_left, *row_top_ref, row_right, *row_top_ref + action_h);
             draw_menu_row(
                 canvas,
                 r,
@@ -286,32 +316,38 @@ impl CellContextMenu {
                 &action_font,
                 mouse,
             );
-            row_top += action_h;
+            *row_top_ref += action_h;
             r
         };
+        let emit_separator = |row_top_ref: &mut f32| {
+            // Hairline divider with `pad/2` breathing band above
+            // and below so groups read as distinct without the
+            // menu feeling sparse.
+            let band = separator_h;
+            let line_y = *row_top_ref + band * 0.5;
+            let mut div = Paint::default();
+            div.set_anti_alias(false);
+            div.set_color(crate::color::hairline_divider());
+            canvas.draw_line(
+                Point::new(rect.left + pad, line_y),
+                Point::new(rect.right - pad, line_y),
+                &div,
+            );
+            *row_top_ref += band;
+        };
 
-        // Delete row (red, hover red-tinted).
-        let delete_rect = emit_row(
-            "Delete cell",
-            crate::color::delete_text(),
-            crate::color::delete_hover_bg(),
-        );
-
-        // Surface as reference — always present. Creates a new reference
-        // cell at "now" pointing to this cell. Lands wherever a fresh
-        // Ctrl+N cell would land. Hover uses the warm-tan tint.
+        // ----- Group 1: Surface actions -----
         let surface_rect = emit_row(
+            &mut row_top,
             "Surface as reference",
             crate::color::text_menu_row(),
             crate::color::embed_hover(),
         );
-
-        // Surface bullet sub-tree as reference — only when right-click hit
-        // a bullet inside an outline.
         let surface_subtree_rect = if has_subtree {
             let snip = self.bullet_snippet.as_deref().unwrap_or("[empty]");
             let label = format!("Surface '{}' as reference", snip);
             Some(emit_row(
+                &mut row_top,
                 &label,
                 crate::color::text_menu_row(),
                 crate::color::embed_hover(),
@@ -320,12 +356,54 @@ impl CellContextMenu {
             None
         };
 
-        // Envelope — only on Reference cells. Replaces the reference
-        // with an outline whose first slot is the original embed
-        // (read-only) and whose body is editable bullets for the user
-        // to write notes around it.
+        emit_separator(&mut row_top);
+
+        // ----- Group 2: Snoozes -----
+        // Six fuzzy presets + optional "Unsnooze". Targets the
+        // bullet when the right-click landed on one; else the cell.
+        let snooze_targets_bullet = has_bullet_toggle;
+        let target_resurface = if snooze_targets_bullet {
+            self.bullet_id.and_then(|bid| match &cell.kind {
+                CellKind::Outline(oc) => oc
+                    .bullets()
+                    .iter()
+                    .find(|b| b.id() == bid)
+                    .map(|b| b.resurface_after()),
+                _ => None,
+            }).flatten()
+        } else {
+            cell.resurface_after
+        };
+
+        let mut snooze_rects: [Option<Rect>; 6] = [None; 6];
+        for (i, (_, label)) in super::SNOOZE_PRESETS.iter().enumerate() {
+            snooze_rects[i] = Some(emit_row(
+                &mut row_top,
+                label,
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ));
+        }
+        let unsnooze_rect = if target_resurface.is_some() {
+            Some(emit_row(
+                &mut row_top,
+                "Unsnooze",
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ))
+        } else {
+            None
+        };
+
+        emit_separator(&mut row_top);
+
+        // ----- Group 3: State-changing actions (Envelope / Unwrap / Close) -----
+        // Envelope/Unwrap mutate the cell's shape; Close/Reopen
+        // flips `closed_at`. Grouped together as "this changes the
+        // cell's state" vs the surfacing/snooze groups above.
         let envelope_rect = if has_envelope {
             Some(emit_row(
+                &mut row_top,
                 "Envelope",
                 crate::color::text_menu_row(),
                 crate::color::embed_hover(),
@@ -333,11 +411,9 @@ impl CellContextMenu {
         } else {
             None
         };
-
-        // Unwrap — inverse of Envelope. The user's note bullets are
-        // dropped; Ctrl+Z restores them if the action was a mistake.
         let unwrap_rect = if has_unwrap {
             Some(emit_row(
+                &mut row_top,
                 "Unwrap envelope",
                 crate::color::text_menu_row(),
                 crate::color::embed_hover(),
@@ -345,41 +421,29 @@ impl CellContextMenu {
         } else {
             None
         };
-
-        // Cell active toggle — always present. Label flips with the
-        // current `active` state; click invokes
-        // `KeptApp::toggle_cell_active`.
-        let cell_active_label = if cell.active {
-            "Mark inactive"
-        } else {
-            "Mark active"
-        };
+        let cell_active_label = if cell.is_open() { "Close" } else { "Reopen" };
         let toggle_cell_active_rect = emit_row(
+            &mut row_top,
             cell_active_label,
             crate::color::text_menu_row(),
             crate::color::embed_hover(),
         );
-
-        // Bullet active toggle — only when the click landed on a
-        // bullet inside this same cell. Label uses "sub-outline"
-        // phrasing because toggling a bullet hides its whole subtree
-        // via the ancestor cascade (`compute_effective_active`).
         let toggle_bullet_active_rect = if has_bullet_toggle {
-            // Look up the bullet's current state for the label.
-            let bullet_active = self.bullet_id.and_then(|bid| match &cell.kind {
+            let bullet_open = self.bullet_id.and_then(|bid| match &cell.kind {
                 CellKind::Outline(oc) => oc
                     .bullets()
                     .iter()
                     .find(|b| b.id() == bid)
-                    .map(|b| b.active()),
+                    .map(|b| b.is_open()),
                 _ => None,
             }).unwrap_or(true);
-            let label = if bullet_active {
-                "Mark sub-outline inactive"
+            let label = if bullet_open {
+                "Close sub-outline"
             } else {
-                "Mark sub-outline active"
+                "Reopen sub-outline"
             };
             Some(emit_row(
+                &mut row_top,
                 label,
                 crate::color::text_menu_row(),
                 crate::color::embed_hover(),
@@ -388,6 +452,16 @@ impl CellContextMenu {
             None
         };
 
+        emit_separator(&mut row_top);
+
+        // ----- Group 4: Delete (destructive, last) -----
+        let delete_rect = emit_row(
+            &mut row_top,
+            "Delete cell",
+            crate::color::delete_text(),
+            crate::color::delete_hover_bg(),
+        );
+
         ctx.hit_tests.cell_menu.delete = Some(delete_rect);
         ctx.hit_tests.cell_menu.surface = Some(surface_rect);
         ctx.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
@@ -395,6 +469,9 @@ impl CellContextMenu {
         ctx.hit_tests.cell_menu.unwrap = unwrap_rect;
         ctx.hit_tests.cell_menu.toggle_cell_active = Some(toggle_cell_active_rect);
         ctx.hit_tests.cell_menu.toggle_bullet_active = toggle_bullet_active_rect;
+        ctx.hit_tests.cell_menu.snooze = snooze_rects;
+        ctx.hit_tests.cell_menu.unsnooze = unsnooze_rect;
+        ctx.hit_tests.cell_menu.snooze_targets_bullet = snooze_targets_bullet;
     }
 }
 

@@ -298,7 +298,7 @@ pub(super) fn search_results(
     let mut hits: Vec<&Cell> = document
         .cells
         .iter()
-        .filter(|c| (c.active || show_inactive_cells) && query::matches(&ast, c, &ctx))
+        .filter(|c| (c.is_open() || show_inactive_cells) && query::matches(&ast, c, &ctx))
         .collect();
     hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     hits.into_iter().map(|c| c.id).collect()

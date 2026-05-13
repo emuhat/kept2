@@ -48,11 +48,12 @@ pub struct CellSnapshot {
     /// title slot.
     pub title: Option<TextBoxSnapshot>,
     pub kind: CellSnapshotKind,
-    /// Active/inactive flag (the "archived" status). True by default;
-    /// false when the user has marked this cell inactive via the cell
-    /// context menu. Driven by `UndoOp::SetCellActive` and gated by
-    /// the global `show_inactive_cells` toggle for visibility.
-    pub active: bool,
+    /// `Some(t)` when the cell was closed at epoch ms `t`; `None` when
+    /// open. Replaces the legacy `active: bool` archive flag.
+    pub closed_at: Option<i64>,
+    /// `Some(t)` schedules the cell to resurface in the Current view at
+    /// epoch ms `t`. `None` means no scheduled resurfacing.
+    pub resurface_after: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -133,14 +134,20 @@ pub struct Cell {
     /// Optional hint about which context the cell was created in.
     /// Does NOT determine visibility — that's purely timestamp-based.
     pub context_hint_id: Option<Uuid>,
-    /// "Archived" flag. True by default; set false via the cell
-    /// context menu's "Mark inactive" row. Inactive cells are
-    /// hidden from views (timeline, sidebar dates, search, entity
+    /// `Some(t)` when the user has closed this cell at epoch ms `t`;
+    /// `None` when the cell is open. Closed cells are hidden from
+    /// default views (timeline, sidebar dates, search, entity
     /// references) unless the global `show_inactive_cells` toggle is
-    /// on, in which case they render dimmed. Persisted in the cell
-    /// JSON; visibility/render is gated entirely at the app layer
-    /// (this struct just carries the flag).
-    pub active: bool,
+    /// on, in which case they render dimmed. Replaces the older
+    /// `active: bool` flag; the field is the source of truth and
+    /// `is_open()` is the canonical accessor.
+    pub closed_at: Option<i64>,
+    /// `Some(t)` schedules the cell to resurface in the Current view
+    /// at epoch ms `t`. Snoozing a cell sets this to a future time;
+    /// when `now >= t`, the cell becomes eligible for the Current
+    /// view (it does NOT disappear from the timeline). `None` means
+    /// no scheduled resurfacing.
+    pub resurface_after: Option<i64>,
 }
 
 pub enum CellKind {
@@ -267,7 +274,8 @@ impl Cell {
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
-            active: true,
+            closed_at: None,
+            resurface_after: None,
         }
     }
 
@@ -285,7 +293,8 @@ impl Cell {
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
-            active: true,
+            closed_at: None,
+            resurface_after: None,
         }
     }
 
@@ -303,7 +312,8 @@ impl Cell {
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
-            active: true,
+            closed_at: None,
+            resurface_after: None,
         }
     }
 
@@ -325,7 +335,8 @@ impl Cell {
             timestamp: now,
             edited_at: now,
             context_hint_id: None,
-            active: true,
+            closed_at: None,
+            resurface_after: None,
         }
     }
 
@@ -337,7 +348,8 @@ impl Cell {
         timestamp: i64,
         edited_at: i64,
         context_hint_id: Option<Uuid>,
-        active: bool,
+        closed_at: Option<i64>,
+        resurface_after: Option<i64>,
     ) -> Self {
         Self {
             id,
@@ -351,8 +363,16 @@ impl Cell {
             timestamp,
             edited_at,
             context_hint_id,
-            active,
+            closed_at,
+            resurface_after,
         }
+    }
+
+    /// True when the cell is open (no close timestamp). Canonical
+    /// accessor — every former `cell.active` read should route through
+    /// here.
+    pub fn is_open(&self) -> bool {
+        self.closed_at.is_none()
     }
 
     /// Lazily create the title TextBox if none. Returns a mutable reference.
@@ -442,7 +462,8 @@ impl Cell {
             snap.timestamp,
             snap.edited_at,
             snap.context_hint_id,
-            snap.active,
+            snap.closed_at,
+            snap.resurface_after,
         )
     }
 
@@ -1099,7 +1120,8 @@ impl Cell {
                 CellKind::Table(tc) => CellSnapshotKind::Table(tc.snapshot()),
                 CellKind::Reference(rc) => CellSnapshotKind::Reference(rc.target()),
             },
-            active: self.active,
+            closed_at: self.closed_at,
+            resurface_after: self.resurface_after,
         }
     }
 
@@ -1111,7 +1133,8 @@ impl Cell {
         self.timestamp = snap.timestamp;
         self.edited_at = snap.edited_at;
         self.context_hint_id = snap.context_hint_id;
-        self.active = snap.active;
+        self.closed_at = snap.closed_at;
+        self.resurface_after = snap.resurface_after;
         self.title = snap.title.map(|tbs| {
             let typeface = self.body_typeface();
             let mut tb = TextBox::new(typeface, String::new());
@@ -1194,49 +1217,51 @@ mod tests {
     }
 
     #[test]
-    fn cell_active_round_trips_through_snapshot() {
-        // Toggling Cell.active is a structural edit that flows
-        // through the same snapshot path the undo system uses;
-        // restore() must replay the flag, not just the kind.
+    fn cell_closed_at_round_trips_through_snapshot() {
+        // Closing a cell is a structural edit that flows through the
+        // same snapshot path the undo system uses; restore() must
+        // replay the flag, not just the kind.
         let mut cell = Cell::new(typeface(), "x".to_string());
-        assert!(cell.active, "new cells default to active");
-        cell.active = false;
+        assert!(cell.is_open(), "new cells default to open");
+        cell.closed_at = Some(123);
 
         let snap = cell.snapshot();
-        assert!(!snap.active, "snapshot captures the flag");
+        assert_eq!(snap.closed_at, Some(123), "snapshot captures closed_at");
 
         let mut reborn = Cell::new(typeface(), String::new());
         reborn.restore(snap);
-        assert!(!reborn.active, "restore replays the flag");
+        assert_eq!(reborn.closed_at, Some(123), "restore replays closed_at");
+        assert!(!reborn.is_open());
     }
 
     #[test]
-    fn bullet_active_round_trips_through_outline_snapshot() {
+    fn bullet_closed_at_round_trips_through_outline_snapshot() {
         let mut oc = OutlineCell::new(typeface());
         let bid = oc.bullets()[0].id();
-        oc.set_bullet_active(bid, false);
+        oc.set_bullet_closed_at(bid, Some(42));
 
         let snap = oc.snapshot();
         assert_eq!(
-            snap.bullets[0].active, false,
-            "BulletSnapshot carries active"
+            snap.bullets[0].closed_at, Some(42),
+            "BulletSnapshot carries closed_at"
         );
 
         let mut reborn = OutlineCell::new(typeface());
         reborn.restore(snap);
-        assert!(
-            !reborn.bullets()[0].active(),
-            "outline restore round-trips bullet active"
+        assert_eq!(
+            reborn.bullets()[0].closed_at(),
+            Some(42),
+            "outline restore round-trips bullet closed_at"
         );
     }
 
     #[test]
-    fn effective_active_cascades_through_outline_ancestors() {
-        // Build an outline at depths [0, 1, 2, 1, 2]. Mark the FIRST
-        // depth-1 bullet inactive; its depth-2 child should report
-        // effectively-inactive even though its own flag is active.
-        // The next depth-1 sibling and its depth-2 child stay active —
-        // cascade only reaches descendants of the inactive ancestor.
+    fn effective_open_cascades_through_outline_ancestors() {
+        // Build an outline at depths [0, 1, 2, 1, 2]. Close the FIRST
+        // depth-1 bullet; its depth-2 child should report
+        // effectively-closed even though its own flag is open. The
+        // next depth-1 sibling and its depth-2 child stay open —
+        // cascade only reaches descendants of the closed ancestor.
         let mut oc = OutlineCell::new(typeface());
         // Replace the seed bullet by snapshot construction (cleanest
         // path that keeps Bullet ids stable across builds).
@@ -1245,31 +1270,36 @@ mod tests {
                 id: Uuid::now_v7(),
                 textbox: TextBox::new(typeface(), "root".to_string()).snapshot(),
                 depth: 0,
-                active: true,
+                closed_at: None,
+                resurface_after: None,
             },
             BulletSnapshot {
                 id: Uuid::now_v7(),
                 textbox: TextBox::new(typeface(), "child A".to_string()).snapshot(),
                 depth: 1,
-                active: false, // ← this is the archived sub-outline root
+                closed_at: Some(1), // ← this is the closed sub-outline root
+                resurface_after: None,
             },
             BulletSnapshot {
                 id: Uuid::now_v7(),
                 textbox: TextBox::new(typeface(), "grandchild A".to_string()).snapshot(),
                 depth: 2,
-                active: true,
+                closed_at: None,
+                resurface_after: None,
             },
             BulletSnapshot {
                 id: Uuid::now_v7(),
                 textbox: TextBox::new(typeface(), "child B".to_string()).snapshot(),
                 depth: 1,
-                active: true,
+                closed_at: None,
+                resurface_after: None,
             },
             BulletSnapshot {
                 id: Uuid::now_v7(),
                 textbox: TextBox::new(typeface(), "grandchild B".to_string()).snapshot(),
                 depth: 2,
-                active: true,
+                closed_at: None,
+                resurface_after: None,
             },
         ];
         let snap = OutlineSnapshot {
@@ -1279,11 +1309,11 @@ mod tests {
         };
         oc.restore(snap);
 
-        let eff = oc.compute_effective_active();
+        let eff = oc.compute_effective_open();
         assert_eq!(eff.len(), 5);
-        assert!(eff[0], "root active");
-        assert!(!eff[1], "self-inactive child A");
-        assert!(!eff[2], "grandchild A inactive via ancestor cascade");
+        assert!(eff[0], "root open");
+        assert!(!eff[1], "self-closed child A");
+        assert!(!eff[2], "grandchild A closed via ancestor cascade");
         assert!(eff[3], "child B unaffected");
         assert!(eff[4], "grandchild B unaffected");
     }

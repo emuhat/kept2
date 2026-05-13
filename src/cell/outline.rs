@@ -24,11 +24,15 @@ pub struct BulletSnapshot {
     pub id: Uuid,
     pub textbox: TextBoxSnapshot,
     pub depth: u32,
-    /// "Archived" flag for this individual bullet. Effective active
-    /// state for visibility/render also requires every ancestor (and
-    /// the containing cell) to be active — see
-    /// `OutlineCell::compute_effective_active`.
-    pub active: bool,
+    /// `Some(t)` when this bullet was closed at epoch ms `t`; `None`
+    /// when open. Effective open state for visibility/render cascades:
+    /// a bullet is effectively open iff its own `closed_at` is None AND
+    /// every ancestor bullet is also effectively open — see
+    /// `OutlineCell::compute_effective_open`.
+    pub closed_at: Option<i64>,
+    /// `Some(t)` schedules this bullet to surface in the Current view
+    /// at epoch ms `t`. `None` when no resurface is scheduled.
+    pub resurface_after: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -45,11 +49,16 @@ pub struct Bullet {
     id: Uuid,
     textbox: TextBox,
     depth: u32,
-    /// Per-bullet "archived" flag. Effective active state cascades
-    /// by ancestry: a bullet is effectively active iff this flag is
-    /// true AND every ancestor bullet is active. Toggled via the
-    /// "Mark sub-outline inactive/active" right-click row.
-    active: bool,
+    /// `Some(t)` when the user has closed this bullet (subtree).
+    /// `None` when open. Effective open state cascades by ancestry —
+    /// `OutlineCell::compute_effective_open` returns false for any
+    /// descendant of a closed bullet, regardless of the descendant's
+    /// own flag. Toggled via the bullet right-click "Close/Reopen" row.
+    closed_at: Option<i64>,
+    /// `Some(t)` schedules this bullet's subtree to appear in the
+    /// Current view at epoch ms `t`. `None` when no resurface is
+    /// scheduled. Does not affect timeline visibility.
+    resurface_after: Option<i64>,
 }
 
 impl Bullet {
@@ -58,7 +67,8 @@ impl Bullet {
             id,
             textbox,
             depth,
-            active: true,
+            closed_at: None,
+            resurface_after: None,
         }
     }
 
@@ -81,12 +91,24 @@ impl Bullet {
         &mut self.textbox
     }
 
-    pub fn active(&self) -> bool {
-        self.active
+    pub fn is_open(&self) -> bool {
+        self.closed_at.is_none()
     }
 
-    pub fn set_active(&mut self, active: bool) {
-        self.active = active;
+    pub fn closed_at(&self) -> Option<i64> {
+        self.closed_at
+    }
+
+    pub fn set_closed_at(&mut self, closed_at: Option<i64>) {
+        self.closed_at = closed_at;
+    }
+
+    pub fn resurface_after(&self) -> Option<i64> {
+        self.resurface_after
+    }
+
+    pub fn set_resurface_after(&mut self, when: Option<i64>) {
+        self.resurface_after = when;
     }
 
     /// Drain any pending link URL the bullet's textbox stashed during
@@ -175,7 +197,8 @@ impl OutlineCell {
             id,
             textbox: TextBox::new(typeface.clone(), String::new()),
             depth: 0,
-            active: true,
+            closed_at: None,
+            resurface_after: None,
         };
         Self {
             typeface,
@@ -230,7 +253,8 @@ impl OutlineCell {
                 id,
                 textbox: TextBox::new(typeface.clone(), String::new()),
                 depth: 0,
-                active: true,
+                closed_at: None,
+                resurface_after: None,
             }]
         } else {
             bullets
@@ -522,9 +546,9 @@ impl OutlineCell {
         } else {
             0
         };
-        let effective_active = self.compute_effective_active();
+        let effective_open = self.compute_effective_open();
         let visible: Vec<bool> = (0..self.bullets.len())
-            .map(|i| tag_visible[i] && (effective_active[i] || self.show_inactive))
+            .map(|i| tag_visible[i] && (effective_open[i] || self.show_inactive))
             .collect();
 
         let mut bullet_y_bands: Vec<(f32, f32)> = Vec::with_capacity(self.bullets.len());
@@ -542,12 +566,12 @@ impl OutlineCell {
             let depth_offset = (normalized_depth as f32) * indent_per_level;
             let marker_x = x + depth_offset + indent_per_level / 2.0;
             let marker_y = cur_y + line_height / 2.0;
-            // Effective-inactive bullets reach this point only when
+            // Effectively-closed bullets reach this point only when
             // `show_inactive` is on (otherwise they were filtered out
             // above). Wrap their draw block — marker + textbox — in
             // an alpha layer so the dim treatment composites
             // uniformly with text, tag overdraw, and link underlines.
-            let bullet_inactive = !effective_active[idx];
+            let bullet_inactive = !effective_open[idx];
             if bullet_inactive {
                 canvas.save_layer_alpha(None, INACTIVE_ALPHA as u32);
             }
@@ -1044,19 +1068,18 @@ impl OutlineCell {
         Some(i..k)
     }
 
-    /// Compute the effective active state for every bullet, parallel
-    /// to `bullets()`. A bullet is *effectively* active iff its own
-    /// `active` flag is true AND every ancestor (any bullet at
-    /// strictly lower depth that precedes this one in the flat list,
-    /// up to depth 0) is active. Walks the outline once with a
-    /// per-depth "lowest inactive ancestor" tracker so a single
-    /// inactive bullet at depth `d` makes its whole subtree
-    /// effectively inactive — even if the descendants' own flags say
-    /// active. Used by render to skip / dim, and by the bullet
-    /// visibility gate.
-    pub fn compute_effective_active(&self) -> Vec<bool> {
+    /// Compute the effective open state for every bullet, parallel to
+    /// `bullets()`. A bullet is *effectively* open iff its own
+    /// `closed_at` is None AND every ancestor (any bullet at strictly
+    /// lower depth that precedes this one in the flat list, up to
+    /// depth 0) is open. Walks the outline once with a per-depth
+    /// "lowest closed ancestor" tracker so a single closed bullet at
+    /// depth `d` makes its whole subtree effectively closed — even if
+    /// the descendants' own flags say open. Used by render to skip /
+    /// dim, and by the bullet visibility gate.
+    pub fn compute_effective_open(&self) -> Vec<bool> {
         let mut effective = Vec::with_capacity(self.bullets.len());
-        // Stack of (depth, active) pairs for the current ancestor
+        // Stack of (depth, is_open) pairs for the current ancestor
         // chain. The chain shrinks back when we return to a shallower
         // depth and grows when we descend.
         let mut chain: Vec<(u32, bool)> = Vec::new();
@@ -1068,34 +1091,46 @@ impl OutlineCell {
                     break;
                 }
             }
-            let ancestors_active = chain.iter().all(|&(_, a)| a);
-            let eff = b.active && ancestors_active;
+            let ancestors_open = chain.iter().all(|&(_, a)| a);
+            let self_open = b.is_open();
+            let eff = self_open && ancestors_open;
             effective.push(eff);
-            chain.push((b.depth, b.active));
+            chain.push((b.depth, self_open));
         }
         effective
     }
 
-    /// Look up a bullet's index by id. Used by `set_bullet_active`
-    /// (and the right-click toggle dispatch) so callers don't need
-    /// to scan the bullet list themselves. Returns None if the id
-    /// isn't in the cell.
+    /// Look up a bullet's index by id. Used by
+    /// `set_bullet_closed_at` (and the right-click toggle dispatch) so
+    /// callers don't need to scan the bullet list themselves. Returns
+    /// None if the id isn't in the cell.
     pub fn bullet_idx(&self, bullet_id: Uuid) -> Option<usize> {
         self.bullets.iter().position(|b| b.id == bullet_id)
     }
 
-    /// Mutate a bullet's `active` flag. No effective-active recompute
-    /// is needed (rendering and filtering call
-    /// `compute_effective_active` per frame). Returns whether the
-    /// bullet exists and the flag actually changed.
-    pub fn set_bullet_active(&mut self, bullet_id: Uuid, active: bool) -> bool {
+    /// Mutate a bullet's `closed_at` flag. Returns whether the bullet
+    /// exists and the flag actually changed.
+    pub fn set_bullet_closed_at(&mut self, bullet_id: Uuid, closed_at: Option<i64>) -> bool {
         let Some(i) = self.bullet_idx(bullet_id) else {
             return false;
         };
-        if self.bullets[i].active == active {
+        if self.bullets[i].closed_at == closed_at {
             return false;
         }
-        self.bullets[i].active = active;
+        self.bullets[i].closed_at = closed_at;
+        true
+    }
+
+    /// Mutate a bullet's `resurface_after` field. Returns whether the
+    /// bullet exists and the field actually changed.
+    pub fn set_bullet_resurface_after(&mut self, bullet_id: Uuid, when: Option<i64>) -> bool {
+        let Some(i) = self.bullet_idx(bullet_id) else {
+            return false;
+        };
+        if self.bullets[i].resurface_after == when {
+            return false;
+        }
+        self.bullets[i].resurface_after = when;
         true
     }
 
@@ -1189,7 +1224,8 @@ impl OutlineCell {
                     id: b.id,
                     textbox: b.textbox.snapshot(),
                     depth: b.depth,
-                    active: b.active,
+                    closed_at: b.closed_at,
+                    resurface_after: b.resurface_after,
                 })
                 .collect(),
             focused_bullet: self.focused_bullet,
@@ -1208,7 +1244,8 @@ impl OutlineCell {
                     id: bs.id,
                     textbox: tb,
                     depth: bs.depth,
-                    active: bs.active,
+                    closed_at: bs.closed_at,
+                    resurface_after: bs.resurface_after,
                 }
             })
             .collect();
@@ -1291,12 +1328,13 @@ impl OutlineCell {
                 id: new_id,
                 textbox: new_tb,
                 depth,
-                // New bullets always start active. Effective-active
-                // cascade (via ancestry) still applies, so a new
-                // bullet under an inactive parent renders as
-                // effectively-inactive without forcing the per-bullet
-                // flag down here.
-                active: true,
+                // New bullets start open with no resurface schedule.
+                // Effective-open cascade (via ancestry) still
+                // applies, so a new bullet under a closed parent
+                // renders as effectively-closed without forcing the
+                // per-bullet flag down here.
+                closed_at: None,
+                resurface_after: None,
             },
         );
         self.focused_bullet = new_id;
@@ -1377,7 +1415,8 @@ impl OutlineCell {
                 id: new_id,
                 textbox: tb,
                 depth: 0,
-                active: true,
+                closed_at: None,
+                resurface_after: None,
             });
             self.focused_bullet = new_id;
             return true;

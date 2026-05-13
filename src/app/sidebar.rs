@@ -141,12 +141,29 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         mouse_x >= r.left && mouse_x <= r.right && mouse_y >= r.top && mouse_y <= r.bottom
     };
 
-    // ---- CONTEXTS section ----
-    // Sidebar order: CONTEXTS first (the daily/weekly working
-    // surfaces — the most-used navigation), then TAGS (filtering
-    // by topic), then PAGES (People — once per session, not the
-    // primary surface).
+    // ---- "Current" top-of-sidebar shortcut ----
+    // Lives above CONTEXTS so the user's working-attention surface
+    // is the most reachable click in the app. No section header —
+    // it's a single row, not a group.
     let mut y = pad_top;
+    let current_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
+    draw_sidebar_row(
+        canvas,
+        current_rect,
+        "Current",
+        matches!(ctx.view.view_kind, ViewKind::Current),
+        in_row(current_rect),
+        radius,
+        pad_x,
+        &row_font,
+    );
+    ctx.hit_tests.sidebar.pages.push((PageKind::Current, current_rect));
+    y += date_h + date_gap;
+
+    // ---- CONTEXTS section ----
+    // Sidebar order: Current first (working attention), then
+    // CONTEXTS (the daily/weekly working surfaces), then TAGS, then
+    // PAGES (People).
     let contexts_header_baseline = y + (-hm.ascent);
     canvas.draw_str(
         "CONTEXTS",
@@ -192,7 +209,7 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
     // so a date with only inactive cells doesn't leave a clickable
     // row that lands on an empty timeline.
     for c in &ctx.document.cells {
-        if !c.active && !ctx.show_inactive_cells {
+        if !c.is_open() && !ctx.show_inactive_cells {
             continue;
         }
         dates_set.insert(local_date_for_ms(c.timestamp));

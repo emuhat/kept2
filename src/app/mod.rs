@@ -141,6 +141,23 @@ struct SidebarHits {
     show_inactive_toggle: Option<Rect>,
 }
 
+/// Rolling window the Current view surfaces. Cells older than this
+/// (by `cell.timestamp`) drop out — Current is a working-attention
+/// surface, not an open-loop archive.
+const CURRENT_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Ordered list of snooze presets the cell / bullet right-click menu
+/// surfaces. Index alignment matters: `CellMenuHits.snooze[i]` is the
+/// rect for `SNOOZE_PRESETS[i]`.
+const SNOOZE_PRESETS: [(crate::attention::SnoozePreset, &str); 6] = [
+    (crate::attention::SnoozePreset::LaterToday, "Snooze: Later today"),
+    (crate::attention::SnoozePreset::Tomorrow, "Snooze: Tomorrow"),
+    (crate::attention::SnoozePreset::NextWeek, "Snooze: Next week"),
+    (crate::attention::SnoozePreset::NextMonth, "Snooze: Next month"),
+    (crate::attention::SnoozePreset::NextQuarter, "Snooze: Next quarter"),
+    (crate::attention::SnoozePreset::Someday, "Snooze: Someday"),
+];
+
 #[derive(Default)]
 struct CellMenuHits {
     delete: Option<Rect>,
@@ -158,14 +175,28 @@ struct CellMenuHits {
     /// bare Reference again. The user's notes are dropped (recoverable
     /// via Ctrl+Z).
     unwrap: Option<Rect>,
-    /// "Mark cell inactive" / "Mark cell active" — toggles
-    /// `Cell.active`. Always present.
+    /// "Close" / "Reopen" — toggles `Cell.closed_at`. Always
+    /// present.
     toggle_cell_active: Option<Rect>,
-    /// "Mark sub-outline inactive" / "Mark sub-outline active" —
-    /// toggles the clicked bullet's `active` flag. Only present
-    /// when the click landed on a bullet that lives in *this*
-    /// cell's outline (not inside a nested embed).
+    /// "Close sub-outline" / "Reopen sub-outline" — toggles the
+    /// clicked bullet's `closed_at`. Only present when the click
+    /// landed on a bullet that lives in *this* cell's outline (not
+    /// inside a nested embed).
     toggle_bullet_active: Option<Rect>,
+    /// Six "Snooze: …" rows when the cell isn't currently snoozed;
+    /// indices align with `SNOOZE_PRESETS` (LaterToday, Tomorrow,
+    /// NextWeek, NextMonth, NextQuarter, Someday). The
+    /// `snooze_targets_bullet` flag below tells the dispatch path
+    /// whether these apply to the bullet (when the menu opened on
+    /// one) or to the cell.
+    snooze: [Option<Rect>; 6],
+    /// "Unsnooze" — present iff the target (cell or bullet) is
+    /// currently snoozed.
+    unsnooze: Option<Rect>,
+    /// When true, the snooze + unsnooze rects target the bullet at
+    /// `cell_context_menu.bullet_id`; when false, they target the
+    /// cell.
+    snooze_targets_bullet: bool,
 }
 
 #[derive(Default)]
@@ -266,11 +297,14 @@ enum NewCellKind {
     PopPop,
 }
 
-/// Sidebar PAGES section row identity. v1 has just `People`; new entries
-/// land here as the section grows (threads, saved queries, etc).
+/// Sidebar PAGES section row identity.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PageKind {
     People,
+    /// Non-chronological "what's on my plate right now" pile.
+    /// Surfaces snooze-expired cells/bullets plus recently-inserted
+    /// reference / envelope cells.
+    Current,
 }
 
 /// In-progress inline rename of a People-page row. While `Some`, the row's
@@ -298,6 +332,10 @@ enum ViewKind {
     Context(Uuid),
     Entity(Uuid),
     People,
+    /// Non-chronological pile of items currently competing for
+    /// attention. Filter and sort live in `render_current_stream`,
+    /// not in `is_visible_for_view`.
+    Current,
 }
 
 /// What the user is viewing in the doc area / highlighting in the sidebar.
@@ -344,6 +382,9 @@ impl Query {
     #[allow(dead_code)]
     fn people() -> Self {
         Self { view_kind: ViewKind::People, ast: query::Ast::default() }
+    }
+    fn current() -> Self {
+        Self { view_kind: ViewKind::Current, ast: query::Ast::default() }
     }
     #[allow(dead_code)]
     fn from_text(input: &str) -> Self {
@@ -518,23 +559,39 @@ enum UndoOp {
         prev: bool,
         new: bool,
     },
-    /// Cell active/inactive toggle (the "archive" gesture). Same
-    /// shape as `SetEntityActive`; flips `Cell.active` and bumps
-    /// `edited_at` so any embed cache pointing at this cell rebuilds
-    /// on the next render.
-    SetCellActive {
+    /// Cell close/reopen (the "archive" gesture, reframed). Sets
+    /// `Cell.closed_at` to `prev` or `new` (each `Some(t)` ↔ closed
+    /// at epoch ms `t`, `None` ↔ open). Pure metadata — does NOT
+    /// touch `edited_at`, so attention sort isn't perturbed by an
+    /// archive action.
+    SetCellClosed {
         cell_id: Uuid,
-        prev: bool,
-        new: bool,
+        prev: Option<i64>,
+        new: Option<i64>,
     },
-    /// Bullet active/inactive toggle (cascades to its sub-outline
-    /// via the ancestor-walk in `compute_effective_active`). Bullet
-    /// ids are unique within a cell; the lookup is a linear scan.
-    SetBulletActive {
+    /// Snooze / clear-snooze on a cell. Sets `Cell.resurface_after`
+    /// to `prev` or `new`. Pure metadata; no `edited_at` bump.
+    SetCellResurface {
+        cell_id: Uuid,
+        prev: Option<i64>,
+        new: Option<i64>,
+    },
+    /// Bullet close/reopen (cascades to its sub-outline via
+    /// `compute_effective_open`). Bullet ids are unique within a
+    /// cell; the lookup is a linear scan.
+    SetBulletClosed {
         cell_id: Uuid,
         bullet_id: Uuid,
-        prev: bool,
-        new: bool,
+        prev: Option<i64>,
+        new: Option<i64>,
+    },
+    /// Bullet snooze / clear-snooze. Sets the bullet's
+    /// `resurface_after`. Metadata-only — no `edited_at` bump.
+    SetBulletResurface {
+        cell_id: Uuid,
+        bullet_id: Uuid,
+        prev: Option<i64>,
+        new: Option<i64>,
     },
     /// "Envelope" action: replaces a Reference cell in place with an
     /// Outline cell whose first slot is the original embed. Cell id /
@@ -577,8 +634,9 @@ impl UndoOp {
     /// 13-arm match blocks (S6).
     ///
     /// Symmetric variants (CellEdit, ResetContextStart, Rename,
-    /// SetEntityActive, SetCellActive, SetBulletActive, Envelope,
-    /// Unwrap) read `pre` vs `post` based on `dir`. Asymmetric
+    /// SetEntityActive, SetCellClosed, SetCellResurface,
+    /// SetBulletClosed, SetBulletResurface, Envelope, Unwrap) read
+    /// `pre` vs `post` based on `dir`. Asymmetric
     /// variants (InsertCell ↔ DeleteCell, Create ↔ Delete cell-less
     /// entity, RotateContext) branch on `dir` inside the arm because
     /// the inverse direction calls a different helper rather than
@@ -783,18 +841,29 @@ impl UndoOp {
                 }
                 app.refresh_entities();
             }
-            Self::SetCellActive { cell_id, prev, new } => {
+            Self::SetCellClosed { cell_id, prev, new } => {
                 let target = match dir {
                     UndoDir::Undo => *prev,
                     UndoDir::Redo => *new,
                 };
                 if let Some(idx) = app.cell_idx(*cell_id) {
-                    app.document.cells[idx].active = target;
+                    app.document.cells[idx].closed_at = target;
                     app.mark_cell_dirty(*cell_id);
-                    app.touch_cell(*cell_id);
+                    // No touch_cell: metadata-only op must not bump
+                    // edited_at (would distort attention sort).
                 }
             }
-            Self::SetBulletActive {
+            Self::SetCellResurface { cell_id, prev, new } => {
+                let target = match dir {
+                    UndoDir::Undo => *prev,
+                    UndoDir::Redo => *new,
+                };
+                if let Some(idx) = app.cell_idx(*cell_id) {
+                    app.document.cells[idx].resurface_after = target;
+                    app.mark_cell_dirty(*cell_id);
+                }
+            }
+            Self::SetBulletClosed {
                 cell_id,
                 bullet_id,
                 prev,
@@ -806,10 +875,26 @@ impl UndoOp {
                 };
                 if let Some(idx) = app.cell_idx(*cell_id) {
                     if let CellKind::Outline(oc) = &mut app.document.cells[idx].kind {
-                        oc.set_bullet_active(*bullet_id, target);
+                        oc.set_bullet_closed_at(*bullet_id, target);
                     }
                     app.mark_cell_dirty(*cell_id);
-                    app.touch_cell(*cell_id);
+                }
+            }
+            Self::SetBulletResurface {
+                cell_id,
+                bullet_id,
+                prev,
+                new,
+            } => {
+                let target = match dir {
+                    UndoDir::Undo => *prev,
+                    UndoDir::Redo => *new,
+                };
+                if let Some(idx) = app.cell_idx(*cell_id) {
+                    if let CellKind::Outline(oc) = &mut app.document.cells[idx].kind {
+                        oc.set_bullet_resurface_after(*bullet_id, target);
+                    }
+                    app.mark_cell_dirty(*cell_id);
                 }
             }
             Self::Envelope {
@@ -2672,11 +2757,12 @@ impl KeptApp {
                     source.edited_at,
                     source.context_hint_id,
                     // Cache cells are internal to the embed render; they
-                    // never enter `self.document.cells`, so the active flag here
-                    // is unused for visibility. Default to true so the
-                    // embed renders normally regardless of source's
-                    // active state (embeds always render in v1).
-                    true,
+                    // never enter `self.document.cells`, so attention
+                    // metadata is irrelevant. Use defaults (open, no
+                    // snooze) so the embed renders normally regardless
+                    // of source state.
+                    None,
+                    None,
                 );
                 cache.set_font_scale(scale);
                 cache
@@ -2708,7 +2794,8 @@ impl KeptApp {
                     source.timestamp,
                     source.edited_at,
                     source.context_hint_id,
-                    true,
+                    None,
+                    None,
                 );
                 cache.set_font_scale(scale);
                 cache
@@ -2966,16 +3053,21 @@ impl KeptApp {
             return false;
         }
         let doc_y = y + self.pane().scroll_y;
-        let ctx = self.match_context();
-        for cell in &self.document.cells {
-            if !self.is_visible_for_view(cell, &ctx) {
-                continue;
-            }
-            if cell.link_at_doc_pos(x, doc_y) || cell.tag_at_doc_pos(x, doc_y) {
-                return true;
-            }
-        }
-        false
+        // Narrow to the single cell under the cursor before doing
+        // any link / tag span walks. Iterating every visible cell
+        // here used to be cheap when most views filtered down to a
+        // few cells, but views like Current expose hundreds of
+        // cells at once — `link_at_doc_pos` per cell walks each
+        // TextBox's spans, and this runs on every cursor-move event
+        // (way faster than 60 Hz). Short-circuit by hitting the
+        // one cell whose y-band covers the cursor.
+        let Some(target) = self.find_cell_at(x, doc_y) else {
+            return false;
+        };
+        let Some(cell) = self.cell(target) else {
+            return false;
+        };
+        cell.link_at_doc_pos(x, doc_y) || cell.tag_at_doc_pos(x, doc_y)
     }
 
     // ----- cell access helpers (thin proxies to `Document`) -----
@@ -3019,12 +3111,12 @@ impl KeptApp {
     /// - `People` → no cells visible (the page is bespoke).
     /// - `Ast` → delegate to `query::matches` against `view.ast`.
     fn is_visible_for_view(&self, cell: &Cell, ctx: &query::MatchContext) -> bool {
-        // Inactive ("archived") cells drop out of every view by
-        // default; the global "Show archived" toggle in the sidebar
-        // surfaces them again (rendered dim — see `INACTIVE_ALPHA`).
-        // Checked first so the rest of the predicate doesn't have to
-        // re-filter on each view kind.
-        if !cell.active && !self.show_inactive_cells {
+        // Closed cells drop out of every view by default; the global
+        // "Show archived" toggle in the sidebar surfaces them again
+        // (rendered dim — see `INACTIVE_ALPHA`). Checked first so the
+        // rest of the predicate doesn't have to re-filter on each
+        // view kind.
+        if !cell.is_open() && !self.show_inactive_cells {
             return false;
         }
         // A focused cell whose caret is mid-edit inside a `#tag` token
@@ -3055,6 +3147,19 @@ impl KeptApp {
                 .and_then(|e| e.primary_cell_id)
                 .map_or(false, |pid| pid == cell.id),
             ViewKind::People => false,
+            // Current is just another filter: cells from the last
+            // CURRENT_WINDOW_DAYS whose snooze (if set) has already
+            // elapsed. Open-ness is already enforced by the
+            // is_open() guard above. Goes through the standard
+            // cell-stream render path like Ast/Context.
+            ViewKind::Current => {
+                let now_ms = crate::cell::now_epoch_ms();
+                let cutoff = now_ms - CURRENT_WINDOW_MS;
+                if cell.timestamp < cutoff {
+                    return false;
+                }
+                cell.resurface_after.map_or(true, |t| now_ms >= t)
+            }
             ViewKind::Ast => query::matches(&self.pane().view.ast, cell, ctx),
         }
     }
@@ -4089,7 +4194,9 @@ impl KeptApp {
         let mouse_doc_x = self.mouse_pos.0;
         let mouse_doc_y = self.mouse_pos.1 + self.pane_mut().scroll_y;
         match self.pane_mut().view.view_kind.clone() {
-            ViewKind::Ast | ViewKind::Context(_) => self.render_cell_stream(canvas, layout),
+            ViewKind::Ast | ViewKind::Context(_) | ViewKind::Current => {
+                self.render_cell_stream(canvas, layout)
+            }
             ViewKind::Entity(eid) => {
                 let h = self.render_entity_page(
                     canvas,
@@ -4282,7 +4389,7 @@ impl KeptApp {
             // and any embed chrome — in an alpha layer so the
             // dim treatment composites uniformly without
             // threading a paint color through every primitive.
-            let cell_inactive = !self.document.cells[i].active;
+            let cell_inactive = !self.document.cells[i].is_open();
             if cell_inactive {
                 rec_canvas.save_layer_alpha(None, cell::INACTIVE_ALPHA as u32);
             }
@@ -4397,6 +4504,7 @@ impl KeptApp {
 
         y
     }
+
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
         // Any *fresh* key press cancels in-flight kinetic coast on
@@ -5820,22 +5928,24 @@ impl KeptApp {
         self.pane_mut().coalesce_break = true;
     }
 
-    /// Flip a cell's `active` flag (the "archive" gesture from the
-    /// cell context menu). Mirrors `toggle_entity_active`: pushes a
-    /// dedicated undo op, marks the cell dirty for persistence, and
-    /// touches `edited_at` so any embed cache pointing at this cell
-    /// rebuilds with the new state on the next render. Returns
-    /// whether the toggle landed (false when the cell is missing).
-    fn toggle_cell_active(&mut self, cell_id: Uuid) -> bool {
+    /// Flip a cell's `closed_at` (the close/reopen gesture from the
+    /// cell context menu). Pushes a dedicated undo op and marks the
+    /// cell dirty for persistence. Metadata-only — does NOT touch
+    /// `edited_at` (would distort attention sort). Returns whether
+    /// the toggle landed (false when the cell is missing).
+    fn toggle_cell_closed(&mut self, cell_id: Uuid) -> bool {
         let Some(idx) = self.cell_idx(cell_id) else {
             return false;
         };
-        let prev = self.document.cells[idx].active;
-        let new = !prev;
-        self.document.cells[idx].active = new;
+        let prev = self.document.cells[idx].closed_at;
+        let new = if prev.is_none() {
+            Some(now_epoch_ms())
+        } else {
+            None
+        };
+        self.document.cells[idx].closed_at = new;
         self.mark_cell_dirty(cell_id);
-        self.touch_cell(cell_id);
-        self.undo_stack.push(UndoOp::SetCellActive {
+        self.undo_stack.push(UndoOp::SetCellClosed {
             cell_id,
             prev,
             new,
@@ -5846,13 +5956,35 @@ impl KeptApp {
         true
     }
 
-    /// Flip a single bullet's `active` flag (the "archive sub-outline"
+    /// Set a cell's `resurface_after`. Pass `None` to clear an
+    /// existing snooze, `Some(t)` to schedule. Metadata-only.
+    fn set_cell_resurface(&mut self, cell_id: Uuid, when: Option<i64>) -> bool {
+        let Some(idx) = self.cell_idx(cell_id) else {
+            return false;
+        };
+        let prev = self.document.cells[idx].resurface_after;
+        if prev == when {
+            return false;
+        }
+        self.document.cells[idx].resurface_after = when;
+        self.mark_cell_dirty(cell_id);
+        self.undo_stack.push(UndoOp::SetCellResurface {
+            cell_id,
+            prev,
+            new: when,
+        });
+        self.redo_stack.clear();
+        self.pane_mut().coalesce_break = true;
+        true
+    }
+
+    /// Flip a single bullet's `closed_at` (the "close sub-outline"
     /// gesture). Cascade is read at render time via
-    /// `compute_effective_active`; nothing is mutated on descendants
+    /// `compute_effective_open`; nothing is mutated on descendants
     /// here. Returns false when the cell isn't an outline or the
     /// bullet id isn't present (defensive — the menu only offers the
     /// row when both hold).
-    fn toggle_bullet_active(&mut self, cell_id: Uuid, bullet_id: Uuid) -> bool {
+    fn toggle_bullet_closed(&mut self, cell_id: Uuid, bullet_id: Uuid) -> bool {
         let Some(idx) = self.cell_idx(cell_id) else {
             return false;
         };
@@ -5861,23 +5993,26 @@ impl KeptApp {
                 .bullets()
                 .iter()
                 .find(|b| b.id() == bullet_id)
-                .map(|b| b.active()),
+                .map(|b| b.closed_at()),
             _ => None,
         };
         let Some(prev) = prev else {
             return false;
         };
-        let new = !prev;
+        let new = if prev.is_none() {
+            Some(now_epoch_ms())
+        } else {
+            None
+        };
         let mutated = match &mut self.document.cells[idx].kind {
-            CellKind::Outline(oc) => oc.set_bullet_active(bullet_id, new),
+            CellKind::Outline(oc) => oc.set_bullet_closed_at(bullet_id, new),
             _ => false,
         };
         if !mutated {
             return false;
         }
         self.mark_cell_dirty(cell_id);
-        self.touch_cell(cell_id);
-        self.undo_stack.push(UndoOp::SetBulletActive {
+        self.undo_stack.push(UndoOp::SetBulletClosed {
             cell_id,
             bullet_id,
             prev,
@@ -5886,6 +6021,49 @@ impl KeptApp {
         self.redo_stack.clear();
         self.pane_mut().coalesce_break = true;
         self.pane_mut().pending_caret_scroll = true;
+        true
+    }
+
+    /// Set a bullet's `resurface_after`. Metadata-only.
+    fn set_bullet_resurface(
+        &mut self,
+        cell_id: Uuid,
+        bullet_id: Uuid,
+        when: Option<i64>,
+    ) -> bool {
+        let Some(idx) = self.cell_idx(cell_id) else {
+            return false;
+        };
+        let prev = match &self.document.cells[idx].kind {
+            CellKind::Outline(oc) => oc
+                .bullets()
+                .iter()
+                .find(|b| b.id() == bullet_id)
+                .map(|b| b.resurface_after()),
+            _ => None,
+        };
+        let Some(prev) = prev else {
+            return false;
+        };
+        if prev == when {
+            return false;
+        }
+        let mutated = match &mut self.document.cells[idx].kind {
+            CellKind::Outline(oc) => oc.set_bullet_resurface_after(bullet_id, when),
+            _ => false,
+        };
+        if !mutated {
+            return false;
+        }
+        self.mark_cell_dirty(cell_id);
+        self.undo_stack.push(UndoOp::SetBulletResurface {
+            cell_id,
+            bullet_id,
+            prev,
+            new: when,
+        });
+        self.redo_stack.clear();
+        self.pane_mut().coalesce_break = true;
         true
     }
 
@@ -6337,7 +6515,8 @@ impl KeptApp {
         let timestamp = self.document.cells[idx].timestamp;
         let edited_at = self.document.cells[idx].edited_at;
         let context_hint = self.document.cells[idx].context_hint_id;
-        let active = self.document.cells[idx].active;
+        let closed_at = self.document.cells[idx].closed_at;
+        let resurface_after = self.document.cells[idx].resurface_after;
 
         // Build the new Outline cell directly so we can hand-pick the
         // id / timestamp (replace-in-place semantics). Cell::from_parts
@@ -6351,7 +6530,8 @@ impl KeptApp {
             timestamp,
             edited_at,
             context_hint,
-            active,
+            closed_at,
+            resurface_after,
         );
         new_cell.set_font_scale(self.font_scale);
         let post = new_cell.snapshot();
@@ -6396,7 +6576,8 @@ impl KeptApp {
         let timestamp = self.document.cells[idx].timestamp;
         let edited_at = self.document.cells[idx].edited_at;
         let context_hint = self.document.cells[idx].context_hint_id;
-        let active = self.document.cells[idx].active;
+        let closed_at = self.document.cells[idx].closed_at;
+        let resurface_after = self.document.cells[idx].resurface_after;
 
         let mut new_cell = Cell::from_parts(
             cell_id,
@@ -6408,7 +6589,8 @@ impl KeptApp {
             timestamp,
             edited_at,
             context_hint,
-            active,
+            closed_at,
+            resurface_after,
         );
         new_cell.set_font_scale(self.font_scale);
         let post = new_cell.snapshot();
@@ -6532,7 +6714,7 @@ impl KeptApp {
         }
         if matches!(
             self.pane_mut().view.view_kind,
-            ViewKind::Ast | ViewKind::Context(_) | ViewKind::Entity(_)
+            ViewKind::Ast | ViewKind::Context(_) | ViewKind::Entity(_) | ViewKind::Current
         ) {
             let doc_y = y + self.pane_mut().scroll_y;
             if let Some(cell_id) = self.find_cell_at(x, doc_y) {
@@ -6836,6 +7018,7 @@ impl KeptApp {
                 self.cell_context_menu = None;
                 return match kind {
                     PageKind::People => open(self, Query::people()),
+                    PageKind::Current => open(self, Query::current()),
                 };
             }
         }
@@ -6974,26 +7157,67 @@ impl KeptApp {
                     return true;
                 }
             }
-            // "Mark inactive" / "Mark active" — flips Cell.active.
-            // The visibility filter / dim render react on the next
-            // frame; if the toggle is off, the cell vanishes from the
+            // "Close" / "Reopen" — flips Cell.closed_at. The
+            // visibility filter / dim render react on the next frame;
+            // if the toggle closes the cell, it vanishes from the
             // current view (still recoverable via Ctrl+Z).
             if let Some(rect) = self.hit_tests.cell_menu.toggle_cell_active {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
-                        self.toggle_cell_active(menu.cell_id);
+                        self.toggle_cell_closed(menu.cell_id);
                     }
                     return true;
                 }
             }
-            // "Mark sub-outline inactive" / "Mark sub-outline active" —
-            // flips the clicked bullet's active flag (cascade applies
-            // via `compute_effective_active` at render time).
+            // "Close sub-outline" / "Reopen sub-outline" — flips the
+            // clicked bullet's closed_at (cascade applies via
+            // `compute_effective_open` at render time).
             if let Some(rect) = self.hit_tests.cell_menu.toggle_bullet_active {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
                         if let Some(bid) = menu.bullet_id {
-                            self.toggle_bullet_active(menu.cell_id, bid);
+                            self.toggle_bullet_closed(menu.cell_id, bid);
+                        }
+                    }
+                    return true;
+                }
+            }
+            // Snooze rows — 6 fuzzy presets that target the bullet
+            // when the menu opened on one, else the cell. Each one
+            // computes its target epoch ms via `attention::resurface_at`
+            // and writes through `set_cell_resurface` /
+            // `set_bullet_resurface` (which record undo).
+            let snooze_rects = self.hit_tests.cell_menu.snooze;
+            let snooze_targets_bullet = self.hit_tests.cell_menu.snooze_targets_bullet;
+            for (i, rect_opt) in snooze_rects.iter().enumerate() {
+                if let Some(rect) = rect_opt {
+                    if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                        let preset = SNOOZE_PRESETS[i].0;
+                        let when = crate::attention::resurface_at(chrono::Local::now(), preset);
+                        if let Some(menu) = self.cell_context_menu.take() {
+                            if snooze_targets_bullet {
+                                if let Some(bid) = menu.bullet_id {
+                                    self.set_bullet_resurface(menu.cell_id, bid, Some(when));
+                                }
+                            } else {
+                                self.set_cell_resurface(menu.cell_id, Some(when));
+                            }
+                        }
+                        return true;
+                    }
+                }
+            }
+            // "Unsnooze" — clears `resurface_after` on the same
+            // target the snooze rows operate on.
+            if let Some(rect) = self.hit_tests.cell_menu.unsnooze {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        if snooze_targets_bullet {
+                            if let Some(bid) = menu.bullet_id {
+                                self.set_bullet_resurface(menu.cell_id, bid, None);
+                            }
+                        } else {
+                            self.set_cell_resurface(menu.cell_id, None);
                         }
                     }
                     return true;
@@ -7848,9 +8072,30 @@ fn select_subtree_at_doc_y(
     descend(&mut cell.kind, top_cell_id, doc_y)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skia_safe::{FontMgr, Typeface};
+
+    fn tf() -> Typeface {
+        FontMgr::new()
+            .new_from_data(include_bytes!("../../resources/fonts/Figtree.ttf"), None)
+            .expect("font loads")
+    }
+
+    #[test]
+    fn closed_cell_still_visible_in_default_view_predicate() {
+        // The visibility filter (is_visible_for_view) used to read
+        // `cell.active`. Under the new model it must read
+        // `cell.closed_at.is_none()` — closed cells are hidden by
+        // default but reappear when `show_inactive_cells` is on.
+        // This test exercises the Cell-level invariant: a closed
+        // cell reports is_open() as false.
+        let mut cell = Cell::new(tf(), "x".to_string());
+        cell.closed_at = Some(123);
+        assert!(!cell.is_open());
+    }
 
     #[test]
     fn split_title_name_and_tags_basic() {
