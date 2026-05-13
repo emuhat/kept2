@@ -141,11 +141,21 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         mouse_x >= r.left && mouse_x <= r.right && mouse_y >= r.top && mouse_y <= r.bottom
     };
 
-    // ---- "Current" top-of-sidebar shortcut ----
-    // Lives above CONTEXTS so the user's working-attention surface
-    // is the most reachable click in the app. No section header —
-    // it's a single row, not a group.
+    // ---- WHAT section (working-attention surface) ----
+    // Sidebar order: WHAT first (the "what am I doing now" pile),
+    // then WHEN (time-window navigation: weeks + per-day),
+    // then TAGS (filter by topic), then PAGES (People). The
+    // WHAT/WHEN/TAGS/PAGES grouping reads as the four axes a
+    // user navigates by — Current is conceptually "what".
     let mut y = pad_top;
+    let what_header_baseline = y + (-hm.ascent);
+    canvas.draw_str(
+        "WHAT",
+        Point::new(pad_x, what_header_baseline),
+        &header_font,
+        &header_paint,
+    );
+    y += header_h;
     let current_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
     draw_sidebar_row(
         canvas,
@@ -160,13 +170,10 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
     ctx.hit_tests.sidebar.pages.push((PageKind::Current, current_rect));
     y += date_h + date_gap;
 
-    // ---- CONTEXTS section ----
-    // Sidebar order: Current first (working attention), then
-    // CONTEXTS (the daily/weekly working surfaces), then TAGS, then
-    // PAGES (People).
+    // ---- WHEN section ----
     let contexts_header_baseline = y + (-hm.ascent);
     canvas.draw_str(
-        "CONTEXTS",
+        "WHEN",
         Point::new(pad_x, contexts_header_baseline),
         &header_font,
         &header_paint,
