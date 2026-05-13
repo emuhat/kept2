@@ -245,11 +245,6 @@ struct PaneLayout {
     outer_cell_width: f32,
     /// Usable content width inside a cell card.
     content_width: f32,
-    /// Doc-space focused-cell geometry. `Some` iff a cell is focused,
-    /// renders with non-zero height, passes the current view's
-    /// visibility filter, AND the view is Ast/Context (Entity / People
-    /// pages bypass the focus card + ring entirely).
-    focused_geom: Option<FocusedCellGeom>,
 }
 
 /// Doc-space rectangle for the focused cell. Used by the card backdrop
@@ -3931,37 +3926,13 @@ impl KeptApp {
         };
         let content_width = outer_cell_width.max(60.0);
 
-        // Capture focused-cell geometry. Card backdrop + focus ring both
-        // read from it so they stay in lockstep — at most one frame of
-        // lag when the cell grows from typing, but they always match.
-        //
-        // Gate on the focused cell still passing the current view's
-        // visibility filter — a cell that just dropped out of a
-        // tag-filtered view (because the user finished renaming its
-        // `#tag` so it no longer matches) shouldn't leave its focus card
-        // behind as a ghost rectangle.
-        //
-        // In focus mode we override y to MARGIN_TOP (the cell renders at
-        // the top of the pane) and suppress the ring elsewhere.
-        let view_kind_local = self.pane().view.view_kind.clone();
-        let match_ctx = self.match_context();
-        let focus_mode = self.pane().focus_mode;
-        let focused_geom = if matches!(view_kind_local, ViewKind::Ast | ViewKind::Context(_)) {
-            self.pane().focused
-                .and_then(|id| self.cell(id))
-                .filter(|c| c.height() > 0.0 && self.is_visible_for_view(c, &match_ctx))
-                .map(|c| {
-                    let y = if focus_mode { MARGIN_TOP } else { c.y_origin() };
-                    FocusedCellGeom {
-                        x: cells_left,
-                        y,
-                        w: content_width,
-                        h: c.height(),
-                    }
-                })
-        } else {
-            None
-        };
+        // Focused-cell geometry isn't captured here anymore — it used
+        // to read `cell.y_origin()` which is a single field shared
+        // across panes, so multi-pane setups would draw focus chrome
+        // at whichever pane rendered most recently. The two-phase
+        // render inside `render_cell_stream` now computes a
+        // pane-local geometry post-record and threads it directly to
+        // the backdrop / ring paints.
 
         PaneLayout {
             pane_idx,
@@ -3970,17 +3941,16 @@ impl KeptApp {
             cells_left,
             outer_cell_width,
             content_width,
-            focused_geom,
         }
     }
 
     /// Drop shadow + white rounded card painted behind the focused
-    /// cell. No-op when no cell is focused (or when the focused cell
-    /// failed the view's visibility filter — `prepare_pane_layout`
-    /// leaves `focused_geom` as `None` in that case).
-    fn render_focus_card_backdrop(&self, canvas: &Canvas, layout: &PaneLayout) {
-        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch }) = layout.focused_geom
-        else {
+    /// cell. No-op when `geom` is `None` (cell-stream views compute it
+    /// inside `render_cell_stream` via the two-phase render so the y
+    /// is always *this* pane's, never polluted by another pane's
+    /// `cell.y_origin` overwrite).
+    fn render_focus_card_backdrop(&self, canvas: &Canvas, geom: Option<FocusedCellGeom>) {
+        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch }) = geom else {
             return;
         };
         let card_rect = Rect::new(
@@ -4015,10 +3985,10 @@ impl KeptApp {
     /// Blue accent ring around the focused cell — subtle when viewing,
     /// brighter and thicker when editing. Suppressed in focus mode
     /// where the white card backdrop alone marks the active area (no
-    /// other cells to compete with). No-op when `focused_geom` is None.
-    fn render_focus_ring(&self, canvas: &Canvas, layout: &PaneLayout) {
+    /// other cells to compete with). No-op when `geom` is None.
+    fn render_focus_ring(&self, canvas: &Canvas, geom: Option<FocusedCellGeom>) {
         let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch }) =
-            layout.focused_geom.filter(|_| !self.pane().focus_mode)
+            geom.filter(|_| !self.pane().focus_mode)
         else {
             return;
         };
@@ -4092,9 +4062,13 @@ impl KeptApp {
         canvas.clip_rect(layout.pane_rect, None, true);
         canvas.translate((0.0, -self.pane_mut().scroll_y));
 
-        self.render_focus_card_backdrop(canvas, &layout);
+        // For cell-stream views, `render_pane_body` runs the two-phase
+        // render internally: record cells to a Picture (which gives us
+        // each cell's *this-pane* y via the running accumulator),
+        // then draw backdrop → replay picture → draw ring with the
+        // freshly-computed `FocusedCellGeom`. Entity / People pages
+        // don't have focus chrome so they paint straight to `canvas`.
         let final_y = self.render_pane_body(canvas, &layout);
-        self.render_focus_ring(canvas, &layout);
 
         canvas.restore();
 
@@ -4155,6 +4129,18 @@ impl KeptApp {
         let focused_id = self.pane_mut().focused;
         let editing_local = self.pane_mut().editing;
         let mut y = MARGIN_TOP;
+
+        // Two-phase render: record cells into a Picture so we can sandwich
+        // them between the focus-card backdrop (under) and focus ring
+        // (over) using a pane-local FocusedCellGeom captured during the
+        // recording pass. Doing it post-render with `cell.y_origin()`
+        // was broken in multi-pane layouts because that field is a single
+        // shared cell-level value overwritten by whichever pane rendered
+        // most recently.
+        let mut recorder = skia_safe::PictureRecorder::new();
+        let rec_bounds = Rect::new(-1.0e6, -1.0e6, 1.0e6, 1.0e6);
+        let rec_canvas = recorder.begin_recording(rec_bounds, None);
+        let mut focused_geom: Option<FocusedCellGeom> = None;
 
         // Precompute per-cell visibility and section headers so the
         // mutable cell loop below doesn't have to re-borrow self.
@@ -4254,7 +4240,7 @@ impl KeptApp {
                 let mut hp = Paint::default();
                 hp.set_anti_alias(true);
                 hp.set_color(crate::color::text_muted_warm());
-                canvas.draw_str(
+                rec_canvas.draw_str(
                     label,
                     Point::new(cells_left, baseline),
                     &header_font,
@@ -4266,7 +4252,7 @@ impl KeptApp {
                 lp.set_anti_alias(true);
                 lp.set_color(crate::color::heading_rule());
                 lp.set_stroke_width(1.5);
-                canvas.draw_line(
+                rec_canvas.draw_line(
                     Point::new(cells_left + label_w + 8.0 * scale, line_y),
                     Point::new(cells_left + outer_cell_width, line_y),
                     &lp,
@@ -4298,13 +4284,13 @@ impl KeptApp {
             // threading a paint color through every primitive.
             let cell_inactive = !self.document.cells[i].active;
             if cell_inactive {
-                canvas.save_layer_alpha(None, cell::INACTIVE_ALPHA as u32);
+                rec_canvas.save_layer_alpha(None, cell::INACTIVE_ALPHA as u32);
             }
             let h = if is_reference {
                 // Reference cells render via the app layer (which can
                 // see the full cell list to look up the target).
                 self.render_reference_cell(
-                    canvas,
+                    rec_canvas,
                     i,
                     cell_x,
                     cell_y,
@@ -4317,7 +4303,7 @@ impl KeptApp {
                 // Reference — needs the cell list to refresh
                 // the embed cache.
                 self.render_envelope_outline_cell(
-                    canvas,
+                    rec_canvas,
                     i,
                     cell_x,
                     cell_y,
@@ -4350,7 +4336,7 @@ impl KeptApp {
                     oc.set_show_inactive(show_inactive);
                 }
                 cell.tick(
-                    canvas,
+                    rec_canvas,
                     cell_x,
                     cell_y,
                     content_width,
@@ -4358,6 +4344,20 @@ impl KeptApp {
                     show_caret,
                 )
             };
+
+            // Capture the focused cell's pane-local geometry while we
+            // still have the values from this pane's render pass. The
+            // backdrop and ring (drawn outside the recording onto the
+            // real canvas) read from this snapshot, so they always
+            // track *this* pane regardless of which pane rendered last.
+            if cell_is_focused {
+                focused_geom = Some(FocusedCellGeom {
+                    x: cell_x,
+                    y: cell_y,
+                    w: content_width,
+                    h,
+                });
+            }
 
             // Faint outline around non-focused cells so each one reads as a
             // distinct unit. Drawn in the same position the focus ring would
@@ -4376,14 +4376,25 @@ impl KeptApp {
                     cell_x + content_width + FOCUS_PAD,
                     cell_y + h + FOCUS_PAD,
                 );
-                canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
+                rec_canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
             }
             if cell_inactive {
-                canvas.restore();
+                rec_canvas.restore();
             }
 
             y += h + CELL_GAP;
         }
+
+        // Phase 2: finalize the recording and composite onto the real
+        // canvas in z-order: focus backdrop (under) → cell stream replay
+        // → focus ring (over).
+        let picture = recorder.finish_recording_as_picture(None);
+        self.render_focus_card_backdrop(canvas, focused_geom);
+        if let Some(pic) = picture {
+            canvas.draw_picture(&pic, None, None);
+        }
+        self.render_focus_ring(canvas, focused_geom);
+
         y
     }
 
