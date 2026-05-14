@@ -154,11 +154,13 @@ struct SidebarHits {
 /// surface, not an open-loop archive.
 const CURRENT_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
-/// Width of the colored left-edge state bar on every cell. Wide
-/// enough to be a comfortable click target — the bar acts as
-/// "select the whole cell" + a right-click anchor for the
-/// whole-cell menu (Delete, info, cell-level Snooze).
-const CELL_BAR_W: f32 = 14.0;
+/// Width of the colored left-edge state bar on every cell. Narrow
+/// enough to read as a slim accent strip without dominating the
+/// cell, but combined with `CELL_BAR_GAP` (= FOCUS_PAD) the hit
+/// rect is `CELL_BAR_W + CELL_BAR_GAP` wide — still clickable.
+/// For the rare whole-cell menu access without aiming at the bar,
+/// Ctrl+right-click anywhere on the cell opens the BarContextMenu.
+const CELL_BAR_W: f32 = 8.0;
 /// Gap between the bar and the cell card's chrome. Set to
 /// `FOCUS_PAD` so the bar's right edge lands exactly on the
 /// chrome's left edge (outline.left / wrapper.left / focus_ring.left
@@ -185,15 +187,6 @@ struct CellMenuHits {
     /// `None` when the right-click didn't hit a bullet (non-outline cell,
     /// or outline whitespace).
     surface_subtree: Option<Rect>,
-    /// "Envelope" row — only populated when the menu's source is a
-    /// Reference cell (turns it into an outline with the original
-    /// embed pinned at the top).
-    envelope: Option<Rect>,
-    /// "Unwrap" row — only populated when the menu's source is an
-    /// envelope outline. Reverse of envelope: the cell becomes a
-    /// bare Reference again. The user's notes are dropped (recoverable
-    /// via Ctrl+Z).
-    unwrap: Option<Rect>,
     /// "Close" / "Reopen" — toggles `Cell.closed_at`. Always
     /// present.
     toggle_cell_active: Option<Rect>,
@@ -223,8 +216,20 @@ struct CellMenuHits {
 /// body's `CellMenuHits` there's no `*_bullet` variant.
 #[derive(Default)]
 struct BarMenuHits {
+    /// "Surface as reference" — always present. Surfaces the
+    /// whole cell (or the Reference's preserved target, for
+    /// Reference cells) into the current writable context.
+    surface: Option<Rect>,
     snooze: [Option<Rect>; 6],
     unsnooze: Option<Rect>,
+    /// "Envelope" — transforms a Reference cell into an envelope
+    /// outline (preserving id + timestamp). `Some` only when the
+    /// bar menu opened on a Reference cell.
+    envelope: Option<Rect>,
+    /// "Unwrap envelope" — inverse of Envelope; turns an envelope
+    /// back into a bare Reference. `Some` only when the bar menu
+    /// opened on an envelope outline.
+    unwrap: Option<Rect>,
     delete: Option<Rect>,
 }
 
@@ -3661,7 +3666,9 @@ impl KeptApp {
         self.pane_mut().focused = self.visible_cell_ids().first().copied();
         self.pane_mut().editing = false;
         self.pane_mut().dragging_cell = None;
-        self.cell_context_menu = None;
+        // Any open context menu is anchored to the previous view —
+        // dismiss every kind on a view switch.
+        self.dismiss_open_context_menu();
         self.pane_mut().scroll_y = 0.0;
         self.pane_mut().coalesce_break = true;
         self.pane_mut().pending_caret_scroll = true;
@@ -3870,8 +3877,11 @@ impl KeptApp {
             .unwrap_or(self.active_pane);
         let moved = self.panes[target].apply_wheel(dy, phase);
         if moved {
-            // Doc-anchored menu loses its anchor on any pane scroll.
-            self.cell_context_menu = None;
+            // Any doc-anchored menu loses its anchor on a pane
+            // scroll — dismiss them all so a stale menu doesn't
+            // sit at the wrong y for a cell that's now scrolled
+            // off / shifted.
+            self.dismiss_open_context_menu();
         }
         moved
     }
@@ -4759,12 +4769,12 @@ impl KeptApp {
             }
         }
 
-        // Esc closes the cell context menu first if it's open.
+        // Esc closes any open right-click context menu (cell, bar,
+        // tag, people) before falling through to other Esc bindings.
         if event.state == ElementState::Pressed
-            && self.cell_context_menu.is_some()
             && matches!(event.logical_key, Key::Named(NamedKey::Escape))
+            && self.dismiss_open_context_menu()
         {
-            self.cell_context_menu = None;
             return true;
         }
 
@@ -5170,16 +5180,8 @@ impl KeptApp {
             && !modifiers.state().alt_key()
         {
             match &event.logical_key {
-                // Esc closes the tag context menu first.
-                Key::Named(NamedKey::Escape) if self.tag_context_menu.is_some() => {
-                    self.tag_context_menu = None;
-                    return true;
-                }
-                // Same for the People context menu.
-                Key::Named(NamedKey::Escape) if self.people_context_menu.is_some() => {
-                    self.people_context_menu = None;
-                    return true;
-                }
+                // (Context-menu Esc dismissals are handled above
+                // by `dismiss_open_context_menu`.)
                 // Esc exits focus mode first; if it wasn't on, fall through
                 // to the edit→view exit below.
                 Key::Named(NamedKey::Escape) if self.pane_mut().focus_mode => {
@@ -6094,6 +6096,21 @@ impl KeptApp {
     }
 
     /// Open the People right-click context menu for `entity_id`,
+    /// Close whichever right-click context menu is currently open
+    /// (cell / bar / tag / people). Returns true if any was open and
+    /// got dismissed. Single point of truth for "dismiss any menu" —
+    /// called by Esc keypress, by right-click before opening a new
+    /// menu, and by any flow that wants to be sure no menu is
+    /// stuck on screen.
+    fn dismiss_open_context_menu(&mut self) -> bool {
+        // `|` (not `||`) so all four `take()`s evaluate — that
+        // way no menu lingers even if multiple were somehow open.
+        self.cell_context_menu.take().is_some()
+            | self.bar_context_menu.take().is_some()
+            | self.tag_context_menu.take().is_some()
+            | self.people_context_menu.take().is_some()
+    }
+
     /// anchored at window-space `(x, y)`. Precomputes deletability
     /// (no backing cell + zero references). The menu closes on any
     /// subsequent click or Esc.
@@ -6884,12 +6901,9 @@ impl KeptApp {
     /// it AND drops the DB row). Doc-area right-clicks open the
     /// per-cell or per-row context menu. Returns true if the click
     /// was consumed.
-    pub fn right_click(&mut self, x: f32, y: f32) -> bool {
+    pub fn right_click(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
         // Right-clicking anywhere first closes any open menu.
-        let was_open = self.tag_context_menu.take().is_some()
-            | self.people_context_menu.take().is_some()
-            | self.cell_context_menu.take().is_some()
-            | self.bar_context_menu.take().is_some();
+        let was_open = self.dismiss_open_context_menu();
         // Sidebar: any tag row offers the delete menu. The previous
         // gate (`count == 0` against `db.cells_with_tag`) was unreachable
         // — every visible tag has at least one in-memory cell carrying
@@ -6936,9 +6950,25 @@ impl KeptApp {
             let doc_y = y + self.pane_mut().scroll_y;
             // Bar hit-test wins over the body — a right-click on the
             // left-edge bar always opens the whole-cell BarContextMenu,
-            // never the body's CellContextMenu.
+            // never the body's CellContextMenu. Ctrl+right-click
+            // anywhere on the cell behaves the same way: bypass the
+            // body's bullet-subtree selection and treat the click as
+            // if it had landed on the bar.
+            let force_bar_menu = cell::primary_mod(modifiers.state());
             for (cell_id, rect) in self.hit_tests.cell_bars.clone() {
                 if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
+                    self.pane_mut().focused = Some(cell_id);
+                    self.pane_mut().editing = false;
+                    self.bar_context_menu = Some(BarContextMenu {
+                        cell_id,
+                        anchor_x: x,
+                        anchor_y: y,
+                    });
+                    return true;
+                }
+            }
+            if force_bar_menu {
+                if let Some(cell_id) = self.find_cell_at(x, doc_y) {
                     self.pane_mut().focused = Some(cell_id);
                     self.pane_mut().editing = false;
                     self.bar_context_menu = Some(BarContextMenu {
@@ -6989,15 +7019,6 @@ impl KeptApp {
                         CellKind::Reference(rc) => Some(rc.target()),
                         _ => None,
                     });
-                // Envelope detection — drives the "Unwrap" row.
-                let source_is_envelope = self
-                    .cell(cell_id)
-                    .map(|c| match &c.kind {
-                        CellKind::Outline(oc) => oc.has_reference_header(),
-                        _ => false,
-                    })
-                    .unwrap_or(false);
-
                 self.cell_context_menu = Some(CellContextMenu {
                     cell_id,
                     anchor_x: x,
@@ -7007,7 +7028,6 @@ impl KeptApp {
                     reference_origin_cell_id,
                     bullet_origin_cell_id,
                     source_reference_target,
-                    source_is_envelope,
                 });
                 return true;
             }
@@ -7308,14 +7328,33 @@ impl KeptApp {
         doc_y: f32,
         modifiers: &Modifiers,
     ) -> bool {
-        // Bar context menu dispatch: whole-cell operations (Delete,
-        // Snooze, Unsnooze). Click anywhere else dismisses and falls
-        // through to normal cell routing.
+        // Bar context menu dispatch: whole-cell operations (Surface,
+        // Snooze, Envelope/Unwrap, Delete). Click anywhere else
+        // dismisses and falls through to normal cell routing.
         if self.bar_context_menu.is_some() {
             if let Some(rect) = self.hit_tests.bar_menu.delete {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.bar_context_menu.take() {
                         self.delete_cell_by_id(menu.cell_id);
+                    }
+                    return true;
+                }
+            }
+            // "Surface as reference" — surfaces the whole cell. For
+            // Reference cells, preserve the original target shape
+            // (Subtree stays a Subtree) so re-surfacing doesn't
+            // degrade to WholeCell of the source.
+            if let Some(rect) = self.hit_tests.bar_menu.surface {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.bar_context_menu.take() {
+                        let target = self
+                            .cell(menu.cell_id)
+                            .and_then(|c| match &c.kind {
+                                CellKind::Reference(rc) => Some(rc.target()),
+                                _ => None,
+                            })
+                            .unwrap_or(ReferenceTarget::WholeCell(menu.cell_id));
+                        self.surface_as_reference(target);
                     }
                     return true;
                 }
@@ -7337,6 +7376,24 @@ impl KeptApp {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.bar_context_menu.take() {
                         self.set_cell_resurface(menu.cell_id, None);
+                    }
+                    return true;
+                }
+            }
+            // Envelope (Reference → envelope outline).
+            if let Some(rect) = self.hit_tests.bar_menu.envelope {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.bar_context_menu.take() {
+                        self.envelope_reference(menu.cell_id);
+                    }
+                    return true;
+                }
+            }
+            // Unwrap envelope (envelope outline → Reference).
+            if let Some(rect) = self.hit_tests.bar_menu.unwrap {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.bar_context_menu.take() {
+                        self.unwrap_envelope(menu.cell_id);
                     }
                     return true;
                 }
@@ -7389,28 +7446,6 @@ impl KeptApp {
                                 bullet_id: bid,
                             });
                         }
-                    }
-                    return true;
-                }
-            }
-            // "Envelope" — only present when the menu's source is a
-            // Reference cell. Wraps the embed in an outline so the
-            // user can write notes around it; cell id and timestamp
-            // are preserved (replace-in-place).
-            if let Some(rect) = self.hit_tests.cell_menu.envelope {
-                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    if let Some(menu) = self.cell_context_menu.take() {
-                        self.envelope_reference(menu.cell_id);
-                    }
-                    return true;
-                }
-            }
-            // "Unwrap envelope" — inverse of envelope. Bullet notes
-            // are dropped (recoverable via Ctrl+Z).
-            if let Some(rect) = self.hit_tests.cell_menu.unwrap {
-                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    if let Some(menu) = self.cell_context_menu.take() {
-                        self.unwrap_envelope(menu.cell_id);
                     }
                     return true;
                 }

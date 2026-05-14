@@ -81,11 +81,6 @@ pub(super) struct CellContextMenu {
     /// produces another Subtree pointing at the same bullet, instead
     /// of degrading to a WholeCell of the source.
     pub(super) source_reference_target: Option<ReferenceTarget>,
-    /// True when the menu was opened on an envelope outline (an
-    /// `OutlineCell` carrying a `reference_header`). Drives the
-    /// "Unwrap" row, which converts the envelope back to a bare
-    /// Reference at the same id / timestamp.
-    pub(super) source_is_envelope: bool,
 }
 
 /// Right-click menu over a People-page row. `deletable` and `ref_count`
@@ -193,30 +188,21 @@ impl CellContextMenu {
         // Compute action rows. Order matches the visual stack.
         let has_subtree = self.bullet_id.is_some();
         // Envelope is offered only when the menu was opened on a
-        // Reference cell (we already capture that via
-        // `source_reference_target`). Wraps the embed in an outline so
-        // the user can write notes around it.
-        let has_envelope = self.source_reference_target.is_some();
-        // Unwrap is the inverse — only on envelope outlines. Mutually
-        // exclusive with `has_envelope` since one targets Reference
-        // sources and the other targets Outline sources.
-        let has_unwrap = self.source_is_envelope;
         // Bullet-active toggle: only shown when the clicked bullet
         // lives in *this* cell's outline. For clicks inside a nested
         // embed (Reference cache, envelope header), the bullet's
         // origin is a different cell — toggling its active flag from
         // here would cross-mutate, which we don't want from a menu
         // anchored on the wrapping cell.
+        //
+        // Note: Envelope / Unwrap are whole-cell operations and now
+        // live on the `BarContextMenu` instead of here. Right-click
+        // anywhere on the cell while holding Ctrl (or right-click
+        // the bar) opens that menu.
         let has_bullet_toggle =
             self.bullet_id.is_some() && self.bullet_origin_cell_id == Some(self.cell_id);
         let mut action_count: usize = 1; // Surface as reference (always)
         if has_subtree {
-            action_count += 1;
-        }
-        if has_envelope {
-            action_count += 1;
-        }
-        if has_unwrap {
             action_count += 1;
         }
         action_count += 1; // Close / Reopen (cell)
@@ -371,30 +357,10 @@ impl CellContextMenu {
 
         emit_separator(&mut row_top);
 
-        // ----- Group 3: State-changing actions (Envelope / Unwrap / Close) -----
-        // Envelope/Unwrap mutate the cell's shape; Close/Reopen
-        // flips `closed_at`. Grouped together as "this changes the
-        // cell's state" vs the surfacing/snooze groups above.
-        let envelope_rect = if has_envelope {
-            Some(emit_row(
-                &mut row_top,
-                "Envelope",
-                crate::color::text_menu_row(),
-                crate::color::embed_hover(),
-            ))
-        } else {
-            None
-        };
-        let unwrap_rect = if has_unwrap {
-            Some(emit_row(
-                &mut row_top,
-                "Unwrap envelope",
-                crate::color::text_menu_row(),
-                crate::color::embed_hover(),
-            ))
-        } else {
-            None
-        };
+        // ----- Group 3: Close (state change, scoped to body context) -----
+        // Whole-cell shape transforms (Envelope / Unwrap) live on
+        // the BarContextMenu now — they're whole-cell operations
+        // and don't belong in a bullet-specific menu.
         let cell_active_label = if cell.is_open() { "Close" } else { "Reopen" };
         let toggle_cell_active_rect = emit_row(
             &mut row_top,
@@ -428,8 +394,6 @@ impl CellContextMenu {
 
         ctx.hit_tests.cell_menu.surface = Some(surface_rect);
         ctx.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
-        ctx.hit_tests.cell_menu.envelope = envelope_rect;
-        ctx.hit_tests.cell_menu.unwrap = unwrap_rect;
         ctx.hit_tests.cell_menu.toggle_cell_active = Some(toggle_cell_active_rect);
         ctx.hit_tests.cell_menu.toggle_bullet_active = toggle_bullet_active_rect;
         ctx.hit_tests.cell_menu.snooze = snooze_rects;
@@ -460,13 +424,32 @@ impl BarContextMenu {
         let separator_h = pad;
 
         let has_unsnooze = cell.resurface_after.is_some();
+        // Envelope is offered for Reference cells; Unwrap for
+        // envelope outlines. Mutually exclusive — a cell is either
+        // a Reference, an envelope-Outline, or neither, never both.
+        let has_envelope = matches!(cell.kind, CellKind::Reference(_));
+        let has_unwrap = matches!(
+            &cell.kind,
+            CellKind::Outline(oc) if oc.has_reference_header()
+        );
+        let has_shape_group = has_envelope || has_unwrap;
         let mut action_count: usize = super::SNOOZE_PRESETS.len();
         if has_unsnooze {
             action_count += 1;
         }
+        if has_envelope {
+            action_count += 1;
+        }
+        if has_unwrap {
+            action_count += 1;
+        }
+        action_count += 1; // Surface as reference (always)
         action_count += 1; // Delete cell
-        // Two separators: info | snoozes | delete.
-        let separator_count: usize = 2;
+        // Separators: info | surface | snoozes | [shape (envelope/unwrap)] | delete.
+        let mut separator_count: usize = 3;
+        if has_shape_group {
+            separator_count += 1;
+        }
         let menu_h = pad
             + info_h * 2.0
             + action_h * action_count as f32
@@ -551,7 +534,17 @@ impl BarContextMenu {
 
         emit_separator(&mut row_top);
 
-        // ----- Group 2: Snoozes (always whole-cell) -----
+        // ----- Group 2: Surface as reference (always) -----
+        let surface_rect = emit_row(
+            &mut row_top,
+            "Surface as reference",
+            crate::color::text_menu_row(),
+            crate::color::embed_hover(),
+        );
+
+        emit_separator(&mut row_top);
+
+        // ----- Group 3: Snoozes (always whole-cell) -----
         let mut snooze_rects: [Option<Rect>; 6] = [None; 6];
         for (i, (_, label)) in super::SNOOZE_PRESETS.iter().enumerate() {
             snooze_rects[i] = Some(emit_row(
@@ -574,7 +567,36 @@ impl BarContextMenu {
 
         emit_separator(&mut row_top);
 
-        // ----- Group 3: Delete (destructive, last) -----
+        // ----- Group 4: Shape transforms (Envelope / Unwrap) -----
+        // Mutually exclusive — only one row possible per cell, and
+        // only when the cell is a Reference (Envelope) or an
+        // envelope-Outline (Unwrap envelope). Skip the whole group
+        // (no separator either) when neither applies.
+        let envelope_rect = if has_envelope {
+            Some(emit_row(
+                &mut row_top,
+                "Envelope",
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ))
+        } else {
+            None
+        };
+        let unwrap_rect = if has_unwrap {
+            Some(emit_row(
+                &mut row_top,
+                "Unwrap envelope",
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ))
+        } else {
+            None
+        };
+        if has_shape_group {
+            emit_separator(&mut row_top);
+        }
+
+        // ----- Group 5: Delete (destructive, last) -----
         let delete_rect = emit_row(
             &mut row_top,
             "Delete cell",
@@ -582,8 +604,11 @@ impl BarContextMenu {
             crate::color::delete_hover_bg(),
         );
 
+        ctx.hit_tests.bar_menu.surface = Some(surface_rect);
         ctx.hit_tests.bar_menu.snooze = snooze_rects;
         ctx.hit_tests.bar_menu.unsnooze = unsnooze_rect;
+        ctx.hit_tests.bar_menu.envelope = envelope_rect;
+        ctx.hit_tests.bar_menu.unwrap = unwrap_rect;
         ctx.hit_tests.bar_menu.delete = Some(delete_rect);
     }
 }

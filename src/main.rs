@@ -139,7 +139,7 @@ impl ApplicationHandler for Application {
                         self.env.window.request_redraw();
                     }
                 } else if button == MouseButton::Right && state == ElementState::Pressed {
-                    if self.kept_app.right_click(x, y) {
+                    if self.kept_app.right_click(x, y, &self.modifiers) {
                         self.env.window.request_redraw();
                     }
                 }
