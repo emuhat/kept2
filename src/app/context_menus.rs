@@ -32,6 +32,17 @@ pub(super) struct TagContextMenu {
     pub(super) anchor_y: f32,
 }
 
+/// Right-click on a cell's left-edge bar opens this menu. Always
+/// operates on the whole cell — never on a bullet — so it carries
+/// just the cell id + anchor + a couple of state flags that drive
+/// label/conditional-row logic. Created/edited timestamp info
+/// comes from the cell itself at render time.
+pub(super) struct BarContextMenu {
+    pub(super) cell_id: Uuid,
+    pub(super) anchor_x: f32,
+    pub(super) anchor_y: f32,
+}
+
 /// Right-click menu anchored on a cell in the doc area. Replaces the
 /// old kebab affordance: timestamps render as muted info rows, and a
 /// "Delete cell" row is the only action.
@@ -176,7 +187,6 @@ impl CellContextMenu {
     ) {
         let scale = ctx.font_scale;
         let pad = CELL_MENU_PAD * scale;
-        let info_h = CELL_MENU_INFO_H * scale;
         let action_h = CELL_MENU_ACTION_H * scale;
         let menu_w = CELL_MENU_WIDTH * scale;
 
@@ -199,8 +209,7 @@ impl CellContextMenu {
         // anchored on the wrapping cell.
         let has_bullet_toggle =
             self.bullet_id.is_some() && self.bullet_origin_cell_id == Some(self.cell_id);
-        let mut action_count: usize = 1; // Delete cell
-        action_count += 1; // Surface as reference (always)
+        let mut action_count: usize = 1; // Surface as reference (always)
         if has_subtree {
             action_count += 1;
         }
@@ -234,14 +243,12 @@ impl CellContextMenu {
         if target_resurface_present {
             action_count += 1;
         }
-        // Three group separators (Surface | Snooze | Close/Mutate |
-        // Delete). Each is a hairline with a small breathing band
-        // top + bottom — `pad` total per separator.
+        // Two group separators (Surface | Snooze | Close/Mutate).
+        // Delete + info live on the BarContextMenu now, so this
+        // menu's tail group is Close/Reopen rather than Delete.
         let separator_h = pad;
-        let separator_count: usize = 3;
+        let separator_count: usize = 2;
         let menu_h = pad
-            + info_h * 2.0
-            + 1.0
             + action_h * action_count as f32
             + separator_h * separator_count as f32
             + pad;
@@ -259,42 +266,9 @@ impl CellContextMenu {
 
         draw_menu_card(canvas, rect, scale);
 
-        // Two muted info lines.
-        let info_font = Font::from_typeface(ctx.typeface, 12.0 * scale);
-        let mut info_paint = Paint::default();
-        info_paint.set_anti_alias(true);
-        info_paint.set_color(crate::color::text_muted_grey());
-        let (_, im) = info_font.metrics();
-        let line1_baseline =
-            rect.top + pad + (info_h + (-im.ascent) - im.descent) * 0.5;
-        let line2_baseline = line1_baseline + info_h;
-        canvas.draw_str(
-            format!("Created {}", format_timestamp(cell.timestamp)),
-            Point::new(rect.left + pad * 2.0, line1_baseline),
-            &info_font,
-            &info_paint,
-        );
-        canvas.draw_str(
-            format!("Last edited {}", format_timestamp(cell.edited_at)),
-            Point::new(rect.left + pad * 2.0, line2_baseline),
-            &info_font,
-            &info_paint,
-        );
-
-        // Hairline divider above the action rows.
-        let divider_y = rect.top + pad + info_h * 2.0 + 0.5;
-        let mut divider = Paint::default();
-        divider.set_anti_alias(false);
-        divider.set_color(crate::color::hairline_divider());
-        canvas.draw_line(
-            Point::new(rect.left + pad, divider_y),
-            Point::new(rect.right - pad, divider_y),
-            &divider,
-        );
-
         let action_font = Font::from_typeface(ctx.typeface, 13.0 * scale);
         let mouse = ctx.mouse_pos;
-        let mut row_top = rect.top + pad + info_h * 2.0 + 1.0;
+        let mut row_top = rect.top + pad;
         let row_left = rect.left + pad * 0.5;
         let row_right = rect.right - pad * 0.5;
         let emit_row = |row_top_ref: &mut f32,
@@ -452,17 +426,6 @@ impl CellContextMenu {
             None
         };
 
-        emit_separator(&mut row_top);
-
-        // ----- Group 4: Delete (destructive, last) -----
-        let delete_rect = emit_row(
-            &mut row_top,
-            "Delete cell",
-            crate::color::delete_text(),
-            crate::color::delete_hover_bg(),
-        );
-
-        ctx.hit_tests.cell_menu.delete = Some(delete_rect);
         ctx.hit_tests.cell_menu.surface = Some(surface_rect);
         ctx.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
         ctx.hit_tests.cell_menu.envelope = envelope_rect;
@@ -472,6 +435,156 @@ impl CellContextMenu {
         ctx.hit_tests.cell_menu.snooze = snooze_rects;
         ctx.hit_tests.cell_menu.unsnooze = unsnooze_rect;
         ctx.hit_tests.cell_menu.snooze_targets_bullet = snooze_targets_bullet;
+    }
+}
+
+impl BarContextMenu {
+    /// Render the bar (whole-cell) context menu: two muted info
+    /// rows (Created / Last edited), the 6-preset Snooze group, an
+    /// optional Unsnooze, and a Delete row at the bottom. Mirrors
+    /// the visual structure of `CellContextMenu` so the two read as
+    /// siblings.
+    pub(super) fn render(
+        &self,
+        canvas: &Canvas,
+        view_w: f32,
+        view_h: f32,
+        cell: &Cell,
+        ctx: &mut MenuRenderCtx<'_>,
+    ) {
+        let scale = ctx.font_scale;
+        let pad = CELL_MENU_PAD * scale;
+        let info_h = CELL_MENU_INFO_H * scale;
+        let action_h = CELL_MENU_ACTION_H * scale;
+        let menu_w = CELL_MENU_WIDTH * scale;
+        let separator_h = pad;
+
+        let has_unsnooze = cell.resurface_after.is_some();
+        let mut action_count: usize = super::SNOOZE_PRESETS.len();
+        if has_unsnooze {
+            action_count += 1;
+        }
+        action_count += 1; // Delete cell
+        // Two separators: info | snoozes | delete.
+        let separator_count: usize = 2;
+        let menu_h = pad
+            + info_h * 2.0
+            + action_h * action_count as f32
+            + separator_h * separator_count as f32
+            + pad;
+        let rect = clamp_rect_to_viewport(
+            Rect::new(
+                self.anchor_x,
+                self.anchor_y,
+                self.anchor_x + menu_w,
+                self.anchor_y + menu_h,
+            ),
+            view_w,
+            view_h,
+            4.0,
+        );
+
+        draw_menu_card(canvas, rect, scale);
+
+        // ----- Group 1: muted info lines -----
+        let info_font = Font::from_typeface(ctx.typeface, 12.0 * scale);
+        let mut info_paint = Paint::default();
+        info_paint.set_anti_alias(true);
+        info_paint.set_color(crate::color::text_muted_grey());
+        let (_, im) = info_font.metrics();
+        let line1_baseline =
+            rect.top + pad + (info_h + (-im.ascent) - im.descent) * 0.5;
+        let line2_baseline = line1_baseline + info_h;
+        canvas.draw_str(
+            format!("Created {}", format_timestamp(cell.timestamp)),
+            Point::new(rect.left + pad * 2.0, line1_baseline),
+            &info_font,
+            &info_paint,
+        );
+        canvas.draw_str(
+            format!("Last edited {}", format_timestamp(cell.edited_at)),
+            Point::new(rect.left + pad * 2.0, line2_baseline),
+            &info_font,
+            &info_paint,
+        );
+
+        let action_font = Font::from_typeface(ctx.typeface, 13.0 * scale);
+        let mouse = ctx.mouse_pos;
+        let row_left = rect.left + pad * 0.5;
+        let row_right = rect.right - pad * 0.5;
+        let mut row_top = rect.top + pad + info_h * 2.0;
+        let emit_row = |row_top_ref: &mut f32,
+                        label: &str,
+                        color: Color,
+                        hover_bg: Color|
+         -> Rect {
+            let r = Rect::new(row_left, *row_top_ref, row_right, *row_top_ref + action_h);
+            draw_menu_row(
+                canvas,
+                r,
+                label,
+                color,
+                hover_bg,
+                true,
+                pad * 2.0,
+                true,
+                scale,
+                &action_font,
+                mouse,
+            );
+            *row_top_ref += action_h;
+            r
+        };
+        let emit_separator = |row_top_ref: &mut f32| {
+            let band = separator_h;
+            let line_y = *row_top_ref + band * 0.5;
+            let mut div = Paint::default();
+            div.set_anti_alias(false);
+            div.set_color(crate::color::hairline_divider());
+            canvas.draw_line(
+                Point::new(rect.left + pad, line_y),
+                Point::new(rect.right - pad, line_y),
+                &div,
+            );
+            *row_top_ref += band;
+        };
+
+        emit_separator(&mut row_top);
+
+        // ----- Group 2: Snoozes (always whole-cell) -----
+        let mut snooze_rects: [Option<Rect>; 6] = [None; 6];
+        for (i, (_, label)) in super::SNOOZE_PRESETS.iter().enumerate() {
+            snooze_rects[i] = Some(emit_row(
+                &mut row_top,
+                label,
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ));
+        }
+        let unsnooze_rect = if has_unsnooze {
+            Some(emit_row(
+                &mut row_top,
+                "Unsnooze",
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ))
+        } else {
+            None
+        };
+
+        emit_separator(&mut row_top);
+
+        // ----- Group 3: Delete (destructive, last) -----
+        let delete_rect = emit_row(
+            &mut row_top,
+            "Delete cell",
+            crate::color::delete_text(),
+            crate::color::delete_hover_bg(),
+        );
+
+        ctx.hit_tests.bar_menu.snooze = snooze_rects;
+        ctx.hit_tests.bar_menu.unsnooze = unsnooze_rect;
+        ctx.hit_tests.bar_menu.delete = Some(delete_rect);
     }
 }
 

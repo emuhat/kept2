@@ -24,7 +24,9 @@ mod context_menus;
 mod mention_popup;
 mod search;
 mod sidebar;
-use context_menus::{CellContextMenu, MenuRenderCtx, PeopleContextMenu, TagContextMenu};
+use context_menus::{
+    BarContextMenu, CellContextMenu, MenuRenderCtx, PeopleContextMenu, TagContextMenu,
+};
 use mention_popup::{MentionKind, MentionPopup};
 use search::SearchState;
 
@@ -114,12 +116,18 @@ fn split_title_name_and_tags(text: &str) -> (String, String) {
 struct HitTestState {
     sidebar: SidebarHits,
     cell_menu: CellMenuHits,
+    bar_menu: BarMenuHits,
     tag_menu: TagMenuHits,
     people_menu: PeopleMenuHits,
     search: SearchHits,
     entity_page: EntityPageHits,
     people_page: PeoplePageHits,
     mention_popup: MentionPopupHits,
+    /// Per-frame list of (cell_id, left-bar rect) populated by
+    /// `render_cell_stream`. The bar is the "select whole cell"
+    /// click target and the anchor for the bar context menu
+    /// (Delete, info, cell-level Snooze).
+    cell_bars: Vec<(Uuid, Rect)>,
 }
 
 #[derive(Default)]
@@ -146,6 +154,18 @@ struct SidebarHits {
 /// surface, not an open-loop archive.
 const CURRENT_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// Width of the colored left-edge state bar on every cell. Wide
+/// enough to be a comfortable click target — the bar acts as
+/// "select the whole cell" + a right-click anchor for the
+/// whole-cell menu (Delete, info, cell-level Snooze).
+const CELL_BAR_W: f32 = 14.0;
+/// Gap between the bar and the cell card's chrome. Set to
+/// `FOCUS_PAD` so the bar's right edge lands exactly on the
+/// chrome's left edge (outline.left / wrapper.left / focus_ring.left
+/// all equal `bar.right`), making the bar visually flush against
+/// whichever chrome the cell uses.
+const CELL_BAR_GAP: f32 = FOCUS_PAD;
+
 /// Ordered list of snooze presets the cell / bullet right-click menu
 /// surfaces. Index alignment matters: `CellMenuHits.snooze[i]` is the
 /// rect for `SNOOZE_PRESETS[i]`.
@@ -160,7 +180,6 @@ const SNOOZE_PRESETS: [(crate::attention::SnoozePreset, &str); 6] = [
 
 #[derive(Default)]
 struct CellMenuHits {
-    delete: Option<Rect>,
     /// Always present when the menu is open.
     surface: Option<Rect>,
     /// `None` when the right-click didn't hit a bullet (non-outline cell,
@@ -197,6 +216,16 @@ struct CellMenuHits {
     /// `cell_context_menu.bullet_id`; when false, they target the
     /// cell.
     snooze_targets_bullet: bool,
+}
+
+/// Right-click on a cell's left-edge bar opens this menu. Always
+/// operates on the whole cell — never on a bullet — so unlike the
+/// body's `CellMenuHits` there's no `*_bullet` variant.
+#[derive(Default)]
+struct BarMenuHits {
+    snooze: [Option<Rect>; 6],
+    unsnooze: Option<Rect>,
+    delete: Option<Rect>,
 }
 
 #[derive(Default)]
@@ -1695,6 +1724,11 @@ pub struct KeptApp {
     /// floating card at the anchor; clicks inside dispatch the action,
     /// clicks elsewhere dismiss.
     cell_context_menu: Option<CellContextMenu>,
+    /// Right-click on the cell's left-edge bar. Whole-cell-only
+    /// operations (Delete, info, Snooze the entire cell). Mutually
+    /// exclusive with `cell_context_menu` in practice — opening one
+    /// dismisses the other.
+    bar_context_menu: Option<BarContextMenu>,
     /// Active right-click context menu for a tag (only shown for tags
     /// with zero attached cells). When `Some`, render and hit-test the
     /// menu at the stored anchor.
@@ -1986,6 +2020,7 @@ impl KeptApp {
             clipboard: Clipboard::new().ok(),
             db,
             cell_context_menu: None,
+            bar_context_menu: None,
             tag_context_menu: None,
             sidebar_scroll: Scroller::new(),
             people_rename: None,
@@ -2504,8 +2539,15 @@ impl KeptApp {
             }
             None => "↗ original deleted".to_string(),
         };
+        // Extend the wrapper LEFT by FOCUS_PAD so the dashed
+        // wrapper's left edge lines up with the chrome's left
+        // edge used by other cell types (outline.left, focus
+        // ring.left, all at `body_x - FOCUS_PAD`). The bar then
+        // sits flush against the wrapper, same as it does
+        // against the outline rect.
+        let bar_extra = FOCUS_PAD;
         let total_h = self.draw_embed_wrapper(
-            canvas, x, y, width, body_x, body_h, &footer_text, scale,
+            canvas, x, y, width, body_x, body_h, &footer_text, scale, bar_extra,
         );
 
         // Record geometry on the embed: both on the inner ReferenceCell
@@ -2690,6 +2732,7 @@ impl KeptApp {
             body_h,
             &footer_text,
             scale,
+            0.0,
         );
 
         // Record header band for hit-testing (clicks inside route to
@@ -2836,6 +2879,13 @@ impl KeptApp {
     /// timeline reference cell render and the entity-page references
     /// list — the visual is identical because the meaning is identical.
     /// Returns the total height (body + footer + paddings).
+    ///
+    /// `wrapper_left_extra` extends the wrapper rect LEFT by that
+    /// many logical pixels without shifting the body. The
+    /// timeline-level reference renderer uses this so the dashed
+    /// border can include the cell's left state bar — otherwise the
+    /// border abuts the bar and the bar reads as a floating thing
+    /// next to (rather than part of) the cell.
     fn draw_embed_wrapper(
         &self,
         canvas: &Canvas,
@@ -2846,11 +2896,12 @@ impl KeptApp {
         body_h: f32,
         footer_text: &str,
         scale: f32,
+        wrapper_left_extra: f32,
     ) -> f32 {
         let pad = EMBED_PAD * scale;
         let footer_h = EMBED_FOOTER_H * scale;
         let total_h = pad + body_h + 4.0 * scale + footer_h;
-        let wrapper = Rect::new(x, y, x + width, y + total_h);
+        let wrapper = Rect::new(x - wrapper_left_extra, y, x + width, y + total_h);
 
         let mut bg = Paint::default();
         bg.set_anti_alias(true);
@@ -2994,6 +3045,7 @@ impl KeptApp {
             header_body_h,
             &footer_text,
             scale,
+            0.0,
         );
 
         // Record the header band on the cache outline so hit-testing
@@ -3936,6 +3988,19 @@ impl KeptApp {
                 menu.render(canvas, width, height, cell, &mut ctx);
             }
         }
+        // Bar menu: whole-cell operations. Same shape as cell menu —
+        // needs the cell for timestamps + the Unsnooze visibility.
+        if let Some(menu) = self.bar_context_menu.as_ref() {
+            if let Some(cell) = self.document.cell(menu.cell_id) {
+                let mut ctx = MenuRenderCtx {
+                    font_scale: self.font_scale,
+                    typeface: &self.typeface,
+                    mouse_pos: self.mouse_pos,
+                    hit_tests: &mut self.hit_tests_builder,
+                };
+                menu.render(canvas, width, height, cell, &mut ctx);
+            }
+        }
     }
 
     /// Draw the transient confirmation pill, if active. Bottom-center
@@ -4237,6 +4302,28 @@ impl KeptApp {
         let editing_local = self.pane_mut().editing;
         let mut y = MARGIN_TOP;
 
+        // Principled layout: the cell column splits horizontally
+        // into a bar slice on the left and a body slice on the right.
+        // The bar lives in `[cells_left, cells_left + bar_full_w]`.
+        // Everything else (headers, cell content, the cell's chrome
+        // — outline / wrapper / focus ring) lives inside the body
+        // slice at `[body_x, body_x + body_w]` where
+        // `body_x = cells_left + bar_full_w + bar_gap`. The
+        // CELL_BAR_GAP-equals-FOCUS_PAD invariant means the cell's
+        // chrome left edge (= body_x - FOCUS_PAD) lands exactly on
+        // the bar's right edge — no overlap, no visible gap.
+        let bar_full_w = CELL_BAR_W * scale;
+        let bar_gap = CELL_BAR_GAP * scale;
+        let bar_left_x = cells_left;
+        let bar_right_x = bar_left_x + bar_full_w;
+        let body_x = cells_left + bar_full_w + bar_gap;
+        let body_w = (content_width - bar_full_w - bar_gap).max(40.0);
+        // `hit_tests_builder` is reset to default between frames by
+        // the mem::take in `tick`; no per-frame clear needed here
+        // (and clearing inside this fn would erase the other pane's
+        // bars in a multi-pane layout).
+        let now_ms_for_bars = crate::cell::now_epoch_ms();
+
         // Two-phase render: record cells into a Picture so we can sandwich
         // them between the focus-card backdrop (under) and focus ring
         // (over) using a pane-local FocusedCellGeom captured during the
@@ -4347,9 +4434,12 @@ impl KeptApp {
                 let mut hp = Paint::default();
                 hp.set_anti_alias(true);
                 hp.set_color(crate::color::text_muted_warm());
+                // Headers align with the cell content (post-bar
+                // shift) so the label sits flush with cell text
+                // below it — not floating into the bar column.
                 rec_canvas.draw_str(
                     label,
-                    Point::new(cells_left, baseline),
+                    Point::new(body_x, baseline),
                     &header_font,
                     &hp,
                 );
@@ -4360,13 +4450,12 @@ impl KeptApp {
                 lp.set_color(crate::color::heading_rule());
                 lp.set_stroke_width(1.5);
                 rec_canvas.draw_line(
-                    Point::new(cells_left + label_w + 8.0 * scale, line_y),
+                    Point::new(body_x + label_w + 8.0 * scale, line_y),
                     Point::new(cells_left + outer_cell_width, line_y),
                     &lp,
                 );
                 y += header_h;
             }
-            let cell_x = cells_left;
             let cell_y = y;
             let cell_id = self.document.cells[i].id;
             let is_reference = matches!(self.document.cells[i].kind, CellKind::Reference(_));
@@ -4399,9 +4488,9 @@ impl KeptApp {
                 self.render_reference_cell(
                     rec_canvas,
                     i,
-                    cell_x,
+                    body_x,
                     cell_y,
-                    content_width,
+                    body_w,
                     render_focused,
                 )
             } else if is_envelope_outline {
@@ -4412,9 +4501,9 @@ impl KeptApp {
                 self.render_envelope_outline_cell(
                     rec_canvas,
                     i,
-                    cell_x,
+                    body_x,
                     cell_y,
-                    content_width,
+                    body_w,
                     render_focused,
                     show_caret,
                 )
@@ -4444,50 +4533,109 @@ impl KeptApp {
                 }
                 cell.tick(
                     rec_canvas,
-                    cell_x,
+                    body_x,
                     cell_y,
-                    content_width,
+                    body_w,
                     render_focused,
                     show_caret,
                 )
             };
 
-            // Capture the focused cell's pane-local geometry while we
-            // still have the values from this pane's render pass. The
-            // backdrop and ring (drawn outside the recording onto the
-            // real canvas) read from this snapshot, so they always
-            // track *this* pane regardless of which pane rendered last.
+            // Capture the focused cell's pane-local geometry. The
+            // backdrop and ring (drawn outside the recording onto
+            // the real canvas) read from this snapshot, so they
+            // always track *this* pane regardless of which pane
+            // rendered last. Geometry = the cell's body region;
+            // the focus ring extends FOCUS_PAD on each side, which
+            // lands its left edge exactly on `bar.right_x` (since
+            // CELL_BAR_GAP == FOCUS_PAD).
             if cell_is_focused {
                 focused_geom = Some(FocusedCellGeom {
-                    x: cell_x,
+                    x: body_x,
                     y: cell_y,
-                    w: content_width,
+                    w: body_w,
                     h,
                 });
             }
 
-            // Faint outline around non-focused cells so each one reads as a
-            // distinct unit. Drawn in the same position the focus ring would
-            // occupy so cells don't visually shift when focus moves.
-            // Reference cells have their own dashed warm-tan border —
-            // skip the standard outline so the two don't compete.
+            // Outline rect — wraps the cell BODY with FOCUS_PAD
+            // padding on each side (same as the focus ring). With
+            // CELL_BAR_GAP == FOCUS_PAD, the outline's left edge
+            // sits at `bar.right_x`, so the bar appears flush
+            // against the outline without any merging logic.
+            let outline_rect = Rect::new(
+                body_x - FOCUS_PAD,
+                cell_y - FOCUS_PAD,
+                body_x + body_w + FOCUS_PAD,
+                cell_y + h + FOCUS_PAD,
+            );
+
+            // Bar visual + hit rect. For reference cells the
+            // wrapper's vertical extent is the body itself (no
+            // FOCUS_PAD padding around it), so the bar matches
+            // that to stay visually paired; for every other cell
+            // type the chrome adds FOCUS_PAD above/below, so the
+            // bar follows suit. Per-corner radii: TL/BL rounded
+            // (match the chrome's corner radius), TR/BR flat
+            // (against the cell card).
+            let (bar_top, bar_bottom) = if is_reference {
+                (cell_y, cell_y + h)
+            } else {
+                (cell_y - FOCUS_PAD, cell_y + h + FOCUS_PAD)
+            };
+            let bar_color = bar_color_for_cell(&self.document.cells[i], now_ms_for_bars);
+            let bar_visual_rect = Rect::new(
+                bar_left_x,
+                bar_top,
+                bar_right_x,
+                bar_bottom,
+            );
+            let mut bar_paint = Paint::default();
+            bar_paint.set_anti_alias(true);
+            bar_paint.set_color(bar_color);
+            let r = FOCUS_RADIUS;
+            let zero = skia_safe::Vector::new(0.0, 0.0);
+            let corner = skia_safe::Vector::new(r, r);
+            let bar_rr = skia_safe::RRect::new_rect_radii(
+                bar_visual_rect,
+                &[corner, zero, zero, corner],
+            );
+            rec_canvas.draw_rrect(&bar_rr, &bar_paint);
+
+            // Hit rect extends across the visible bar AND the
+            // bar_gap up to the chrome's left edge, so a click
+            // anywhere in the left column registers.
+            let bar_rect = Rect::new(
+                bar_left_x,
+                bar_top,
+                body_x,
+                bar_bottom,
+            );
+
+            // Faint outline around non-focused cells so each one
+            // reads as a distinct unit. Drawn in the same position
+            // the focus ring would occupy so cells don't visually
+            // shift when focus moves. Reference cells have their
+            // own dashed warm-tan border — skip the standard
+            // outline so the two don't compete.
             if !cell_is_focused && !is_reference {
                 let mut outline = Paint::default();
                 outline.set_anti_alias(true);
                 outline.set_style(PaintStyle::Stroke);
                 outline.set_stroke_width(CELL_OUTLINE_STROKE);
                 outline.set_color(crate::color::dark_alpha(CELL_OUTLINE_ALPHA));
-                let rect = Rect::new(
-                    cell_x - FOCUS_PAD,
-                    cell_y - FOCUS_PAD,
-                    cell_x + content_width + FOCUS_PAD,
-                    cell_y + h + FOCUS_PAD,
-                );
-                rec_canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
+                rec_canvas.draw_round_rect(outline_rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
             }
             if cell_inactive {
                 rec_canvas.restore();
             }
+
+            // Record the bar's hit rect for click dispatch
+            // (left-click → focus cell view-mode, right-click →
+            // BarContextMenu).
+            self.hit_tests_builder
+                .cell_bars
+                .push((cell_id, bar_rect));
 
             y += h + CELL_GAP;
         }
@@ -5556,6 +5704,7 @@ impl KeptApp {
                     body_h,
                     &footer_text,
                     scale,
+                    0.0,
                 );
                 self.hit_tests_builder.entity_page.refs.push((
                     target_cell_id,
@@ -6672,7 +6821,8 @@ impl KeptApp {
         // Right-clicking anywhere first closes any open menu.
         let was_open = self.tag_context_menu.take().is_some()
             | self.people_context_menu.take().is_some()
-            | self.cell_context_menu.take().is_some();
+            | self.cell_context_menu.take().is_some()
+            | self.bar_context_menu.take().is_some();
         // Sidebar: any tag row offers the delete menu. The previous
         // gate (`count == 0` against `db.cells_with_tag`) was unreachable
         // — every visible tag has at least one in-memory cell carrying
@@ -6717,6 +6867,21 @@ impl KeptApp {
             ViewKind::Ast | ViewKind::Context(_) | ViewKind::Entity(_) | ViewKind::Current
         ) {
             let doc_y = y + self.pane_mut().scroll_y;
+            // Bar hit-test wins over the body — a right-click on the
+            // left-edge bar always opens the whole-cell BarContextMenu,
+            // never the body's CellContextMenu.
+            for (cell_id, rect) in self.hit_tests.cell_bars.clone() {
+                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
+                    self.pane_mut().focused = Some(cell_id);
+                    self.pane_mut().editing = false;
+                    self.bar_context_menu = Some(BarContextMenu {
+                        cell_id,
+                        anchor_x: x,
+                        anchor_y: y,
+                    });
+                    return true;
+                }
+            }
             if let Some(cell_id) = self.find_cell_at(x, doc_y) {
                 // Right-click on a bullet captures (id, snippet) AND
                 // visually highlights its sub-tree, descending through
@@ -7076,18 +7241,44 @@ impl KeptApp {
         doc_y: f32,
         modifiers: &Modifiers,
     ) -> bool {
-        // Cell context menu dispatch: click on Delete row deletes;
-        // click anywhere else dismisses and falls through to normal
-        // cell routing.
-        if self.cell_context_menu.is_some() {
-            if let Some(rect) = self.hit_tests.cell_menu.delete {
+        // Bar context menu dispatch: whole-cell operations (Delete,
+        // Snooze, Unsnooze). Click anywhere else dismisses and falls
+        // through to normal cell routing.
+        if self.bar_context_menu.is_some() {
+            if let Some(rect) = self.hit_tests.bar_menu.delete {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    if let Some(menu) = self.cell_context_menu.take() {
+                    if let Some(menu) = self.bar_context_menu.take() {
                         self.delete_cell_by_id(menu.cell_id);
                     }
                     return true;
                 }
             }
+            let bar_snooze = self.hit_tests.bar_menu.snooze;
+            for (i, rect_opt) in bar_snooze.iter().enumerate() {
+                if let Some(rect) = rect_opt {
+                    if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                        let preset = SNOOZE_PRESETS[i].0;
+                        let when = crate::attention::resurface_at(chrono::Local::now(), preset);
+                        if let Some(menu) = self.bar_context_menu.take() {
+                            self.set_cell_resurface(menu.cell_id, Some(when));
+                        }
+                        return true;
+                    }
+                }
+            }
+            if let Some(rect) = self.hit_tests.bar_menu.unsnooze {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.bar_context_menu.take() {
+                        self.set_cell_resurface(menu.cell_id, None);
+                    }
+                    return true;
+                }
+            }
+            self.bar_context_menu = None;
+        }
+        // Cell context menu dispatch: click row dispatches, miss
+        // dismisses and falls through.
+        if self.cell_context_menu.is_some() {
             // "Surface as reference" — create a new reference cell at "now"
             // pointing at the source. For a Reference source, copy its
             // target verbatim: re-surfacing a Subtree reference yields
@@ -7351,6 +7542,29 @@ impl KeptApp {
                 }
             }
             return false;
+        }
+
+        // Bar hit-test before falling through to the cell body. A
+        // left-click on the bar selects the whole cell in view-mode
+        // (focus only; no caret placement, no editing). Distinct
+        // from clicking the body, which can drop into edit mode on
+        // the same-cell case.
+        for (cell_id, rect) in self.hit_tests.cell_bars.clone() {
+            if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
+                self.pane_mut().focused = Some(cell_id);
+                self.pane_mut().editing = false;
+                self.pane_mut().dragging_cell = None;
+                self.pane_mut().pending_caret_scroll = true;
+                self.pane_mut().coalesce_break = true;
+                // Retire any visible selection on every other cell
+                // (matches `dispatch_cell_click` behaviour).
+                for other in &mut self.document.cells {
+                    if other.id != cell_id {
+                        other.clear_all_selections();
+                    }
+                }
+                return true;
+            }
         }
 
         self.dispatch_cell_click(x, doc_y, modifiers)
@@ -7777,6 +7991,32 @@ fn local_date_for_ms(epoch_ms: i64) -> chrono::NaiveDate {
 ///   cell matched via body bullets only — title-tagged cells are
 ///   whole-cell matches).
 /// Otherwise None — render all bullets.
+/// Pick the color the cell's left-edge state bar should paint with.
+/// Priority order matters: closed wins over snoozed (closed cells
+/// only show at all when the show-inactive toggle is on, and the
+/// dim treatment should read first); snoozed wins over the
+/// reference/envelope accent (a snoozed reference is "waiting" more
+/// than "surfaced"); reference/envelope wins over plain open
+/// (resurfacing origin is the distinguishing signal).
+fn bar_color_for_cell(cell: &Cell, now_ms: i64) -> skia_safe::Color {
+    if !cell.is_open() {
+        return crate::color::cell_bar_closed();
+    }
+    let snoozed = cell.resurface_after.map_or(false, |t| now_ms < t);
+    if snoozed {
+        return crate::color::cell_bar_snoozed();
+    }
+    let is_reference_or_envelope = match &cell.kind {
+        CellKind::Reference(_) => true,
+        CellKind::Outline(oc) => oc.has_reference_header(),
+        _ => false,
+    };
+    if is_reference_or_envelope {
+        return crate::color::cell_bar_resurfaced();
+    }
+    crate::color::cell_bar_default()
+}
+
 fn compute_outline_bullet_filter(
     cell: &Cell,
     include_tags: &[String],

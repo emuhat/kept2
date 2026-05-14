@@ -79,6 +79,15 @@ pub struct Palette {
     pub embed_tint: Color,
     pub embed_hover: Color,
 
+    // Cell left-edge bars — slot for click-to-select + state color
+    // coding. `default` is the always-present muted slot; the rest
+    // are state overrides (snoozed cells get amber, reference /
+    // envelope cells get the warm-tan accent, closed cells go dim).
+    pub cell_bar_default: Color,
+    pub cell_bar_snoozed: Color,
+    pub cell_bar_resurfaced: Color,
+    pub cell_bar_closed: Color,
+
     // Destructive
     pub delete_text: Color,
     pub delete_hover_bg: Color,
@@ -149,6 +158,17 @@ impl Palette {
             embed_tint: Color::from_argb(0x0c, 24, 58, 180),
             embed_hover: Color::from_argb(0x20, 24, 58, 180),
 
+            // Cell bars: default at ~28% alpha over text_primary so
+            // it reads as a present-but-quiet column without
+            // competing with cell text. Snoozed = warm amber
+            // (waiting). Resurfaced = the same blue accent the
+            // reference border uses, so the surfacing origin reads
+            // visually. Closed = neutral dim.
+            cell_bar_default: Color::from_argb(0x48, 3, 23, 12),
+            cell_bar_snoozed: Color::from_rgb(0xd8, 0x91, 0x2a),
+            cell_bar_resurfaced: Color::from_rgb(24, 58, 180),
+            cell_bar_closed: Color::from_argb(0x70, 3, 23, 12),
+
             delete_text: Color::from_rgb(0xc0, 0x30, 0x30),
             delete_hover_bg: Color::from_argb(0x20, 0xc0, 0x30, 0x30),
 
@@ -207,6 +227,10 @@ impl Palette {
             "embed_border" => self.embed_border = value,
             "embed_tint" => self.embed_tint = value,
             "embed_hover" => self.embed_hover = value,
+            "cell_bar_default" => self.cell_bar_default = value,
+            "cell_bar_snoozed" => self.cell_bar_snoozed = value,
+            "cell_bar_resurfaced" => self.cell_bar_resurfaced = value,
+            "cell_bar_closed" => self.cell_bar_closed = value,
             "delete_text" => self.delete_text = value,
             "delete_hover_bg" => self.delete_hover_bg = value,
             "menu_border" => self.menu_border = value,
@@ -330,6 +354,12 @@ impl Palette {
         row(&mut out, "embed_border", p.embed_border);
         row(&mut out, "embed_tint", p.embed_tint);
         row(&mut out, "embed_hover", p.embed_hover);
+
+        out.push_str("\n# Cell left-edge state bars\n");
+        row(&mut out, "cell_bar_default", p.cell_bar_default);
+        row(&mut out, "cell_bar_snoozed", p.cell_bar_snoozed);
+        row(&mut out, "cell_bar_resurfaced", p.cell_bar_resurfaced);
+        row(&mut out, "cell_bar_closed", p.cell_bar_closed);
 
         out.push_str("\n# Destructive\n");
         row(&mut out, "delete_text", p.delete_text);
@@ -650,6 +680,22 @@ pub fn embed_tint() -> Color {
 #[inline]
 pub fn embed_hover() -> Color {
     palette().embed_hover
+}
+#[inline]
+pub fn cell_bar_default() -> Color {
+    palette().cell_bar_default
+}
+#[inline]
+pub fn cell_bar_snoozed() -> Color {
+    palette().cell_bar_snoozed
+}
+#[inline]
+pub fn cell_bar_resurfaced() -> Color {
+    palette().cell_bar_resurfaced
+}
+#[inline]
+pub fn cell_bar_closed() -> Color {
+    palette().cell_bar_closed
 }
 
 #[inline]
