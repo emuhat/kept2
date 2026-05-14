@@ -40,8 +40,8 @@ const CELL_GAP: f32 = 25.0;
 const FOCUS_MODE_PAD: f32 = 16.0;
 const FOCUS_PAD: f32 = 5.0;
 const FOCUS_RADIUS: f32 = 10.0;
-const FOCUS_STROKE: f32 = 1.0;
-const FOCUS_STROKE_EDIT: f32 = 2.0;
+const FOCUS_STROKE: f32 = 2.0;
+const FOCUS_STROKE_EDIT: f32 = 3.0;
 const FOCUS_RING_ALPHA: u8 = 0x60;
 const FOCUS_RING_ALPHA_EDIT: u8 = 0xff;
 const FOCUS_SHADOW_ALPHA: u8 = 0x30;
@@ -2539,15 +2539,24 @@ impl KeptApp {
             }
             None => "↗ original deleted".to_string(),
         };
-        // Extend the wrapper LEFT by FOCUS_PAD so the dashed
-        // wrapper's left edge lines up with the chrome's left
-        // edge used by other cell types (outline.left, focus
-        // ring.left, all at `body_x - FOCUS_PAD`). The bar then
-        // sits flush against the wrapper, same as it does
-        // against the outline rect.
-        let bar_extra = FOCUS_PAD;
+        // Timeline-level reference cell: extend the wrapper
+        // FOCUS_PAD on every side so its outer geometry matches
+        // the `outline_rect` used by non-reference cells. The
+        // bar abuts wrapper.left identically to how it abuts
+        // outline.left for plain cells, and the vertical extent
+        // matches outline.top/bottom — no special-casing in
+        // render_cell_stream needed.
         let total_h = self.draw_embed_wrapper(
-            canvas, x, y, width, body_x, body_h, &footer_text, scale, bar_extra,
+            canvas,
+            x,
+            y,
+            width,
+            body_x,
+            body_h,
+            &footer_text,
+            scale,
+            [FOCUS_PAD, FOCUS_PAD, FOCUS_PAD, FOCUS_PAD],
+            true,
         );
 
         // Record geometry on the embed: both on the inner ReferenceCell
@@ -2732,7 +2741,8 @@ impl KeptApp {
             body_h,
             &footer_text,
             scale,
-            0.0,
+            [0.0, 0.0, 0.0, 0.0],
+            false,
         );
 
         // Record header band for hit-testing (clicks inside route to
@@ -2878,14 +2888,17 @@ impl KeptApp {
     /// dashed warm-tan border, muted footer line. Used by both the
     /// timeline reference cell render and the entity-page references
     /// list — the visual is identical because the meaning is identical.
-    /// Returns the total height (body + footer + paddings).
+    /// Returns `inner_h` (= body + footer + paddings) — i.e. the
+    /// natural content height. The wrapper visual rect can extend
+    /// past the content on any of the four sides via `extras` so
+    /// it matches the outline_rect's chrome geometry used by
+    /// other cell types (FOCUS_PAD all around), without affecting
+    /// the returned height (so inter-cell spacing stays consistent).
     ///
-    /// `wrapper_left_extra` extends the wrapper rect LEFT by that
-    /// many logical pixels without shifting the body. The
-    /// timeline-level reference renderer uses this so the dashed
-    /// border can include the cell's left state bar — otherwise the
-    /// border abuts the bar and the bar reads as a floating thing
-    /// next to (rather than part of) the cell.
+    /// `extras = [left, top, right, bottom]` — extension in logical
+    /// pixels per side. Top-level reference cells pass FOCUS_PAD on
+    /// all four sides; internal embed wrappers (envelope headers,
+    /// recursive nested embeds) pass 0 everywhere.
     fn draw_embed_wrapper(
         &self,
         canvas: &Canvas,
@@ -2896,17 +2909,40 @@ impl KeptApp {
         body_h: f32,
         footer_text: &str,
         scale: f32,
-        wrapper_left_extra: f32,
+        extras: [f32; 4],
+        flat_left_corners: bool,
     ) -> f32 {
         let pad = EMBED_PAD * scale;
         let footer_h = EMBED_FOOTER_H * scale;
-        let total_h = pad + body_h + 4.0 * scale + footer_h;
-        let wrapper = Rect::new(x - wrapper_left_extra, y, x + width, y + total_h);
+        let inner_h = pad + body_h + 4.0 * scale + footer_h;
+        let [extra_left, extra_top, extra_right, extra_bottom] = extras;
+        let wrapper = Rect::new(
+            x - extra_left,
+            y - extra_top,
+            x + width + extra_right,
+            y + inner_h + extra_bottom,
+        );
+        let total_h = inner_h;
+        // When this wrapper plays the role of the cell's OUTER
+        // chrome (timeline reference render), its TL/BL corners go
+        // flat — the cell's left state bar supplies those outer
+        // corners. Internal embed wrappers (envelope headers,
+        // recursive nested embeds, entity-page refs) stay fully
+        // rounded so they read as self-contained pills.
+        let r = FOCUS_RADIUS;
+        let flat = skia_safe::Vector::new(0.0, 0.0);
+        let round = skia_safe::Vector::new(r, r);
+        let radii: [skia_safe::Vector; 4] = if flat_left_corners {
+            [flat, round, round, flat]
+        } else {
+            [round, round, round, round]
+        };
+        let wrapper_rr = skia_safe::RRect::new_rect_radii(wrapper, &radii);
 
         let mut bg = Paint::default();
         bg.set_anti_alias(true);
         bg.set_color(crate::color::embed_tint());
-        canvas.draw_round_rect(wrapper, FOCUS_RADIUS, FOCUS_RADIUS, &bg);
+        canvas.draw_rrect(&wrapper_rr, &bg);
 
         let mut stroke = Paint::default();
         stroke.set_anti_alias(true);
@@ -2919,7 +2955,15 @@ impl KeptApp {
         if let Some(eff) = PathEffect::dash(&[0.0, 4.0], 0.0) {
             stroke.set_path_effect(eff);
         }
-        canvas.draw_round_rect(wrapper, FOCUS_RADIUS, FOCUS_RADIUS, &stroke);
+        if flat_left_corners {
+            // Outer chrome (timeline reference): skip the left
+            // edge so the dashed border doesn't overdraw the bar.
+            let path = chrome_open_path(wrapper, FOCUS_RADIUS);
+            canvas.draw_path(&path, &stroke);
+        } else {
+            // Internal embed wrapper: stroke the full rrect.
+            canvas.draw_rrect(&wrapper_rr, &stroke);
+        }
 
         let footer_font = Font::from_typeface(&self.typeface, EMBED_FOOTER_FONT_SIZE * scale);
         let (_, fm) = footer_font.metrics();
@@ -3045,7 +3089,8 @@ impl KeptApp {
             header_body_h,
             &footer_text,
             scale,
-            0.0,
+            [0.0, 0.0, 0.0, 0.0],
+            false,
         );
 
         // Record the header band on the cache outline so hit-testing
@@ -4129,6 +4174,11 @@ impl KeptApp {
             cx + cw + FOCUS_PAD,
             cy + ch + FOCUS_PAD,
         );
+        // TL/BL flat (the bar supplies those outer corners),
+        // TR/BR rounded. Same shape language as outline_rect.
+        let r = FOCUS_RADIUS;
+        let flat = skia_safe::Vector::new(0.0, 0.0);
+        let round = skia_safe::Vector::new(r, r);
         // Drop shadow: blurred dark rect, offset down a few px.
         let mut shadow_paint = Paint::default();
         shadow_paint.set_anti_alias(true);
@@ -4144,18 +4194,28 @@ impl KeptApp {
             card_rect.right,
             card_rect.bottom + FOCUS_SHADOW_DY,
         );
-        canvas.draw_round_rect(shadow_rect, FOCUS_RADIUS, FOCUS_RADIUS, &shadow_paint);
+        let shadow_rr = skia_safe::RRect::new_rect_radii(
+            shadow_rect,
+            &[flat, round, round, flat],
+        );
+        canvas.draw_rrect(&shadow_rr, &shadow_paint);
         // White card fill.
         let mut fill_paint = Paint::default();
         fill_paint.set_anti_alias(true);
         fill_paint.set_color(crate::color::bg_card());
-        canvas.draw_round_rect(card_rect, FOCUS_RADIUS, FOCUS_RADIUS, &fill_paint);
+        let card_rr = skia_safe::RRect::new_rect_radii(
+            card_rect,
+            &[flat, round, round, flat],
+        );
+        canvas.draw_rrect(&card_rr, &fill_paint);
     }
 
-    /// Blue accent ring around the focused cell — subtle when viewing,
-    /// brighter and thicker when editing. Suppressed in focus mode
-    /// where the white card backdrop alone marks the active area (no
-    /// other cells to compete with). No-op when `geom` is None.
+    /// Section-header-green accent ring around the focused cell —
+    /// subtle when viewing, brighter and thicker when editing.
+    /// Color matches the WHAT / WHEN sidebar headers so the active
+    /// cell visually rhymes with the sidebar's section accents.
+    /// Suppressed in focus mode where the white card backdrop
+    /// alone marks the active area. No-op when `geom` is None.
     fn render_focus_ring(&self, canvas: &Canvas, geom: Option<FocusedCellGeom>) {
         let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch }) =
             geom.filter(|_| !self.pane().focus_mode)
@@ -4171,14 +4231,18 @@ impl KeptApp {
         focus_paint.set_anti_alias(true);
         focus_paint.set_style(PaintStyle::Stroke);
         focus_paint.set_stroke_width(stroke);
-        focus_paint.set_color(crate::color::accent_blue_alpha(alpha));
+        focus_paint.set_color(crate::color::sidebar_section_header_alpha(alpha));
         let rect = Rect::new(
             cx - FOCUS_PAD,
             cy - FOCUS_PAD,
             cx + cw + FOCUS_PAD,
             cy + ch + FOCUS_PAD,
         );
-        canvas.draw_round_rect(rect, FOCUS_RADIUS, FOCUS_RADIUS, &focus_paint);
+        // Open path — traces top, TR corner, right, BR corner,
+        // bottom. The left edge is omitted so the ring doesn't
+        // overdraw the bar's right edge.
+        let path = chrome_open_path(rect, FOCUS_RADIUS);
+        canvas.draw_path(&path, &focus_paint);
     }
 
     /// Post-body bookkeeping: publish this frame's `doc_height` /
@@ -4570,19 +4634,14 @@ impl KeptApp {
                 cell_y + h + FOCUS_PAD,
             );
 
-            // Bar visual + hit rect. For reference cells the
-            // wrapper's vertical extent is the body itself (no
-            // FOCUS_PAD padding around it), so the bar matches
-            // that to stay visually paired; for every other cell
-            // type the chrome adds FOCUS_PAD above/below, so the
-            // bar follows suit. Per-corner radii: TL/BL rounded
+            // Bar visual + hit rect. Every cell type's chrome
+            // now has the same outer geometry — FOCUS_PAD on each
+            // side around the body — so the bar's vertical bounds
+            // are uniform too. Per-corner radii: TL/BL rounded
             // (match the chrome's corner radius), TR/BR flat
             // (against the cell card).
-            let (bar_top, bar_bottom) = if is_reference {
-                (cell_y, cell_y + h)
-            } else {
-                (cell_y - FOCUS_PAD, cell_y + h + FOCUS_PAD)
-            };
+            let bar_top = cell_y - FOCUS_PAD;
+            let bar_bottom = cell_y + h + FOCUS_PAD;
             let bar_color = bar_color_for_cell(&self.document.cells[i], now_ms_for_bars);
             let bar_visual_rect = Rect::new(
                 bar_left_x,
@@ -4618,13 +4677,20 @@ impl KeptApp {
             // shift when focus moves. Reference cells have their
             // own dashed warm-tan border — skip the standard
             // outline so the two don't compete.
+            //
+            // TL/BL corners are FLAT — the bar provides those
+            // outer corners. TR/BR rounded matches the bar's
+            // rounded BL/TL on its side, giving the combined card
+            // a uniform rounded outer shape and a clean vertical
+            // seam at `bar.right`.
             if !cell_is_focused && !is_reference {
                 let mut outline = Paint::default();
                 outline.set_anti_alias(true);
                 outline.set_style(PaintStyle::Stroke);
                 outline.set_stroke_width(CELL_OUTLINE_STROKE);
                 outline.set_color(crate::color::dark_alpha(CELL_OUTLINE_ALPHA));
-                rec_canvas.draw_round_rect(outline_rect, FOCUS_RADIUS, FOCUS_RADIUS, &outline);
+                let path = chrome_open_path(outline_rect, FOCUS_RADIUS);
+                rec_canvas.draw_path(&path, &outline);
             }
             if cell_inactive {
                 rec_canvas.restore();
@@ -5704,7 +5770,8 @@ impl KeptApp {
                     body_h,
                     &footer_text,
                     scale,
-                    0.0,
+                    [0.0, 0.0, 0.0, 0.0],
+                    false,
                 );
                 self.hit_tests_builder.entity_page.refs.push((
                     target_cell_id,
@@ -7998,6 +8065,38 @@ fn local_date_for_ms(epoch_ms: i64) -> chrono::NaiveDate {
 /// reference/envelope accent (a snoozed reference is "waiting" more
 /// than "surfaced"); reference/envelope wins over plain open
 /// (resurfacing origin is the distinguishing signal).
+/// Build an OPEN path tracing the cell-chrome rect's top, right
+/// side, and bottom — but NOT the left edge. The bar already
+/// occupies the chrome's left edge visually (its rounded TL/BL
+/// supply the card's outer-left corners), so any stroke painted
+/// along chrome.left would overdraw the bar's right edge as a
+/// visible line. Stroke this path instead of the full rrect to
+/// hide that line.
+///
+/// The path's TL and BL are at `(rect.left, rect.top)` and
+/// `(rect.left, rect.bottom)` — flat against the bar. TR and BR
+/// curve at `radius`. Filling this path gives the same area as a
+/// flat-left rrect (the implicit close is the missing left edge),
+/// but stroking only traces the visible three sides.
+fn chrome_open_path(rect: skia_safe::Rect, radius: f32) -> skia_safe::Path {
+    let mut p = skia_safe::Path::new();
+    p.move_to((rect.left, rect.top));
+    p.line_to((rect.right - radius, rect.top));
+    p.arc_to_tangent(
+        (rect.right, rect.top),
+        (rect.right, rect.top + radius),
+        radius,
+    );
+    p.line_to((rect.right, rect.bottom - radius));
+    p.arc_to_tangent(
+        (rect.right, rect.bottom),
+        (rect.right - radius, rect.bottom),
+        radius,
+    );
+    p.line_to((rect.left, rect.bottom));
+    p
+}
+
 fn bar_color_for_cell(cell: &Cell, now_ms: i64) -> skia_safe::Color {
     if !cell.is_open() {
         return crate::color::cell_bar_closed();

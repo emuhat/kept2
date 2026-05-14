@@ -669,6 +669,15 @@ pub fn accent_blue_alpha(a: u8) -> Color {
     Color::from_argb(a, c.r(), c.g(), c.b())
 }
 
+/// Sidebar section-header color composed with a runtime alpha.
+/// Used by the focus ring so the active cell pops in the same hue
+/// as the WHAT / WHEN section labels.
+#[inline]
+pub fn sidebar_section_header_alpha(a: u8) -> Color {
+    let c = palette().sidebar_section_header;
+    Color::from_argb(a, c.r(), c.g(), c.b())
+}
+
 #[inline]
 pub fn embed_border() -> Color {
     palette().embed_border
