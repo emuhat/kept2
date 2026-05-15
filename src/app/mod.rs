@@ -318,13 +318,18 @@ struct PaneLayout {
 
 /// Doc-space rectangle for the focused cell. Used by the card backdrop
 /// (drawn before body content) and the focus ring (drawn after); both
-/// read from the same struct so they stay in lockstep.
+/// read from the same struct so they stay in lockstep. `(x, y, w, h)`
+/// covers the **body** content area (right of the bar); `bar_left_dx`
+/// is how far to extend leftward to reach the bar's left edge — the
+/// focus ring uses it to wrap the bar; the backdrop ignores it (the
+/// bar is its own rounded shape).
 #[derive(Clone, Copy)]
 struct FocusedCellGeom {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
+    bar_left_dx: f32,
 }
 
 /// Which kind of cell to spawn from a "new cell" hotkey.
@@ -4181,7 +4186,7 @@ impl KeptApp {
     /// is always *this* pane's, never polluted by another pane's
     /// `cell.y_origin` overwrite).
     fn render_focus_card_backdrop(&self, canvas: &Canvas, geom: Option<FocusedCellGeom>) {
-        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch }) = geom else {
+        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch, .. }) = geom else {
             return;
         };
         let card_rect = Rect::new(
@@ -4233,7 +4238,7 @@ impl KeptApp {
     /// Suppressed in focus mode where the white card backdrop
     /// alone marks the active area. No-op when `geom` is None.
     fn render_focus_ring(&self, canvas: &Canvas, geom: Option<FocusedCellGeom>) {
-        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch }) =
+        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch, bar_left_dx }) =
             geom.filter(|_| !self.pane().focus_mode)
         else {
             return;
@@ -4248,17 +4253,19 @@ impl KeptApp {
         focus_paint.set_style(PaintStyle::Stroke);
         focus_paint.set_stroke_width(stroke);
         focus_paint.set_color(crate::color::sidebar_section_header_alpha(alpha));
+        // Extend leftward across the bar slice so the ring encloses
+        // both the bar and the body. The bar isn't padded on its
+        // outer edge (its left == `cells_left`), so the FOCUS_PAD
+        // inset only applies on the body side. Drawn last in the
+        // cell stream, so the ring's left edge paints over the bar.
         let rect = Rect::new(
-            cx - FOCUS_PAD,
+            cx - bar_left_dx,
             cy - FOCUS_PAD,
             cx + cw + FOCUS_PAD,
             cy + ch + FOCUS_PAD,
         );
-        // Open path — traces top, TR corner, right, BR corner,
-        // bottom. The left edge is omitted so the ring doesn't
-        // overdraw the bar's right edge.
-        let path = chrome_open_path(rect, FOCUS_RADIUS);
-        canvas.draw_path(&path, &focus_paint);
+        let rr = skia_safe::RRect::new_rect_xy(rect, FOCUS_RADIUS, FOCUS_RADIUS);
+        canvas.draw_rrect(&rr, &focus_paint);
     }
 
     /// Post-body bookkeeping: publish this frame's `doc_height` /
@@ -4635,6 +4642,7 @@ impl KeptApp {
                     y: cell_y,
                     w: body_w,
                     h,
+                    bar_left_dx: bar_full_w + bar_gap,
                 });
             }
 
