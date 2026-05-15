@@ -22,12 +22,24 @@ const MENTION_POPUP_PAD: f32 = 6.0;
 const MENTION_POPUP_RADIUS: f32 = 6.0;
 const MENTION_POPUP_MAX_VISIBLE: usize = 6;
 const MENTION_BODY_FONT_SIZE: f32 = 16.0;
+/// Smaller font for the right-justified mention count — metadata,
+/// not primary content, so it shouldn't compete with the name.
+const MENTION_COUNT_FONT_SIZE: f32 = 11.0;
 
 /// Heavy penalty applied to inactive candidates in the @-mention popup.
 /// Typical short-query fuzzy scores are in roughly `[0, 30]`, so an
 /// inactive match always ranks below any active match — but the user can
 /// still find an inactive person by typing enough of the name.
 const INACTIVE_FUZZY_PENALTY: i32 = 50;
+
+/// Per-mention score bonus added on top of the fuzzy score. Small
+/// enough that a clearly-better fuzzy match still wins, but big
+/// enough that two ambiguous initial-matches break in favor of the
+/// person the user actually interacts with. The bonus saturates so
+/// a single power-user contact doesn't completely drown out new
+/// matches.
+const MENTION_FREQUENCY_WEIGHT: i32 = 1;
+const MENTION_FREQUENCY_CAP: i32 = 12;
 
 pub(super) struct MentionPopup {
     /// What the popup is anchored to: a focused cell's text or the search
@@ -138,33 +150,40 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
     Some((score, matches))
 }
 
-/// Rank `names` by fuzzy match against `query`. Empty query returns the
-/// names in their input order.
+/// Rank `names` by fuzzy match against `query`. Empty query returns
+/// the names in their input order. Mention count contributes a small
+/// capped bonus (so frequently-mentioned people tie-break above
+/// rare ones without overwhelming a clearly-better fuzzy match).
+/// Returns `(name, match_indices, mention_count)` for each surviving
+/// candidate so the renderer can display the count next to the name.
 fn filter_mentions(
-    candidates: &[(String, bool)],
+    candidates: &[(String, bool, usize)],
     query: &str,
-) -> Vec<(String, Vec<usize>)> {
+) -> Vec<(String, Vec<usize>, usize)> {
     if query.is_empty() {
         return candidates
             .iter()
-            .map(|(n, _)| (n.clone(), Vec::new()))
+            .map(|(n, _, c)| (n.clone(), Vec::new(), *c))
             .collect();
     }
-    let mut scored: Vec<(i32, String, Vec<usize>)> = candidates
+    let mut scored: Vec<(i32, String, Vec<usize>, usize)> = candidates
         .iter()
-        .filter_map(|(name, is_active)| {
+        .filter_map(|(name, is_active, mention_count)| {
             fuzzy_score(query, name).map(|(s, m)| {
-                let s = if *is_active {
+                let mut s = if *is_active {
                     s
                 } else {
                     s - INACTIVE_FUZZY_PENALTY
                 };
-                (s, name.clone(), m)
+                let bonus = (*mention_count as i32 * MENTION_FREQUENCY_WEIGHT)
+                    .min(MENTION_FREQUENCY_CAP);
+                s += bonus;
+                (s, name.clone(), m, *mention_count)
             })
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, n, m)| (n, m)).collect()
+    scored.into_iter().map(|(_, n, m, c)| (n, m, c)).collect()
 }
 
 fn draw_runs_with_matches(
@@ -204,7 +223,7 @@ impl MentionPopup {
         view_w: f32,
         view_h: f32,
         anchor_pos: (f32, f32),
-        candidates: &[(String, bool)],
+        candidates: &[(String, bool, usize)],
         ctx: &mut MentionRenderCtx<'_>,
     ) {
         let (anchor_x, anchor_y_below) = anchor_pos;
@@ -349,7 +368,7 @@ impl MentionPopup {
 
         let sel_idx = selected.min(visible - 1);
         let mut row_y = popup_y + pad;
-        for (i, (item, matches)) in items.iter().take(visible).enumerate() {
+        for (i, (item, matches, mention_count)) in items.iter().take(visible).enumerate() {
             let row_rect = Rect::new(
                 popup_x + 4.0 * scale,
                 row_y,
@@ -380,6 +399,27 @@ impl MentionPopup {
                 &match_paint,
                 &dim_paint,
             );
+            // Right-justified mention count when > 0 — visual cue
+            // for "who you interact with often". Suppressed at 0
+            // (tags + cold-start people) to avoid noise.
+            if *mention_count > 0 {
+                let count_font =
+                    Font::from_typeface(ctx.typeface, MENTION_COUNT_FONT_SIZE * scale);
+                let mut count_paint = Paint::default();
+                count_paint.set_anti_alias(true);
+                // Even softer than `dim_paint` — pulls the count
+                // further back so the eye lands on the name first.
+                count_paint.set_color(crate::color::text_ghost());
+                let count_text = format!("{}", mention_count);
+                let count_w = count_font.measure_str(&count_text, Some(&count_paint)).0;
+                let count_x = popup_x + popup_w - 12.0 * scale - count_w;
+                canvas.draw_str(
+                    &count_text,
+                    Point::new(count_x, baseline),
+                    &count_font,
+                    &count_paint,
+                );
+            }
             ctx.hit_tests.mention_popup.rows.push(row_rect);
             row_y += row_h;
         }
@@ -403,16 +443,21 @@ impl KeptApp {
         out
     }
 
-    /// `(display_name, is_active)` for every person entity, in the same
-    /// alphabetical order as `person_entries`. Fed to `filter_mentions`
-    /// so the popup can downweight inactive matches without losing them.
-    fn person_mention_candidates(&self) -> Vec<(String, bool)> {
-        let mut out: Vec<(String, bool)> = self
+    /// `(display_name, is_active, mention_count)` for every person
+    /// entity, in alphabetical order. Fed to `filter_mentions` so the
+    /// popup can downweight inactive matches AND nudge frequently-
+    /// mentioned people above rare ones when fuzzy scores tie.
+    fn person_mention_candidates(&self) -> Vec<(String, bool, usize)> {
+        let mut out: Vec<(String, bool, usize)> = self
             .entities
             .entities
             .iter()
             .filter(|e| e.kind == "person")
-            .map(|e| (e.display_name.clone(), e.is_active))
+            .map(|e| (
+                e.display_name.clone(),
+                e.is_active,
+                self.entities.mention_count(e.id),
+            ))
             .collect();
         out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
         out
@@ -422,15 +467,17 @@ impl KeptApp {
     /// the in-memory cells so a tag committed in this session shows up
     /// in the candidate list before the debounced save flushes. All
     /// tags are treated as "active" — there's no inactive-tag concept.
-    fn tag_mention_candidates(&self) -> Vec<(String, bool)> {
+    /// Mention count is 0 since we don't track per-tag use frequency
+    /// (would require a separate index; not yet motivated).
+    fn tag_mention_candidates(&self) -> Vec<(String, bool, usize)> {
         self.all_tag_names_in_memory()
             .into_iter()
-            .map(|n| (n, true))
+            .map(|n| (n, true, 0))
             .collect()
     }
 
     /// Pick the candidate set for the popup's current kind.
-    fn mention_candidates_for(&self, kind: MentionKind) -> Vec<(String, bool)> {
+    fn mention_candidates_for(&self, kind: MentionKind) -> Vec<(String, bool, usize)> {
         match kind {
             MentionKind::Person => self.person_mention_candidates(),
             MentionKind::Tag => self.tag_mention_candidates(),
@@ -919,8 +966,8 @@ mod tests {
     #[test]
     fn filter_mentions_orders_camelcase_correctly() {
         let cands = vec![
-            ("PatrickFoy".to_string(), true),
-            ("PeterCarr".to_string(), true),
+            ("PatrickFoy".to_string(), true, 0),
+            ("PeterCarr".to_string(), true, 0),
         ];
         let ranked = filter_mentions(&cands, "pc");
         assert_eq!(ranked[0].0, "PeterCarr");
@@ -949,8 +996,23 @@ mod tests {
         // though the alphabetical tiebreak alone would put PatrickFoy
         // first. Inactive still appears in the result list — just last.
         let cands = vec![
-            ("PatrickFoy".to_string(), false), // inactive
-            ("PeterCarr".to_string(), true),   // active
+            ("PatrickFoy".to_string(), false, 0), // inactive
+            ("PeterCarr".to_string(), true, 0),   // active
+        ];
+        let ranked = filter_mentions(&cands, "p");
+        assert_eq!(ranked[0].0, "PeterCarr");
+        assert_eq!(ranked[1].0, "PatrickFoy");
+    }
+
+    #[test]
+    fn fuzzy_mention_count_breaks_ties() {
+        // Same fuzzy score (same query, same shape) — the
+        // higher-mention-count candidate should rank first. This
+        // captures the user complaint: the "short" initials match
+        // shouldn't always pick the rarely-interacted person.
+        let cands = vec![
+            ("PatrickFoy".to_string(), true, 0),   // rarely mentioned
+            ("PeterCarr".to_string(), true, 50),   // often mentioned
         ];
         let ranked = filter_mentions(&cands, "p");
         assert_eq!(ranked[0].0, "PeterCarr");

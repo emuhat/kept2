@@ -1925,7 +1925,7 @@ impl KeptApp {
         // Initial entity load. The migration backfilled the entity
         // tables from `#person` cells in v4→v5, so this populates the
         // cache from the existing data.
-        let entities = EntityCache::load(db.as_ref());
+        let entities = EntityCache::load(db.as_ref(), &cells);
 
         // Sweep: drop any closed context whose window contains no cells.
         // These are leftovers from earlier rotations on already-empty
@@ -3186,12 +3186,14 @@ impl KeptApp {
         self.document.cell_mut(id)
     }
 
-    /// Reload the entity caches from the DB. Called after every
+    /// Reload the entity caches from the DB + recompute mention
+    /// counts from the in-memory cells. Called after every
     /// `save_cell` / `delete_cell` so the in-memory state stays in
-    /// lockstep with the persistence layer's authoritative entity
-    /// table. Thin proxy — see `EntityCache::refresh`.
+    /// lockstep with persistence + the cell mutations that just
+    /// happened. Thin proxy — see `EntityCache::refresh`.
     fn refresh_entities(&mut self) {
-        self.entities.refresh(self.db.as_ref());
+        self.entities
+            .refresh(self.db.as_ref(), &self.document.cells);
     }
 
     fn writable_context_id(&self) -> Option<Uuid> {
@@ -5943,6 +5945,25 @@ impl KeptApp {
                     &row_font,
                     row_text_paint,
                 );
+                // Right-justified mention count when > 0 — surfaces
+                // who you actually interact with. Painted in the
+                // muted inactive color regardless of `is_active` so
+                // it reads as metadata, not the row's primary text.
+                let mention_count = self.entities.mention_count(*entity_id);
+                if mention_count > 0 {
+                    let count_text = format!("{}", mention_count);
+                    let count_w =
+                        row_font.measure_str(&count_text, Some(&inactive_paint)).0;
+                    canvas.draw_str(
+                        &count_text,
+                        Point::new(
+                            row_rect.right - row_pad_x - count_w,
+                            row_rect.top + text_baseline_offset,
+                        ),
+                        &row_font,
+                        &inactive_paint,
+                    );
+                }
             }
 
             // Hairline divider at the bottom of each row.
@@ -6078,21 +6099,12 @@ impl KeptApp {
         self.pane_mut().coalesce_break = true;
     }
 
-    /// Count `kept://<entity_id>` mentions across every cell's links.
-    /// Used to gate "Delete person" — a deleted entity with live
-    /// mentions would leave dangling links. Walks all cells (title +
-    /// body + nested elements) via `Cell::all_link_urls`.
+    /// Count `kept://<entity_id>` mentions across every cell.
+    /// Thin proxy over `EntityCache::mention_count` (the indexed
+    /// HashMap rebuilt by `refresh`); the walk happens once per
+    /// entity-mutating event, not once per lookup.
     fn count_entity_references(&self, entity_id: Uuid) -> usize {
-        let target = format!("kept://{}", entity_id);
-        let mut n = 0usize;
-        for cell in &self.document.cells {
-            for url in cell.all_link_urls() {
-                if url == target {
-                    n += 1;
-                }
-            }
-        }
-        n
+        self.entities.mention_count(entity_id)
     }
 
     /// Open the People right-click context menu for `entity_id`,

@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
+use crate::cell::Cell;
 use crate::persist::{Db, Entity};
 
 pub struct EntityCache {
@@ -36,6 +37,13 @@ pub struct EntityCache {
     /// entity-derived. Cells without a corresponding entity are *not*
     /// here, even if their title matches (invariant #2).
     pub title_fallback: Vec<(Uuid, String)>,
+    /// `entity_id → number of `kept://<id>` link spans in cell
+    /// content`. Rebuilt by `refresh` from the in-memory cells (the
+    /// counts can't be derived from the DB alone — mentions live as
+    /// link spans inside cell JSON bodies). Used to gate "Delete
+    /// person", weight @-mention fuzzy ranking, and surface a count
+    /// next to people in the picker / People page.
+    pub mentions: HashMap<Uuid, usize>,
 }
 
 impl EntityCache {
@@ -45,49 +53,80 @@ impl EntityCache {
             alias_index: Vec::new(),
             cell_to_entity: HashMap::new(),
             title_fallback: Vec::new(),
+            mentions: HashMap::new(),
         }
     }
 
-    /// Initial load from the DB. Equivalent to `empty()` followed by
-    /// `refresh(db)`, but eliminates one temporary allocation for the
-    /// caller. Returns an empty cache if `db` is None (test / headless
-    /// builds).
-    pub fn load(db: Option<&Db>) -> Self {
+    /// Initial load from the DB + the in-memory cells. Equivalent to
+    /// `empty()` followed by `refresh(db, cells)`. Returns an empty
+    /// cache if `db` is None (test / headless builds).
+    pub fn load(db: Option<&Db>, cells: &[Cell]) -> Self {
         let mut cache = Self::empty();
-        cache.refresh(db);
+        cache.refresh(db, cells);
         cache
     }
 
-    /// Re-fetch all four indices from the DB. The single invalidation
-    /// entry point — call after any entity-table write to bring the
-    /// in-memory caches back in line with disk.
+    /// Re-fetch every index from the DB + recompute mention counts
+    /// from `cells`. The single invalidation entry point — call after
+    /// any entity-table write OR any cell mutation that may have
+    /// changed link spans, to bring the in-memory caches back in
+    /// line with disk + memory.
     ///
     /// Each sub-query is independent; a failure on one logs and leaves
     /// the corresponding cache slot empty rather than poisoning the
-    /// other three (matches the prior `refresh_entities` behavior).
-    pub fn refresh(&mut self, db: Option<&Db>) {
-        let Some(db) = db else {
-            return;
-        };
-        match db.all_entities() {
-            Ok(rows) => self.entities = rows,
-            Err(e) => eprintln!("kept: refresh_entities failed: {e}"),
+    /// others.
+    pub fn refresh(&mut self, db: Option<&Db>, cells: &[Cell]) {
+        if let Some(db) = db {
+            match db.all_entities() {
+                Ok(rows) => self.entities = rows,
+                Err(e) => eprintln!("kept: refresh_entities failed: {e}"),
+            }
+            match db.entity_alias_index() {
+                Ok(rows) => self.alias_index = rows,
+                Err(e) => eprintln!("kept: entity_alias_index reload failed: {e}"),
+            }
+            match db.cell_to_entity_index() {
+                Ok(rows) => self.cell_to_entity = rows.into_iter().collect(),
+                Err(e) => eprintln!("kept: cell_to_entity_index reload failed: {e}"),
+            }
+            self.title_fallback = self
+                .entities
+                .iter()
+                .filter(|e| e.primary_cell_id.is_some())
+                .map(|e| (e.id, normalize_title_for_fallback(&e.display_name)))
+                .collect();
         }
-        match db.entity_alias_index() {
-            Ok(rows) => self.alias_index = rows,
-            Err(e) => eprintln!("kept: entity_alias_index reload failed: {e}"),
-        }
-        match db.cell_to_entity_index() {
-            Ok(rows) => self.cell_to_entity = rows.into_iter().collect(),
-            Err(e) => eprintln!("kept: cell_to_entity_index reload failed: {e}"),
-        }
-        self.title_fallback = self
-            .entities
-            .iter()
-            .filter(|e| e.primary_cell_id.is_some())
-            .map(|e| (e.id, normalize_title_for_fallback(&e.display_name)))
-            .collect();
+        self.refresh_mentions(cells);
     }
+
+    /// Rebuild `mentions` from the in-memory cells. Pulled out so
+    /// cell-only mutations (cell save / delete) can update mention
+    /// counts without re-fetching every entity row from the DB.
+    pub fn refresh_mentions(&mut self, cells: &[Cell]) {
+        let mut counts: HashMap<Uuid, usize> = HashMap::new();
+        for cell in cells {
+            for url in cell.all_link_urls() {
+                if let Some(id) = parse_kept_entity_url(&url) {
+                    *counts.entry(id).or_insert(0) += 1;
+                }
+            }
+        }
+        self.mentions = counts;
+    }
+
+    /// O(1) lookup. Returns 0 for an entity with no recorded mentions
+    /// (either unknown or genuinely zero — callers don't need to
+    /// distinguish for the use cases we have today).
+    pub fn mention_count(&self, entity_id: Uuid) -> usize {
+        self.mentions.get(&entity_id).copied().unwrap_or(0)
+    }
+}
+
+/// Parse `kept://<uuid>` → entity_id. Returns None for any URL that
+/// isn't of that shape (external links, malformed kept URLs, etc).
+fn parse_kept_entity_url(url: &str) -> Option<Uuid> {
+    let suffix = url.strip_prefix("kept://")?;
+    Uuid::parse_str(suffix).ok()
 }
 
 impl Default for EntityCache {
