@@ -155,6 +155,14 @@ impl CellBody for PlainCell {
         self.body.paste(s);
     }
 
+    fn paste_with_links(
+        &mut self,
+        text: &str,
+        links: &[super::common::LinkSpan],
+    ) {
+        self.body.paste_with_links(text, links);
+    }
+
     fn replace_at_focused_with_link(
         &mut self,
         range: Range<usize>,

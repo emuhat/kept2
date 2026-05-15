@@ -13,7 +13,7 @@ use winit::{
 };
 
 use super::TextBox;
-use super::common::{BODY_FONT_SIZE, INACTIVE_ALPHA, TextBoxSnapshot, primary_mod, word_mod};
+use super::common::{BODY_FONT_SIZE, INACTIVE_ALPHA, LinkSpan, TextBoxSnapshot, primary_mod, word_mod};
 use super::reference::{EmbeddedReference, ReferenceTarget};
 
 const BULLET_INDENT: f32 = 22.0;
@@ -113,15 +113,10 @@ impl Bullet {
 
     /// Drain any pending link URL the bullet's textbox stashed during
     /// the most recent `mouse_down`. Used by the `Cell` aggregator that
-    /// feeds `KeptApp::handle_link_click`.
+    /// feeds `KeptApp::handle_link_click`. `kept-tag://<name>` URLs ride
+    /// this same channel — the app routes them to the tag view.
     pub fn take_pending_link_url(&mut self) -> Option<String> {
         self.textbox.take_pending_link_url()
-    }
-
-    /// Drain any pending inline-tag name (mirrors
-    /// `take_pending_link_url`).
-    pub fn take_pending_tag_name(&mut self) -> Option<String> {
-        self.textbox.take_pending_tag_name()
     }
 }
 
@@ -397,25 +392,6 @@ impl OutlineCell {
         for b in &mut self.bullets {
             if let Some(url) = b.take_pending_link_url() {
                 return Some(url);
-            }
-        }
-        None
-    }
-
-    /// Drain the first pending inline-tag name across all bullets.
-    /// Header cache is also drained so a `#tag` click inside an
-    /// envelope's embedded preview navigates to the tag view.
-    pub fn take_pending_tag_name(&mut self) -> Option<String> {
-        if let Some(header) = self.reference_header.as_mut() {
-            if let Some(cache) = header.cache_mut() {
-                if let Some(name) = cache.take_pending_tag_name() {
-                    return Some(name);
-                }
-            }
-        }
-        for b in &mut self.bullets {
-            if let Some(name) = b.take_pending_tag_name() {
-                return Some(name);
             }
         }
         None
@@ -903,27 +879,6 @@ impl OutlineCell {
         self.bullets[idx].textbox.link_at_doc_pos(abs_x, abs_y)
     }
 
-    /// True if an inline `#tag` in the bullet under `(abs_x, abs_y)`
-    /// (or the header cache, for envelope outlines) is hit.
-    pub fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
-        if self.point_in_header_band(abs_y) {
-            return self
-                .reference_header
-                .as_ref()
-                .and_then(|h| h.cache_ref())
-                .map(|cache| cache.tag_at_doc_pos(abs_x, abs_y))
-                .unwrap_or(false);
-        }
-        if abs_y < self.y_origin || abs_y > self.y_origin + self.height {
-            return false;
-        }
-        let idx = self.bullet_idx_at_y(abs_y);
-        if idx >= self.bullets.len() {
-            return false;
-        }
-        self.bullets[idx].textbox.tag_at_doc_pos(abs_x, abs_y)
-    }
-
     /// True iff `abs_y` falls inside the rendered header band (only
     /// possible on envelope outlines after at least one render pass).
     pub fn point_in_header_band(&self, abs_y: f32) -> bool {
@@ -1002,6 +957,87 @@ impl OutlineCell {
         if let Some(idx) = self.focused_index() {
             self.bullets[idx].textbox.paste(s);
         }
+    }
+
+    /// Insert a list of pasted bullets as siblings AFTER the
+    /// focused bullet, at the focused bullet's depth. Each input
+    /// tuple is `(rel_depth, text, links)` where `rel_depth` is
+    /// the bullet's depth in the original copied set. The minimum
+    /// of those becomes the focused bullet's depth — i.e. the
+    /// pasted top-level joins at the focused depth, nested items
+    /// keep their relative offset.
+    ///
+    /// If a bullet selection is active, it's deleted first so the
+    /// paste replaces the selection. Empty input is a no-op.
+    /// Focus moves to the first inserted bullet so subsequent
+    /// keystrokes land inside the paste.
+    pub fn insert_bullets_after_focused(
+        &mut self,
+        bullets: Vec<(u32, String, Vec<crate::cell::LinkSpan>)>,
+    ) {
+        if bullets.is_empty() {
+            return;
+        }
+        if self.bullet_selection.is_some() {
+            self.delete_bullet_selection();
+        }
+        let Some(insert_at) = self.focused_index() else {
+            return;
+        };
+        let focused_depth = self.bullets[insert_at].depth;
+        let min_rel = bullets.iter().map(|(d, _, _)| *d).min().unwrap_or(0);
+        let scale = self.font_scale;
+        let mut new_focus: Option<Uuid> = None;
+        for (offset, (rel_depth, text, links)) in bullets.into_iter().enumerate() {
+            let abs_depth = focused_depth + (rel_depth - min_rel);
+            let id = Uuid::now_v7();
+            let mut tb = TextBox::new(self.typeface.clone(), String::new());
+            tb.append_with_links(&text, links);
+            tb.set_font_scale(scale);
+            tb.set_caret_at(text.len());
+            self.bullets.insert(
+                insert_at + 1 + offset,
+                Bullet {
+                    id,
+                    textbox: tb,
+                    depth: abs_depth,
+                    closed_at: None,
+                    resurface_after: None,
+                },
+            );
+            if new_focus.is_none() {
+                new_focus = Some(id);
+            }
+        }
+        if let Some(id) = new_focus {
+            self.focused_bullet = id;
+        }
+    }
+
+    /// Bullet-selection copy, but returning `(rel_depth, text, links)`
+    /// for each selected bullet so the clipboard layer can build a
+    /// structured `KeptPayload::Outline`. Depths are rebased so the
+    /// shallowest selected bullet is 0; nested items keep their
+    /// relative offset. Returns None when no bullet selection is
+    /// active (caller falls back to TextBox-selection copy).
+    pub fn copy_bullet_selection_with_links(
+        &self,
+    ) -> Option<Vec<(u32, String, Vec<LinkSpan>)>> {
+        let sel = self.bullet_selection?;
+        let ai = self.bullet_idx_by_id(sel.anchor_id)?;
+        let hi = self.bullet_idx_by_id(sel.head_id)?;
+        let lo = ai.min(hi);
+        let hi = ai.max(hi);
+        let min_depth = (lo..=hi).map(|i| self.bullets[i].depth).min().unwrap_or(0);
+        let mut out = Vec::with_capacity(hi - lo + 1);
+        for i in lo..=hi {
+            let b = &self.bullets[i];
+            let rel = b.depth - min_depth;
+            let text = b.textbox.text().to_string();
+            let links: Vec<LinkSpan> = b.textbox.links().to_vec();
+            out.push((rel, text, links));
+        }
+        Some(out)
     }
 
     fn copy_bullet_range(&self, sel: BulletSelection) -> String {
@@ -1765,6 +1801,19 @@ impl super::body::CellBody for OutlineCell {
         OutlineCell::paste_text(self, s);
     }
 
+    fn paste_with_links(
+        &mut self,
+        text: &str,
+        links: &[super::common::LinkSpan],
+    ) {
+        if self.bullet_selection.is_some() {
+            self.delete_bullet_selection();
+        }
+        if let Some(idx) = self.focused_index() {
+            self.bullets[idx].textbox.paste_with_links(text, links);
+        }
+    }
+
     fn replace_at_focused_with_link(
         &mut self,
         range: Range<usize>,
@@ -1813,20 +1862,12 @@ impl super::body::CellBody for OutlineCell {
         OutlineCell::take_pending_link_url(self)
     }
 
-    fn take_pending_tag_name(&mut self) -> Option<String> {
-        OutlineCell::take_pending_tag_name(self)
-    }
-
     fn clear_all_selections(&mut self) {
         OutlineCell::clear_all_selections(self);
     }
 
     fn link_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
         OutlineCell::link_at_doc_pos(self, abs_x, abs_y)
-    }
-
-    fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
-        OutlineCell::tag_at_doc_pos(self, abs_x, abs_y)
     }
 
     /// Outline drag carries a `DragState` (TextBox / BulletRange /

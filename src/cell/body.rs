@@ -4,8 +4,8 @@
 //! `app/mod.rs` with one trait. Default methods key off `for_each_textbox`
 //! so multi-textbox containers (outline / table / poppop) inherit
 //! `mouse_drag_to`, `mouse_up`, `clear_all_selections`, `link_at_doc_pos`,
-//! `tag_at_doc_pos`, `take_pending_link_url`, `take_pending_tag_name`,
-//! `remove_tags_named`, `all_link_urls_into`, `all_tag_names_into` for free.
+//! `take_pending_link_url`, `remove_tags_named`, `all_link_urls_into`,
+//! `all_tag_names_into` for free.
 //!
 //! ### Header / cache descent (asymmetric)
 //!
@@ -112,6 +112,14 @@ pub trait CellBody {
     fn cut_text(&mut self) -> String;
     fn paste_text(&mut self, s: &str);
 
+    /// Paste with authoritative `LinkSpan`s (from the clipboard
+    /// payload's structured form). Default routes through
+    /// `paste_text`, losing the links — kinds that have a focused
+    /// `TextBox` override this to apply the links atomically.
+    fn paste_with_links(&mut self, text: &str, _links: &[super::common::LinkSpan]) {
+        self.paste_text(text);
+    }
+
     fn replace_at_focused_with_link(
         &mut self,
         range: Range<usize>,
@@ -170,31 +178,11 @@ pub trait CellBody {
         hit
     }
 
-    fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
-        let mut hit = false;
-        self.for_each_textbox(&mut |tb| {
-            if !hit && tb.tag_at_doc_pos(abs_x, abs_y) {
-                hit = true;
-            }
-        });
-        hit
-    }
-
     fn take_pending_link_url(&mut self) -> Option<String> {
         let mut out: Option<String> = None;
         self.for_each_textbox_mut(&mut |tb| {
             if out.is_none() {
                 out = tb.take_pending_link_url();
-            }
-        });
-        out
-    }
-
-    fn take_pending_tag_name(&mut self) -> Option<String> {
-        let mut out: Option<String> = None;
-        self.for_each_textbox_mut(&mut |tb| {
-            if out.is_none() {
-                out = tb.take_pending_tag_name();
             }
         });
         out

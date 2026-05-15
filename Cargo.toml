@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-arboard = "3"
+arboard = "3.6"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "5"
 gl = "0.14"
 glutin = "0.32.0"
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
 poppop = { path = "../poppop" }
 glutin-winit = "0.5.0"
 raw-window-handle = "0.6.0"

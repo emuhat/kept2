@@ -460,6 +460,14 @@ impl super::body::CellBody for PopPopCell {
         self.textbox.paste(s);
     }
 
+    fn paste_with_links(
+        &mut self,
+        text: &str,
+        links: &[super::common::LinkSpan],
+    ) {
+        self.textbox.paste_with_links(text, links);
+    }
+
     fn replace_at_focused_with_link(
         &mut self,
         range: Range<usize>,
@@ -498,9 +506,4 @@ impl super::body::CellBody for PopPopCell {
     /// Same reasoning as `remove_tags_named`: PopPop contributes no
     /// tag names to cell-level aggregation.
     fn all_tag_names_into(&self, _out: &mut Vec<String>) {}
-
-    /// Output column carries no tags or links to hit-test.
-    fn tag_at_doc_pos(&self, _abs_x: f32, _abs_y: f32) -> bool {
-        false
-    }
 }

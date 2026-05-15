@@ -10,11 +10,14 @@ use std::ops::Range;
 
 use skia_safe::{Canvas, Font, Paint, Point};
 
-use super::common::{Affinity, LinkSpan};
+use super::common::{Affinity, LinkSpan, is_kept_tag_url};
 
 /// Draw the visible portion of `line` from `text` at `(text_x, baseline)`,
-/// switching to `link_paint` (and drawing an underline below the baseline)
-/// for byte ranges that fall inside any of `links`.
+/// switching paints per span:
+/// - `kept-tag://` URLs render in the dim ghost color used for committed
+///   `#tag` tokens. No underline.
+/// - any other URL renders in `link_paint` with an underline.
+/// Plain text uses `text_paint`.
 pub(super) fn draw_line_with_links(
     canvas: &Canvas,
     text: &str,
@@ -27,6 +30,10 @@ pub(super) fn draw_line_with_links(
     link_paint: &Paint,
     underline_paint: &Paint,
 ) {
+    let mut tag_paint = Paint::default();
+    tag_paint.set_anti_alias(true);
+    tag_paint.set_color(crate::color::text_ghost());
+
     let mut pos = line.start;
     let mut x = text_x;
     while pos < line.end {
@@ -41,10 +48,15 @@ pub(super) fn draw_line_with_links(
                 .unwrap_or(line.end),
         };
         let segment = &text[pos..run_end];
-        let paint = if in_link.is_some() { link_paint } else { text_paint };
+        let is_tag = in_link.map(|l| is_kept_tag_url(&l.url)).unwrap_or(false);
+        let paint = match in_link {
+            Some(_) if is_tag => &tag_paint,
+            Some(_) => link_paint,
+            None => text_paint,
+        };
         canvas.draw_str(segment, Point::new(x, baseline), font, paint);
         let w = font.measure_str(segment, Some(paint)).0;
-        if in_link.is_some() {
+        if in_link.is_some() && !is_tag {
             canvas.draw_line(
                 (x, baseline + 2.0),
                 (x + w, baseline + 2.0),

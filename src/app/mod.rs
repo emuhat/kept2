@@ -220,6 +220,10 @@ struct BarMenuHits {
     /// whole cell (or the Reference's preserved target, for
     /// Reference cells) into the current writable context.
     surface: Option<Rect>,
+    /// "Copy reference" — writes a `KeptPayload::Reference` to
+    /// the OS clipboard. Default paste = inline `kept://` link;
+    /// Ctrl+Shift+V paste = a fresh Reference cell.
+    copy_reference: Option<Rect>,
     snooze: [Option<Rect>; 6],
     unsnooze: Option<Rect>,
     /// "Envelope" — transforms a Reference cell into an envelope
@@ -3169,7 +3173,7 @@ impl KeptApp {
         let Some(cell) = self.cell(target) else {
             return false;
         };
-        cell.link_at_doc_pos(x, doc_y) || cell.tag_at_doc_pos(x, doc_y)
+        cell.link_at_doc_pos(x, doc_y)
     }
 
     // ----- cell access helpers (thin proxies to `Document`) -----
@@ -5087,6 +5091,13 @@ impl KeptApp {
                     return self.cut_to_clipboard();
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("v") => {
+                    // Ctrl+Shift+V → paste-alternate: a Reference
+                    // payload becomes a fresh Reference cell rather
+                    // than an inline link; any other payload pastes
+                    // as plain text (strips formatting + links).
+                    if modifiers.state().shift_key() {
+                        return self.paste_from_clipboard_alternate();
+                    }
                     return self.paste_from_clipboard();
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("n") => {
@@ -5409,37 +5420,144 @@ impl KeptApp {
         handled
     }
 
-    fn copy_to_clipboard(&mut self) -> bool {
-        let Some(id) = self.pane_mut().focused else { return false };
-        let mut text = self.cell(id).map(|c| c.copy_text()).unwrap_or_default();
-        // View mode + no selection → copy the whole cell. Edit mode keeps
-        // the selection-or-nothing behavior so an accidental Ctrl+C with no
-        // selection doesn't dump the whole cell.
-        if text.is_empty() && !self.pane_mut().editing {
-            text = self.cell(id).map(|c| c.full_text()).unwrap_or_default();
+    /// Build a `KeptPayload` from the focused cell's current
+    /// selection. Returns `None` when there's nothing to copy.
+    /// View-mode + no selection falls back to a whole-cell payload
+    /// (Outline for outline cells, Text otherwise) — that's the
+    /// "Ctrl+C with no selection copies the whole cell" affordance.
+    fn build_copy_payload(&self) -> Option<crate::clipboard::KeptPayload> {
+        use crate::clipboard::{BulletPayload, KeptPayload, SerLink};
+        let id = self.pane().focused?;
+        let cell = self.cell(id)?;
+        // 1. Outline with active multi-bullet selection → Outline payload.
+        if !cell.title_focused {
+            if let CellKind::Outline(oc) = &cell.kind {
+                if let Some(rows) = oc.copy_bullet_selection_with_links() {
+                    if !rows.is_empty() {
+                        return Some(KeptPayload::Outline {
+                            bullets: rows
+                                .into_iter()
+                                .map(|(d, t, ls)| BulletPayload {
+                                    depth: d,
+                                    text: t,
+                                    links: SerLink::spans_to_ser(&ls),
+                                })
+                                .collect(),
+                        });
+                    }
+                }
+            }
         }
-        if text.is_empty() {
-            return false;
+        // 2. Focused textbox selection → Text payload.
+        let tb_with_sel: Option<&crate::cell::TextBox> = if cell.title_focused {
+            cell.title()
+        } else {
+            cell.kind.body().focused_textbox()
+        };
+        if let Some(tb) = tb_with_sel {
+            if let Some((text, links)) = tb.copy_primary_selection_with_links() {
+                return Some(KeptPayload::Text {
+                    text,
+                    links: SerLink::spans_to_ser(&links),
+                });
+            }
         }
+        // 3. View-mode whole-cell fallback. Same selection-or-nothing
+        // rule the old `copy_to_clipboard` used: only fires when we're
+        // NOT in edit mode (so a stray Ctrl+C while editing with no
+        // selection doesn't dump the whole cell into the buffer).
+        if self.pane().editing {
+            return None;
+        }
+        let whole_text = cell.full_text();
+        if whole_text.is_empty() {
+            return None;
+        }
+        Some(KeptPayload::Text {
+            text: whole_text,
+            links: Vec::new(),
+        })
+    }
+
+    /// Write a `KeptPayload` to the OS clipboard as HTML (with the
+    /// embedded round-trip marker) + plain-text fallback.
+    fn write_payload_to_clipboard(&mut self, p: &crate::clipboard::KeptPayload) {
+        let html = crate::clipboard::to_html(p);
+        let plain = crate::clipboard::to_plain_text(p);
         if let Some(cb) = self.clipboard.as_mut() {
-            let _ = cb.set_text(text);
+            let _ = cb.set_html(html, Some(plain));
         }
+    }
+
+    fn copy_to_clipboard(&mut self) -> bool {
+        let Some(p) = self.build_copy_payload() else {
+            return false;
+        };
+        self.write_payload_to_clipboard(&p);
         true
     }
 
     fn cut_to_clipboard(&mut self) -> bool {
-        let Some(id) = self.pane_mut().focused else { return false };
+        let Some(id) = self.pane_mut().focused else {
+            return false;
+        };
+        let Some(payload) = self.build_copy_payload() else {
+            return false;
+        };
+        self.write_payload_to_clipboard(&payload);
         let pre = self.cell(id).map(|c| c.snapshot());
         let cut = match self.cell_mut(id) {
             Some(c) => c.cut_text(),
             None => return false,
         };
         if cut.is_empty() {
+            return true; // We still wrote the payload; nothing to delete.
+        }
+        if let (Some(pre), Some(cell)) = (pre, self.cell(id)) {
+            let post = cell.snapshot();
+            if !pre.doc_eq(&post) {
+                self.record_edit(pre, post);
+            }
+        }
+        self.pane_mut().coalesce_break = true;
+        self.pane_mut().pending_caret_scroll = true;
+        true
+    }
+
+    /// Read clipboard formats (HTML preferred — carries the
+    /// embedded marker for byte-perfect Kept↔Kept round-trip;
+    /// plain text fallback) and apply to the focused cell.
+    ///
+    /// `alternate` (Ctrl+Shift+V): on a Reference payload, insert
+    /// a fresh Reference cell rather than an inline link; on any
+    /// other payload, strip formatting (paste-as-plain-text).
+    fn paste_from_clipboard_inner(&mut self, alternate: bool) -> bool {
+        let Some(id) = self.pane_mut().focused else {
+            return false;
+        };
+        let html = self
+            .clipboard
+            .as_mut()
+            .and_then(|cb| cb.get().html().ok());
+        let text = self
+            .clipboard
+            .as_mut()
+            .and_then(|cb| cb.get_text().ok())
+            .unwrap_or_default();
+        if html.is_none() && text.is_empty() {
             return false;
         }
-        if let Some(cb) = self.clipboard.as_mut() {
-            let _ = cb.set_text(cut);
+        let payload =
+            crate::clipboard::from_clipboard(html.as_deref(), &text);
+
+        let pre = self.cell(id).map(|c| c.snapshot());
+
+        if alternate {
+            self.apply_paste_alternate(id, payload);
+        } else {
+            self.apply_paste_default(id, payload);
         }
+
         if let (Some(pre), Some(cell)) = (pre, self.cell(id)) {
             let post = cell.snapshot();
             if !pre.doc_eq(&post) {
@@ -5452,32 +5570,124 @@ impl KeptApp {
     }
 
     fn paste_from_clipboard(&mut self) -> bool {
-        let Some(id) = self.pane_mut().focused else { return false };
-        let Some(cb) = self.clipboard.as_mut() else {
-            return false;
-        };
-        let text = match cb.get_text() {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
-        if text.is_empty() {
-            return false;
-        }
-        let pre = self.cell(id).map(|c| c.snapshot());
-        if let Some(c) = self.cell_mut(id) {
-            c.paste_text(&text);
-        } else {
-            return false;
-        }
-        if let (Some(pre), Some(cell)) = (pre, self.cell(id)) {
-            let post = cell.snapshot();
-            if !pre.doc_eq(&post) {
-                self.record_edit(pre, post);
+        self.paste_from_clipboard_inner(false)
+    }
+
+    fn paste_from_clipboard_alternate(&mut self) -> bool {
+        self.paste_from_clipboard_inner(true)
+    }
+
+    /// Default paste dispatch — by payload kind.
+    fn apply_paste_default(
+        &mut self,
+        cell_id: Uuid,
+        payload: crate::clipboard::KeptPayload,
+    ) {
+        use crate::clipboard::{KeptPayload, SerLink};
+        match payload {
+            KeptPayload::Text { text, links } => {
+                self.paste_text_with_links(
+                    cell_id,
+                    &text,
+                    &SerLink::ser_to_spans(links),
+                );
+            }
+            KeptPayload::Outline { bullets } => {
+                // Outline target → insert as siblings. Anything
+                // else → flatten to indented text (preserving link
+                // spans rebased into the flattened string).
+                let is_outline = matches!(
+                    self.cell(cell_id).map(|c| &c.kind),
+                    Some(CellKind::Outline(_))
+                );
+                if is_outline && !self.cell(cell_id).map(|c| c.title_focused).unwrap_or(false) {
+                    if let Some(cell) = self.cell_mut(cell_id) {
+                        if let CellKind::Outline(oc) = &mut cell.kind {
+                            let raw: Vec<(u32, String, Vec<crate::cell::LinkSpan>)> =
+                                bullets
+                                    .into_iter()
+                                    .map(|b| {
+                                        (
+                                            b.depth,
+                                            b.text,
+                                            SerLink::ser_to_spans(b.links),
+                                        )
+                                    })
+                                    .collect();
+                            oc.insert_bullets_after_focused(raw);
+                        }
+                    }
+                } else {
+                    let (text, links) = flatten_outline(&bullets);
+                    self.paste_text_with_links(
+                        cell_id,
+                        &text,
+                        &SerLink::ser_to_spans(links),
+                    );
+                }
+            }
+            KeptPayload::Reference { target, snippet } => {
+                let url = target.to_url();
+                let display = if snippet.trim().is_empty() {
+                    "↗ reference".to_string()
+                } else {
+                    format!("↗ {}", snippet)
+                };
+                let links = vec![crate::cell::LinkSpan {
+                    range: 0..display.len(),
+                    url,
+                }];
+                self.paste_text_with_links(cell_id, &display, &links);
             }
         }
-        self.pane_mut().coalesce_break = true;
-        self.pane_mut().pending_caret_scroll = true;
-        true
+    }
+
+    /// Alternate paste (Ctrl+Shift+V).
+    fn apply_paste_alternate(
+        &mut self,
+        cell_id: Uuid,
+        payload: crate::clipboard::KeptPayload,
+    ) {
+        use crate::clipboard::KeptPayload;
+        match payload {
+            KeptPayload::Reference { target, .. } => {
+                // Materialize as a fresh Reference cell, sorted into
+                // the timeline. Same machinery the "Surface as
+                // reference" action uses.
+                let _ = self.surface_as_reference(target.into_target());
+            }
+            KeptPayload::Text { text, .. } => {
+                // Strip links — paste plain text only.
+                self.paste_text_with_links(cell_id, &text, &[]);
+            }
+            KeptPayload::Outline { bullets } => {
+                // Strip links, flatten to indented text.
+                let (flat, _) = flatten_outline(&bullets);
+                self.paste_text_with_links(cell_id, &flat, &[]);
+            }
+        }
+    }
+
+    /// Insert `text` + `links` at the focused caret in `cell_id`.
+    /// Title or body, depending on `title_focused`.
+    fn paste_text_with_links(
+        &mut self,
+        cell_id: Uuid,
+        text: &str,
+        links: &[crate::cell::LinkSpan],
+    ) {
+        let Some(cell) = self.cell_mut(cell_id) else {
+            return;
+        };
+        if cell.title_focused {
+            if let Some(title) = cell.title_mut() {
+                title.paste_with_links(text, links);
+                return;
+            }
+        }
+        // Forward to the body's focused TextBox via the trait
+        // method that lets us reach mutable TextBoxes.
+        cell.paste_into_focused_with_links(text, links);
     }
 
     /// Render the entity page for `entity_id` into the doc area. Returns
@@ -7371,6 +7581,35 @@ impl KeptApp {
                     return true;
                 }
             }
+            // "Copy reference" — same target resolution as Surface,
+            // but writes a `KeptPayload::Reference` to the
+            // clipboard instead of inserting a Reference cell.
+            // Pastes elsewhere as an inline kept:// link
+            // (Ctrl+Shift+V to materialize as a Reference cell).
+            if let Some(rect) = self.hit_tests.bar_menu.copy_reference {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.bar_context_menu.take() {
+                        let target = self
+                            .cell(menu.cell_id)
+                            .and_then(|c| match &c.kind {
+                                CellKind::Reference(rc) => Some(rc.target()),
+                                _ => None,
+                            })
+                            .unwrap_or(ReferenceTarget::WholeCell(menu.cell_id));
+                        let snippet = self
+                            .cell(menu.cell_id)
+                            .map(|c| snippet_for_cell(c))
+                            .unwrap_or_default();
+                        let payload = crate::clipboard::KeptPayload::Reference {
+                            target: crate::clipboard::SerTarget::from_target(target),
+                            snippet,
+                        };
+                        self.write_payload_to_clipboard(&payload);
+                        self.show_toast("Reference copied");
+                    }
+                    return true;
+                }
+            }
             let bar_snooze = self.hit_tests.bar_menu.snooze;
             for (i, rect_opt) in bar_snooze.iter().enumerate() {
                 if let Some(rect) = rect_opt {
@@ -7715,7 +7954,7 @@ impl KeptApp {
         if plain_alt {
             let on_link_or_tag = self
                 .cell(target)
-                .map(|c| c.link_at_doc_pos(x, doc_y) || c.tag_at_doc_pos(x, doc_y))
+                .map(|c| c.link_at_doc_pos(x, doc_y))
                 .unwrap_or(false);
             if !on_link_or_tag {
                 return self.open_cell_in_other_pane(target);
@@ -7748,32 +7987,19 @@ impl KeptApp {
             Some(cell) => cell.mouse_down(x, doc_y, modifiers, editing),
             None => false,
         };
-        // The cell's mouse_down may have stashed a `kept://...` (or other)
-        // URL because the click landed on a link. Drain it here and route
-        // through the navigation policy that lives on `KeptApp`.
-        // Alt+click on a kept:// link or `#tag` opens the destination in
-        // the other pane (matches the sidebar alt-click semantics) —
-        // external URLs always shell out via `open_url` regardless.
+        // The cell's mouse_down may have stashed a URL because the click
+        // landed on a link. Drain it here and route through the
+        // navigation policy that lives on `KeptApp`. `kept://...` jumps
+        // entity / cell pages; `kept-tag://<name>` opens the tag's
+        // filter view; external URLs shell out via `open_url`.
+        // Alt+click opens kept:// / kept-tag:// in the other pane to
+        // match sidebar alt-click semantics.
         let alt = modifiers.state().alt_key();
         let pending = self
             .cell_mut(target)
             .and_then(|c| c.take_pending_link_url());
         if let Some(url) = pending {
             self.handle_link_click(&url, alt);
-        }
-        // Same shape for inline `#tag` clicks: the textbox stashed the
-        // tag name; drain and navigate to the tag's filter view (same
-        // destination as a sidebar tag-row click).
-        let pending_tag = self
-            .cell_mut(target)
-            .and_then(|c| c.take_pending_tag_name());
-        if let Some(name) = pending_tag {
-            let q = Query::tag(name);
-            if alt {
-                self.open_in_other_pane(q);
-            } else {
-                self.push_view(q);
-            }
         }
         result
     }
@@ -7814,6 +8040,21 @@ impl KeptApp {
     /// cell; neither → drop (don't shell out, that produces a useless
     /// OS error). Other URLs hand off to `cell::open_url` (xdg-open).
     fn handle_link_click(&mut self, url: &str, alt: bool) {
+        // `kept-tag://<name>` → navigate to the tag's filter view, same
+        // destination as a sidebar tag-row click. Alt+click opens it
+        // in the other pane.
+        if let Some(name) = cell::tag_name_from_url(url) {
+            if name.is_empty() {
+                return;
+            }
+            let q = Query::tag(name.to_string());
+            if alt {
+                self.open_in_other_pane(q);
+            } else {
+                self.push_view(q);
+            }
+            return;
+        }
         if let Some(rest) = url.strip_prefix("kept://") {
             if let Ok(uuid) = Uuid::parse_str(rest) {
                 let q = if self.entities.entities.iter().any(|e| e.id == uuid) {
@@ -8142,6 +8383,67 @@ fn chrome_open_path(rect: skia_safe::Rect, radius: f32) -> skia_safe::Path {
     );
     p.line_to((rect.left, rect.bottom));
     p
+}
+
+/// Short display snippet for a cell — used as the human-readable
+/// label on a reference link. Takes the cell's first ~40 chars,
+/// stripping newlines and trailing whitespace. Empty for empty
+/// cells (caller falls back to a generic label).
+fn snippet_for_cell(cell: &Cell) -> String {
+    const MAX: usize = 40;
+    let text = cell.full_text();
+    let mut one_line = String::new();
+    for c in text.chars() {
+        if c == '\n' || c == '\r' {
+            if !one_line.is_empty() && !one_line.ends_with(' ') {
+                one_line.push(' ');
+            }
+        } else {
+            one_line.push(c);
+        }
+        if one_line.chars().count() >= MAX {
+            break;
+        }
+    }
+    let trimmed = one_line.trim();
+    if trimmed.chars().count() > MAX {
+        let truncated: String = trimmed.chars().take(MAX).collect();
+        format!("{}…", truncated.trim_end())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Flatten an Outline payload to a single indented text string +
+/// rebased link spans, for pasting into a non-outline target.
+/// Each bullet becomes a line prefixed by 4 spaces per depth.
+fn flatten_outline(
+    bullets: &[crate::clipboard::BulletPayload],
+) -> (String, Vec<crate::clipboard::SerLink>) {
+    use crate::clipboard::SerLink;
+    let mut text = String::new();
+    let mut links: Vec<SerLink> = Vec::new();
+    for (i, b) in bullets.iter().enumerate() {
+        if i > 0 {
+            text.push('\n');
+        }
+        let indent = "    ".repeat(b.depth as usize);
+        text.push_str(&indent);
+        let bullet_start = text.len();
+        text.push_str(&b.text);
+        for l in &b.links {
+            let s = bullet_start + l.start;
+            let e = bullet_start + l.end;
+            if e <= text.len() && s < e {
+                links.push(SerLink {
+                    start: s,
+                    end: e,
+                    url: l.url.clone(),
+                });
+            }
+        }
+    }
+    (text, links)
 }
 
 fn bar_color_for_cell(cell: &Cell, now_ms: i64) -> skia_safe::Color {

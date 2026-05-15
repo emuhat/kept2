@@ -19,7 +19,9 @@ mod textbox;
 mod wrap;
 
 pub use body::CellBody;
-pub use common::{TagSpan, TextBoxSnapshot, now_epoch_ms};
+pub use common::{
+    KEPT_TAG_SCHEME, LinkSpan, TextBoxSnapshot, is_kept_tag_url, now_epoch_ms, tag_name_from_url,
+};
 pub use outline::{Bullet, OutlineCell, OutlineSnapshot};
 #[cfg(test)]
 pub use outline::BulletSnapshot;
@@ -31,7 +33,6 @@ pub use textbox::TextBox;
 
 pub(crate) use common::{INACTIVE_ALPHA, TITLE_BODY_GAP, open_url, primary_mod};
 pub use wrap::parse_inline_tags;
-use wrap::parse_heading_tags;
 
 
 // ---------------------------------------------------------------------------
@@ -485,18 +486,6 @@ impl Cell {
         self.kind.body().link_at_doc_pos(abs_x, abs_y)
     }
 
-    /// True if `(abs_x, abs_y)` lands on an inline `#tag` substring in
-    /// this cell. Sibling of `link_at_doc_pos` — same hand-cursor
-    /// affordance, different navigation target.
-    pub fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
-        if let Some(title) = self.title.as_ref() {
-            if title.tag_at_doc_pos(abs_x, abs_y) {
-                return true;
-            }
-        }
-        self.kind.body().tag_at_doc_pos(abs_x, abs_y)
-    }
-
     /// Replace `range` with `text` in the focused editable slot (title
     /// when focused, otherwise the kind's focused inner element) and link
     /// the inserted text to `url`.
@@ -557,18 +546,43 @@ impl Cell {
 
     /// Cell title, if any: the title slot's text with trailing #tags
     /// stripped. None when there is no title slot or the title contains
-    /// only tags / whitespace.
+    /// only tags / whitespace. "Trailing tags" here means committed
+    /// kept-tag link spans within the heading paragraph that, together
+    /// with intervening whitespace, run all the way to the heading's
+    /// end. A `#X` in the middle of the title is body content, not
+    /// trailing.
     #[allow(dead_code)]
     pub fn heading_title(&self) -> Option<String> {
         let title_tb = self.title.as_ref()?;
         let text = title_tb.text();
         let title_end = text.find('\n').unwrap_or(text.len());
-        let tags = parse_heading_tags(text, title_end);
         let bytes = text.as_bytes();
-        let mut end = tags.first().map(|r| r.start).unwrap_or(title_end);
-        while end > 0 && (bytes[end - 1] as char).is_whitespace() {
-            end -= 1;
+        // Walk backward through whitespace + kept-tag spans until we
+        // hit a non-tag, non-whitespace byte. That's the end of the
+        // human title.
+        let mut tag_starts: Vec<usize> = title_tb
+            .links()
+            .iter()
+            .filter(|l| is_kept_tag_url(&l.url) && l.range.end <= title_end)
+            .map(|l| l.range.start)
+            .collect();
+        tag_starts.sort_unstable();
+        let mut end = title_end;
+        loop {
+            while end > 0 && (bytes[end - 1] as char).is_whitespace() {
+                end -= 1;
+            }
+            // If a kept-tag span ends exactly at `end`, retreat past it.
+            let preceding_tag = title_tb
+                .links()
+                .iter()
+                .find(|l| is_kept_tag_url(&l.url) && l.range.end == end);
+            match preceding_tag {
+                Some(l) => end = l.range.start,
+                None => break,
+            }
         }
+        let _ = tag_starts;
         if end == 0 {
             return None;
         }
@@ -644,14 +658,15 @@ impl Cell {
     /// after the last char) IS in-progress — the next keystroke would
     /// extend the tag.
     pub fn caret_in_in_progress_tag(&self) -> bool {
-        // Span-based tags: only commit-via-popup ranges count. Caret
-        // inside a TagSpan means the user is editing an existing tag
-        // in place — defer save until they leave the span. Typed
-        // `#X` with no span is just text and never defers (it never
-        // would have made a tag in the first place).
-        let in_tag = |tags: &[crate::cell::TagSpan], caret: usize| -> bool {
-            tags.iter()
-                .any(|t| caret > t.range.start && caret <= t.range.end)
+        // Span-based tags: only `kept-tag://` link spans count. Caret
+        // inside one means the user is editing an existing tag in
+        // place — defer save until they leave the span. Typed `#X`
+        // with no span is just text and never defers (it never would
+        // have made a tag in the first place).
+        let in_tag = |links: &[LinkSpan], caret: usize| -> bool {
+            links.iter().any(|l| {
+                is_kept_tag_url(&l.url) && caret > l.range.start && caret <= l.range.end
+            })
         };
         if self.title_focused {
             let Some(title) = self.title.as_ref() else {
@@ -660,7 +675,7 @@ impl Cell {
             let Some((_, caret)) = title.primary_caret() else {
                 return false;
             };
-            return in_tag(title.tags(), caret);
+            return in_tag(title.links(), caret);
         }
         // PopPop opts out of tag semantics (its `focused_textbox()`
         // returns None); Reference has no editable focus either. Both
@@ -671,7 +686,7 @@ impl Cell {
         let Some((_, caret)) = tb.primary_caret() else {
             return false;
         };
-        in_tag(tb.tags(), caret)
+        in_tag(tb.links(), caret)
     }
 
     /// Full text of the cell, ignoring selection state. Title (if any) is
@@ -705,18 +720,6 @@ impl Cell {
         self.kind.body_mut().take_pending_link_url()
     }
 
-    /// Drain the first inline-tag name (without `#`) stashed by any
-    /// inner `TextBox` during the most recent `mouse_down`. The app
-    /// layer routes it through `push_view(Query::tag(name))` — same
-    /// destination as the sidebar tag-row click.
-    pub fn take_pending_tag_name(&mut self) -> Option<String> {
-        if let Some(t) = self.title.as_mut() {
-            if let Some(name) = t.take_pending_tag_name() {
-                return Some(name);
-            }
-        }
-        self.kind.body_mut().take_pending_tag_name()
-    }
 
 
     /// Every link URL in the cell — title (if any) + body. Used by the
@@ -743,14 +746,22 @@ impl Cell {
         self.kind.body_mut().cut_text()
     }
 
-    pub fn paste_text(&mut self, s: &str) {
+    /// Paste with explicit `LinkSpan`s carried from the clipboard.
+    /// Same dispatch shape as `paste_text` but reaches each cell
+    /// kind's focused TextBox to call `paste_with_links` (no URL
+    /// auto-detection — link metadata is authoritative).
+    pub fn paste_into_focused_with_links(
+        &mut self,
+        text: &str,
+        links: &[LinkSpan],
+    ) {
         if self.title_focused {
             if let Some(title) = self.title.as_mut() {
-                title.paste(s);
+                title.paste_with_links(text, links);
                 return;
             }
         }
-        self.kind.body_mut().paste_text(s);
+        self.kind.body_mut().paste_with_links(text, links);
     }
 
     pub fn tick(
@@ -1196,7 +1207,8 @@ mod tests {
     fn clone_for_cache_preserves_links_and_tags_on_textbox() {
         // The single source of truth for "deep-copy a TextBox into an
         // embed cache" must carry every render-affecting span across:
-        // text, font scale, heading mode, links, AND tags. Embedded
+        // text, font scale, heading mode, and all link spans (which
+        // now includes committed `kept-tag://` tag spans). Embedded
         // titles in particular surface tags, so dropping them was the
         // bug that motivated this helper.
         let mut tb = TextBox::new(typeface(), "Patrick #person and link".to_string());
@@ -1208,12 +1220,55 @@ mod tests {
         let cloned = tb.clone_for_cache(typeface(), 1.0);
         assert_eq!(cloned.text(), "Patrick #person and link");
         assert_eq!(cloned.font_scale(), 1.0, "scale override applies");
-        let cloned_tags = cloned.tags();
-        assert_eq!(cloned_tags.len(), 1, "tag span survives the clone");
-        assert_eq!(cloned_tags[0].range, 8..15);
         let cloned_links = cloned.links();
-        assert_eq!(cloned_links.len(), 1, "link span survives the clone");
-        assert_eq!(cloned_links[0].range, 20..24);
+        assert_eq!(cloned_links.len(), 2, "link + tag spans survive the clone");
+        let tag = cloned_links
+            .iter()
+            .find(|l| is_kept_tag_url(&l.url))
+            .expect("tag link present");
+        assert_eq!(tag.range, 8..15);
+        assert_eq!(tag.url, "kept-tag://person");
+        let external = cloned_links
+            .iter()
+            .find(|l| !is_kept_tag_url(&l.url))
+            .expect("external link present");
+        assert_eq!(external.range, 20..24);
+    }
+
+    /// REGRESSION: a clipboard payload with explicit link spans
+    /// must transfer those spans onto the destination textbox
+    /// (kept→kept paste). Tests `paste_with_links` directly with
+    /// non-empty link metadata.
+    #[test]
+    fn paste_with_links_applies_explicit_spans() {
+        let mut tb = TextBox::new(typeface(), String::new());
+        let url = "https://example.com/".to_string();
+        // Selection ranges are byte offsets in `s` (the pasted text).
+        let span = LinkSpan { range: 6..11, url: url.clone() };
+        tb.paste_with_links("hello world", &[span]);
+        let links = tb.links();
+        assert_eq!(links.len(), 1, "explicit link span survived paste");
+        assert_eq!(links[0].url, url);
+        assert_eq!(&tb.text()[links[0].range.clone()], "world");
+    }
+
+    /// REGRESSION: empty link list + a paste containing a bare URL
+    /// must fall back to URL auto-detection so plain-text pastes
+    /// of "https://x.com" still produce a clickable link (the old
+    /// `paste` behavior). Without this fallback, the new payload
+    /// path silently drops every URL that arrives without an
+    /// HTML/marker wrapper.
+    #[test]
+    fn paste_with_links_falls_back_to_url_autodetect_when_empty() {
+        let mut tb = TextBox::new(typeface(), String::new());
+        tb.paste_with_links("visit https://example.com/ today", &[]);
+        let links = tb.links();
+        assert_eq!(
+            links.len(),
+            1,
+            "URL in plain text must auto-linkify even via paste_with_links"
+        );
+        assert_eq!(links[0].url, "https://example.com/");
     }
 
     #[test]
@@ -1611,14 +1666,17 @@ mod tests {
         // `#u` lives at bytes 6..8; replace with `#urgent`.
         tb.replace_with_tag(6..8, "#urgent".to_string());
         assert_eq!(tb.text(), "Notes #urgent");
-        assert_eq!(tb.tags().len(), 1);
+        let tag_links: Vec<&LinkSpan> =
+            tb.links().iter().filter(|l| is_kept_tag_url(&l.url)).collect();
+        assert_eq!(tag_links.len(), 1);
+        assert_eq!(tag_links[0].url, "kept-tag://urgent");
         assert_eq!(tb.heading_tag_names(), vec!["urgent".to_string()]);
     }
 
     #[test]
     fn textbox_replace_with_tag_visible_immediately() {
-        // Render-time tag styling reads `self.tags` directly (no
-        // layout cache), so a span pushed by replace_with_tag is
+        // Render-time tag styling reads kept-tag link spans directly
+        // (no layout cache), so a span pushed by replace_with_tag is
         // picked up on the very next frame regardless of whether the
         // textbox's width has changed.
         let mut tb = TextBox::new(typeface(), "Notes #u".to_string());
@@ -1633,24 +1691,30 @@ mod tests {
             false,
             false,
         );
-        assert!(tb.tags().is_empty());
+        assert!(tb.links().iter().all(|l| !is_kept_tag_url(&l.url)));
         tb.replace_with_tag(6..8, "#urgent".to_string());
-        assert_eq!(tb.tags().len(), 1);
-        assert_eq!(tb.tags()[0].range, 6..13);
+        let tag_links: Vec<&LinkSpan> =
+            tb.links().iter().filter(|l| is_kept_tag_url(&l.url)).collect();
+        assert_eq!(tag_links.len(), 1);
+        assert_eq!(tag_links[0].range, 6..13);
     }
 
     #[test]
     fn textbox_migrate_tags_from_text_seeds_legacy_spans() {
         // Round-trip simulator for v6→v7 backfill: a freshly-loaded
         // TextBox has no spans; migrate scans trailing/inline tokens
-        // and adds them. Idempotent — second call is a no-op.
+        // and adds them as kept-tag link spans. Idempotent — second
+        // call is a no-op.
         let mut tb = TextBox::new(typeface(), "Notes #urgent".to_string());
         tb.set_force_heading(true);
         tb.migrate_tags_from_text();
-        assert_eq!(tb.tags().len(), 1);
+        let tag_count = |tb: &TextBox| -> usize {
+            tb.links().iter().filter(|l| is_kept_tag_url(&l.url)).count()
+        };
+        assert_eq!(tag_count(&tb), 1);
         assert_eq!(tb.heading_tag_names(), vec!["urgent".to_string()]);
         tb.migrate_tags_from_text();
-        assert_eq!(tb.tags().len(), 1, "migration is idempotent");
+        assert_eq!(tag_count(&tb), 1, "migration is idempotent");
     }
 
     #[test]

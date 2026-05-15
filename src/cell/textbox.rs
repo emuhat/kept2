@@ -14,8 +14,9 @@ use winit::{
 
 use super::common::{
     Affinity, BODY_FONT_SIZE, CARET_WIDTH, Edit, HEADING_FONT_SCALE, LinkSpan,
-    MULTI_CLICK_DIST, MULTI_CLICK_INTERVAL, Selection, Selections, TagSpan, TextBoxSnapshot,
-    line_edge_mod, primary_mod, transform_index, transform_index_closed_end, word_mod,
+    MULTI_CLICK_DIST, MULTI_CLICK_INTERVAL, Selection, Selections, TextBoxSnapshot,
+    is_kept_tag_url, line_edge_mod, primary_mod, tag_name_from_url, tag_url_for,
+    transform_index, transform_index_closed_end, word_mod,
 };
 use super::wrap::{
     draw_line_with_links, find_line_at, find_word_at, find_word_left_of, find_word_right_of,
@@ -72,13 +73,13 @@ pub struct TextBox {
     last_click_pos: (f32, f32),
     click_count: u8,
     font_scale: f32,
+    /// Every span — both external/internal links and committed
+    /// `#tag` tokens (URL `kept-tag://<name>`). Tag styling and
+    /// click routing branch on the URL scheme; nothing else cares
+    /// about the difference, so spans share storage. Typing `#X`
+    /// without going through the mention popup leaves NO span and
+    /// no tag.
     links: Vec<LinkSpan>,
-    /// Byte ranges marked as `#tag` tokens. Populated by the mention
-    /// popup's commit path and by the persistence layer's legacy
-    /// migration (one-shot at load if the saved cell has no spans but
-    /// the text has tag-shaped tokens). Typing `#X` without going
-    /// through the popup leaves NO span — so no tag.
-    tags: Vec<TagSpan>,
     /// Body text color. Default dark gray. Cells (e.g. PopPop's output
     /// column) may override to render their textbox in a custom color.
     text_color: Color,
@@ -95,13 +96,9 @@ pub struct TextBox {
     /// We can't navigate from inside `mouse_down` because routing
     /// `kept://...` requires the entity / cell caches that live on
     /// `KeptApp`. Buffering here keeps click detection in the cell while
-    /// keeping navigation policy in the app.
+    /// keeping navigation policy in the app. Same channel carries
+    /// committed-tag click intent (URL `kept-tag://<name>`).
     pending_link_url: Option<String>,
-    /// Tag name (without leading `#`) set by a click on an inline `#tag`
-    /// substring. Drained by the app, which navigates to that tag's
-    /// filter view via `push_view(Query::tag(name))`. Same buffering
-    /// rationale as `pending_link_url`.
-    pending_tag_name: Option<String>,
     /// Local undo stack — pre-edit `TextBoxSnapshot`s pushed by every
     /// run through `apply_edits_right_to_left` (the chokepoint for
     /// every text mutation). Drives Cmd+Z inside inline inputs that
@@ -146,12 +143,10 @@ impl TextBox {
             click_count: 0,
             font_scale: 1.0,
             links: Vec::new(),
-            tags: Vec::new(),
             text_color: crate::color::text_primary(),
             force_heading: false,
             enable_comment_coloring: false,
             pending_link_url: None,
-            pending_tag_name: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_at: None,
@@ -167,39 +162,21 @@ impl TextBox {
         self.pending_link_url.take()
     }
 
-    /// Drain an inline-tag name (without leading `#`) set by a click in
-    /// the most recent `mouse_down`. The app routes it through
-    /// `push_view(Query::tag(name))` — same destination as the sidebar
-    /// tag-row click.
-    pub fn take_pending_tag_name(&mut self) -> Option<String> {
-        self.pending_tag_name.take()
-    }
-
     /// Tag name (without leading `#`) at byte position `byte`, if any.
-    /// Uses the same `parse_inline_tags` rule as the persistence and
-    /// query layers so visual styling, click target, and DB membership
-    /// stay aligned.
+    /// Derives from `kept-tag://` link spans — there's no parallel tag
+    /// storage. Typing `#X` without committing through the mention
+    /// popup leaves no span and bottoms out at `None`.
+    #[cfg(test)]
     pub fn tag_at(&self, byte: usize) -> Option<String> {
-        for tag in &self.tags {
-            let r = &tag.range;
+        for link in &self.links {
+            let r = &link.range;
             if byte >= r.start && byte < r.end && r.end > r.start + 1 {
-                let s = &self.text[r.start..r.end];
-                return s.strip_prefix('#').map(|name| name.to_string());
+                if let Some(name) = tag_name_from_url(&link.url) {
+                    return Some(name.to_string());
+                }
             }
         }
         None
-    }
-
-    /// True iff `(abs_x, abs_y)` lands on an inline-tag substring.
-    /// Powers the hand cursor on hover (mirrors `link_at_doc_pos`).
-    pub fn tag_at_doc_pos(&self, abs_x: f32, abs_y: f32) -> bool {
-        let lx = abs_x - self.x_origin;
-        let ly = abs_y - self.y_origin;
-        if lx < 0.0 || lx > self.width || ly < 0.0 || ly > self.height {
-            return false;
-        }
-        let (idx, _) = self.hit_test(lx, ly);
-        self.tag_at(idx).is_some()
     }
 
     /// Override the body-text color. Used by PopPopCell for the output
@@ -479,7 +456,6 @@ impl TextBox {
             sels: self.sels.clone(),
             font_scale: self.font_scale,
             links: self.links.clone(),
-            tags: self.tags.clone(),
         }
     }
 
@@ -532,40 +508,33 @@ impl TextBox {
         }
     }
 
-    /// Mark a byte range as a `#tag` token. The range should cover the
-    /// whole `#tagname` substring (leading `#` included). Used by the
-    /// mention popup's tag-commit path and by the persistence layer's
-    /// legacy migration. Invalid ranges are silently dropped.
-    /// Rendering reads `self.tags` directly each frame (overdraw
-    /// pass), so no cache recomputation is needed here.
-    /// Drop every `TagSpan` whose covered substring is exactly
-    /// `#name`. Used by global tag-deletion (right-click "Delete
-    /// tag" in the sidebar): the user has decided this tag should
-    /// vanish, so any cell still carrying a span for it gets the
-    /// span removed. The underlying text is left alone — only the
-    /// styling/semantic span goes away. Returns whether anything
-    /// changed (so the caller can mark dirty + push undo entries
-    /// only when the operation actually mutated state).
+    /// Drop every committed-tag link span whose URL is
+    /// `kept-tag://<name>`. Used by global tag-deletion (right-click
+    /// "Delete tag" in the sidebar): the user has decided this tag
+    /// should vanish, so any cell still carrying a span for it gets
+    /// the span removed. The underlying `#text` is left alone — only
+    /// the link span / semantic marker goes away. Returns whether
+    /// anything changed (so the caller can mark dirty + push undo
+    /// entries only when the operation actually mutated state).
     pub fn remove_tags_named(&mut self, name: &str) -> bool {
-        let target = format!("#{name}");
-        let before = self.tags.len();
-        self.tags.retain(|t| {
-            if t.range.end > self.text.len() || t.range.start >= t.range.end {
-                // Stale / collapsed span: defensively keep (nothing to
-                // compare against). Won't render anyway.
-                return true;
-            }
-            self.text.get(t.range.clone()).map_or(true, |s| s != target)
-        });
-        self.tags.len() != before
+        let target = tag_url_for(name);
+        let before = self.links.len();
+        self.links.retain(|l| l.url != target);
+        self.links.len() != before
     }
 
+    /// Mark a byte range as a `#tag` token. The range should cover
+    /// the whole `#tagname` substring (leading `#` included). Used
+    /// by the mention popup's tag-commit path and by the persistence
+    /// layer's legacy migration. Invalid ranges are silently dropped.
     pub fn add_tag(&mut self, range: Range<usize>) {
         if range.start < range.end
             && range.end <= self.text.len()
             && self.text[range.clone()].starts_with('#')
         {
-            self.tags.push(TagSpan { range });
+            let name = &self.text[range.start + 1..range.end];
+            let url = tag_url_for(name);
+            self.links.push(LinkSpan { range, url });
         }
     }
 
@@ -573,14 +542,14 @@ impl TextBox {
     /// content for use as a read-only embed cache (Reference cells,
     /// envelope outline headers, the entity-page references list).
     /// Copies everything that affects how the text *renders* — text,
-    /// font scale, heading mode, link spans, tag spans — so the
-    /// cache looks identical to the source. View state (selection,
-    /// caret, drag, undo stack, layout cache) is intentionally
-    /// dropped: the cache is a separate live widget that owns its
-    /// own interaction state across frames. `scale` overrides the
-    /// source's recorded scale, since callers typically want the
-    /// cache to render at the app's current zoom level rather than
-    /// whatever the source was last rendered at.
+    /// font scale, heading mode, link spans (tag and otherwise) — so
+    /// the cache looks identical to the source. View state
+    /// (selection, caret, drag, undo stack, layout cache) is
+    /// intentionally dropped: the cache is a separate live widget
+    /// that owns its own interaction state across frames. `scale`
+    /// overrides the source's recorded scale, since callers
+    /// typically want the cache to render at the app's current zoom
+    /// level rather than whatever the source was last rendered at.
     pub fn clone_for_cache(&self, typeface: Typeface, scale: f32) -> Self {
         let mut new_tb = TextBox::new(typeface, self.text.clone());
         new_tb.set_force_heading(self.force_heading);
@@ -588,38 +557,29 @@ impl TextBox {
         for l in &self.links {
             new_tb.add_link(l.range.clone(), l.url.clone());
         }
-        for t in &self.tags {
-            new_tb.add_tag(t.range.clone());
-        }
         new_tb
     }
 
-    pub fn tags(&self) -> &[TagSpan] {
-        &self.tags
-    }
-
     /// One-shot legacy migration: scan the current text for tag-shaped
-    /// tokens and add `TagSpan`s for each. Intended for cells loaded
-    /// from a persisted blob that pre-dates span-based tags. No-op if
-    /// the textbox already has tags. Heading mode (`force_heading`)
-    /// uses the trailing-tags rule (matching `heading_tag_names`'
-    /// previous behavior); body mode uses the inline-tags rule.
+    /// tokens and add `kept-tag://` link spans for each. Intended for
+    /// cells loaded from a persisted blob that pre-dates span-based
+    /// tags. No-op if the textbox already has any kept-tag links.
+    /// Heading mode (`force_heading`) uses the trailing-tags rule
+    /// (matching `heading_tag_names`' previous behavior); body mode
+    /// uses the inline-tags rule.
     pub fn migrate_tags_from_text(&mut self) {
-        if !self.tags.is_empty() {
+        if self.links.iter().any(|l| is_kept_tag_url(&l.url)) {
             return;
         }
-        if self.force_heading {
+        let ranges = if self.force_heading {
             let heading_end = self.text.find('\n').unwrap_or(self.text.len());
-            for r in parse_heading_tags(&self.text, heading_end) {
-                if r.end > r.start + 1 {
-                    self.tags.push(TagSpan { range: r });
-                }
-            }
+            parse_heading_tags(&self.text, heading_end)
         } else {
-            for r in parse_inline_tags(&self.text) {
-                if r.end > r.start + 1 {
-                    self.tags.push(TagSpan { range: r });
-                }
+            parse_inline_tags(&self.text)
+        };
+        for r in ranges {
+            if r.end > r.start + 1 {
+                self.add_tag(r);
             }
         }
     }
@@ -627,20 +587,19 @@ impl TextBox {
     /// Distinct tag names (without the leading `#`) within the heading
     /// paragraph. Only meaningful when this TextBox is in
     /// `force_heading` mode (i.e., a cell title); plain body TextBoxes
-    /// return an empty list. Names come from `TagSpan`s — typed `#X`
-    /// without a span is NOT a tag.
+    /// return an empty list. Names come from `kept-tag://` link spans —
+    /// typed `#X` without a span is NOT a tag.
     pub fn heading_tag_names(&self) -> Vec<String> {
         if !self.force_heading {
             return Vec::new();
         }
         let heading_end = self.text.find('\n').unwrap_or(self.text.len());
         let mut out: Vec<String> = Vec::new();
-        for tag in &self.tags {
-            if tag.range.end > heading_end || tag.range.end <= tag.range.start + 1 {
+        for link in &self.links {
+            if link.range.end > heading_end || link.range.end <= link.range.start + 1 {
                 continue;
             }
-            let s = &self.text[tag.range.clone()];
-            if let Some(name) = s.strip_prefix('#') {
+            if let Some(name) = tag_name_from_url(&link.url) {
                 let name = name.to_string();
                 if !out.contains(&name) {
                     out.push(name);
@@ -652,15 +611,14 @@ impl TextBox {
 
     /// Distinct tag names anywhere in the textbox — body inline tags
     /// for plain bodies, outline bullets, and table entries. Same
-    /// span-derived rule as `heading_tag_names`.
+    /// link-span-derived rule as `heading_tag_names`.
     pub fn all_tag_names(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for tag in &self.tags {
-            if tag.range.end <= tag.range.start + 1 {
+        for link in &self.links {
+            if link.range.end <= link.range.start + 1 {
                 continue;
             }
-            let s = &self.text[tag.range.clone()];
-            if let Some(name) = s.strip_prefix('#') {
+            if let Some(name) = tag_name_from_url(&link.url) {
                 let name = name.to_string();
                 if !out.contains(&name) {
                     out.push(name);
@@ -707,6 +665,32 @@ impl TextBox {
         self.text[lo..hi].to_string()
     }
 
+    /// Same as `copy_primary_selection` but also returns the
+    /// `LinkSpan`s that fall *wholly* inside the selected range,
+    /// with their byte offsets rebased to the start of the
+    /// selection (so `span.range.start == 0` means the link
+    /// starts at the first selected character).
+    pub fn copy_primary_selection_with_links(&self) -> Option<(String, Vec<LinkSpan>)> {
+        let (anchor, head) = self.primary_caret()?;
+        if anchor == head {
+            return None;
+        }
+        let lo = anchor.min(head);
+        let hi = anchor.max(head);
+        let text = self.text[lo..hi].to_string();
+        let links: Vec<LinkSpan> = self
+            .links
+            .iter()
+            .filter(|l| l.range.start >= lo && l.range.end <= hi)
+            .map(|l| LinkSpan {
+                range: (l.range.start - lo)..(l.range.end - lo),
+                url: l.url.clone(),
+            })
+            .collect();
+        Some((text, links))
+    }
+
+
     /// Returns the cut text and removes it from the textbox via `apply_edit`
     /// (so undo records the change).
     pub fn cut_primary_selection(&mut self) -> String {
@@ -728,6 +712,44 @@ impl TextBox {
         // doesn't merge with it.
         self.break_coalesce();
         cut_text
+    }
+
+    /// Paste with explicit `LinkSpan`s carried from the clipboard.
+    /// When `links` is empty (typical for plain-text pastes from
+    /// other apps), defer to `paste()` so a bare `https://…` URL
+    /// still auto-linkifies — otherwise this path would silently
+    /// strip every link that arrives without HTML / marker
+    /// metadata. Non-empty `links` are authoritative; URL
+    /// auto-detection is skipped to avoid double-linking.
+    pub fn paste_with_links(&mut self, s: &str, links: &[LinkSpan]) {
+        if s.is_empty() {
+            return;
+        }
+        if links.is_empty() {
+            self.paste(s);
+            return;
+        }
+        let mut starts: Vec<Range<usize>> =
+            self.sels.items.iter().map(|sel| sel.range()).collect();
+        starts.sort_by_key(|r| r.start);
+        let mut insert_starts: Vec<usize> = Vec::with_capacity(starts.len());
+        let mut cum: isize = 0;
+        let s_len = s.len() as isize;
+        for r in &starts {
+            let landing = r.start as isize + cum;
+            insert_starts.push(landing.max(0) as usize);
+            cum += s_len - (r.end - r.start) as isize;
+        }
+        self.insert_text(s);
+        for &start in &insert_starts {
+            for l in links {
+                let abs = (start + l.range.start)..(start + l.range.end);
+                if abs.end <= self.text.len() && abs.start < abs.end {
+                    self.add_link(abs, l.url.clone());
+                }
+            }
+        }
+        self.break_coalesce();
     }
 
     /// Insert `s` at every cursor (replacing each cursor's selection).
@@ -784,7 +806,6 @@ impl TextBox {
         self.sels = snap.sels;
         self.font_scale = snap.font_scale;
         self.links = snap.links;
-        self.tags = snap.tags;
         self.body_lines_width = f32::NAN;
         self.mouse_drag = None;
         self.click_count = 0;
@@ -1024,51 +1045,6 @@ impl TextBox {
             }
         }
 
-        // Tag overlay: re-draw each `TagSpan` substring in the muted
-        // ghost color so tags read as metadata, not prose. Same font
-        // as the underlying line (heading_font for headings, body_font
-        // otherwise) — just an overdraw with a different paint, which
-        // is cheap and visually clean at the antialias level. Skips
-        // comment lines (PopPop colors them green and exempts them
-        // from tag semantics anyway). Driven by `TagSpan`s — typed
-        // `#X` without a span (no popup commit) is plain text.
-        let inline_tag_ranges: Vec<Range<usize>> =
-            self.tags.iter().map(|t| t.range.clone()).collect();
-        if !inline_tag_ranges.is_empty() {
-            let mut tag_dim_paint = Paint::default();
-            tag_dim_paint.set_anti_alias(true);
-            tag_dim_paint.set_color(crate::color::text_ghost());
-            for (li, line) in self.body_lines.iter().enumerate() {
-                if self.line_is_comment.get(li).copied().unwrap_or(false) {
-                    continue;
-                }
-                let line_font = if self.line_is_heading.get(li).copied().unwrap_or(false) {
-                    &heading_font
-                } else {
-                    &body_font
-                };
-                let visible_end = trim_nl_end(&self.text, line);
-                let line_text = &self.text[line.start..line.end];
-                let baseline = baselines_local[li] + y;
-                for r in &inline_tag_ranges {
-                    let s = r.start.max(line.start).min(visible_end);
-                    let e = r.end.min(visible_end);
-                    if s >= e {
-                        continue;
-                    }
-                    let prefix_w = line_font
-                        .measure_str(&line_text[..s - line.start], Some(&text_paint))
-                        .0;
-                    canvas.draw_str(
-                        &self.text[s..e],
-                        Point::new(x + prefix_w, baseline),
-                        line_font,
-                        &tag_dim_paint,
-                    );
-                }
-            }
-        }
-
         if show_caret {
             let mut caret_paint = Paint::default();
             caret_paint.set_anti_alias(false);
@@ -1228,10 +1204,6 @@ impl TextBox {
             editing && primary_mod(mods) && !mods.shift_key() && !mods.alt_key();
         let alt_open = mods.alt_key() && !mods.shift_key() && !primary_mod(mods);
         if plain_in_view || modified_in_edit || alt_open {
-            if let Some(name) = self.tag_at(idx) {
-                self.pending_tag_name = Some(name);
-                return true;
-            }
             if let Some(link) = self.link_at(idx) {
                 self.pending_link_url = Some(link.url.clone());
                 return true;
@@ -1675,25 +1647,25 @@ impl TextBox {
     }
 
     /// Replace `range` with `text` (which must start with `#`) and
-    /// mark the inserted run as a tag span. Caret lands at the end of
-    /// the inserted text. Used by the `#`-mention popup commit so the
-    /// inserted `#tagname` is recognized as a tag at save time.
+    /// mark the inserted run as a tag. Caret lands at the end of the
+    /// inserted text. Used by the `#`-mention popup commit so the
+    /// inserted `#tagname` is recognized as a tag at save time. The
+    /// span lives in `self.links` with URL `kept-tag://<name>`.
     pub fn replace_with_tag(&mut self, range: Range<usize>, text: String) {
         let start = range.start;
         let inserted_len = text.len();
         self.record_undo();
+        let stripped = text.strip_prefix('#').unwrap_or(&text).to_string();
         self.apply_edit(&Edit {
             range,
             replacement: text,
         });
         let end = start + inserted_len;
-        // Route through `add_tag` so the heading-tag layout cache
-        // gets recomputed — `apply_edit` above already ran rewrap,
-        // but with the OLD `self.tags`. Without this the new span
-        // lands in `self.tags` (sidebar sees it) but the title
-        // doesn't render with tag styling until the next rewrap.
-        if inserted_len > 0 {
-            self.add_tag(start..end);
+        if inserted_len > 0 && !stripped.is_empty() {
+            self.links.push(LinkSpan {
+                range: start..end,
+                url: tag_url_for(&stripped),
+            });
         }
         self.set_caret_at(end);
         self.break_coalesce();
@@ -1799,22 +1771,24 @@ impl TextBox {
         // typing right before or right after it produces plain text. Edits
         // inside the link still grow/shrink it; edits that fully cover it
         // leave a degenerate range and the `start < end` check drops it.
+        //
+        // `kept-tag://` spans add a substring check: if the span no
+        // longer reads `#<name>` (user edited inside it, or chopped
+        // the leading `#`), drop it so the tag no longer counts. Same
+        // policy the old TagSpan revalidation enforced — moved here
+        // so tag and link spans share storage.
+        let text_len = self.text.len();
         self.links.retain_mut(|link| {
             link.range.start = transform_index(link.range.start, start, del, ins);
             link.range.end = transform_index_closed_end(link.range.end, start, del, ins);
-            link.range.start < link.range.end
-        });
-        // Tag spans use the same closed-bound gravity as links: typing
-        // adjacent to a tag stays outside it; edits that erase the
-        // tag's text leave a degenerate range and drop. If the user
-        // backspaces away the leading `#`, the span becomes degenerate
-        // by failing the `starts_with('#')` revalidation below.
-        self.tags.retain_mut(|tag| {
-            tag.range.start = transform_index(tag.range.start, start, del, ins);
-            tag.range.end = transform_index_closed_end(tag.range.end, start, del, ins);
-            tag.range.start < tag.range.end
-                && tag.range.end <= self.text.len()
-                && self.text[tag.range.clone()].starts_with('#')
+            if link.range.start >= link.range.end || link.range.end > text_len {
+                return false;
+            }
+            if let Some(name) = tag_name_from_url(&link.url) {
+                let expected = format!("#{name}");
+                return self.text.get(link.range.clone()) == Some(expected.as_str());
+            }
+            true
         });
         self.rewrap();
     }

@@ -127,14 +127,28 @@ pub struct LinkSpan {
     pub url: String,
 }
 
-/// A `#tag` token marked for tag treatment. Pure byte range — the tag's
-/// name is the substring at `range` minus the leading `#`. Tag spans
-/// only exist when the user explicitly committed a tag through the
-/// mention popup (or when they were migrated in from legacy text on
-/// first load): typing `#X` without commit leaves no span and no tag.
-#[derive(Clone, Debug)]
-pub struct TagSpan {
-    pub range: Range<usize>,
+/// URL scheme used for committed `#tag` spans. A LinkSpan with URL
+/// `kept-tag://<name>` is how the editor marks a token as a tag — same
+/// span machinery as any other link, just routed differently at click
+/// time and rendered in the dim "ghost" color instead of the usual
+/// link-paint accent. Typing `#X` without committing through the
+/// mention popup leaves no span and no tag (matches the prior
+/// span-based tag rule).
+pub const KEPT_TAG_SCHEME: &str = "kept-tag://";
+
+#[inline]
+pub fn is_kept_tag_url(url: &str) -> bool {
+    url.starts_with(KEPT_TAG_SCHEME)
+}
+
+#[inline]
+pub fn tag_name_from_url(url: &str) -> Option<&str> {
+    url.strip_prefix(KEPT_TAG_SCHEME)
+}
+
+#[inline]
+pub fn tag_url_for(name: &str) -> String {
+    format!("{}{}", KEPT_TAG_SCHEME, name)
 }
 
 /// A point-in-time clone of a cell's document state. Used by undo/redo to
@@ -146,7 +160,6 @@ pub struct TextBoxSnapshot {
     pub sels: Selections,
     pub font_scale: f32,
     pub links: Vec<LinkSpan>,
-    pub tags: Vec<TagSpan>,
 }
 
 /// Whether the platform "primary" modifier is held — Cmd on macOS, Ctrl

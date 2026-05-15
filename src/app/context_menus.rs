@@ -444,8 +444,9 @@ impl BarContextMenu {
             action_count += 1;
         }
         action_count += 1; // Surface as reference (always)
+        action_count += 1; // Copy reference (always)
         action_count += 1; // Delete cell
-        // Separators: info | surface | snoozes | [shape (envelope/unwrap)] | delete.
+        // Separators: info | surface+copyref | snoozes | [shape (envelope/unwrap)] | delete.
         let mut separator_count: usize = 3;
         if has_shape_group {
             separator_count += 1;
@@ -534,10 +535,16 @@ impl BarContextMenu {
 
         emit_separator(&mut row_top);
 
-        // ----- Group 2: Surface as reference (always) -----
+        // ----- Group 2: Surface / Copy as reference (always) -----
         let surface_rect = emit_row(
             &mut row_top,
             "Surface as reference",
+            crate::color::text_menu_row(),
+            crate::color::embed_hover(),
+        );
+        let copy_reference_rect = emit_row(
+            &mut row_top,
+            "Copy reference",
             crate::color::text_menu_row(),
             crate::color::embed_hover(),
         );
@@ -605,6 +612,7 @@ impl BarContextMenu {
         );
 
         ctx.hit_tests.bar_menu.surface = Some(surface_rect);
+        ctx.hit_tests.bar_menu.copy_reference = Some(copy_reference_rect);
         ctx.hit_tests.bar_menu.snooze = snooze_rects;
         ctx.hit_tests.bar_menu.unsnooze = unsnooze_rect;
         ctx.hit_tests.bar_menu.envelope = envelope_rect;

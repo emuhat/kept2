@@ -940,9 +940,12 @@ struct TitleRecord {
     text: String,
     #[serde(default)]
     links: Vec<LinkRecord>,
-    /// `#tag` spans within the title. Absent in pre-span data — see
-    /// `migrate_tags_in_textbox` for the load-time backfill.
-    #[serde(default)]
+    /// Legacy field: `#tag` spans within the title. Pre-unification
+    /// data stored these as a separate vector. New writes leave it
+    /// empty — committed tags are emitted as `kept-tag://` link spans
+    /// in `links` instead. Still read on load (and translated back
+    /// into kept-tag link spans) so older databases keep working.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tags: Vec<TagRecord>,
 }
 
@@ -953,7 +956,7 @@ enum CellBody {
         text: String,
         #[serde(default)]
         links: Vec<LinkRecord>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tags: Vec<TagRecord>,
     },
     Outline {
@@ -1074,14 +1077,12 @@ fn persisted_cell_from(cell: &Cell) -> PersistedCell {
                 url: l.url.clone(),
             })
             .collect(),
-        tags: tb
-            .tags()
-            .iter()
-            .map(|t| TagRecord {
-                start: t.range.start,
-                end: t.range.end,
-            })
-            .collect(),
+        // Tags now live as `kept-tag://` link spans inside `links` —
+        // see `cell::common::KEPT_TAG_SCHEME`. The legacy `tags` field
+        // stays in the schema for older readers but is always empty
+        // on new writes (and is `skip_serializing_if = "Vec::is_empty"`,
+        // so it drops out of the JSON entirely).
+        tags: Vec::new(),
     });
     PersistedCell {
         title,
@@ -1095,15 +1096,12 @@ fn persisted_cell_from(cell: &Cell) -> PersistedCell {
 }
 
 fn cell_to_body(cell: &Cell) -> CellBody {
-    let tag_records = |tb: &TextBox| -> Vec<TagRecord> {
-        tb.tags()
-            .iter()
-            .map(|t| TagRecord {
-                start: t.range.start,
-                end: t.range.end,
-            })
-            .collect()
-    };
+    // Tags travel through `links` (URL `kept-tag://<name>`) since the
+    // tag-unification refactor. We still emit an empty `tags` field
+    // so the JSON schema stays the same shape; with
+    // `skip_serializing_if = "Vec::is_empty"` it drops out of the
+    // written JSON.
+    let tag_records = |_tb: &TextBox| -> Vec<TagRecord> { Vec::new() };
     match &cell.kind {
         CellKind::Plain(pc) => CellBody::Plain {
             text: pc.body().text().to_string(),
@@ -1377,8 +1375,27 @@ fn normalize_alias(display_name: &str) -> String {
 
 /// Names from saved span ranges; if no spans are present (legacy data
 /// or a freshly-typed `#X` that the user never committed), the result
-/// is empty — span absence means "not a tag." Falling back to a
-/// text-parse here would re-introduce the accidental-tag bug.
+/// Pull tag names out of a record's link list — any LinkRecord whose
+/// URL is `kept-tag://<name>` contributes its `<name>`. Empty tags
+/// and zero-length ranges drop. This is the post-unification path:
+/// committed tag spans share storage with regular link spans.
+fn names_from_link_records(text: &str, links: &[LinkRecord], sink: &mut dyn FnMut(String)) {
+    for l in links {
+        if l.end <= l.start + 1 || l.end > text.len() {
+            continue;
+        }
+        if let Some(name) = l.url.strip_prefix(crate::cell::KEPT_TAG_SCHEME) {
+            if !name.is_empty() {
+                sink(name.to_string());
+            }
+        }
+    }
+}
+
+/// Legacy `TagRecord` list reader. Pre-unification data carried tags
+/// as a separate vector. New writes leave `tags` empty (committed
+/// tags live in `links` as `kept-tag://` URLs), so this path only
+/// fires when reading older databases.
 fn names_from_tag_ranges(text: &str, tags: &[TagRecord], sink: &mut dyn FnMut(String)) {
     for t in tags {
         if t.end <= t.start + 1 || t.end > text.len() {
@@ -1396,6 +1413,10 @@ fn names_from_tag_ranges(text: &str, tags: &[TagRecord], sink: &mut dyn FnMut(St
 /// Strict (post-v7) reading: tags come from spans only. Used at save
 /// time. New cells where the user typed `#X` without committing
 /// produce no tag — exactly what the no-accidental-tags rule requires.
+/// Reads kept-tag `LinkRecord` URLs (the post-unification path) and
+/// also any legacy `TagRecord` entries (so newly-saved cells whose
+/// JSON happened to still carry a non-empty `tags` field from an
+/// in-flight upgrade still index correctly).
 fn tag_names_from_persisted(pc: &PersistedCell) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |name: String| {
@@ -1404,20 +1425,24 @@ fn tag_names_from_persisted(pc: &PersistedCell) -> Vec<String> {
         }
     };
     if let Some(t) = pc.title.as_ref() {
+        names_from_link_records(&t.text, &t.links, &mut |n| push(n));
         names_from_tag_ranges(&t.text, &t.tags, &mut |n| push(n));
     }
     match &pc.body {
-        CellBody::Plain { text, tags, .. } => {
+        CellBody::Plain { text, links, tags } => {
+            names_from_link_records(text, links, &mut |n| push(n));
             names_from_tag_ranges(text, tags, &mut |n| push(n));
         }
         CellBody::Outline { blocks, .. } => {
             for b in blocks {
+                names_from_link_records(&b.text, &b.links, &mut |n| push(n));
                 names_from_tag_ranges(&b.text, &b.tags, &mut |n| push(n));
             }
         }
         CellBody::Table { cells, .. } => {
             for row in cells {
                 for c in row {
+                    names_from_link_records(&c.text, &c.links, &mut |n| push(n));
                     names_from_tag_ranges(&c.text, &c.tags, &mut |n| push(n));
                 }
             }
@@ -1441,9 +1466,10 @@ fn tag_names_from_persisted_legacy(pc: &PersistedCell) -> Vec<String> {
         }
     };
     let title_names = |t: &TitleRecord, sink: &mut dyn FnMut(String)| {
+        names_from_link_records(&t.text, &t.links, sink);
         if !t.tags.is_empty() {
             names_from_tag_ranges(&t.text, &t.tags, sink);
-        } else {
+        } else if !t.links.iter().any(|l| l.url.starts_with(crate::cell::KEPT_TAG_SCHEME)) {
             let heading_end = t.text.find('\n').unwrap_or(t.text.len());
             for r in parse_trailing_tags(&t.text, heading_end) {
                 if r.end > r.start + 1 {
@@ -1452,33 +1478,35 @@ fn tag_names_from_persisted_legacy(pc: &PersistedCell) -> Vec<String> {
             }
         }
     };
-    let body_names = |text: &str, tags: &[TagRecord], sink: &mut dyn FnMut(String)| {
-        if !tags.is_empty() {
-            names_from_tag_ranges(text, tags, sink);
-        } else {
-            for r in parse_inline_tags(text) {
-                if r.end > r.start + 1 {
-                    sink(text[r.start + 1..r.end].to_string());
+    let body_names =
+        |text: &str, links: &[LinkRecord], tags: &[TagRecord], sink: &mut dyn FnMut(String)| {
+            names_from_link_records(text, links, sink);
+            if !tags.is_empty() {
+                names_from_tag_ranges(text, tags, sink);
+            } else if !links.iter().any(|l| l.url.starts_with(crate::cell::KEPT_TAG_SCHEME)) {
+                for r in parse_inline_tags(text) {
+                    if r.end > r.start + 1 {
+                        sink(text[r.start + 1..r.end].to_string());
+                    }
                 }
             }
-        }
-    };
+        };
     if let Some(t) = pc.title.as_ref() {
         title_names(t, &mut |n| push(n));
     }
     match &pc.body {
-        CellBody::Plain { text, tags, .. } => {
-            body_names(text, tags, &mut |n| push(n));
+        CellBody::Plain { text, links, tags } => {
+            body_names(text, links, tags, &mut |n| push(n));
         }
         CellBody::Outline { blocks, .. } => {
             for b in blocks {
-                body_names(&b.text, &b.tags, &mut |n| push(n));
+                body_names(&b.text, &b.links, &b.tags, &mut |n| push(n));
             }
         }
         CellBody::Table { cells, .. } => {
             for row in cells {
                 for c in row {
-                    body_names(&c.text, &c.tags, &mut |n| push(n));
+                    body_names(&c.text, &c.links, &c.tags, &mut |n| push(n));
                 }
             }
         }

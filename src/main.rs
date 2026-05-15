@@ -1,6 +1,7 @@
 mod app;
 mod attention;
 mod cell;
+mod clipboard;
 mod color;
 mod document;
 mod entity_cache;
