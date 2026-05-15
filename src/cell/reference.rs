@@ -274,6 +274,25 @@ impl super::body::CellBody for ReferenceCell {
         true
     }
 
+    /// Forward drag motion to the cache so kind-specific drag state
+    /// (outline's BulletRange promotion, table's row drag, etc.) gets
+    /// updated. The trait default only iterates per-textbox, which is
+    /// the wrong shape for multi-bullet selection inside an embedded
+    /// outline.
+    fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
+        match self.head.cache_mut() {
+            Some(cache) => cache.mouse_drag_to(abs_x, abs_y),
+            None => false,
+        }
+    }
+
+    fn mouse_up(&mut self) -> bool {
+        match self.head.cache_mut() {
+            Some(cache) => cache.mouse_up(),
+            None => false,
+        }
+    }
+
     /// Descend into the cache's textboxes (title + body). When the cache
     /// is missing (dangling target), iterate nothing — the placeholder
     /// has no editable content.
