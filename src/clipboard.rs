@@ -226,7 +226,6 @@ fn render_outline(bullets: &[BulletPayload]) -> String {
         while open_uls > target_uls {
             if has_open_li {
                 out.push_str("</li>");
-                has_open_li = false;
             }
             out.push_str("</ul>");
             open_uls -= 1;
@@ -242,7 +241,6 @@ fn render_outline(bullets: &[BulletPayload]) -> String {
         // Sibling at the current depth: close the prior <li>.
         if has_open_li {
             out.push_str("</li>");
-            has_open_li = false;
         }
         out.push_str("<li>");
         out.push_str(&render_text_with_links(&b.text, &b.links));
