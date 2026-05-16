@@ -4520,13 +4520,13 @@ impl KeptApp {
             return true;
         }
 
-        // Cmd/Ctrl+K — toggle focus on the active pane's header
-        // pill (the URL bar). When focused with empty / synced
-        // text we select-all so the next keystroke starts fresh,
-        // matching the "open Ctrl+K, start typing" feel.
+        // Cmd/Ctrl+L — toggle focus on the active pane's header
+        // pill (the URL bar). When focused with synced text we
+        // select-all so the next keystroke starts fresh, matching
+        // browser URL-bar feel.
         if event.state == ElementState::Pressed
             && primary_mod(modifiers.state())
-            && matches!(&event.logical_key, Key::Character(s) if s.as_str().eq_ignore_ascii_case("k"))
+            && matches!(&event.logical_key, Key::Character(s) if s.as_str().eq_ignore_ascii_case("l"))
         {
             let idx = self.active_pane;
             if self.panes[idx].header.focused {
