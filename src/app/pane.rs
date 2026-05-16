@@ -271,13 +271,13 @@ impl KeptApp {
             pane_rect.right,
             pane_rect.top + PANE_HEADER_H,
         );
-        // Opaque background so doc content scrolled to the top hides
-        // cleanly under the band. Same hue as the search popup's
-        // outline (`panel_border_warm`) so the navigation chrome
-        // reads as a family.
+        // Opaque background so doc content scrolled to the top
+        // hides cleanly under the band. Sourced from
+        // `pane_header_bg` so the header tone can be tuned without
+        // pulling the URL-bar dropdown border along with it.
         let mut bg = Paint::default();
         bg.set_anti_alias(true);
-        bg.set_color(crate::color::panel_border_warm());
+        bg.set_color(crate::color::pane_header_bg());
         canvas.draw_rect(band, &bg);
         // Hairline separator along the band's bottom edge.
         let mut sep = Paint::default();

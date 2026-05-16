@@ -537,6 +537,24 @@ impl OutlineCell {
         let mut bullet_y_bands: Vec<(f32, f32)> = Vec::with_capacity(self.bullets.len());
         let suppress_caret = active_indices.is_some();
         let mut cur_y = y;
+        // Bullet-range highlight is opaque — same as per-textbox
+        // selection — so the bullet content has to render ON TOP of
+        // the highlight, not beneath it. We do this in one pass:
+        // for each bullet, `layout()` first to get the height,
+        // draw the highlight if this bullet is in the active range,
+        // then draw marker + `tick()` (which re-runs `layout` but is
+        // a cheap no-op when width hasn't changed).
+        let in_active_range = |idx: usize| -> bool {
+            match active_indices {
+                Some((lo, hi)) => focused && idx >= lo && idx <= hi,
+                None => false,
+            }
+        };
+        let hl_color = if show_caret {
+            crate::color::text_selection_edit()
+        } else {
+            crate::color::text_selection_view()
+        };
         for (idx, bullet) in self.bullets.iter_mut().enumerate() {
             if !visible[idx] {
                 // Skipped (filtered out). Push a degenerate band so
@@ -549,62 +567,51 @@ impl OutlineCell {
             let depth_offset = (normalized_depth as f32) * indent_per_level;
             let marker_x = x + depth_offset + indent_per_level / 2.0;
             let marker_y = cur_y + line_height / 2.0;
+            let text_x = x + depth_offset + indent_per_level;
+            let text_w = (width - depth_offset - indent_per_level).max(40.0);
+
+            // Layout-only first so we know this bullet's height
+            // before drawing its highlight underlay.
+            bullet.textbox.layout(text_x, cur_y, text_w);
+            let h = bullet.textbox.height();
+
             // Effectively-closed bullets reach this point only when
             // `show_inactive` is on (otherwise they were filtered out
-            // above). Wrap their draw block — marker + textbox — in
-            // an alpha layer so the dim treatment composites
-            // uniformly with text, tag overdraw, and link underlines.
+            // above). Wrap their draw block — highlight + marker +
+            // textbox — in an alpha layer so the dim treatment
+            // composites uniformly with text, tag overdraw, and link
+            // underlines. The highlight participates so the row
+            // doesn't pop visually while everything else fades.
             let bullet_inactive = !effective_open[idx];
             if bullet_inactive {
                 canvas.save_layer_alpha(None, INACTIVE_ALPHA as u32);
             }
+
+            if in_active_range(idx) {
+                let mut hl_paint = Paint::default();
+                hl_paint.set_anti_alias(true);
+                hl_paint.set_color(hl_color);
+                canvas.draw_rect(Rect::new(x, cur_y, x + width, cur_y + h), &hl_paint);
+            }
+
             canvas.draw_circle((marker_x, marker_y), radius, &bullet_paint);
 
-            let text_x = x + depth_offset + indent_per_level;
-            let text_w = (width - depth_offset - indent_per_level).max(40.0);
             let is_focused_bullet = focused && bullet.id == self.focused_bullet;
             // Selection (highlight) for the active bullet whenever the cell is
             // focused. Caret only when also editing.
             let bullet_focused = is_focused_bullet && !suppress_caret;
             let bullet_show_caret = show_caret && !suppress_caret && bullet.id == self.focused_bullet;
-            let h =
-                bullet
-                    .textbox
-                    .tick(canvas, text_x, cur_y, text_w, bullet_focused, bullet_show_caret);
+            // `tick` re-runs `layout` internally; the second call is
+            // a no-op (cached lines reused when width hasn't
+            // changed) so the prelayout above is essentially free.
+            let drawn_h = bullet.textbox.tick(
+                canvas, text_x, cur_y, text_w, bullet_focused, bullet_show_caret,
+            );
             if bullet_inactive {
                 canvas.restore();
             }
-            bullet_y_bands.push((cur_y, cur_y + h));
-            cur_y += h;
-        }
-
-        // Bullet-range overlay (only when this cell is focused).
-        // Mirrors the text-selection swap in `TextBox::tick`:
-        // `show_caret` is the edit-mode tell, so the highlight hue
-        // tracks mode just like a per-bullet text drag does.
-        if focused {
-            if let Some((lo, hi)) = active_indices {
-                let mut hl_paint = Paint::default();
-                hl_paint.set_anti_alias(true);
-                // Match the alpha bullet-range view-mode uses
-                // (`accent_blue_selection` bakes in 0x40) so the
-                // mode delta is purely hue, not opacity. Note this
-                // is a different alpha than the per-textbox path
-                // (0x60) — that's a pre-existing convention from
-                // `accent_blue_selection`, kept for visual parity
-                // with the mention popup / sidebar row highlights.
-                let hl_color = if show_caret {
-                    crate::color::text_selection_edit_alpha(0x40)
-                } else {
-                    crate::color::accent_blue_selection()
-                };
-                hl_paint.set_color(hl_color);
-                for i in lo..=hi {
-                    if let Some(&(top, bot)) = bullet_y_bands.get(i) {
-                        canvas.draw_rect(Rect::new(x, top, x + width, bot), &hl_paint);
-                    }
-                }
-            }
+            bullet_y_bands.push((cur_y, cur_y + drawn_h));
+            cur_y += drawn_h;
         }
 
         self.height = cur_y - y;

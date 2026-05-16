@@ -106,14 +106,9 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
     bg_paint.set_anti_alias(true);
     bg_paint.set_color(crate::color::bg_panel());
     canvas.draw_rect(Rect::new(0.0, 0.0, sb_w, height.max(0.0)), &bg_paint);
-    // Right-edge separator.
-    let mut sep = Paint::default();
-    sep.set_anti_alias(false);
-    sep.set_color(crate::color::divider_pane());
-    canvas.draw_rect(
-        Rect::new(sb_w - 1.0, 0.0, sb_w, height.max(0.0)),
-        &sep,
-    );
+    // (No right-edge separator — the sidebar's `bg_panel` and the
+    // pane's white card already provide enough contrast at the
+    // seam, and a colored 1px stripe was visually noisy.)
 
     // Everything below the bg + edge separator scrolls together
     // under `sidebar_scroll.scroll_y`. Clip so off-screen rows
