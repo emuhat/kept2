@@ -4158,75 +4158,63 @@ impl KeptApp {
         let rec_canvas = recorder.begin_recording(rec_bounds, None);
         let mut focused_geom: Option<FocusedCellGeom> = None;
 
-        // Precompute per-cell visibility and section headers so the
-        // mutable cell loop below doesn't have to re-borrow self. The
-        // Cell(_) view already filters to a single id via
-        // `is_visible_for_view`; nothing special needed here.
-        let visible: Vec<bool> = {
-            let match_ctx = self.match_context();
-            self.document.cells
-                .iter()
-                .map(|c| self.is_visible_for_view(c, &match_ctx))
-                .collect()
-        };
-        // Headers are aligned to self.document.cells indices but computed in DISPLAY
-        // order (descending) so a header lands above the first cell of each
+        // Precompute per-cell visibility and section headers in a
+        // single descending walk. Cells are stored ascending in
+        // `document.cells`; rendering iterates descending (newest
+        // first), so a header lands above the first cell of each
         // group as the user scrolls top-down.
         //
-        // Date view groups by context (multiple contexts can land in one day).
-        // Any other AST view (tag, search query, multi-filter, free-text)
-        // groups by local date since cells can span days. Context view and
-        // focus mode have no inter-group headers.
+        // Date view groups by context (multiple contexts can land in
+        // one day). Any other AST view (tag, search query,
+        // multi-filter, free-text) groups by local date. Context view
+        // and the single-cell view have no inter-group headers.
         #[derive(PartialEq, Eq)]
         enum HeaderMode {
             ByContext,
             ByDate,
             None,
         }
-        let header_mode = if !matches!(self.pane_mut().view.view_kind, ViewKind::Ast) {
+        let view_ref = &self.pane().view;
+        let header_mode = if !matches!(view_ref.view_kind, ViewKind::Ast) {
             HeaderMode::None
         } else if matches!(
-            self.pane_mut().view.ast.include.time,
+            view_ref.ast.include.time,
             Some(query::TimeFilter::Day(_))
-        ) && self.pane_mut().view.ast.include.tags.is_empty()
-            && self.pane_mut().view.ast.include.entities.is_empty()
-            && self.pane_mut().view.ast.exclude.tags.is_empty()
-            && self.pane_mut().view.ast.exclude.entities.is_empty()
-            && self.pane_mut().view.ast.text.is_empty()
+        ) && view_ref.ast.include.tags.is_empty()
+            && view_ref.ast.include.entities.is_empty()
+            && view_ref.ast.exclude.tags.is_empty()
+            && view_ref.ast.exclude.entities.is_empty()
+            && view_ref.ast.text.is_empty()
         {
-            // Pure date view — show context-section headers within the day.
             HeaderMode::ByContext
         } else {
-            // Tag / search / multi-filter — group by date across the result set.
             HeaderMode::ByDate
         };
-        let headers: Vec<Option<String>> = if header_mode == HeaderMode::None {
-            vec![None; self.document.cells.len()]
-        } else {
-            let mut hs: Vec<Option<String>> = vec![None; self.document.cells.len()];
-            let mut last_label: Option<String> = None;
-            for i in (0..self.document.cells.len()).rev() {
-                if !visible[i] {
-                    continue;
-                }
-                let cell = &self.document.cells[i];
-                let label: String = match header_mode {
-                    HeaderMode::ByContext => self
-                        .context_for_timestamp(cell.timestamp)
-                        .map(|c| format_context_time(c.start_time))
-                        .unwrap_or_default(),
-                    HeaderMode::ByDate => {
-                        format_date_label(local_date_for_ms(cell.timestamp))
-                    }
-                    HeaderMode::None => unreachable!(),
-                };
-                if last_label.as_deref() != Some(label.as_str()) {
-                    last_label = Some(label.clone());
-                    hs[i] = Some(label);
-                }
+        let total_cells = self.document.cells.len();
+        let match_ctx = self.match_context();
+        let mut visible: Vec<bool> = vec![false; total_cells];
+        let mut headers: Vec<Option<String>> = vec![None; total_cells];
+        let mut last_label: Option<String> = None;
+        for i in (0..total_cells).rev() {
+            let cell = &self.document.cells[i];
+            let v = self.is_visible_for_view(cell, &match_ctx);
+            visible[i] = v;
+            if !v || header_mode == HeaderMode::None {
+                continue;
             }
-            hs
-        };
+            let label: String = match header_mode {
+                HeaderMode::ByContext => self
+                    .context_for_timestamp(cell.timestamp)
+                    .map(|c| format_context_time(c.start_time))
+                    .unwrap_or_default(),
+                HeaderMode::ByDate => format_date_label(local_date_for_ms(cell.timestamp)),
+                HeaderMode::None => unreachable!(),
+            };
+            if last_label.as_deref() != Some(label.as_str()) {
+                last_label = Some(label.clone());
+                headers[i] = Some(label);
+            }
+        }
 
         let header_font = Font::from_typeface(
             &self.typeface,
@@ -4236,11 +4224,49 @@ impl KeptApp {
         let header_h = CONTEXT_HEADER_H * scale;
         let header_pad_top = CONTEXT_HEADER_PAD_TOP * scale;
 
+        // Viewport culling: only cells whose vertical band overlaps
+        // `[viewport_top, viewport_bot]` get fully rendered. Cells
+        // outside that band re-use their previously-cached
+        // `cell.height()` to advance `y` and to refresh
+        // `cell.set_view_geometry`, but skip the expensive `cell.tick`
+        // / `render_reference_cell` / bar+outline drawing. The slack
+        // half-viewport above and below absorbs a fast scroll without
+        // exposing blank space for a frame. Cells with no cached
+        // height (just inserted, view just switched) bypass the cull
+        // and render eagerly; the focused cell also bypasses so its
+        // `FocusedCellGeom` is always captured.
+        let scroll_y = self.pane().scroll_y;
+        let body_viewport_h = (layout.pane_h - PANE_HEADER_H).max(0.0);
+        let cull_slack = body_viewport_h * 0.5;
+        let viewport_top = scroll_y - cull_slack;
+        let viewport_bot = scroll_y + body_viewport_h + cull_slack;
+
         // Render cells newest-first (descending) — index walked in reverse so
         // self.document.cells (asc) iterates from end to start.
-        let total_cells = self.document.cells.len();
         for i in (0..total_cells).rev() {
             if !visible[i] {
+                continue;
+            }
+            let cached_h = self.document.cells[i].height();
+            let header_advance = if headers[i].is_some() { header_h } else { 0.0 };
+            let cell_top_doc = y + header_advance;
+            let cell_bot_doc = cell_top_doc + cached_h;
+            let in_viewport = cell_bot_doc >= viewport_top && cell_top_doc <= viewport_bot;
+            let cell_is_focused_now = focused_id == Some(self.document.cells[i].id);
+            let can_skip = cached_h > 0.0 && !in_viewport && !cell_is_focused_now;
+            if can_skip {
+                // Refresh the cell's recorded geometry (y may have
+                // shifted from prior frames as content above grew /
+                // shrank) so hit-tests and embed lookups stay
+                // accurate even without a full tick.
+                let cell_y_skip = y + header_advance;
+                self.document.cells[i].set_view_geometry(
+                    body_x,
+                    cell_y_skip,
+                    body_w,
+                    cached_h,
+                );
+                y += header_advance + cached_h + CELL_GAP;
                 continue;
             }
             if let Some(label) = &headers[i] {
