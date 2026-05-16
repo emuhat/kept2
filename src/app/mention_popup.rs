@@ -78,7 +78,10 @@ impl MentionKind {
 #[derive(Clone, Copy)]
 enum MentionSource {
     Cell { cell_id: Uuid, bullet_id: Option<Uuid> },
-    SearchBar,
+    /// The pane's URL-bar pill (replaces the old standalone
+    /// Ctrl+K popup). `pane_idx` is the pane the focused header
+    /// belongs to.
+    PaneHeader { pane_idx: usize },
 }
 
 /// Subsequence fuzzy match. Returns `(score, matched_byte_positions)` if every
@@ -486,16 +489,14 @@ impl KeptApp {
 
     pub(super) fn try_open_mention_popup(&mut self, kind: MentionKind) {
         let trigger = kind.trigger();
-        // Prefer the search bar when it has the keyboard focus — typing in
-        // the popup never goes through cell.handle_key, so the cell-source
-        // path would be a no-op here.
-        if let Some(state) = self.search.as_ref() {
-            let text = state.input.text();
-            let caret = state
-                .input
-                .primary_caret()
-                .map(|(_, h)| h)
-                .unwrap_or(0);
+        // Prefer the focused pane header when it has the keyboard
+        // focus — typing in the URL-bar pill never goes through
+        // cell.handle_key, so the cell-source path would be a no-op
+        // here.
+        if let Some(idx) = self.panes.iter().position(|p| p.header.focused) {
+            let tb = &self.panes[idx].header.textbox;
+            let text = tb.text();
+            let caret = tb.primary_caret().map(|(_, h)| h).unwrap_or(0);
             if caret == 0 {
                 return;
             }
@@ -503,7 +504,7 @@ impl KeptApp {
                 return;
             }
             self.mention_popup = Some(MentionPopup {
-                source: MentionSource::SearchBar,
+                source: MentionSource::PaneHeader { pane_idx: idx },
                 kind,
                 anchor_byte: caret - 1,
                 query: String::new(),
@@ -573,10 +574,14 @@ impl KeptApp {
                     None
                 }
             }
-            MentionSource::SearchBar => self.search.as_ref().and_then(|s| {
-                let caret = s.input.primary_caret().map(|(_, h)| h)?;
-                Some((s.input.text().to_string(), caret))
-            }),
+            MentionSource::PaneHeader { pane_idx } => self
+                .panes
+                .get(pane_idx)
+                .filter(|p| p.header.focused)
+                .and_then(|p| {
+                    let caret = p.header.textbox.primary_caret().map(|(_, h)| h)?;
+                    Some((p.header.textbox.text().to_string(), caret))
+                }),
         };
         let Some((text, caret)) = cur else {
             self.mention_popup = None;
@@ -646,12 +651,13 @@ impl KeptApp {
                 let scroll_y = self.panes[self.active_pane].scroller.scroll_y;
                 (x, y - scroll_y)
             }
-            MentionSource::SearchBar => {
-                let Some(state) = self.search.as_ref() else { return };
-                let Some((x, _)) = state.input.doc_position_of_byte(anchor_byte) else {
+            MentionSource::PaneHeader { pane_idx } => {
+                let Some(pane) = self.panes.get(pane_idx) else { return };
+                let tb = &pane.header.textbox;
+                let Some((x, _)) = tb.doc_position_of_byte(anchor_byte) else {
                     return;
                 };
-                let Some((_, bot)) = state.input.line_y_band_of_byte(anchor_byte) else {
+                let Some((_, bot)) = tb.line_y_band_of_byte(anchor_byte) else {
                     return;
                 };
                 (x, bot)
@@ -824,7 +830,7 @@ impl KeptApp {
                     }
                 }
             }
-            MentionSource::SearchBar => {
+            MentionSource::PaneHeader { .. } => {
                 // Replace `@<query>` with `@<Title_Cased_With_Underscores>`
                 // so the resulting query string is readable and parses
                 // cleanly (entity tokens can't contain whitespace). The
@@ -879,7 +885,7 @@ impl KeptApp {
                     }
                 }
             }
-            MentionSource::SearchBar => {
+            MentionSource::PaneHeader { .. } => {
                 self.replace_search_or_cell_text(source, start, end, replacement);
             }
         }
@@ -887,7 +893,7 @@ impl KeptApp {
 
     /// Plain-text replacement of `[start..end]` with `replacement` in
     /// whichever source the popup was anchored on. Records an undo edit
-    /// for cell sources; mutates the search input directly otherwise.
+    /// for cell sources; mutates the URL-bar pill's textbox otherwise.
     fn replace_search_or_cell_text(
         &mut self,
         source: MentionSource,
@@ -914,19 +920,18 @@ impl KeptApp {
                     }
                 }
             }
-            MentionSource::SearchBar => {
-                if let Some(state) = self.search.as_mut() {
-                    let txt = state.input.text();
+            MentionSource::PaneHeader { pane_idx } => {
+                if let Some(pane) = self.panes.get_mut(pane_idx) {
+                    let tb = &mut pane.header.textbox;
+                    let txt = tb.text();
                     if start <= txt.len() && end <= txt.len() {
                         let prefix = &txt[..start];
                         let suffix = &txt[end..];
                         let new_text = format!("{prefix}{replacement}{suffix}");
-                        state.input.replace_text(new_text);
-                        state
-                            .input
-                            .set_caret_at(start + replacement.len());
+                        tb.replace_text(new_text);
+                        tb.set_caret_at(start + replacement.len());
                     }
-                    state.selected = 0;
+                    pane.header.selected = 0;
                 }
             }
         }

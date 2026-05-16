@@ -1,270 +1,25 @@
-use skia_safe::{
-    BlurStyle, Canvas, Font, MaskFilter, Paint, PaintStyle, Point, Rect, Typeface,
-};
+//! Search executor: free functions used by the pane URL-bar pill
+//! to populate its suggestion dropdown. Pre-pill this module also
+//! owned a standalone Ctrl+K popup (`SearchState`); now the pill
+//! plays that role and only the search executor + result-snippet
+//! helpers live here.
+
 use uuid::Uuid;
 
-use crate::cell::{Cell, TextBox, now_epoch_ms};
+use crate::cell::{Cell, now_epoch_ms};
 use crate::document::Document;
 use crate::entity_cache::EntityCache;
 use crate::query;
 
-use super::{HitTestState, KeptApp, Query, fit_text_ellipsized, format_date_label, local_date_for_ms};
+use super::local_date_for_ms;
 
-/// Per-frame context the search render path needs from `KeptApp`.
-/// Pure data slice — `SearchState::render` takes this instead of
-/// reaching into the whole app (S8: explicit subsystem scope).
-pub(super) struct SearchRenderCtx<'a> {
-    pub(super) font_scale: f32,
-    pub(super) typeface: &'a Typeface,
-    pub(super) document: &'a Document,
-    pub(super) entities: &'a EntityCache,
-    pub(super) show_inactive_cells: bool,
-    /// True while the @-mention popup is showing. Render skips the
-    /// per-frame `search_results` recompute in that case so the result
-    /// list doesn't churn on every keystroke of the in-progress
-    /// `@<query>` token; the cached results from `SearchState` are
-    /// shown instead.
-    pub(super) mention_popup_active: bool,
-    /// Per-frame hit-test write surface (see S2).
-    pub(super) hit_tests: &'a mut HitTestState,
-}
-
-/// Search popup (Ctrl/Cmd+K).
-const SEARCH_WIDTH: f32 = 520.0;
-const SEARCH_TOP: f32 = 48.0;
-const SEARCH_PAD: f32 = 12.0;
-const SEARCH_RADIUS: f32 = 8.0;
-const SEARCH_INPUT_H: f32 = 36.0;
-const SEARCH_INPUT_FONT_SIZE: f32 = 16.0;
-const SEARCH_RESULT_H: f32 = 32.0;
-const SEARCH_RESULT_FONT_SIZE: f32 = 13.0;
-const SEARCH_DATE_FONT_SIZE: f32 = 12.0;
-const SEARCH_MAX_VISIBLE: usize = 8;
 const SEARCH_SNIPPET_LEN: usize = 80;
 
-pub(super) struct SearchState {
-    pub(super) input: TextBox,
-    /// Index of the highlighted result row. Reset to 0 on text change.
-    pub(super) selected: usize,
-    /// Result list from the last render where the @-mention popup was
-    /// closed. While the user is mid-pick (mention popup open), we keep
-    /// showing these so the search-popup result list doesn't churn on
-    /// every keystroke of the in-progress `@<query>` token.
-    pub(super) cached_results: Vec<Uuid>,
-}
-
-impl SearchState {
-    pub(super) fn new(typeface: Typeface, font_scale: f32) -> Self {
-        let mut input = TextBox::new(typeface, String::new());
-        input.set_font_scale(font_scale);
-        Self {
-            input,
-            selected: 0,
-            cached_results: Vec::new(),
-        }
-    }
-
-    pub(super) fn render(
-        &mut self,
-        canvas: &Canvas,
-        width: f32,
-        ctx: &mut SearchRenderCtx<'_>,
-    ) {
-        let scale = ctx.font_scale;
-        let pad = SEARCH_PAD * scale;
-        let radius = SEARCH_RADIUS * scale;
-        let popup_w = (SEARCH_WIDTH * scale).min(width - pad * 2.0).max(200.0);
-        let popup_x = (width - popup_w) * 0.5;
-        let popup_y = SEARCH_TOP * scale;
-
-        let input_h = SEARCH_INPUT_H * scale;
-        let result_h = SEARCH_RESULT_H * scale;
-        let query = self.input.text().to_string();
-        // Only recompute results when the @-mention popup is closed —
-        // otherwise the in-progress `@<query>` token would churn the list
-        // on every keystroke. Cache survives until the mention popup
-        // closes (commit or cancel), at which point the next render
-        // refreshes against the now-final query text.
-        let results: Vec<Uuid> = if !ctx.mention_popup_active {
-            let fresh =
-                search_results(&query, ctx.document, ctx.entities, ctx.show_inactive_cells);
-            self.cached_results = fresh.clone();
-            fresh
-        } else {
-            self.cached_results.clone()
-        };
-        let visible = results.len().min(SEARCH_MAX_VISIBLE);
-        let popup_h = input_h + (visible as f32) * result_h + pad * 2.0;
-
-        // Drop shadow.
-        let mut shadow = Paint::default();
-        shadow.set_anti_alias(true);
-        shadow.set_color(crate::color::shadow_menu());
-        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 14.0, false));
-        canvas.draw_round_rect(
-            Rect::new(popup_x, popup_y + 4.0, popup_x + popup_w, popup_y + popup_h + 4.0),
-            radius,
-            radius,
-            &shadow,
-        );
-
-        // Background card.
-        let mut bg = Paint::default();
-        bg.set_anti_alias(true);
-        bg.set_color(crate::color::bg_card());
-        let card = Rect::new(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h);
-        canvas.draw_round_rect(card, radius, radius, &bg);
-
-        let mut border = Paint::default();
-        border.set_anti_alias(true);
-        border.set_style(PaintStyle::Stroke);
-        border.set_stroke_width(2.0);
-        border.set_color(crate::color::panel_border_warm());
-        canvas.draw_round_rect(card, radius, radius, &border);
-
-        // Input row: drive the TextBox directly so caret, selection, arrow
-        // nav, word jumps, and line edges all work natively.
-        let input_x = popup_x + pad;
-        let input_y = popup_y + pad;
-        let input_w = popup_w - pad * 2.0;
-        self.input.tick(canvas, input_x, input_y, input_w, true, true);
-        ctx.hit_tests.search.input = Some(Rect::new(
-            input_x,
-            input_y,
-            input_x + input_w,
-            input_y + input_h - SEARCH_PAD * scale,
-        ));
-
-        // Placeholder text rendered ON TOP only when the input is empty.
-        if query.is_empty() {
-            let input_font =
-                Font::from_typeface(ctx.typeface, SEARCH_INPUT_FONT_SIZE * scale);
-            let (_, im) = input_font.metrics();
-            let baseline = input_y + (-im.ascent);
-            let mut hint = Paint::default();
-            hint.set_anti_alias(true);
-            hint.set_color(crate::color::text_ghost_warm());
-            canvas.draw_str(
-                "Search…",
-                Point::new(input_x, baseline),
-                &input_font,
-                &hint,
-            );
-        }
-
-        // Divider between input and results.
-        let div_y = popup_y + pad + input_h - 4.0 * scale;
-        let mut div = Paint::default();
-        div.set_anti_alias(false);
-        div.set_color(crate::color::toggle_inactive_bg());
-        canvas.draw_line(
-            (popup_x + pad, div_y),
-            (popup_x + popup_w - pad, div_y),
-            &div,
-        );
-
-        // Result rows.
-        let result_font =
-            Font::from_typeface(ctx.typeface, SEARCH_RESULT_FONT_SIZE * scale);
-        let date_font =
-            Font::from_typeface(ctx.typeface, SEARCH_DATE_FONT_SIZE * scale);
-        let (_, rm) = result_font.metrics();
-        let mut date_paint = Paint::default();
-        date_paint.set_anti_alias(true);
-        date_paint.set_color(crate::color::text_muted_warm_soft());
-        let mut row_paint = Paint::default();
-        row_paint.set_anti_alias(true);
-        row_paint.set_color(crate::color::text_primary());
-
-        let selected = self.selected;
-        let mut row_y = popup_y + pad + input_h;
-        for (i, &id) in results.iter().take(SEARCH_MAX_VISIBLE).enumerate() {
-            let is_selected = i == selected.min(visible.saturating_sub(1));
-            if is_selected {
-                let mut sel = Paint::default();
-                sel.set_anti_alias(true);
-                sel.set_color(crate::color::accent_blue_selection());
-                canvas.draw_rect(
-                    Rect::new(
-                        popup_x + pad * 0.5,
-                        row_y,
-                        popup_x + popup_w - pad * 0.5,
-                        row_y + result_h,
-                    ),
-                    &sel,
-                );
-            }
-
-            if let Some(cell) = ctx.document.cell(id) {
-                let date_label = format_date_label(local_date_for_ms(cell.timestamp));
-                let baseline = row_y + (result_h + (-rm.ascent) - rm.descent) * 0.5;
-                let date_w = date_font
-                    .measure_str(&date_label, Some(&date_paint))
-                    .0;
-                canvas.draw_str(
-                    &date_label,
-                    Point::new(popup_x + pad, baseline),
-                    &date_font,
-                    &date_paint,
-                );
-                let snippet = result_snippet(&cell.full_text(), &query);
-                // Truncate to fit the row's remaining width (right
-                // edge inset by `pad * 0.5` to match the highlight
-                // bg). Otherwise long snippets overflow the popup
-                // border into nothingness.
-                let snippet_left = popup_x + pad + date_w + 12.0 * scale;
-                let snippet_right = popup_x + popup_w - pad * 0.5;
-                let avail = (snippet_right - snippet_left).max(0.0);
-                let fitted =
-                    fit_text_ellipsized(&snippet, avail, &result_font, &row_paint);
-                canvas.draw_str(
-                    &fitted,
-                    Point::new(snippet_left, baseline),
-                    &result_font,
-                    &row_paint,
-                );
-            }
-            row_y += result_h;
-        }
-
-        if visible == 0 && !query.trim().is_empty() {
-            let baseline = popup_y + pad + input_h + (result_h + (-rm.ascent) - rm.descent) * 0.5;
-            let mut empty_paint = Paint::default();
-            empty_paint.set_anti_alias(true);
-            empty_paint.set_color(crate::color::text_section_header());
-            canvas.draw_str(
-                "no matches",
-                Point::new(popup_x + pad, baseline),
-                &result_font,
-                &empty_paint,
-            );
-        }
-    }
-
-    /// Move the highlight up/down within the current result list.
-    /// `delta = -1` is up, `+1` is down. Wraps modulo result count.
-    pub(super) fn move_selection(
-        &mut self,
-        delta: i32,
-        document: &Document,
-        entities: &EntityCache,
-        show_inactive_cells: bool,
-    ) {
-        let query = self.input.text().to_string();
-        let results = search_results(&query, document, entities, show_inactive_cells);
-        let count = results.len().min(SEARCH_MAX_VISIBLE);
-        if count == 0 {
-            return;
-        }
-        let cur = self.selected.min(count - 1) as i32;
-        self.selected = ((cur + delta).rem_euclid(count as i32)) as usize;
-    }
-}
-
-/// Top-N matching cell IDs for the popup result list. Parses `query`
-/// through the language, runs the executor, and sorts most-recent first.
-/// Free function (not a method on KeptApp) — the search subsystem owns
-/// it and renders / commit / move-selection all call here.
+/// Top-N matching cell IDs for the suggestion dropdown. Parses
+/// `query` through the language, runs the executor, and sorts
+/// most-recent first. Free function so anyone who needs cell search
+/// (URL-bar dropdown today; previously the Ctrl+K popup) can call
+/// it without owning an input.
 pub(super) fn search_results(
     query: &str,
     document: &Document,
@@ -288,13 +43,11 @@ pub(super) fn search_results(
             &entities.title_fallback,
         ),
     };
-    // Inactive cells drop out of search results unless the global
-    // "Show archived" toggle is on, mirroring the visibility gate in
-    // `is_visible_for_view`. Otherwise an archived cell could surface
-    // here, the user clicks it, and navigates to a date view that has
-    // it filtered out — a dead-end click. Bullet-level cascade isn't
-    // applied (search returns whole cells; the cell-level gate is
-    // enough).
+    // Inactive cells drop out of search unless the global "Show
+    // archived" toggle is on, mirroring `is_visible_for_view`.
+    // Otherwise an archived cell could surface here, the user clicks
+    // it, and navigates to a single-cell view that has it filtered
+    // out — a dead-end click.
     let mut hits: Vec<&Cell> = document
         .cells
         .iter()
@@ -304,102 +57,12 @@ pub(super) fn search_results(
     hits.into_iter().map(|c| c.id).collect()
 }
 
-impl KeptApp {
-    pub(super) fn render_search_popup(&mut self, canvas: &Canvas, width: f32) {
-        let mention_popup_active = self.mention_popup.is_some();
-        let Some(state) = self.search.as_mut() else {
-            return;
-        };
-        let mut ctx = SearchRenderCtx {
-            font_scale: self.font_scale,
-            typeface: &self.typeface,
-            document: &self.document,
-            entities: &self.entities,
-            show_inactive_cells: self.show_inactive_cells,
-            mention_popup_active,
-            hit_tests: &mut self.hit_tests_builder,
-        };
-        state.render(canvas, width, &mut ctx);
-    }
-
-    pub(super) fn open_search(&mut self) {
-        if self.search.is_some() {
-            return;
-        }
-        self.search = Some(SearchState::new(self.typeface.clone(), self.font_scale));
-        // Drop other transient overlays so they don't compete for input.
-        self.mention_popup = None;
-        self.cell_context_menu = None;
-    }
-
-    pub(super) fn close_search_cancel(&mut self) {
-        if self.search.take().is_some() {
-            // Doc area was never replaced; nothing to restore.
-            self.pane_mut().coalesce_break = true;
-        }
-    }
-
-    /// Enter on the search popup: jump to the highlighted result. View
-    /// becomes that cell's date and the cell is focused. Empty / no-match
-    /// input just closes the popup.
-    pub(super) fn close_search_commit(&mut self, in_other_pane: bool) {
-        let Some(state) = self.search.take() else { return };
-        let query = state.input.text().to_string();
-        let results = search_results(
-            &query,
-            &self.document,
-            &self.entities,
-            self.show_inactive_cells,
-        );
-        let Some(&id) = results.get(state.selected) else {
-            self.pane_mut().coalesce_break = true;
-            return;
-        };
-        if self.cell(id).is_some() {
-            // Track the destination pane so the cell-focus / scroll
-            // step lands there, since `open_in_other_pane` preserves
-            // the *active* pane (the user expects their typing focus
-            // to stay where they were searching from). Cell-search
-            // commits land on a single-cell view, not the cell's
-            // owning timeline — the user wanted "just this cell,"
-            // not "this cell in context of its date."
-            let dest_pane = if in_other_pane {
-                self.open_in_other_pane(Query::cell(id))
-            } else if self.push_view(Query::cell(id)) {
-                Some(self.active_pane)
-            } else {
-                Some(self.active_pane)
-            };
-            if let Some(idx) = dest_pane {
-                let pane = &mut self.panes[idx];
-                pane.focused = Some(id);
-                pane.editing = false;
-                pane.coalesce_break = true;
-                pane.pending_caret_scroll = true;
-                return;
-            }
-        }
-        // Fallback (cell vanished): no focus changes; just break
-        // coalesce so the next edit starts a fresh undo entry.
-        self.pane_mut().coalesce_break = true;
-    }
-
-    pub(super) fn search_move(&mut self, delta: i32) {
-        if let Some(state) = self.search.as_mut() {
-            state.move_selection(
-                delta,
-                &self.document,
-                &self.entities,
-                self.show_inactive_cells,
-            );
-        }
-    }
-}
-
-fn result_snippet(text: &str, query: &str) -> String {
+/// Build a result-row snippet centered on the residual text portion
+/// of `query` (so `#tag` / `@person` / time tokens don't drive
+/// centering). Falls back to the head of the cell text when the
+/// residual is empty.
+pub(super) fn result_snippet(text: &str, query: &str) -> String {
     let flat: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
-    // Pull the residual-text tail out of the parsed AST so structured
-    // tokens (#tag / @person / today / dates) don't drive snippet centering.
     let residual = query::parse(query).text;
     let lower = flat.to_lowercase();
     let needle = residual.to_lowercase();

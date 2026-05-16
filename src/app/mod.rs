@@ -4,8 +4,7 @@ use std::time::{Duration, Instant};
 use arboard::Clipboard;
 use uuid::{Uuid, uuid};
 use skia_safe::{
-    BlurStyle, Canvas, Font, FontMgr, MaskFilter, Paint, PaintStyle, PathEffect, Point,
-    Rect, Typeface,
+    Canvas, Font, FontMgr, Paint, PaintStyle, PathEffect, Point, Rect, Typeface,
 };
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
@@ -24,16 +23,22 @@ mod context_menus;
 mod mention_popup;
 mod search;
 mod sidebar;
+mod pane;
+use pane::{FocusedCellGeom, PANE_HEADER_H, PaneLayout};
+
 use context_menus::{
     BarContextMenu, CellContextMenu, MenuRenderCtx, PeopleContextMenu, TagContextMenu,
 };
 use mention_popup::{MentionKind, MentionPopup};
-use search::SearchState;
 
 const FONT_BYTES: &[u8] = include_bytes!("../../resources/fonts/Figtree.ttf");
 
 const MARGIN_X: f32 = 20.0;
-const MARGIN_TOP: f32 = 20.0;
+/// Top inset for body content inside a pane. Bakes in
+/// `pane::PANE_HEADER_H` so cells start below the URL-bar header
+/// (the header is drawn as a window-space overlay in `tick_pane`
+/// and doesn't otherwise consume layout).
+const MARGIN_TOP: f32 = PANE_HEADER_H + 20.0;
 const CELL_GAP: f32 = 25.0;
 /// Outer padding around the focused cell in focus mode (Ctrl+F). Smaller
 /// than `MARGIN_X` so the cell really feels "kinda fullscreen."
@@ -119,7 +124,6 @@ struct HitTestState {
     bar_menu: BarMenuHits,
     tag_menu: TagMenuHits,
     people_menu: PeopleMenuHits,
-    search: SearchHits,
     entity_page: EntityPageHits,
     people_page: PeoplePageHits,
     mention_popup: MentionPopupHits,
@@ -128,6 +132,14 @@ struct HitTestState {
     /// click target and the anchor for the bar context menu
     /// (Delete, info, cell-level Snooze).
     cell_bars: Vec<(Uuid, Rect)>,
+    /// Per-pane URL-bar pill rect (window coords), populated by
+    /// `render_pane_header`. Clicks on this rect focus the pane's
+    /// `header.textbox` for editing.
+    pane_headers: Vec<(usize, Rect)>,
+    /// Per-pane result-row rects for the URL-bar dropdown.
+    /// `header_results[i] = (pane_idx, rects)` where the index into
+    /// `rects` matches `pane.header.cached_results[i]`.
+    header_results: Vec<(usize, Vec<Rect>)>,
 }
 
 #[derive(Default)]
@@ -250,12 +262,6 @@ struct PeopleMenuHits {
     delete: Option<Rect>,
 }
 
-#[derive(Default)]
-struct SearchHits {
-    /// Search-popup input rect (window coords). `Some` only while the
-    /// popup is open; routes clicks into the search `TextBox`.
-    input: Option<Rect>,
-}
 
 #[derive(Default)]
 struct MentionPopupHits {
@@ -292,44 +298,6 @@ struct PeoplePageHits {
     add: Option<Rect>,
     /// "Show inactive" toggle rect.
     show_inactive_toggle: Option<Rect>,
-}
-
-/// Per-pane window-space + doc-space geometry computed once per frame
-/// by `prepare_pane_layout`. Every sub-render-pass inside `tick_pane`
-/// takes this by reference; nothing in here is mutated after the
-/// `prepare_pane_layout` call returns.
-struct PaneLayout {
-    /// Pane index in `KeptApp::panes`. Currently unused by the sub-render
-    /// passes (they read state via Deref-to-active-pane), but kept for
-    /// future passes that need to address the pane explicitly without
-    /// relying on `active_pane` being swapped.
-    #[allow(dead_code)]
-    pane_idx: usize,
-    pane_rect: Rect,
-    pane_h: f32,
-    /// Left edge of the cell column (after MARGIN_X or FOCUS_MODE_PAD).
-    cells_left: f32,
-    /// Outer width of a cell card (used as the right edge for the
-    /// section-header rule).
-    outer_cell_width: f32,
-    /// Usable content width inside a cell card.
-    content_width: f32,
-}
-
-/// Doc-space rectangle for the focused cell. Used by the card backdrop
-/// (drawn before body content) and the focus ring (drawn after); both
-/// read from the same struct so they stay in lockstep. `(x, y, w, h)`
-/// covers the **body** content area (right of the bar); `bar_left_dx`
-/// is how far to extend leftward to reach the bar's left edge — the
-/// focus ring uses it to wrap the bar; the backdrop ignores it (the
-/// bar is its own rounded shape).
-#[derive(Clone, Copy)]
-struct FocusedCellGeom {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    bar_left_dx: f32,
 }
 
 /// Which kind of cell to spawn from a "new cell" hotkey.
@@ -1400,14 +1368,20 @@ impl Scroller {
         right_edge_x: f32,
         viewport_h: f32,
         content_h: f32,
+        track_top_inset: f32,
     ) {
         if self.max_scroll <= 0.0 || content_h <= 0.0 {
             self.last_thumb_rect = Rect::new(0.0, 0.0, 0.0, 0.0);
             self.last_bar_geom = None;
             return;
         }
-        let track_top = 6.0_f32;
-        let track_bot = viewport_h - 6.0;
+        // Track lives inside the body area: `track_top_inset` shifts
+        // it down past the pane's header band so the scrollbar
+        // doesn't intrude on the URL pill. `viewport_h` is the body
+        // viewport (pane height minus the header), so the bottom of
+        // the track lands at `track_top_inset + viewport_h - 6`.
+        let track_top = track_top_inset + 6.0_f32;
+        let track_bot = track_top_inset + viewport_h - 6.0;
         let track_len = (track_bot - track_top).max(1.0);
         let raw_thumb = (viewport_h / content_h) * track_len;
         let thumb_h = raw_thumb.max(SCROLLBAR_MIN_THUMB).min(track_len);
@@ -1672,6 +1646,10 @@ pub struct Pane {
     /// input dispatch (which pane was clicked) and overlay anchoring.
     #[allow(dead_code)]
     last_rect: Rect,
+    /// Browser-style URL bar at the top of the pane. Doubles as the
+    /// search input: when focused, suggestions drop under the pill
+    /// (replacing the standalone Ctrl+K popup). See `pane::PaneHeader`.
+    header: pane::PaneHeader,
 }
 
 impl std::ops::Deref for Pane {
@@ -1687,7 +1665,7 @@ impl std::ops::DerefMut for Pane {
 }
 
 impl Pane {
-    fn new(view: Query, focused: Option<Uuid>) -> Self {
+    fn new(typeface: Typeface, view: Query, focused: Option<Uuid>) -> Self {
         Self {
             view,
             focused,
@@ -1701,6 +1679,7 @@ impl Pane {
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             last_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+            header: pane::PaneHeader::new(typeface),
         }
     }
 }
@@ -1738,7 +1717,6 @@ pub struct KeptApp {
     redo_stack: Vec<UndoOp>,
     last_edit_time: Option<Instant>,
     mention_popup: Option<MentionPopup>,
-    search: Option<SearchState>,
     clipboard: Option<Clipboard>,
     db: Option<Db>,
     /// Right-click context menu over a cell. While `Some`, render a
@@ -1786,9 +1764,10 @@ pub struct KeptApp {
     toast: Option<Toast>,
     /// Active right-click menu over a People-page row.
     people_context_menu: Option<PeopleContextMenu>,
-    /// True while the user is mouse-dragging inside the search input
-    /// (selecting text). Drives `mouse_drag_to` / `mouse_up` routing.
-    search_dragging: bool,
+    /// True while the user is mouse-dragging inside the URL-bar pill
+    /// (selecting header text). Drives `mouse_drag_to` / `mouse_up`
+    /// routing. Holds the pane index whose pill owns the drag.
+    header_dragging_pane: Option<usize>,
     /// Frozen hit-test snapshot from the most recently completed frame.
     /// Input handlers (mouse_down, right_click, dispatch_*) read here
     /// and here only.
@@ -2017,7 +1996,7 @@ impl KeptApp {
         let focused = cells.first().map(|c| c.id);
 
         Self {
-            typeface,
+            typeface: typeface.clone(),
             document: Document {
                 cells,
                 contexts,
@@ -2026,7 +2005,7 @@ impl KeptApp {
                 dirty_contexts: HashSet::new(),
                 pending_context_deletes: HashSet::new(),
             },
-            panes: vec![Pane::new(view, focused)],
+            panes: vec![Pane::new(typeface, view, focused)],
             active_pane: 0,
             split_ratio: 0.5,
             dragging_divider: false,
@@ -2037,7 +2016,6 @@ impl KeptApp {
             redo_stack: Vec::new(),
             last_edit_time: None,
             mention_popup: None,
-            search: None,
             clipboard: Clipboard::new().ok(),
             db,
             cell_context_menu: None,
@@ -2050,7 +2028,7 @@ impl KeptApp {
             show_inactive_cells: false,
             toast: None,
             people_context_menu: None,
-            search_dragging: false,
+            header_dragging_pane: None,
             hit_tests: HitTestState::default(),
             hit_tests_builder: HitTestState::default(),
             entities,
@@ -2185,7 +2163,7 @@ impl KeptApp {
     /// because Space types a character there.
     fn is_text_input_focused(&self) -> bool {
         self.pane().editing
-            || self.search.is_some()
+            || self.panes.iter().any(|p| p.header.focused)
             || self.people_rename.is_some()
             || self.people_add.is_some()
     }
@@ -2271,6 +2249,7 @@ impl KeptApp {
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             last_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+            header: pane::PaneHeader::new(self.typeface.clone()),
         };
         // Insert to the right of the active pane and activate it. With v1
         // capped at 2 panes, this just means push + active = 1.
@@ -3996,7 +3975,10 @@ impl KeptApp {
         self.render_sidebar(canvas, height);
 
         // Overlays (window space, drawn last so they layer on top).
-        self.render_search_popup(canvas, width);
+        // The URL-bar pill + result dropdown live inside each pane's
+        // `render_pane_header` (see `pane.rs`); they're already
+        // painted before this point.
+        let _ = width; // kept for symmetry with mention_popup signature
         self.render_mention_popup(canvas, width, height);
         self.render_context_menus(canvas, width, height);
         self.render_toast(canvas, width, height);
@@ -4127,253 +4109,6 @@ impl KeptApp {
         );
     }
 
-    /// Compute this frame's `PaneLayout` for `pane_idx`. Runs the
-    /// per-pane kinetic-scroll step and the pre-render scroll clamp as
-    /// a side-effect (both touch the active pane's `Scroller`). No
-    /// canvas mutation — the caller wraps the rendering in
-    /// `canvas.save / clip / translate`.
-    fn prepare_pane_layout(&mut self, pane_idx: usize) -> PaneLayout {
-        // Kinetic decay step (no-op when wheel is still active or
-        // velocity is below the floor).
-        self.step_kinetic(pane_idx);
-
-        // Clamp scroll using last frame's max_scroll before drawing this frame.
-        self.pane_mut().scroll_y = self.pane_mut().scroll_y.clamp(0.0, self.pane_mut().max_scroll);
-
-        let pane_rect = self.panes[pane_idx].last_rect;
-        let pane_left = pane_rect.left;
-        let pane_right = pane_rect.right;
-        let pane_h = pane_rect.height();
-
-        let scale = self.font_scale;
-        // Single-cell view pulls the cell out near the pane's left edge
-        // with smaller pad so it visually expands to fill the pane;
-        // every other view uses MARGIN_X on both sides.
-        let single_cell = matches!(self.pane().view.view_kind, ViewKind::Cell(_));
-        let (cells_left, outer_cell_width) = if single_cell {
-            let left = pane_left + FOCUS_MODE_PAD * scale;
-            let outer = (pane_right - left - FOCUS_MODE_PAD * scale).max(80.0);
-            (left, outer)
-        } else {
-            let left = pane_left + MARGIN_X;
-            let outer = (pane_right - left - MARGIN_X).max(80.0);
-            (left, outer)
-        };
-        let content_width = outer_cell_width.max(60.0);
-
-        // Focused-cell geometry isn't captured here anymore — it used
-        // to read `cell.y_origin()` which is a single field shared
-        // across panes, so multi-pane setups would draw focus chrome
-        // at whichever pane rendered most recently. The two-phase
-        // render inside `render_cell_stream` now computes a
-        // pane-local geometry post-record and threads it directly to
-        // the backdrop / ring paints.
-
-        PaneLayout {
-            pane_idx,
-            pane_rect,
-            pane_h,
-            cells_left,
-            outer_cell_width,
-            content_width,
-        }
-    }
-
-    /// Drop shadow + white rounded card painted behind the focused
-    /// cell. No-op when `geom` is `None` (cell-stream views compute it
-    /// inside `render_cell_stream` via the two-phase render so the y
-    /// is always *this* pane's, never polluted by another pane's
-    /// `cell.y_origin` overwrite).
-    fn render_focus_card_backdrop(&self, canvas: &Canvas, geom: Option<FocusedCellGeom>) {
-        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch, .. }) = geom else {
-            return;
-        };
-        let card_rect = Rect::new(
-            cx - FOCUS_PAD,
-            cy - FOCUS_PAD,
-            cx + cw + FOCUS_PAD,
-            cy + ch + FOCUS_PAD,
-        );
-        // TL/BL flat (the bar supplies those outer corners),
-        // TR/BR rounded. Same shape language as outline_rect.
-        let r = FOCUS_RADIUS;
-        let flat = skia_safe::Vector::new(0.0, 0.0);
-        let round = skia_safe::Vector::new(r, r);
-        // Drop shadow: blurred dark rect, offset down a few px.
-        let mut shadow_paint = Paint::default();
-        shadow_paint.set_anti_alias(true);
-        shadow_paint.set_color(crate::color::black_alpha(FOCUS_SHADOW_ALPHA));
-        shadow_paint.set_mask_filter(MaskFilter::blur(
-            BlurStyle::Normal,
-            FOCUS_SHADOW_BLUR,
-            false,
-        ));
-        let shadow_rect = Rect::new(
-            card_rect.left,
-            card_rect.top + FOCUS_SHADOW_DY,
-            card_rect.right,
-            card_rect.bottom + FOCUS_SHADOW_DY,
-        );
-        let shadow_rr = skia_safe::RRect::new_rect_radii(
-            shadow_rect,
-            &[flat, round, round, flat],
-        );
-        canvas.draw_rrect(&shadow_rr, &shadow_paint);
-        // White card fill.
-        let mut fill_paint = Paint::default();
-        fill_paint.set_anti_alias(true);
-        fill_paint.set_color(crate::color::bg_card());
-        let card_rr = skia_safe::RRect::new_rect_radii(
-            card_rect,
-            &[flat, round, round, flat],
-        );
-        canvas.draw_rrect(&card_rr, &fill_paint);
-    }
-
-    /// Section-header-green accent ring around the focused cell —
-    /// subtle when viewing, brighter and thicker when editing.
-    /// Color matches the WHAT / WHEN sidebar headers so the active
-    /// cell visually rhymes with the sidebar's section accents.
-    /// Suppressed in focus mode where the white card backdrop
-    /// alone marks the active area. No-op when `geom` is None.
-    fn render_focus_ring(&self, canvas: &Canvas, geom: Option<FocusedCellGeom>) {
-        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch, bar_left_dx }) =
-            geom.filter(|_| !matches!(self.pane().view.view_kind, ViewKind::Cell(_)))
-        else {
-            return;
-        };
-        let (stroke, alpha) = if self.pane().editing {
-            (FOCUS_STROKE_EDIT, FOCUS_RING_ALPHA_EDIT)
-        } else {
-            (FOCUS_STROKE, FOCUS_RING_ALPHA)
-        };
-        let mut focus_paint = Paint::default();
-        focus_paint.set_anti_alias(true);
-        focus_paint.set_style(PaintStyle::Stroke);
-        focus_paint.set_stroke_width(stroke);
-        focus_paint.set_color(crate::color::sidebar_section_header_alpha(alpha));
-        // Extend leftward across the bar slice so the ring encloses
-        // both the bar and the body. The bar isn't padded on its
-        // outer edge (its left == `cells_left`), so the FOCUS_PAD
-        // inset only applies on the body side. Drawn last in the
-        // cell stream, so the ring's left edge paints over the bar.
-        let rect = Rect::new(
-            cx - bar_left_dx,
-            cy - FOCUS_PAD,
-            cx + cw + FOCUS_PAD,
-            cy + ch + FOCUS_PAD,
-        );
-        let rr = skia_safe::RRect::new_rect_xy(rect, FOCUS_RADIUS, FOCUS_RADIUS);
-        canvas.draw_rrect(&rr, &focus_paint);
-    }
-
-    /// Post-body bookkeeping: publish this frame's `doc_height` /
-    /// `viewport_height` / `max_scroll`, re-clamp `scroll_y` in case
-    /// content shrank, honor a pending caret-into-view request, then
-    /// draw the scrollbar in window space. Called AFTER `canvas.restore`
-    /// — the scrollbar is window-coord, not doc-coord.
-    ///
-    /// `final_y` is the y cursor accumulated by the view body (cell
-    /// stream / entity page / people page); `doc_height` is computed as
-    /// `final_y - CELL_GAP + DOC_BOTTOM_PAD` to match the cell-loop
-    /// convention (each cell adds CELL_GAP after itself; the last gap
-    /// is replaced by the bottom pad).
-    fn finalize_pane_scroll(
-        &mut self,
-        canvas: &Canvas,
-        layout: &PaneLayout,
-        final_y: f32,
-    ) {
-        self.pane_mut().doc_height = final_y - CELL_GAP + DOC_BOTTOM_PAD;
-        self.pane_mut().viewport_height = layout.pane_h.max(0.0);
-        self.pane_mut().max_scroll = (self.pane_mut().doc_height - self.pane_mut().viewport_height).max(0.0);
-        self.pane_mut().scroll_y = self.pane_mut().scroll_y.min(self.pane_mut().max_scroll);
-
-        // After cells are laid out (y_origin/height fresh), honor any caret-into-view
-        // request from this tick's events. Effect lands on the next frame.
-        if std::mem::take(&mut self.pane_mut().pending_caret_scroll) {
-            self.scroll_caret_into_view();
-        }
-
-        // Per-pane scrollbar in window coords, anchored at the pane's right edge.
-        let viewport_h = self.pane_mut().viewport_height;
-        let doc_h = self.pane_mut().doc_height;
-        self.pane_mut()
-            .scroller
-            .draw_bar(canvas, layout.pane_rect.right, viewport_h, doc_h);
-    }
-
-    /// Render a single pane. With `active_pane` swapped to `pane_idx` by
-    /// the caller, all `self.X` field accesses (Deref) resolve to this
-    /// pane. Pane geometry comes from `self.panes[pane_idx].last_rect`,
-    /// populated by `layout_panes`.
-    fn tick_pane(&mut self, canvas: &Canvas, pane_idx: usize, _height: f32) {
-        let layout = self.prepare_pane_layout(pane_idx);
-
-        // Clip to this pane's rect so over-wide content / focus shadows
-        // can't bleed across the divider into the other pane. Translate
-        // into document space (doc y=0 → window y = -scroll_y) so all
-        // sub-render passes paint in doc-coords.
-        canvas.save();
-        canvas.clip_rect(layout.pane_rect, None, true);
-        canvas.translate((0.0, -self.pane_mut().scroll_y));
-
-        // For cell-stream views, `render_pane_body` runs the two-phase
-        // render internally: record cells to a Picture (which gives us
-        // each cell's *this-pane* y via the running accumulator),
-        // then draw backdrop → replay picture → draw ring with the
-        // freshly-computed `FocusedCellGeom`. Entity / People pages
-        // don't have focus chrome so they paint straight to `canvas`.
-        let final_y = self.render_pane_body(canvas, &layout);
-
-        canvas.restore();
-
-        self.finalize_pane_scroll(canvas, &layout, final_y);
-    }
-
-    /// View-kind dispatcher: routes to `render_cell_stream` (Ast /
-    /// Context), `render_entity_page` (Entity), or `render_people_page`
-    /// (People). Returns the final `y` cursor used by
-    /// `finalize_pane_scroll` to compute `doc_height`.
-    ///
-    /// The `+ CELL_GAP` on the entity / people branches matches the
-    /// cell-loop convention (each cell adds CELL_GAP after itself; the
-    /// post-body formula in `finalize_pane_scroll` subtracts one
-    /// CELL_GAP and adds DOC_BOTTOM_PAD).
-    fn render_pane_body(&mut self, canvas: &Canvas, layout: &PaneLayout) -> f32 {
-        let scale = self.font_scale;
-        let mouse_doc_x = self.mouse_pos.0;
-        let mouse_doc_y = self.mouse_pos.1 + self.pane_mut().scroll_y;
-        match self.pane_mut().view.view_kind.clone() {
-            ViewKind::Ast
-            | ViewKind::Context(_)
-            | ViewKind::Current
-            | ViewKind::Cell(_) => self.render_cell_stream(canvas, layout),
-            ViewKind::Entity(eid) => {
-                let h = self.render_entity_page(
-                    canvas,
-                    eid,
-                    layout.cells_left,
-                    layout.content_width,
-                    scale,
-                    mouse_doc_x,
-                    mouse_doc_y,
-                );
-                MARGIN_TOP + h + CELL_GAP
-            }
-            ViewKind::People => {
-                let h = self.render_people_page(
-                    canvas,
-                    layout.cells_left,
-                    layout.content_width,
-                    scale,
-                    mouse_doc_x,
-                    mouse_doc_y,
-                );
-                MARGIN_TOP + h + CELL_GAP
-            }
-        }
-    }
 
     /// The cell-stream view body (Ast / Context). Pre-computes per-cell
     /// visibility + section headers, then loops visible cells
@@ -4785,24 +4520,46 @@ impl KeptApp {
             return true;
         }
 
-        // Search popup. Ctrl/Cmd+K opens; while open, all keys go to it.
+        // Cmd/Ctrl+K — toggle focus on the active pane's header
+        // pill (the URL bar). When focused with empty / synced
+        // text we select-all so the next keystroke starts fresh,
+        // matching the "open Ctrl+K, start typing" feel.
         if event.state == ElementState::Pressed
             && primary_mod(modifiers.state())
             && matches!(&event.logical_key, Key::Character(s) if s.as_str().eq_ignore_ascii_case("k"))
         {
-            if self.search.is_some() {
-                self.close_search_cancel();
+            let idx = self.active_pane;
+            if self.panes[idx].header.focused {
+                self.panes[idx].header.blur();
             } else {
-                self.open_search();
+                // Blur the other pane just in case.
+                for (i, p) in self.panes.iter_mut().enumerate() {
+                    if i != idx {
+                        p.header.blur();
+                    }
+                }
+                self.panes[idx].header.focused = true;
+                self.panes[idx].header.selected = 0;
+                self.panes[idx].header.textbox.select_all();
+                // Other transient overlays would compete for input.
+                self.mention_popup = None;
+                self.cell_context_menu = None;
             }
             return true;
         }
-        if event.state == ElementState::Pressed && self.search.is_some() {
+
+        // Pane header URL-bar pill: when focused it doubles as the
+        // search input. Arrow nav / Enter commit / Esc blur are
+        // handled here; clipboard + select-all + undo / redo route
+        // through the shared `apply_clipboard_shortcut` helper
+        // (same path as every other inline input). Other keystrokes
+        // edit the textbox.
+        let header_focused_pane = self.panes.iter().position(|p| p.header.focused);
+        if let Some(idx) = header_focused_pane {
             let mods = modifiers.state();
-            // When the @-mention popup is open over the search input, it
-            // owns Enter/Tab/Esc/Up/Down — those select / commit / dismiss
-            // a person, not the search-popup result list.
-            if self.mention_popup.is_some() {
+            // Mention popup over the pill (typed `@` or `#`):
+            // owns Enter/Tab/Esc/Up/Down for that picker only.
+            if self.mention_popup.is_some() && event.state == ElementState::Pressed {
                 match &event.logical_key {
                     Key::Named(NamedKey::Escape) => {
                         self.mention_popup = None;
@@ -4823,92 +4580,69 @@ impl KeptApp {
                     _ => {}
                 }
             }
-            // Popup-specific keys take precedence over text editing.
-            match &event.logical_key {
-                Key::Named(NamedKey::Escape) => {
-                    self.close_search_cancel();
-                    return true;
-                }
-                Key::Named(NamedKey::Enter) => {
-                    // Alt+Enter routes the result into the *other* pane
-                    // (splitting if needed). Plain Enter lands it in the
-                    // active pane.
-                    let other = mods.alt_key();
-                    self.close_search_commit(other);
-                    return true;
-                }
-                Key::Named(NamedKey::ArrowUp) if !mods.shift_key() => {
-                    self.search_move(-1);
-                    return true;
-                }
-                Key::Named(NamedKey::ArrowDown) if !mods.shift_key() => {
-                    self.search_move(1);
-                    return true;
-                }
-                _ => {}
-            }
-            // Cmd/Ctrl + letter combos: clipboard + select-all route
-            // through the shared TextBox helper; other letter shortcuts
-            // (zoom, new cell, undo, etc.) are swallowed so they don't
-            // fire behind the popup. Named keys (arrows, Home/End,
-            // Backspace) under primary_mod fall through to the TextBox
-            // so line-edge (Cmd+Arrow on Mac), word-nav (Ctrl+Arrow on
-            // Linux/Win), and word-Backspace all work.
-            if primary_mod(mods) {
-                let mut handled = false;
-                let mut text_changed = false;
-                {
-                    let search_state = self.search.as_mut();
-                    let clipboard = self.clipboard.as_mut();
-                    if let Some(state) = search_state {
-                        let pre = state.input.text().to_string();
-                        if apply_clipboard_shortcut(
-                            &mut state.input,
-                            clipboard,
-                            event,
-                            mods,
-                            true,
-                        ) {
-                            handled = true;
-                            text_changed = state.input.text() != pre;
-                            if text_changed {
-                                state.selected = 0;
-                            }
-                        }
+            if event.state == ElementState::Pressed {
+                match &event.logical_key {
+                    Key::Named(NamedKey::Escape) => {
+                        self.panes[idx].header.blur();
+                        return true;
                     }
+                    Key::Named(NamedKey::Enter) => {
+                        // Alt+Enter routes into the other pane
+                        // (matches the old search popup).
+                        let alt = mods.alt_key();
+                        let sel = self.panes[idx].header.selected;
+                        self.commit_header_result(idx, sel, alt);
+                        return true;
+                    }
+                    Key::Named(NamedKey::ArrowUp) if !mods.shift_key() => {
+                        self.panes[idx].header.move_selection(-1);
+                        return true;
+                    }
+                    Key::Named(NamedKey::ArrowDown) if !mods.shift_key() => {
+                        self.panes[idx].header.move_selection(1);
+                        return true;
+                    }
+                    _ => {}
                 }
-                if handled {
-                    if text_changed {
-                        // Mention popup tracks search input text; keep
-                        // it in sync after a paste/cut.
+            }
+            // Cmd/Ctrl + letter: clipboard / undo / select-all
+            // route through the shared helper. Swallow other
+            // letter combos so app shortcuts don't fire behind
+            // the focused pill. Named keys (arrows, Home/End,
+            // Backspace) under primary_mod fall through to the
+            // textbox so word-nav and line-edge work.
+            if event.state == ElementState::Pressed && primary_mod(mods) {
+                let clipboard = self.clipboard.as_mut();
+                let pre = self.panes[idx].header.textbox.text().to_string();
+                if apply_clipboard_shortcut(
+                    &mut self.panes[idx].header.textbox,
+                    clipboard,
+                    event,
+                    mods,
+                    true,
+                ) {
+                    if self.panes[idx].header.textbox.text() != pre {
+                        self.panes[idx].header.selected = 0;
                         self.sync_mention_popup();
                     }
                     return true;
                 }
                 if let Key::Character(_) = &event.logical_key {
-                    // Other letter combos: swallow so app shortcuts
-                    // don't fire while the popup is up.
                     return true;
                 }
-                // Fall through for Named keys.
+                // Fall through for Named keys (arrows etc.) so
+                // word-nav reaches the textbox.
             }
-            // Forward to the input. Reset selected on text change so the
-            // result list always tracks the current query.
-            let pre = self.search.as_ref().map(|s| s.input.text().to_string());
+            // Forward to the textbox; on text change reset
+            // `selected` so the result list stays in sync, and
+            // hook the mention popup against new triggers.
+            let pre = self.panes[idx].header.textbox.text().to_string();
             let popup_was_open = self.mention_popup.is_some();
-            if let Some(state) = self.search.as_mut() {
-                state.input.handle_key(event, modifiers);
-            }
-            let post = self.search.as_ref().map(|s| s.input.text().to_string());
+            self.panes[idx].header.textbox.handle_key(event, modifiers);
+            let post = self.panes[idx].header.textbox.text().to_string();
             if pre != post {
-                if let Some(state) = self.search.as_mut() {
-                    state.selected = 0;
-                }
+                self.panes[idx].header.selected = 0;
             }
-            // Mention popup hooks: maybe open if the user just typed a
-            // trigger character (`@` for persons, `#` for tags); sync
-            // against the new caret/text otherwise so a shrinking query
-            // backs out the popup or updates its filter.
             if !popup_was_open {
                 match event.text.as_deref() {
                     Some("@") => self.try_open_mention_popup(MentionKind::Person),
@@ -7270,6 +7004,56 @@ impl KeptApp {
         // Any click cancels in-flight kinetic coast on every pane.
         self.kill_all_kinetic();
 
+        // Pane header URL-pill / dropdown click. Wins over body /
+        // sidebar dispatch so the user can interact with the pill
+        // and its result rows. A click outside any pill or its
+        // suggestions blurs all headers.
+        let in_rect = |r: Rect| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+        // Click on a result row → commit it.
+        let result_click = self.hit_tests.header_results.iter().find_map(|(idx, rects)| {
+            rects.iter().position(|r| in_rect(*r)).map(|i| (*idx, i))
+        });
+        if let Some((pane_idx, row_idx)) = result_click {
+            let alt = modifiers.state().alt_key();
+            self.commit_header_result(pane_idx, row_idx, alt);
+            return true;
+        }
+        // Click on the pill itself → focus the textbox at the
+        // clicked position.
+        let header_hit = self
+            .hit_tests
+            .pane_headers
+            .iter()
+            .find(|(_, r)| in_rect(*r))
+            .map(|(idx, _)| *idx);
+        if let Some(pane_idx) = header_hit {
+            // Blur any other pane's header.
+            for (i, p) in self.panes.iter_mut().enumerate() {
+                if i != pane_idx {
+                    p.header.blur();
+                }
+            }
+            let pane = &mut self.panes[pane_idx];
+            pane.header.focused = true;
+            pane.header.selected = 0;
+            pane.header.textbox.mouse_down(x, y, modifiers, true);
+            // Track the drag so cursor motion before mouse_up
+            // extends the selection inside the pill.
+            self.header_dragging_pane = Some(pane_idx);
+            return true;
+        }
+        // Click outside any pill / dropdown blurs all focused headers.
+        if self.panes.iter().any(|p| p.header.focused) {
+            for p in &mut self.panes {
+                if p.header.focused {
+                    p.header.blur();
+                }
+            }
+            self.mention_popup = None;
+            // Don't return — fall through so the click also lands
+            // wherever it normally would (cell focus, sidebar, etc.).
+        }
+
         // Mention popup intercepts left-clicks first: clicking a row
         // commits that candidate; clicking the "Add @X" / "Add #X" row
         // creates a new entity / tag and commits it. A click that
@@ -7340,22 +7124,6 @@ impl KeptApp {
 
         // Any click dismisses an active @-mention popup.
         self.mention_popup = None;
-
-        // Search popup is modal-ish: while open, clicks inside the input
-        // route to its TextBox; clicks elsewhere are swallowed so the cells
-        // beneath don't get focus changes / selections.
-        if self.search.is_some() {
-            self.search_dragging = false;
-            if let Some(rect) = self.hit_tests.search.input {
-                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                    self.search_dragging = true;
-                    if let Some(state) = self.search.as_mut() {
-                        return state.input.mouse_down(x, y, modifiers, true);
-                    }
-                }
-            }
-            return true;
-        }
 
         // Scrollbar thumb grab. Wins over divider / sidebar / cell
         // dispatch because the bar is a visible UI element directly
@@ -8017,6 +7785,46 @@ impl KeptApp {
     /// step for `Subtree` targets that focuses the specific bullet inside
     /// the target outline. No-op when the target cell is gone (the embed
     /// already showed a "[deleted]" placeholder).
+    /// Commit a result row from the focused pane's URL-bar
+    /// dropdown. `pane_idx` is the pane the dropdown belongs to;
+    /// `row_idx` is the index into that pane's
+    /// `header.cached_results`. With `alt=true` the destination is
+    /// the other pane (matches the old Ctrl+K Alt+Enter behavior).
+    /// Blurs the header on commit. No-op if the row is out of
+    /// range or the cell vanished between cache and dispatch.
+    fn commit_header_result(&mut self, pane_idx: usize, row_idx: usize, alt: bool) {
+        let id = match self.panes[pane_idx].header.cached_results.get(row_idx) {
+            Some(&id) => id,
+            None => return,
+        };
+        if self.cell(id).is_none() {
+            self.panes[pane_idx].header.blur();
+            return;
+        }
+        // Hop active focus to the source pane so `push_view`'s
+        // deref-writes land there.
+        let saved_active = self.active_pane;
+        self.active_pane = pane_idx;
+        let dest_pane = if alt {
+            self.open_in_other_pane(Query::cell(id))
+        } else if self.push_view(Query::cell(id)) {
+            Some(self.active_pane)
+        } else {
+            Some(self.active_pane)
+        };
+        self.active_pane = saved_active;
+        if let Some(idx) = dest_pane {
+            let pane = &mut self.panes[idx];
+            pane.focused = Some(id);
+            pane.editing = false;
+            pane.coalesce_break = true;
+            pane.pending_caret_scroll = true;
+        }
+        // Blur the source pane's header now that nav happened.
+        self.panes[pane_idx].header.blur();
+        self.mention_popup = None;
+    }
+
     fn navigate_to_reference(&mut self, target: ReferenceTarget) {
         let cell_id = target.cell_id();
         if self.cell(cell_id).is_none() {
@@ -8134,9 +7942,9 @@ impl KeptApp {
             self.split_ratio = ((x - pane_area_left) / pane_area_w).clamp(SPLIT_MIN, SPLIT_MAX);
             return true;
         }
-        if self.search_dragging {
-            if let Some(state) = self.search.as_mut() {
-                return state.input.mouse_drag_to(x, y);
+        if let Some(idx) = self.header_dragging_pane {
+            if let Some(pane) = self.panes.get_mut(idx) {
+                return pane.header.textbox.mouse_drag_to(x, y);
             }
         }
         let doc_y = y + self.pane_mut().scroll_y;
@@ -8211,10 +8019,9 @@ impl KeptApp {
             self.dragging_divider = false;
             return true;
         }
-        if self.search_dragging {
-            self.search_dragging = false;
-            if let Some(state) = self.search.as_mut() {
-                return state.input.mouse_up();
+        if let Some(idx) = self.header_dragging_pane.take() {
+            if let Some(pane) = self.panes.get_mut(idx) {
+                return pane.header.textbox.mouse_up();
             }
         }
         if let Some(id) = self.pane_mut().dragging_cell.take() {

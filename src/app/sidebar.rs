@@ -378,7 +378,7 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
 
     // Sidebar scrollbar — anchored just inside the right-edge
     // separator (`sb_w - 1.0` is the separator itself).
-    ctx.scroll.draw_bar(canvas, sb_w - 1.0, height, total_h);
+    ctx.scroll.draw_bar(canvas, sb_w - 1.0, height, total_h, 0.0);
 }
 
 impl KeptApp {
