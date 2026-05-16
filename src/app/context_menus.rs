@@ -201,9 +201,16 @@ impl CellContextMenu {
         // the bar) opens that menu.
         let has_bullet_toggle =
             self.bullet_id.is_some() && self.bullet_origin_cell_id == Some(self.cell_id);
-        let mut action_count: usize = 1; // Surface as reference (always)
-        if has_subtree {
-            action_count += 1;
+        // Scratch cells aren't linkable — no Surface row, no
+        // Surface-subtree row. The "Surface group" collapses to
+        // zero rows + zero separator on scratch.
+        let is_scratch = cell.scratch;
+        let mut action_count: usize = 0;
+        if !is_scratch {
+            action_count += 1; // Surface as reference
+            if has_subtree {
+                action_count += 1; // Surface subtree
+            }
         }
         action_count += 1; // Close / Reopen (cell)
         if has_bullet_toggle {
@@ -229,11 +236,11 @@ impl CellContextMenu {
         if target_resurface_present {
             action_count += 1;
         }
-        // Two group separators (Surface | Snooze | Close/Mutate).
-        // Delete + info live on the BarContextMenu now, so this
-        // menu's tail group is Close/Reopen rather than Delete.
+        // Two group separators (Surface | Snooze | Close/Mutate)
+        // for regular cells. Scratch cells skip the Surface group
+        // entirely → one fewer row group and one fewer separator.
         let separator_h = pad;
-        let separator_count: usize = 2;
+        let separator_count: usize = if is_scratch { 1 } else { 2 };
         let menu_h = pad
             + action_h * action_count as f32
             + separator_h * separator_count as f32
@@ -297,13 +304,21 @@ impl CellContextMenu {
         };
 
         // ----- Group 1: Surface actions -----
-        let surface_rect = emit_row(
-            &mut row_top,
-            "Surface as reference",
-            crate::color::text_menu_row(),
-            crate::color::embed_hover(),
-        );
-        let surface_subtree_rect = if has_subtree {
+        // Suppressed entirely on scratch cells — they're not
+        // linkable. The group's trailing separator is suppressed
+        // along with it so the menu doesn't open with a stray
+        // hairline above the snoozes.
+        let surface_rect: Option<Rect> = if is_scratch {
+            None
+        } else {
+            Some(emit_row(
+                &mut row_top,
+                "Surface as reference",
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ))
+        };
+        let surface_subtree_rect = if !is_scratch && has_subtree {
             let snip = self.bullet_snippet.as_deref().unwrap_or("[empty]");
             let label = format!("Surface '{}' as reference", snip);
             Some(emit_row(
@@ -316,7 +331,9 @@ impl CellContextMenu {
             None
         };
 
-        emit_separator(&mut row_top);
+        if !is_scratch {
+            emit_separator(&mut row_top);
+        }
 
         // ----- Group 2: Snoozes -----
         // Six fuzzy presets + optional "Unsnooze". Targets the
@@ -392,7 +409,7 @@ impl CellContextMenu {
             None
         };
 
-        ctx.hit_tests.cell_menu.surface = Some(surface_rect);
+        ctx.hit_tests.cell_menu.surface = surface_rect;
         ctx.hit_tests.cell_menu.surface_subtree = surface_subtree_rect;
         ctx.hit_tests.cell_menu.toggle_cell_active = Some(toggle_cell_active_rect);
         ctx.hit_tests.cell_menu.toggle_bullet_active = toggle_bullet_active_rect;
@@ -433,6 +450,10 @@ impl BarContextMenu {
             CellKind::Outline(oc) if oc.has_reference_header()
         );
         let has_shape_group = has_envelope || has_unwrap;
+        // Scratch cells aren't linkable, so the Surface / Copy
+        // reference rows are suppressed. In their place sits a
+        // single "Move to Timeline" row that promotes the cell.
+        let is_scratch = cell.scratch;
         let mut action_count: usize = super::SNOOZE_PRESETS.len();
         if has_unsnooze {
             action_count += 1;
@@ -443,10 +464,15 @@ impl BarContextMenu {
         if has_unwrap {
             action_count += 1;
         }
-        action_count += 1; // Surface as reference (always)
-        action_count += 1; // Copy reference (always)
+        if is_scratch {
+            action_count += 1; // Move to Timeline
+        } else {
+            action_count += 1; // Surface as reference
+            action_count += 1; // Copy reference
+        }
         action_count += 1; // Delete cell
-        // Separators: info | surface+copyref | snoozes | [shape (envelope/unwrap)] | delete.
+        // Separators: info | surface+copyref (or move-to-timeline) |
+        // snoozes | [shape (envelope/unwrap)] | delete.
         let mut separator_count: usize = 3;
         if has_shape_group {
             separator_count += 1;
@@ -535,19 +561,32 @@ impl BarContextMenu {
 
         emit_separator(&mut row_top);
 
-        // ----- Group 2: Surface / Copy as reference (always) -----
-        let surface_rect = emit_row(
-            &mut row_top,
-            "Surface as reference",
-            crate::color::text_menu_row(),
-            crate::color::embed_hover(),
-        );
-        let copy_reference_rect = emit_row(
-            &mut row_top,
-            "Copy reference",
-            crate::color::text_menu_row(),
-            crate::color::embed_hover(),
-        );
+        // ----- Group 2: reference actions (regular cells) OR
+        // promotion (scratch cells). The two paths share a slot. -----
+        let mut surface_rect: Option<Rect> = None;
+        let mut copy_reference_rect: Option<Rect> = None;
+        let mut move_to_timeline_rect: Option<Rect> = None;
+        if is_scratch {
+            move_to_timeline_rect = Some(emit_row(
+                &mut row_top,
+                "Move to Timeline",
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ));
+        } else {
+            surface_rect = Some(emit_row(
+                &mut row_top,
+                "Surface as reference",
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ));
+            copy_reference_rect = Some(emit_row(
+                &mut row_top,
+                "Copy reference",
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ));
+        }
 
         emit_separator(&mut row_top);
 
@@ -611,8 +650,9 @@ impl BarContextMenu {
             crate::color::delete_hover_bg(),
         );
 
-        ctx.hit_tests.bar_menu.surface = Some(surface_rect);
-        ctx.hit_tests.bar_menu.copy_reference = Some(copy_reference_rect);
+        ctx.hit_tests.bar_menu.surface = surface_rect;
+        ctx.hit_tests.bar_menu.copy_reference = copy_reference_rect;
+        ctx.hit_tests.bar_menu.move_to_timeline = move_to_timeline_rect;
         ctx.hit_tests.bar_menu.snooze = snooze_rects;
         ctx.hit_tests.bar_menu.unsnooze = unsnooze_rect;
         ctx.hit_tests.bar_menu.envelope = envelope_rect;

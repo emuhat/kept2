@@ -166,6 +166,14 @@ struct SidebarHits {
 /// (by `cell.timestamp`) drop out — Current is a working-attention
 /// surface, not an open-loop archive.
 const CURRENT_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// How long a scratch cell lives before the TTL pruner deletes it.
+/// Scratch is transient by design — anything that survives this
+/// window has to be promoted via "Move to Timeline" first.
+const SCRATCH_TTL_MS: i64 = 10 * 24 * 60 * 60 * 1000;
+/// How often the TTL pruner re-runs while the app is running
+/// (in addition to a one-shot at startup). Daily is enough — the
+/// boundary isn't sharp, and we don't need to delete in real time.
+const SCRATCH_PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Width of the colored left-edge state bar on every cell. Narrow
 /// enough to read as a slim accent strip without dominating the
@@ -237,6 +245,10 @@ struct BarMenuHits {
     /// the OS clipboard. Default paste = inline `kept://` link;
     /// Ctrl+Shift+V paste = a fresh Reference cell.
     copy_reference: Option<Rect>,
+    /// "Move to Timeline" — only present on a scratch cell. Flips
+    /// `scratch=false`, re-stamps `timestamp` and `edited_at` to
+    /// now, attaches to the writable context.
+    move_to_timeline: Option<Rect>,
     snooze: [Option<Rect>; 6],
     unsnooze: Option<Rect>,
     /// "Envelope" — transforms a Reference cell into an envelope
@@ -317,6 +329,9 @@ enum PageKind {
     /// Surfaces snooze-expired cells/bullets plus recently-inserted
     /// reference / envelope cells.
     Current,
+    /// Transient scratch timeline. Auto-deletes notes older than
+    /// `SCRATCH_TTL_MS`; not findable, not linkable.
+    Scratch,
 }
 
 /// In-progress inline rename of a People-page row. While `Some`, the row's
@@ -355,6 +370,12 @@ enum ViewKind {
     /// standard cell-stream pipeline; `is_visible_for_view` reduces
     /// the cell list to one entry.
     Cell(Uuid),
+    /// Scratch page — transient sibling timeline. Filters
+    /// `is_visible_for_view` to cells with `scratch == true`; all
+    /// other views filter scratch cells OUT. New cells created
+    /// while this view is active are scratch-flagged. See
+    /// `Cmd/Ctrl+S` to enter.
+    Scratch,
 }
 
 /// What the user is viewing in the doc area / highlighting in the sidebar.
@@ -404,6 +425,9 @@ impl Query {
     }
     fn current() -> Self {
         Self { view_kind: ViewKind::Current, ast: query::Ast::default() }
+    }
+    fn scratch() -> Self {
+        Self { view_kind: ViewKind::Scratch, ast: query::Ast::default() }
     }
     fn cell(id: Uuid) -> Self {
         Self { view_kind: ViewKind::Cell(id), ast: query::Ast::default() }
@@ -1716,6 +1740,11 @@ pub struct KeptApp {
     undo_stack: Vec<UndoOp>,
     redo_stack: Vec<UndoOp>,
     last_edit_time: Option<Instant>,
+    /// Wall-clock timestamp of the most recent Scratch TTL prune.
+    /// Drives `SCRATCH_PRUNE_INTERVAL` — the per-tick check
+    /// pruning every ~24h. Initial prune runs in `KeptApp::new`
+    /// and seeds this field.
+    last_scratch_prune_at: Option<Instant>,
     mention_popup: Option<MentionPopup>,
     /// Quick-Add modal (Ctrl+H / Ctrl+Shift+H). `Some` while open.
     /// See `app/quick_add.rs`.
@@ -1894,6 +1923,22 @@ impl KeptApp {
             }
         };
 
+        // Scratch TTL prune before load — DB-side delete is cheap
+        // (indexed scan over `scratch=1` rows) and the load below
+        // never sees the expired rows. The in-tick prune (driven
+        // by `last_scratch_prune_at`) handles long-running sessions.
+        let now_ms = crate::cell::now_epoch_ms();
+        let expire_before = now_ms - SCRATCH_TTL_MS;
+        if let Some(d) = db.as_mut() {
+            match d.prune_expired_scratch(expire_before) {
+                Ok(ids) if !ids.is_empty() => {
+                    eprintln!("kept: scratch TTL pruned {} cells at startup", ids.len());
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("kept: scratch prune failed: {e}"),
+            }
+        }
+
         let mut cells: Vec<Cell> = match db.as_ref().map(|d| d.load_cells(&typeface)) {
             Some(Ok(rows)) => rows,
             Some(Err(e)) => {
@@ -2018,6 +2063,7 @@ impl KeptApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_time: None,
+            last_scratch_prune_at: None,
             mention_popup: None,
             quick_add: None,
             clipboard: Clipboard::new().ok(),
@@ -2815,6 +2861,7 @@ impl KeptApp {
                     // of source state.
                     None,
                     None,
+                    false,
                 );
                 cache.set_font_scale(scale);
                 cache
@@ -2848,6 +2895,7 @@ impl KeptApp {
                     source.context_hint_id,
                     None,
                     None,
+                    false,
                 );
                 cache.set_font_scale(scale);
                 cache
@@ -3217,6 +3265,15 @@ impl KeptApp {
         if !cell.is_open() && !self.show_inactive_cells {
             return false;
         }
+        // Scratch / non-scratch are two disjoint streams. Scratch
+        // cells appear ONLY in `ViewKind::Scratch`; every other
+        // view filters them out. The Scratch arm below applies
+        // the reverse rule. Gated up here so the per-view arms
+        // don't each have to remember to exclude scratch.
+        let want_scratch = matches!(self.pane().view.view_kind, ViewKind::Scratch);
+        if cell.scratch != want_scratch {
+            return false;
+        }
         // A focused cell whose caret is mid-edit inside a `#tag` token
         // stays visible regardless of filter match. Otherwise the in-
         // memory tag set shifts on every keystroke and the cell yanks
@@ -3260,6 +3317,11 @@ impl KeptApp {
             }
             ViewKind::Ast => query::matches(&self.pane().view.ast, cell, ctx),
             ViewKind::Cell(target) => cell.id == target,
+            // Scratch-vs-non-scratch is already filtered up above
+            // (cells with scratch=false were excluded before the
+            // match). Every scratch cell that made it here is
+            // visible.
+            ViewKind::Scratch => true,
         }
     }
 
@@ -3940,6 +4002,12 @@ impl KeptApp {
         // Cheap when the file's mtime hasn't changed.
         crate::color::maybe_reload();
         canvas.clear(crate::color::bg_page());
+        // Scratch TTL re-prune: once per `SCRATCH_PRUNE_INTERVAL`
+        // of session wall time. Cheap when nothing's expired
+        // (indexed SQL scan). Drops the returned ids from the
+        // in-memory `Document` so the running app reflects the
+        // delete immediately.
+        self.maybe_prune_scratch();
         self.layout_panes(width, height);
 
         // Render each pane. We swap `active_pane` for the duration of each
@@ -4986,6 +5054,17 @@ impl KeptApp {
                     // Ctrl/Cmd+Shift+D: jump to today's date view.
                     let today = local_date_for_ms(now_epoch_ms());
                     return self.push_view(Query::date(today));
+                }
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("s") => {
+                    // Ctrl/Cmd+S: toggle the Scratch view. Same key
+                    // in / same key out — matches browser address-bar
+                    // feel. Cmd+[ also backs out, but the toggle is
+                    // the natural muscle-memory exit.
+                    let target = Query::scratch();
+                    if self.pane().view == target {
+                        return self.nav_back();
+                    }
+                    return self.push_view(target);
                 }
                 _ => {}
             }
@@ -6571,42 +6650,49 @@ impl KeptApp {
     }
 
     fn insert_cell_after_focused(&mut self, kind: NewCellKind, with_title: bool) -> bool {
-        // If the user is viewing a closed context, jump to the current open
-        // one before inserting. The note belongs in "today," not in history.
-        let auto_switched = self.ensure_writable_context();
-        // No-op if the focused cell is empty — the new-cell shortcut shouldn't
-        // pile up empties. Skip when we just auto-switched: the destination's focused
-        // cell is incidental, the user's intent was clearly to write.
-        if !auto_switched {
-            if let Some(id) = self.pane_mut().focused {
-                if let Some(cell) = self.cell(id) {
-                    if cell.is_empty() {
-                        return false;
+        let in_scratch = matches!(self.pane().view.view_kind, ViewKind::Scratch);
+        // The scratch view side-steps the "jump to writable context"
+        // dance entirely: scratch cells have no context, idle rotation
+        // doesn't apply, and the empty-focused-cell guard would just
+        // get in the way of a deliberate "fresh scratch note" gesture.
+        if !in_scratch {
+            // If the user is viewing a closed context, jump to the current open
+            // one before inserting. The note belongs in "today," not in history.
+            let auto_switched = self.ensure_writable_context();
+            // No-op if the focused cell is empty — the new-cell shortcut shouldn't
+            // pile up empties. Skip when we just auto-switched: the destination's focused
+            // cell is incidental, the user's intent was clearly to write.
+            if !auto_switched {
+                if let Some(id) = self.pane_mut().focused {
+                    if let Some(cell) = self.cell(id) {
+                        if cell.is_empty() {
+                            return false;
+                        }
                     }
                 }
             }
-        }
-        // Idle rotation: if the user has been quiet (no new cells) for the
-        // threshold, this write opens a fresh context instead of extending the
-        // current one. Pre-existing cells stay where they were — context
-        // membership is purely time-derived. The baseline is the later of the
-        // last cell creation and the active context's start, so an empty fresh
-        // context can't rotate again on its very first write.
-        let now = now_epoch_ms();
-        let idle_ms = IDLE_CONTEXT_THRESHOLD.as_millis() as i64;
-        // Idle baseline tracks the writable (most recent open) context, not
-        // the user's view selection — date-view doesn't affect rotation.
-        let writable_start = self
-            .writable_context_id()
-            .and_then(|id| self.document.contexts.iter().find(|c| c.id == id))
-            .map(|c| c.start_time)
-            .unwrap_or(i64::MIN);
-        let baseline = self
-            .last_cell_create_ms()
-            .map(|t| t.max(writable_start))
-            .unwrap_or(writable_start);
-        if baseline > i64::MIN && now - baseline >= idle_ms {
-            self.rotate_context_now();
+            // Idle rotation: if the user has been quiet (no new cells) for the
+            // threshold, this write opens a fresh context instead of extending the
+            // current one. Pre-existing cells stay where they were — context
+            // membership is purely time-derived. The baseline is the later of the
+            // last cell creation and the active context's start, so an empty fresh
+            // context can't rotate again on its very first write.
+            let now = now_epoch_ms();
+            let idle_ms = IDLE_CONTEXT_THRESHOLD.as_millis() as i64;
+            // Idle baseline tracks the writable (most recent open) context, not
+            // the user's view selection — date-view doesn't affect rotation.
+            let writable_start = self
+                .writable_context_id()
+                .and_then(|id| self.document.contexts.iter().find(|c| c.id == id))
+                .map(|c| c.start_time)
+                .unwrap_or(i64::MIN);
+            let baseline = self
+                .last_cell_create_ms()
+                .map(|t| t.max(writable_start))
+                .unwrap_or(writable_start);
+            if baseline > i64::MIN && now - baseline >= idle_ms {
+                self.rotate_context_now();
+            }
         }
         let pre_focused = self.pane_mut().focused;
         let mut new_cell = match kind {
@@ -6615,7 +6701,13 @@ impl KeptApp {
             NewCellKind::PopPop => Cell::new_poppop(self.typeface.clone()),
         };
         new_cell.set_font_scale(self.font_scale);
-        new_cell.context_hint_id = self.writable_context_id();
+        if in_scratch {
+            new_cell.scratch = true;
+            // Scratch cells have no context association.
+            new_cell.context_hint_id = None;
+        } else {
+            new_cell.context_hint_id = self.writable_context_id();
+        }
         // When the user asked for "create + title" in one keystroke,
         // pre-attach an empty title and aim the cursor at it. Done
         // before the snapshot so undo/redo round-trips the
@@ -6644,12 +6736,95 @@ impl KeptApp {
         true
     }
 
+    /// Periodic Scratch TTL prune called from `tick`. Runs at most
+    /// once per `SCRATCH_PRUNE_INTERVAL` of session wall time, and
+    /// always on the first frame (`last_scratch_prune_at == None`).
+    /// Deletes expired rows from the DB and drops the returned ids
+    /// from the in-memory `Document` so the running view updates.
+    fn maybe_prune_scratch(&mut self) {
+        let now = Instant::now();
+        let due = match self.last_scratch_prune_at {
+            None => true,
+            Some(t) => now.duration_since(t) >= SCRATCH_PRUNE_INTERVAL,
+        };
+        if !due {
+            return;
+        }
+        self.last_scratch_prune_at = Some(now);
+        let expire_before = now_epoch_ms() - SCRATCH_TTL_MS;
+        let removed = match self.db.as_mut() {
+            Some(d) => match d.prune_expired_scratch(expire_before) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    eprintln!("kept: scratch prune failed: {e}");
+                    return;
+                }
+            },
+            None => return,
+        };
+        if removed.is_empty() {
+            return;
+        }
+        let removed_set: HashSet<Uuid> = removed.iter().copied().collect();
+        self.document.cells.retain(|c| !removed_set.contains(&c.id));
+        // Also retire any focus or drag state aimed at the removed
+        // cells — otherwise stale ids linger after the cell is gone.
+        for pane in &mut self.panes {
+            if let Some(id) = pane.focused {
+                if removed_set.contains(&id) {
+                    pane.focused = None;
+                    pane.editing = false;
+                }
+            }
+            if let Some(id) = pane.dragging_cell {
+                if removed_set.contains(&id) {
+                    pane.dragging_cell = None;
+                }
+            }
+        }
+    }
+
+    /// Promote a scratch cell into the principled timeline. Flips
+    /// the scratch flag off, re-stamps `timestamp` and `edited_at`
+    /// to now so the cell sorts as just-created, and attaches it
+    /// to the current writable context. The cell vanishes from the
+    /// scratch view and appears in today's timeline; from this
+    /// moment it's a regular cell — findable, linkable, etc.
+    /// No-op when called on a non-scratch cell (belt-and-suspenders;
+    /// the menu row that triggers this is only emitted for scratch
+    /// cells).
+    fn promote_scratch_to_timeline(&mut self, cell_id: Uuid) {
+        let needs_promote = self.cell(cell_id).map(|c| c.scratch).unwrap_or(false);
+        if !needs_promote {
+            return;
+        }
+        let now = now_epoch_ms();
+        let ctx = self.writable_context_id();
+        if let Some(c) = self.cell_mut(cell_id) {
+            c.scratch = false;
+            c.timestamp = now;
+            c.edited_at = now;
+            c.context_hint_id = ctx;
+        }
+        self.touch_cell(cell_id);
+        self.show_toast("Moved to timeline");
+    }
+
     /// "Surface as reference" — create a new Reference cell pointing at
     /// `target` and insert it where any new cell would land: at "now," in
     /// the current writable context (auto-rotating to a fresh context when
     /// the user has been idle, just like `insert_cell_after_focused`).
     /// Focuses the new reference. Returns true on insert.
     fn surface_as_reference(&mut self, target: ReferenceTarget) -> bool {
+        // Scratch cells are explicitly non-linkable. The bar-menu
+        // path doesn't expose Surface for scratch, but guard here
+        // defensively for any future caller (paste-as-Reference,
+        // an outline-bullet surface, etc.).
+        if let Some(src) = self.cell(target.cell_id()) {
+            if src.scratch {
+                return false;
+            }
+        }
         // Surface = drop a reference into "today" *without* yanking
         // the user's view. The cell goes into the current writable
         // context if one exists (None is fine — the cell just has no
@@ -6698,6 +6873,7 @@ impl KeptApp {
         let context_hint = self.document.cells[idx].context_hint_id;
         let closed_at = self.document.cells[idx].closed_at;
         let resurface_after = self.document.cells[idx].resurface_after;
+        let scratch = self.document.cells[idx].scratch;
 
         // Build the new Outline cell directly so we can hand-pick the
         // id / timestamp (replace-in-place semantics). Cell::from_parts
@@ -6713,6 +6889,7 @@ impl KeptApp {
             context_hint,
             closed_at,
             resurface_after,
+            scratch,
         );
         new_cell.set_font_scale(self.font_scale);
         let post = new_cell.snapshot();
@@ -6759,6 +6936,7 @@ impl KeptApp {
         let context_hint = self.document.cells[idx].context_hint_id;
         let closed_at = self.document.cells[idx].closed_at;
         let resurface_after = self.document.cells[idx].resurface_after;
+        let scratch = self.document.cells[idx].scratch;
 
         let mut new_cell = Cell::from_parts(
             cell_id,
@@ -6772,6 +6950,7 @@ impl KeptApp {
             context_hint,
             closed_at,
             resurface_after,
+            scratch,
         );
         new_cell.set_font_scale(self.font_scale);
         let post = new_cell.snapshot();
@@ -6898,6 +7077,7 @@ impl KeptApp {
                 | ViewKind::Entity(_)
                 | ViewKind::Current
                 | ViewKind::Cell(_)
+                | ViewKind::Scratch
         ) {
             let doc_y = y + self.pane_mut().scroll_y;
             // Bar hit-test wins over the body — a right-click on the
@@ -6911,6 +7091,14 @@ impl KeptApp {
                 if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     self.pane_mut().focused = Some(cell_id);
                     self.pane_mut().editing = false;
+                    // Whole-cell context menu → retire any inner
+                    // text / bullet selection (matches the
+                    // left-click-on-bar behaviour). The menu's
+                    // actions operate on THE CELL, not on
+                    // selected sub-content.
+                    for cell in &mut self.document.cells {
+                        cell.clear_all_selections();
+                    }
                     self.bar_context_menu = Some(BarContextMenu {
                         cell_id,
                         anchor_x: x,
@@ -6923,6 +7111,12 @@ impl KeptApp {
                 if let Some(cell_id) = self.find_cell_at(x, doc_y) {
                     self.pane_mut().focused = Some(cell_id);
                     self.pane_mut().editing = false;
+                    // Ctrl+right-click is the keyboard-modifier
+                    // route to the same whole-cell menu; same
+                    // selection-wipe semantics.
+                    for cell in &mut self.document.cells {
+                        cell.clear_all_selections();
+                    }
                     self.bar_context_menu = Some(BarContextMenu {
                         cell_id,
                         anchor_x: x,
@@ -7268,6 +7462,7 @@ impl KeptApp {
                 return match kind {
                     PageKind::People => open(self, Query::people()),
                     PageKind::Current => open(self, Query::current()),
+                    PageKind::Scratch => open(self, Query::scratch()),
                 };
             }
         }
@@ -7381,6 +7576,19 @@ impl KeptApp {
                         };
                         self.write_payload_to_clipboard(&payload);
                         self.show_toast("Reference copied");
+                    }
+                    return true;
+                }
+            }
+            // "Move to Timeline" — only appears on scratch cells.
+            // Flips `scratch=false`, restamps timestamps so the cell
+            // sorts as just-created, attaches to the writable
+            // context. The cell vanishes from scratch view and
+            // appears in today's timeline.
+            if let Some(rect) = self.hit_tests.bar_menu.move_to_timeline {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.bar_context_menu.take() {
+                        self.promote_scratch_to_timeline(menu.cell_id);
                     }
                     return true;
                 }
@@ -7684,12 +7892,15 @@ impl KeptApp {
                 self.pane_mut().dragging_cell = None;
                 self.pane_mut().pending_caret_scroll = true;
                 self.pane_mut().coalesce_break = true;
-                // Retire any visible selection on every other cell
-                // (matches `dispatch_cell_click` behaviour).
-                for other in &mut self.document.cells {
-                    if other.id != cell_id {
-                        other.clear_all_selections();
-                    }
+                // Whole-cell select → retire every text / bullet
+                // selection on every cell, including the clicked
+                // one. The bar click is "I'm selecting THE CELL,"
+                // not "I'm selecting text inside it" — leaving an
+                // inner selection would invite a confusing
+                // Ctrl+C that copies the old text drag instead of
+                // the whole cell.
+                for cell in &mut self.document.cells {
+                    cell.clear_all_selections();
                 }
                 return true;
             }

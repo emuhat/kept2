@@ -47,11 +47,17 @@ pub(super) fn search_results(
     // archived" toggle is on, mirroring `is_visible_for_view`.
     // Otherwise an archived cell could surface here, the user clicks
     // it, and navigates to a single-cell view that has it filtered
-    // out — a dead-end click.
+    // out — a dead-end click. Scratch cells are excluded
+    // unconditionally — they're transient by design and shouldn't
+    // surface in the URL-bar dropdown.
     let mut hits: Vec<&Cell> = document
         .cells
         .iter()
-        .filter(|c| (c.is_open() || show_inactive_cells) && query::matches(&ast, c, &ctx))
+        .filter(|c| {
+            (c.is_open() || show_inactive_cells)
+                && !c.scratch
+                && query::matches(&ast, c, &ctx)
+        })
         .collect();
     hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     hits.into_iter().map(|c| c.id).collect()

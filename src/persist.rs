@@ -179,6 +179,17 @@ impl Db {
             self.conn
                 .execute_batch("BEGIN; PRAGMA user_version = 7; COMMIT;")?;
         }
+        if version < 8 {
+            // v7 → v8: scratch flag for transient notes. Existing
+            // rows default to 0 (regular cells); the Scratch view
+            // is populated only by new writes from Cmd+S → Ctrl+O.
+            self.conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE cells ADD COLUMN scratch INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 8;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 
@@ -382,7 +393,7 @@ impl Db {
 
     pub fn load_cells(&self, typeface: &Typeface) -> rusqlite::Result<Vec<Cell>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, body, edited_at, context_hint_id \
+            "SELECT id, timestamp, body, edited_at, context_hint_id, scratch \
              FROM cells ORDER BY timestamp ASC",
         )?;
         let rows = stmt
@@ -392,6 +403,7 @@ impl Db {
                 let body: String = row.get(2)?;
                 let edited_at: i64 = row.get(3)?;
                 let hint_bytes: Option<Vec<u8>> = row.get(4)?;
+                let scratch: i64 = row.get(5)?;
                 let id = Uuid::from_slice(&id_bytes).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
                         0,
@@ -409,12 +421,12 @@ impl Db {
                     })?),
                     None => None,
                 };
-                Ok((id, timestamp, body, edited_at, hint))
+                Ok((id, timestamp, body, edited_at, hint, scratch != 0))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut cells = Vec::with_capacity(rows.len());
-        for (id, timestamp, body_json, edited_at, hint) in rows {
+        for (id, timestamp, body_json, edited_at, hint, scratch) in rows {
             let pc: PersistedCell = serde_json::from_str(&body_json).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     0,
@@ -449,7 +461,7 @@ impl Db {
             let resurface_after = pc.resurface_after;
             let kind = body_to_kind(pc.body, typeface);
             cells.push(Cell::from_parts(
-                id, kind, title, timestamp, edited_at, hint, closed_at, resurface_after,
+                id, kind, title, timestamp, edited_at, hint, closed_at, resurface_after, scratch,
             ));
         }
         Ok(cells)
@@ -487,19 +499,21 @@ impl Db {
         let hint_bytes = cell.context_hint_id.map(|u| u.as_bytes().to_vec());
         let cell_id_bytes = cell.id.as_bytes().to_vec();
         self.conn.execute(
-            "INSERT INTO cells (id, timestamp, body, edited_at, context_hint_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
+            "INSERT INTO cells (id, timestamp, body, edited_at, context_hint_id, scratch) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(id) DO UPDATE SET \
                  timestamp = excluded.timestamp, \
                  body = excluded.body, \
                  edited_at = excluded.edited_at, \
-                 context_hint_id = excluded.context_hint_id",
+                 context_hint_id = excluded.context_hint_id, \
+                 scratch = excluded.scratch",
             params![
                 cell_id_bytes,
                 cell.timestamp,
                 body_json,
                 cell.edited_at,
                 hint_bytes,
+                if cell.scratch { 1_i64 } else { 0_i64 },
             ],
         )?;
         let names = tag_names_from_persisted(&pc);
@@ -575,6 +589,41 @@ impl Db {
         // Entity lifecycle is independent of cell lifecycle.
         self.detach_entities_from_cell(id)?;
         Ok(())
+    }
+
+    /// Delete every scratch cell whose `timestamp` is older than
+    /// `expire_before_ms`, returning the ids that were removed so
+    /// the in-memory `Document` can drop them too. Used by the
+    /// 10-day Scratch TTL pruner (run at startup and once per
+    /// session-day). `cell_tags` rows cascade via the FK.
+    pub fn prune_expired_scratch(
+        &mut self,
+        expire_before_ms: i64,
+    ) -> rusqlite::Result<Vec<Uuid>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM cells WHERE scratch = 1 AND timestamp < ?1",
+        )?;
+        let ids: Vec<Uuid> = stmt
+            .query_map(params![expire_before_ms], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                Uuid::from_slice(&id_bytes).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        Box::new(e),
+                    )
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        self.conn.execute(
+            "DELETE FROM cells WHERE scratch = 1 AND timestamp < ?1",
+            params![expire_before_ms],
+        )?;
+        Ok(ids)
     }
 
     /// All entities, in insertion order. Used by KeptApp to refresh its
@@ -1732,6 +1781,7 @@ mod tests {
             cell.context_hint_id,
             closed_at,
             resurface_after,
+            cell.scratch,
         )
     }
 
@@ -1851,6 +1901,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let back = round_trip(&cell, &tf);
         match (&cell.kind, &back.kind) {
@@ -1913,6 +1964,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let back = round_trip(&cell, &tf);
         match &back.kind {
@@ -2028,6 +2080,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let back = round_trip(&cell, &tf);
         match &back.kind {
@@ -2184,5 +2237,89 @@ mod tests {
             tag_names_from_persisted_legacy(&pc),
             vec!["person".to_string()],
         );
+    }
+
+    /// In-memory `Db` for scratch-flag tests. SQLite treats
+    /// `:memory:` specially — no on-disk file is created, the DB
+    /// lives only for the lifetime of the connection. The migration
+    /// chain runs as usual, so the resulting Db has the post-v8
+    /// `scratch` column.
+    fn open_in_memory_db() -> Db {
+        Db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    #[test]
+    fn round_trip_scratch_cell_preserves_flag() {
+        let tf = typeface();
+        let mut db = open_in_memory_db();
+        let mut cell = Cell::new(tf.clone(), "scratch note".to_string());
+        cell.scratch = true;
+        let id = cell.id;
+        db.save_cell(&cell).expect("save");
+        let back = db
+            .load_cells(&tf)
+            .expect("load")
+            .into_iter()
+            .find(|c| c.id == id)
+            .expect("cell present");
+        assert!(back.scratch, "scratch flag survives a save→load round-trip");
+    }
+
+    #[test]
+    fn round_trip_non_scratch_cell_defaults_to_non_scratch() {
+        // Belt-and-suspenders for the column-default → live-flag
+        // path: a regular cell saved without explicit scratch
+        // loads back with scratch == false.
+        let tf = typeface();
+        let mut db = open_in_memory_db();
+        let cell = Cell::new(tf.clone(), "regular".to_string());
+        let id = cell.id;
+        db.save_cell(&cell).expect("save");
+        let back = db
+            .load_cells(&tf)
+            .expect("load")
+            .into_iter()
+            .find(|c| c.id == id)
+            .expect("cell present");
+        assert!(!back.scratch, "regular cells stay non-scratch");
+    }
+
+    #[test]
+    fn prune_expired_scratch_removes_old_only() {
+        let tf = typeface();
+        let mut db = open_in_memory_db();
+        let now = now_epoch_ms();
+        let day = 24 * 60 * 60 * 1000_i64;
+        // Old scratch cell — should prune.
+        let mut old_scratch = Cell::new(tf.clone(), "old scratch".to_string());
+        old_scratch.timestamp = now - 11 * day;
+        old_scratch.scratch = true;
+        let old_scratch_id = old_scratch.id;
+        // Fresh scratch cell — must stay.
+        let mut new_scratch = Cell::new(tf.clone(), "new scratch".to_string());
+        new_scratch.timestamp = now - 1 * day;
+        new_scratch.scratch = true;
+        let new_scratch_id = new_scratch.id;
+        // Old regular cell — must stay (the TTL only fires on
+        // scratch=1, not aged regular cells).
+        let mut old_regular = Cell::new(tf.clone(), "old regular".to_string());
+        old_regular.timestamp = now - 30 * day;
+        let old_regular_id = old_regular.id;
+        for c in [&old_scratch, &new_scratch, &old_regular] {
+            db.save_cell(c).expect("save");
+        }
+        let cutoff = now - 10 * day;
+        let removed = db.prune_expired_scratch(cutoff).expect("prune");
+        assert_eq!(removed.len(), 1, "exactly one row removed");
+        assert_eq!(removed[0], old_scratch_id);
+        let remaining: Vec<Uuid> = db
+            .load_cells(&tf)
+            .expect("load")
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(remaining.contains(&new_scratch_id), "fresh scratch survives");
+        assert!(remaining.contains(&old_regular_id), "old regular cells aren't touched");
+        assert!(!remaining.contains(&old_scratch_id), "expired scratch is gone");
     }
 }

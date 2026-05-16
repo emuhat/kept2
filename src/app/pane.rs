@@ -184,6 +184,18 @@ impl KeptApp {
     pub(super) fn tick_pane(&mut self, canvas: &Canvas, pane_idx: usize, _height: f32) {
         let layout = self.prepare_pane_layout(pane_idx);
 
+        // Scratch view paints a distinct page background over this
+        // pane's rect — the page hue is the at-a-glance signal that
+        // you're in the throwaway space. Done before clip + scroll
+        // translate so the whole pane (header band included) reads
+        // as one tinted surface.
+        if matches!(self.panes[pane_idx].view.view_kind, ViewKind::Scratch) {
+            let mut bg = Paint::default();
+            bg.set_anti_alias(false);
+            bg.set_color(crate::color::bg_scratch_page());
+            canvas.draw_rect(layout.pane_rect, &bg);
+        }
+
         // Clip to this pane's rect so over-wide content / focus shadows
         // can't bleed across the divider into the other pane.
         // Translate into document space (doc y=0 → window y = -scroll_y)
@@ -610,6 +622,7 @@ impl KeptApp {
                 .unwrap_or_else(|| "@entity".into()),
             ViewKind::People => "people".into(),
             ViewKind::Current => "current".into(),
+            ViewKind::Scratch => "scratch".into(),
             ViewKind::Cell(cid) => {
                 let label = self.cell(*cid).and_then(|c| {
                     c.heading_title().or_else(|| {
@@ -647,7 +660,8 @@ impl KeptApp {
             ViewKind::Ast
             | ViewKind::Context(_)
             | ViewKind::Current
-            | ViewKind::Cell(_) => self.render_cell_stream(canvas, layout),
+            | ViewKind::Cell(_)
+            | ViewKind::Scratch => self.render_cell_stream(canvas, layout),
             ViewKind::Entity(eid) => {
                 let h = self.render_entity_page(
                     canvas,

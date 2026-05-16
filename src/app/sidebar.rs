@@ -163,6 +163,23 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         &row_font,
     );
     ctx.hit_tests.sidebar.pages.push((PageKind::Current, current_rect));
+    y += date_h + item_gap;
+
+    // Scratch sits at the end of WHAT so the principled
+    // "what am I doing now" surfaces (Current) read first; Scratch
+    // is the auxiliary throwaway pad below them.
+    let scratch_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
+    draw_sidebar_row(
+        canvas,
+        scratch_rect,
+        "Scratch",
+        matches!(ctx.view.view_kind, ViewKind::Scratch),
+        in_row(scratch_rect),
+        radius,
+        pad_x,
+        &row_font,
+    );
+    ctx.hit_tests.sidebar.pages.push((PageKind::Scratch, scratch_rect));
     y += date_h + date_gap;
 
     // ---- WHEN section ----

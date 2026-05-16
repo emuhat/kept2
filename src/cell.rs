@@ -55,6 +55,9 @@ pub struct CellSnapshot {
     /// `Some(t)` schedules the cell to resurface in the Current view at
     /// epoch ms `t`. `None` means no scheduled resurfacing.
     pub resurface_after: Option<i64>,
+    /// Scratch flag. Carried so undo/redo of a Move-to-Timeline
+    /// action (whenever we add it) can flip the bit back.
+    pub scratch: bool,
 }
 
 #[derive(Clone)]
@@ -149,6 +152,13 @@ pub struct Cell {
     /// view (it does NOT disappear from the timeline). `None` means
     /// no scheduled resurfacing.
     pub resurface_after: Option<i64>,
+    /// True when this cell lives in the Scratch view rather than
+    /// the principled timeline. Scratch cells are excluded from
+    /// search, can't be referenced (no `kept://` URLs), and are
+    /// auto-deleted by the TTL pruner once they age past
+    /// `SCRATCH_TTL_MS`. Flipped to false by the "Move to Timeline"
+    /// bar-menu action which also re-stamps the timestamp.
+    pub scratch: bool,
 }
 
 pub enum CellKind {
@@ -277,6 +287,7 @@ impl Cell {
             context_hint_id: None,
             closed_at: None,
             resurface_after: None,
+            scratch: false,
         }
     }
 
@@ -296,6 +307,7 @@ impl Cell {
             context_hint_id: None,
             closed_at: None,
             resurface_after: None,
+            scratch: false,
         }
     }
 
@@ -315,6 +327,7 @@ impl Cell {
             context_hint_id: None,
             closed_at: None,
             resurface_after: None,
+            scratch: false,
         }
     }
 
@@ -338,6 +351,7 @@ impl Cell {
             context_hint_id: None,
             closed_at: None,
             resurface_after: None,
+            scratch: false,
         }
     }
 
@@ -351,6 +365,7 @@ impl Cell {
         context_hint_id: Option<Uuid>,
         closed_at: Option<i64>,
         resurface_after: Option<i64>,
+        scratch: bool,
     ) -> Self {
         Self {
             id,
@@ -366,6 +381,7 @@ impl Cell {
             context_hint_id,
             closed_at,
             resurface_after,
+            scratch,
         }
     }
 
@@ -465,6 +481,7 @@ impl Cell {
             snap.context_hint_id,
             snap.closed_at,
             snap.resurface_after,
+            snap.scratch,
         )
     }
 
@@ -1221,6 +1238,7 @@ impl Cell {
             },
             closed_at: self.closed_at,
             resurface_after: self.resurface_after,
+            scratch: self.scratch,
         }
     }
 
@@ -1234,6 +1252,7 @@ impl Cell {
         self.context_hint_id = snap.context_hint_id;
         self.closed_at = snap.closed_at;
         self.resurface_after = snap.resurface_after;
+        self.scratch = snap.scratch;
         self.title = snap.title.map(|tbs| {
             let typeface = self.body_typeface();
             let mut tb = TextBox::new(typeface, String::new());

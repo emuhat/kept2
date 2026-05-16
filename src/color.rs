@@ -40,6 +40,10 @@ pub struct Palette {
     pub bg_page: Color,
     pub bg_panel: Color,
     pub bg_card: Color,
+    /// Page background painted under the Scratch view. Distinct
+    /// from `bg_page` so the user can tell at a glance they're in
+    /// the throwaway timeline rather than the principled one.
+    pub bg_scratch_page: Color,
 
     // Text — `text_primary` and `text_section_header` paint against
     // the page bg; the `sidebar_*` variants paint against `bg_panel`
@@ -144,6 +148,7 @@ impl Palette {
             bg_page: Color::from_rgb(233, 252, 239),
             bg_panel: Color::from_rgb(210, 249, 223),
             bg_card: Color::WHITE,
+            bg_scratch_page: Color::from_rgb(0xf7, 0xe5, 0xf1),
 
             text_primary: Color::from_rgb(3, 23, 12),
             text_menu_row: Color::from_rgb(11, 91, 47),
@@ -221,6 +226,7 @@ impl Palette {
             "bg_page" => self.bg_page = value,
             "bg_panel" => self.bg_panel = value,
             "bg_card" => self.bg_card = value,
+            "bg_scratch_page" => self.bg_scratch_page = value,
             "text_primary" => self.text_primary = value,
             "text_menu_row" => self.text_menu_row = value,
             "text_muted_grey" => self.text_muted_grey = value,
@@ -343,6 +349,7 @@ impl Palette {
         row(&mut out, "bg_page", p.bg_page);
         row(&mut out, "bg_panel", p.bg_panel);
         row(&mut out, "bg_card", p.bg_card);
+        row(&mut out, "bg_scratch_page", p.bg_scratch_page);
 
         out.push_str("\n# Text\n");
         row(&mut out, "text_primary", p.text_primary);
@@ -586,6 +593,10 @@ pub fn maybe_reload() {
 #[inline]
 pub fn bg_page() -> Color {
     palette().bg_page
+}
+#[inline]
+pub fn bg_scratch_page() -> Color {
+    palette().bg_scratch_page
 }
 #[inline]
 #[allow(dead_code)]
