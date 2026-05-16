@@ -561,36 +561,21 @@ impl KeptApp {
     }
 
     /// Resolve entity-page shortcuts for the URL-bar dropdown.
-    /// Returns `Some(uuids)` when `query` is *exactly* one or more
-    /// `@person` tokens with nothing else — no other filter, no
-    /// residual text. Returns `None` for any other shape so the
-    /// dropdown stays a pure cell-picker. Unknown person names
-    /// resolve to an empty Vec → `None`.
+    /// Parses `query` and delegates to the free
+    /// `entity_page_shortcuts_for_ast` predicate, supplying the
+    /// app's entity caches as the resolution backing store. See
+    /// that function for the qualification rule.
     fn entity_page_shortcuts_for(&self, query: &str) -> Option<Vec<Uuid>> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return None;
         }
         let ast = query::parse(trimmed);
-        if !ast.include.tags.is_empty()
-            || !ast.exclude.tags.is_empty()
-            || !ast.exclude.entities.is_empty()
-            || ast.include.time.is_some()
-            || !ast.text.is_empty()
-            || ast.include.entities.is_empty()
-        {
-            return None;
-        }
-        let ids = query::resolve_persons(
-            &ast.include.entities,
+        entity_page_shortcuts_for_ast(
+            &ast,
             &self.entities.alias_index,
             &self.entities.title_fallback,
-        );
-        if ids.is_empty() {
-            None
-        } else {
-            Some(ids)
-        }
+        )
     }
 
     /// Single-line summary of a pane's current view, for the URL-bar
@@ -822,5 +807,230 @@ impl KeptApp {
             doc_h,
             PANE_HEADER_H,
         );
+    }
+}
+
+/// Pure predicate over a parsed query AST: does this query qualify
+/// for the entity-page shortcut in the URL-bar dropdown?
+///
+/// Qualifies iff the AST is *exactly* one or more `@person` includes
+/// — no tags (include or exclude), no entity excludes, no time
+/// filter, no residual text. Returns the resolved person UUIDs in
+/// `query::resolve_persons` order. Unknown person names (no
+/// matches) resolve to an empty Vec → `None`.
+///
+/// Free function so the qualification rule and the resolution path
+/// are testable without standing up a `KeptApp`. The caller wires
+/// the resolver's backing indices (`alias_index`, `title_fallback`)
+/// in directly.
+pub(super) fn entity_page_shortcuts_for_ast(
+    ast: &query::Ast,
+    alias_index: &[(String, Uuid, String)],
+    title_fallback: &[(Uuid, String)],
+) -> Option<Vec<Uuid>> {
+    if !ast.include.tags.is_empty()
+        || !ast.exclude.tags.is_empty()
+        || !ast.exclude.entities.is_empty()
+        || ast.include.time.is_some()
+        || !ast.text.is_empty()
+        || ast.include.entities.is_empty()
+    {
+        return None;
+    }
+    let ids = query::resolve_persons(&ast.include.entities, alias_index, title_fallback);
+    if ids.is_empty() { None } else { Some(ids) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skia_safe::FontMgr;
+
+    fn typeface() -> Typeface {
+        FontMgr::new()
+            .new_from_data(include_bytes!("../../resources/fonts/Figtree.ttf"), None)
+            .expect("font loads")
+    }
+
+    fn cell_entry() -> HeaderResultEntry {
+        HeaderResultEntry::Cell(Uuid::new_v4())
+    }
+
+    // ----- PaneHeader::move_selection -----
+
+    #[test]
+    fn move_selection_empty_results_stays_none() {
+        let mut h = PaneHeader::new(typeface());
+        h.move_selection(1);
+        assert_eq!(h.selected, None);
+        h.move_selection(-1);
+        assert_eq!(h.selected, None);
+    }
+
+    #[test]
+    fn move_selection_down_from_none_lands_on_first_row() {
+        let mut h = PaneHeader::new(typeface());
+        h.cached_results = vec![cell_entry(), cell_entry(), cell_entry()];
+        h.selected = None;
+        h.move_selection(1);
+        assert_eq!(h.selected, Some(0));
+    }
+
+    #[test]
+    fn move_selection_up_from_none_lands_on_last_row() {
+        let mut h = PaneHeader::new(typeface());
+        h.cached_results = vec![cell_entry(), cell_entry(), cell_entry()];
+        h.selected = None;
+        h.move_selection(-1);
+        assert_eq!(h.selected, Some(2));
+    }
+
+    #[test]
+    fn move_selection_down_past_last_row_wraps_to_none() {
+        // The "rest stop" between last and first is `None` — Enter
+        // there commits the typed query as a view (filter-first
+        // semantic).
+        let mut h = PaneHeader::new(typeface());
+        h.cached_results = vec![cell_entry(), cell_entry(), cell_entry()];
+        h.selected = Some(2);
+        h.move_selection(1);
+        assert_eq!(h.selected, None);
+    }
+
+    #[test]
+    fn move_selection_up_from_first_row_wraps_to_none() {
+        let mut h = PaneHeader::new(typeface());
+        h.cached_results = vec![cell_entry(), cell_entry(), cell_entry()];
+        h.selected = Some(0);
+        h.move_selection(-1);
+        assert_eq!(h.selected, None);
+    }
+
+    #[test]
+    fn move_selection_full_cycle_down_returns_to_start() {
+        // count rows + the None rest stop = count + 1 positions.
+        let mut h = PaneHeader::new(typeface());
+        h.cached_results = vec![cell_entry(), cell_entry(), cell_entry()];
+        h.selected = None;
+        for _ in 0..4 {
+            h.move_selection(1);
+        }
+        assert_eq!(h.selected, None);
+    }
+
+    #[test]
+    fn move_selection_caps_results_at_max_visible() {
+        // The dropdown shows at most HEADER_MAX_VISIBLE rows;
+        // arrow nav should respect the same window so the user
+        // can't highlight a row that isn't rendered.
+        let mut h = PaneHeader::new(typeface());
+        let huge = std::iter::repeat_with(cell_entry)
+            .take(HEADER_MAX_VISIBLE + 5)
+            .collect::<Vec<_>>();
+        h.cached_results = huge;
+        h.selected = Some(HEADER_MAX_VISIBLE - 1);
+        h.move_selection(1);
+        assert_eq!(h.selected, None);
+    }
+
+    // ----- entity_page_shortcuts_for_ast -----
+
+    fn person_alias(name: &str, id: Uuid) -> (String, Uuid, String) {
+        (name.to_string(), id, "person".to_string())
+    }
+
+    #[test]
+    fn shortcut_single_person_resolves_via_alias_index() {
+        let alice = Uuid::new_v4();
+        let alias_index = vec![person_alias("alice", alice)];
+        let ast = query::parse("@alice");
+        let got = entity_page_shortcuts_for_ast(&ast, &alias_index, &[]);
+        assert_eq!(got, Some(vec![alice]));
+    }
+
+    #[test]
+    fn shortcut_multiple_persons_returns_all_in_resolver_order() {
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let alias_index = vec![person_alias("alice", alice), person_alias("bob", bob)];
+        let ast = query::parse("@alice @bob");
+        let got = entity_page_shortcuts_for_ast(&ast, &alias_index, &[]).expect("matched");
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&alice));
+        assert!(got.contains(&bob));
+    }
+
+    #[test]
+    fn shortcut_unknown_person_returns_none() {
+        let alias_index: Vec<(String, Uuid, String)> = vec![];
+        let ast = query::parse("@nobody");
+        assert_eq!(
+            entity_page_shortcuts_for_ast(&ast, &alias_index, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn shortcut_disqualified_by_text() {
+        // `@alice cluster` — residual text rules out the shortcut.
+        let alice = Uuid::new_v4();
+        let alias_index = vec![person_alias("alice", alice)];
+        let ast = query::parse("@alice cluster");
+        assert_eq!(
+            entity_page_shortcuts_for_ast(&ast, &alias_index, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn shortcut_disqualified_by_tag() {
+        let alice = Uuid::new_v4();
+        let alias_index = vec![person_alias("alice", alice)];
+        let ast = query::parse("@alice #urgent");
+        assert_eq!(
+            entity_page_shortcuts_for_ast(&ast, &alias_index, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn shortcut_disqualified_by_time() {
+        let alice = Uuid::new_v4();
+        let alias_index = vec![person_alias("alice", alice)];
+        let ast = query::parse("@alice today");
+        assert_eq!(
+            entity_page_shortcuts_for_ast(&ast, &alias_index, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn shortcut_disqualified_by_exclude_entity() {
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let alias_index = vec![person_alias("alice", alice), person_alias("bob", bob)];
+        let ast = query::parse("@alice -@bob");
+        assert_eq!(
+            entity_page_shortcuts_for_ast(&ast, &alias_index, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn shortcut_disqualified_by_empty_ast() {
+        // No entities means nothing to shortcut to.
+        let ast = query::parse("");
+        assert_eq!(entity_page_shortcuts_for_ast(&ast, &[], &[]), None);
+    }
+
+    #[test]
+    fn shortcut_resolves_via_title_fallback() {
+        // Alias index misses; title fallback catches by display-name
+        // substring. Same shape as the resolver's two-step lookup.
+        let alice = Uuid::new_v4();
+        let title_fallback = vec![(alice, "alicestone".to_string())];
+        let ast = query::parse("@alice");
+        let got = entity_page_shortcuts_for_ast(&ast, &[], &title_fallback);
+        assert_eq!(got, Some(vec![alice]));
     }
 }
