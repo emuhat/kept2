@@ -639,6 +639,19 @@ impl OutlineCell {
                 Key::Named(NamedKey::ArrowDown) if mods.shift_key() => {
                     return self.extend_bullet_selection_down();
                 }
+                Key::Named(NamedKey::Enter)
+                    if !primary_mod(mods) && !mods.alt_key() && !mods.shift_key() =>
+                {
+                    // Enter replaces the selection like a printable
+                    // character does: drop the selected bullets,
+                    // then run the normal "Enter splits the focused
+                    // bullet at the caret" path. After delete the
+                    // caret is at the end of the surviving previous
+                    // bullet, so the split produces an empty new
+                    // bullet right after it.
+                    self.delete_bullet_selection();
+                    return self.split_focused();
+                }
                 // Lone modifier presses don't dismiss the selection.
                 Key::Named(NamedKey::Shift)
                 | Key::Named(NamedKey::Control)
@@ -648,6 +661,29 @@ impl OutlineCell {
                     return false;
                 }
                 _ => {
+                    // Typing a printable character replaces the
+                    // bullet selection — same shape as typing over
+                    // a text selection inside a textbox. We delete
+                    // the selected bullets (which leaves the caret
+                    // on the surviving neighbor) and forward the
+                    // keystroke so the typed char lands there.
+                    // Anything that isn't a printable keystroke
+                    // (shortcuts, function keys, etc.) just clears
+                    // the selection.
+                    let typed = !primary_mod(mods)
+                        && event.text.as_deref().map_or(false, |s| {
+                            !s.is_empty() && s.chars().any(|c| !c.is_control())
+                        });
+                    if typed {
+                        self.delete_bullet_selection();
+                        let focused_id = self.focused_bullet;
+                        if let Some(bullet) =
+                            self.bullets.iter_mut().find(|b| b.id == focused_id)
+                        {
+                            bullet.textbox.handle_key(event, modifiers);
+                        }
+                        return true;
+                    }
                     self.bullet_selection = None;
                     return true;
                 }
