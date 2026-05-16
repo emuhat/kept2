@@ -55,17 +55,35 @@ const HEADER_MAX_VISIBLE: usize = 8;
 /// typing freely: results pop under the pill, Arrow keys move
 /// `selected`, Enter commits the selection like the old Ctrl+K
 /// popup did. Esc and clicks outside blur.
+/// One row in the URL-bar suggestion dropdown. Either a synthetic
+/// entry that navigates to a non-cell destination (currently just
+/// the entity page when the query is exactly `@person`) or a cell
+/// match from the search executor.
+#[derive(Clone, Copy)]
+pub(super) enum HeaderResultEntry {
+    /// "Page · <display_name>" — Enter / click jumps to the entity
+    /// page (`Query::entity(uuid)`). Always rendered first when
+    /// present.
+    EntityPage(Uuid),
+    /// A specific cell — Enter / click lands on `Query::cell(uuid)`.
+    Cell(Uuid),
+}
+
 pub(super) struct PaneHeader {
     pub(super) textbox: TextBox,
     pub(super) focused: bool,
-    /// Index of the highlighted result row in `cached_results`.
-    /// Reset to 0 on any text change.
-    pub(super) selected: usize,
+    /// Highlighted result row in `cached_results`, if any. `None`
+    /// means "no row selected" — the default state; Enter in that
+    /// state commits the typed text as a filter view (browser
+    /// URL-bar feel). `Some(i)` means a row was explicitly picked
+    /// with Down/Up arrow; Enter then commits that row's
+    /// destination (entity page or cell).
+    pub(super) selected: Option<usize>,
     /// Result list from the last render; reused for arrow nav,
     /// Enter commit, and result-row click dispatch. Stable while
     /// the @-mention popup is open over the pill so the dropdown
     /// doesn't churn on every keystroke of the `@<query>` token.
-    pub(super) cached_results: Vec<Uuid>,
+    pub(super) cached_results: Vec<HeaderResultEntry>,
     /// The `view` value the textbox was last synced for. Lets the
     /// frame loop skip re-running `query_display_text` when
     /// nothing's changed. `None` forces a sync on the next frame
@@ -78,21 +96,36 @@ impl PaneHeader {
         Self {
             textbox: TextBox::new(typeface, String::new()),
             focused: false,
-            selected: 0,
+            selected: None,
             cached_results: Vec::new(),
             synced_view: None,
         }
     }
 
-    /// Move the selection delta within the cached result count,
-    /// wrapping. No-op when there are no results.
+    /// Move the selection within the cached result count.
+    /// `delta = +1` (Down) walks `None → Some(0) → Some(1) → … →
+    /// Some(count-1) → None` and wraps. `delta = -1` (Up) walks the
+    /// other way. The `None` rest stop lets the user dismiss a
+    /// highlight without exiting focus.
     pub(super) fn move_selection(&mut self, delta: i32) {
         let count = self.cached_results.len().min(HEADER_MAX_VISIBLE);
         if count == 0 {
+            self.selected = None;
             return;
         }
-        let cur = self.selected.min(count - 1) as i32;
-        self.selected = ((cur + delta).rem_euclid(count as i32)) as usize;
+        // Encode `None` as `count` so the wrap math is uniform; map
+        // back at the end.
+        let cur = match self.selected {
+            Some(i) => i.min(count - 1) as i32,
+            None => count as i32,
+        };
+        let total = count as i32 + 1; // +1 for the `None` slot
+        let next = (cur + delta).rem_euclid(total);
+        self.selected = if next == count as i32 {
+            None
+        } else {
+            Some(next as usize)
+        };
     }
 
     /// Drop focus + reset the suggestion list. Caller invalidates
@@ -101,7 +134,7 @@ impl PaneHeader {
     pub(super) fn blur(&mut self) {
         self.focused = false;
         self.cached_results.clear();
-        self.selected = 0;
+        self.selected = None;
         self.synced_view = None;
     }
 }
@@ -353,12 +386,24 @@ impl KeptApp {
         // doesn't churn on every keystroke of the in-progress
         // `@<query>` token.
         let mention_popup_active = self.mention_popup.is_some();
-        let results: Vec<Uuid> = if !mention_popup_active {
-            let fresh = search_results(
-                &query,
-                &self.document,
-                &self.entities,
-                self.show_inactive_cells,
+        let results: Vec<HeaderResultEntry> = if !mention_popup_active {
+            let mut fresh: Vec<HeaderResultEntry> = Vec::new();
+            // If the query is exactly `@person` with nothing else,
+            // prepend a synthetic "Page · <display_name>" row that
+            // commits to the entity page. Multiple matches all
+            // appear, in resolver order.
+            if let Some(ids) = self.entity_page_shortcuts_for(&query) {
+                fresh.extend(ids.into_iter().map(HeaderResultEntry::EntityPage));
+            }
+            fresh.extend(
+                search_results(
+                    &query,
+                    &self.document,
+                    &self.entities,
+                    self.show_inactive_cells,
+                )
+                .into_iter()
+                .map(HeaderResultEntry::Cell),
             );
             self.panes[pane_idx].header.cached_results = fresh.clone();
             fresh
@@ -426,7 +471,7 @@ impl KeptApp {
             return;
         }
 
-        let selected = self.panes[pane_idx].header.selected.min(visible - 1);
+        let selected_idx = self.panes[pane_idx].header.selected;
         let mut date_paint = Paint::default();
         date_paint.set_anti_alias(true);
         date_paint.set_color(crate::color::text_muted_warm_soft());
@@ -436,42 +481,116 @@ impl KeptApp {
 
         let mut row_rects: Vec<Rect> = Vec::with_capacity(visible);
         let mut row_y = drop_rect.top + pad * 0.5;
-        for (i, &id) in results.iter().take(HEADER_MAX_VISIBLE).enumerate() {
-            let row_rect = Rect::new(drop_rect.left + pad * 0.5, row_y, drop_rect.right - pad * 0.5, row_y + row_h);
+        for (i, entry) in results.iter().take(HEADER_MAX_VISIBLE).enumerate() {
+            let row_rect = Rect::new(
+                drop_rect.left + pad * 0.5,
+                row_y,
+                drop_rect.right - pad * 0.5,
+                row_y + row_h,
+            );
             row_rects.push(row_rect);
-            if i == selected {
+            if selected_idx == Some(i) {
                 let mut sel = Paint::default();
                 sel.set_anti_alias(true);
                 sel.set_color(crate::color::accent_blue_selection());
                 canvas.draw_rect(row_rect, &sel);
             }
-            if let Some(cell) = self.document.cell(id) {
-                let date_label = format_date_label(local_date_for_ms(cell.timestamp));
-                let baseline = row_y + (row_h + (-rm.ascent) - rm.descent) * 0.5;
-                let date_w = date_font.measure_str(&date_label, Some(&date_paint)).0;
-                canvas.draw_str(
-                    &date_label,
-                    Point::new(drop_rect.left + pad, baseline),
-                    &date_font,
-                    &date_paint,
-                );
-                let snippet = result_snippet(&cell.full_text(), &query);
-                let snippet_left = drop_rect.left + pad + date_w + 12.0 * scale;
-                let snippet_right = drop_rect.right - pad * 0.5;
-                let avail = (snippet_right - snippet_left).max(0.0);
-                let fitted = fit_text_ellipsized(&snippet, avail, &result_font, &row_paint);
-                canvas.draw_str(
-                    &fitted,
-                    Point::new(snippet_left, baseline),
-                    &result_font,
-                    &row_paint,
-                );
+            let baseline = row_y + (row_h + (-rm.ascent) - rm.descent) * 0.5;
+            match *entry {
+                HeaderResultEntry::EntityPage(entity_id) => {
+                    // Entity-page shortcut: dot prefix in muted
+                    // warm + "Page" tag in the date column, then
+                    // the person's display name in the body column.
+                    let tag = "Page";
+                    let tag_w = date_font.measure_str(tag, Some(&date_paint)).0;
+                    canvas.draw_str(
+                        tag,
+                        Point::new(drop_rect.left + pad, baseline),
+                        &date_font,
+                        &date_paint,
+                    );
+                    let name = self
+                        .entities
+                        .entities
+                        .iter()
+                        .find(|e| e.id == entity_id)
+                        .map(|e| e.display_name.clone())
+                        .unwrap_or_else(|| "(unknown)".to_string());
+                    let name_left = drop_rect.left + pad + tag_w + 12.0 * scale;
+                    let name_right = drop_rect.right - pad * 0.5;
+                    let avail = (name_right - name_left).max(0.0);
+                    let fitted =
+                        fit_text_ellipsized(&name, avail, &result_font, &row_paint);
+                    canvas.draw_str(
+                        &fitted,
+                        Point::new(name_left, baseline),
+                        &result_font,
+                        &row_paint,
+                    );
+                }
+                HeaderResultEntry::Cell(cell_id) => {
+                    if let Some(cell) = self.document.cell(cell_id) {
+                        let date_label = format_date_label(local_date_for_ms(cell.timestamp));
+                        let date_w = date_font.measure_str(&date_label, Some(&date_paint)).0;
+                        canvas.draw_str(
+                            &date_label,
+                            Point::new(drop_rect.left + pad, baseline),
+                            &date_font,
+                            &date_paint,
+                        );
+                        let snippet = result_snippet(&cell.full_text(), &query);
+                        let snippet_left = drop_rect.left + pad + date_w + 12.0 * scale;
+                        let snippet_right = drop_rect.right - pad * 0.5;
+                        let avail = (snippet_right - snippet_left).max(0.0);
+                        let fitted =
+                            fit_text_ellipsized(&snippet, avail, &result_font, &row_paint);
+                        canvas.draw_str(
+                            &fitted,
+                            Point::new(snippet_left, baseline),
+                            &result_font,
+                            &row_paint,
+                        );
+                    }
+                }
             }
             row_y += row_h;
         }
         self.hit_tests_builder
             .header_results
             .push((pane_idx, row_rects));
+    }
+
+    /// Resolve entity-page shortcuts for the URL-bar dropdown.
+    /// Returns `Some(uuids)` when `query` is *exactly* one or more
+    /// `@person` tokens with nothing else — no other filter, no
+    /// residual text. Returns `None` for any other shape so the
+    /// dropdown stays a pure cell-picker. Unknown person names
+    /// resolve to an empty Vec → `None`.
+    fn entity_page_shortcuts_for(&self, query: &str) -> Option<Vec<Uuid>> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let ast = query::parse(trimmed);
+        if !ast.include.tags.is_empty()
+            || !ast.exclude.tags.is_empty()
+            || !ast.exclude.entities.is_empty()
+            || ast.include.time.is_some()
+            || !ast.text.is_empty()
+            || ast.include.entities.is_empty()
+        {
+            return None;
+        }
+        let ids = query::resolve_persons(
+            &ast.include.entities,
+            &self.entities.alias_index,
+            &self.entities.title_fallback,
+        );
+        if ids.is_empty() {
+            None
+        } else {
+            Some(ids)
+        }
     }
 
     /// Single-line summary of a pane's current view, for the URL-bar

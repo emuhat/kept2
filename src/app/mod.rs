@@ -407,7 +407,6 @@ impl Query {
     fn cell(id: Uuid) -> Self {
         Self { view_kind: ViewKind::Cell(id), ast: query::Ast::default() }
     }
-    #[allow(dead_code)]
     fn from_text(input: &str) -> Self {
         Self { view_kind: ViewKind::Ast, ast: query::parse(input) }
     }
@@ -4565,7 +4564,7 @@ impl KeptApp {
                     }
                 }
                 self.panes[idx].header.focused = true;
-                self.panes[idx].header.selected = 0;
+                self.panes[idx].header.selected = None;
                 self.panes[idx].header.textbox.select_all();
                 // Other transient overlays would compete for input.
                 self.mention_popup = None;
@@ -4613,11 +4612,16 @@ impl KeptApp {
                         return true;
                     }
                     Key::Named(NamedKey::Enter) => {
-                        // Alt+Enter routes into the other pane
-                        // (matches the old search popup).
+                        // Filter-first: with no row picked, commit
+                        // the typed query as a view (browser URL-bar
+                        // feel). With a row picked (Down arrow), jump
+                        // to that cell instead. Alt+Enter routes into
+                        // the other pane in both cases.
                         let alt = mods.alt_key();
-                        let sel = self.panes[idx].header.selected;
-                        self.commit_header_result(idx, sel, alt);
+                        match self.panes[idx].header.selected {
+                            Some(row) => self.commit_header_result(idx, row, alt),
+                            None => self.commit_header_filter(idx, alt),
+                        }
                         return true;
                     }
                     Key::Named(NamedKey::ArrowUp) if !mods.shift_key() => {
@@ -4648,7 +4652,7 @@ impl KeptApp {
                     true,
                 ) {
                     if self.panes[idx].header.textbox.text() != pre {
-                        self.panes[idx].header.selected = 0;
+                        self.panes[idx].header.selected = None;
                         self.sync_mention_popup();
                     }
                     return true;
@@ -4667,7 +4671,7 @@ impl KeptApp {
             self.panes[idx].header.textbox.handle_key(event, modifiers);
             let post = self.panes[idx].header.textbox.text().to_string();
             if pre != post {
-                self.panes[idx].header.selected = 0;
+                self.panes[idx].header.selected = None;
             }
             if !popup_was_open {
                 match event.text.as_deref() {
@@ -7061,7 +7065,7 @@ impl KeptApp {
             }
             let pane = &mut self.panes[pane_idx];
             pane.header.focused = true;
-            pane.header.selected = 0;
+            pane.header.selected = None;
             pane.header.textbox.mouse_down(x, y, modifiers, true);
             // Track the drag so cursor motion before mouse_up
             // extends the selection inside the pill.
@@ -7811,37 +7815,78 @@ impl KeptApp {
     /// step for `Subtree` targets that focuses the specific bullet inside
     /// the target outline. No-op when the target cell is gone (the embed
     /// already showed a "[deleted]" placeholder).
+    /// Filter-first commit from the URL bar: parse the typed text
+    /// as a query AST and push it as a new view on `pane_idx` (or
+    /// the other pane when `alt=true`). Matches browser URL-bar
+    /// feel — Enter on `today` lands you in today's date timeline;
+    /// Enter on `#urgent` lands you in the tag filter view; Enter
+    /// on free-text lands you in a substring-match view. Blurs
+    /// the header on commit. No-op when the typed text is empty.
+    fn commit_header_filter(&mut self, pane_idx: usize, alt: bool) {
+        let text = self.panes[pane_idx].header.textbox.text().trim().to_string();
+        if text.is_empty() {
+            self.panes[pane_idx].header.blur();
+            return;
+        }
+        let q = Query::from_text(&text);
+        let saved_active = self.active_pane;
+        self.active_pane = pane_idx;
+        if alt {
+            self.open_in_other_pane(q);
+        } else {
+            self.push_view(q);
+        }
+        self.active_pane = saved_active;
+        self.panes[pane_idx].header.blur();
+        self.mention_popup = None;
+    }
+
     /// Commit a result row from the focused pane's URL-bar
     /// dropdown. `pane_idx` is the pane the dropdown belongs to;
     /// `row_idx` is the index into that pane's
     /// `header.cached_results`. With `alt=true` the destination is
     /// the other pane (matches the old Ctrl+K Alt+Enter behavior).
-    /// Blurs the header on commit. No-op if the row is out of
-    /// range or the cell vanished between cache and dispatch.
+    /// Dispatches on entry kind: entity-page shortcut → entity
+    /// view; cell row → single-cell view. Blurs the header on
+    /// commit. No-op if the row is out of range or the target
+    /// vanished between cache and dispatch.
     fn commit_header_result(&mut self, pane_idx: usize, row_idx: usize, alt: bool) {
-        let id = match self.panes[pane_idx].header.cached_results.get(row_idx) {
-            Some(&id) => id,
+        let entry = match self.panes[pane_idx].header.cached_results.get(row_idx) {
+            Some(&e) => e,
             None => return,
         };
-        if self.cell(id).is_none() {
-            self.panes[pane_idx].header.blur();
-            return;
-        }
+        let (query, focus_cell_id): (Query, Option<Uuid>) = match entry {
+            pane::HeaderResultEntry::EntityPage(eid) => {
+                let known = self.entities.entities.iter().any(|e| e.id == eid);
+                if !known {
+                    self.panes[pane_idx].header.blur();
+                    return;
+                }
+                (Query::entity(eid), None)
+            }
+            pane::HeaderResultEntry::Cell(cid) => {
+                if self.cell(cid).is_none() {
+                    self.panes[pane_idx].header.blur();
+                    return;
+                }
+                (Query::cell(cid), Some(cid))
+            }
+        };
         // Hop active focus to the source pane so `push_view`'s
         // deref-writes land there.
         let saved_active = self.active_pane;
         self.active_pane = pane_idx;
         let dest_pane = if alt {
-            self.open_in_other_pane(Query::cell(id))
-        } else if self.push_view(Query::cell(id)) {
+            self.open_in_other_pane(query)
+        } else if self.push_view(query) {
             Some(self.active_pane)
         } else {
             Some(self.active_pane)
         };
         self.active_pane = saved_active;
-        if let Some(idx) = dest_pane {
+        if let (Some(idx), Some(cell_id)) = (dest_pane, focus_cell_id) {
             let pane = &mut self.panes[idx];
-            pane.focused = Some(id);
+            pane.focused = Some(cell_id);
             pane.editing = false;
             pane.coalesce_break = true;
             pane.pending_caret_scroll = true;

@@ -931,7 +931,7 @@ impl KeptApp {
                         tb.replace_text(new_text);
                         tb.set_caret_at(start + replacement.len());
                     }
-                    pane.header.selected = 0;
+                    pane.header.selected = None;
                 }
             }
         }
