@@ -1289,11 +1289,65 @@ impl OutlineCell {
         }
     }
 
-    /// Select all text inside the focused bullet's textbox.
+    /// Two-step Ctrl+A:
+    /// 1. First press → select all text inside the focused
+    ///    bullet's textbox.
+    /// 2. Second press (focused bullet's text already fully
+    ///    selected, OR a bullet-range selection is already active
+    ///    but doesn't cover everything) → escalate to a
+    ///    bullet-range selection covering every bullet in the
+    ///    outline. Text-level selections are wiped so the
+    ///    single-selection invariant holds.
+    /// Empty focused bullets skip step 1 (nothing to select) and
+    /// go straight to step 2 on the first press, which makes
+    /// "Ctrl+A on an empty bullet" usefully select the whole
+    /// outline. When the bullet-range already covers everything
+    /// the call is a no-op.
     pub fn select_all_in_focused(&mut self) {
+        if self.bullet_selection_covers_all() {
+            return;
+        }
+        let escalate = self.bullet_selection.is_some() || {
+            let Some(idx) = self.focused_index() else { return };
+            let tb = &self.bullets[idx].textbox;
+            let len = tb.text().len();
+            let text_fully_selected = match tb.primary_caret() {
+                Some((a, h)) if len > 0 => a.min(h) == 0 && a.max(h) == len,
+                _ => false,
+            };
+            text_fully_selected || tb.text().is_empty()
+        };
+        if escalate {
+            for b in &mut self.bullets {
+                b.textbox.clear_selection();
+            }
+            let (Some(first), Some(last)) = (
+                self.bullets.first().map(|b| b.id),
+                self.bullets.last().map(|b| b.id),
+            ) else {
+                return;
+            };
+            self.bullet_selection = Some(BulletSelection {
+                anchor_id: first,
+                head_id: last,
+            });
+            return;
+        }
         if let Some(idx) = self.focused_index() {
             self.bullets[idx].textbox.select_all();
         }
+    }
+
+    /// True iff `bullet_selection` is set and spans the first
+    /// bullet through the last (regardless of anchor/head order).
+    fn bullet_selection_covers_all(&self) -> bool {
+        let Some(sel) = self.bullet_selection else { return false };
+        let pos_of = |id: Uuid| self.bullets.iter().position(|b| b.id == id);
+        let Some(a) = pos_of(sel.anchor_id) else { return false };
+        let Some(h) = pos_of(sel.head_id) else { return false };
+        let lo = a.min(h);
+        let hi = a.max(h);
+        lo == 0 && hi + 1 == self.bullets.len()
     }
 
     pub fn focused_text_and_caret(&self) -> Option<(&str, usize)> {
