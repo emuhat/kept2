@@ -227,9 +227,26 @@ impl KeptApp {
                 _ => {}
             }
         }
-        // Esc commits + closes (the "yeet" exit). Skipped above
-        // when the mention popup wants it first.
+        // Esc precedence inside the modal:
+        //   1. Mention popup wants Esc → already handled above.
+        //   2. Active selection on the modal cell → clear it
+        //      (matches the in-timeline Esc-clears-selection rule).
+        //   3. Otherwise → commit + close (the "yeet" exit).
         if pressed && matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+            let has_sel = self
+                .quick_add
+                .as_ref()
+                .map(|s| s.cell.has_any_selection())
+                .unwrap_or(false);
+            if has_sel {
+                if let Some(state) = self.quick_add.as_mut() {
+                    state.cell.clear_all_selections();
+                    // Decisive gesture — next edit starts a fresh
+                    // undo entry.
+                    state.coalesce_break = true;
+                }
+                return true;
+            }
             self.commit_quick_add();
             return true;
         }

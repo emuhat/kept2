@@ -4999,15 +4999,39 @@ impl KeptApp {
             match &event.logical_key {
                 // (Context-menu Esc dismissals are handled above
                 // by `dismiss_open_context_menu`.)
-                // Esc only exits edit mode now — view changes happen
-                // through deliberate nav (Cmd+[ for back, sidebar
-                // clicks, link clicks). A single-cell view stays put
-                // on Esc; press Cmd+[ to back out.
-                Key::Named(NamedKey::Escape) if self.pane_mut().editing => {
-                    self.pane_mut().editing = false;
-                    self.mention_popup = None;
-                    self.pane_mut().coalesce_break = true;
-                    return true;
+                // Esc with an active text / bullet-range selection
+                // on the focused cell → clear the selection
+                // instead of exiting edit mode. One Esc cancels
+                // the selection; a second Esc (now selection-less)
+                // exits edit. Works in view mode too — Esc on a
+                // view-mode drag-selection retires it.
+                Key::Named(NamedKey::Escape) => {
+                    let has_sel = self
+                        .pane_mut()
+                        .focused
+                        .and_then(|id| self.cell(id))
+                        .map(|c| c.has_any_selection())
+                        .unwrap_or(false);
+                    if has_sel {
+                        if let Some(id) = self.pane_mut().focused {
+                            if let Some(c) = self.cell_mut(id) {
+                                c.clear_all_selections();
+                            }
+                        }
+                        self.pane_mut().coalesce_break = true;
+                        return true;
+                    }
+                    // No selection — fall through to edit-mode
+                    // exit if applicable. A view-mode Esc with no
+                    // selection is a no-op (the existing single-
+                    // cell view stays put; press Cmd+[ to back).
+                    if self.pane_mut().editing {
+                        self.pane_mut().editing = false;
+                        self.mention_popup = None;
+                        self.pane_mut().coalesce_break = true;
+                        return true;
+                    }
+                    return false;
                 }
                 Key::Named(NamedKey::Enter)
                     if !self.pane_mut().editing
