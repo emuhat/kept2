@@ -4624,14 +4624,18 @@ impl KeptApp {
             return true;
         }
 
-        // Cmd/Ctrl+H — toggle the Quick-Add modal. Shift adds a
-        // title slot. Same key while open commits + closes (the
-        // "yeet" gesture). The toggle short-circuits BEFORE the
-        // generic Quick-Add key forwarder below so the H itself
+        // Cmd/Ctrl+Y — toggle the Quick-Add modal ("yeet"). Shift
+        // adds a title slot. Same key while open commits + closes.
+        // Y rather than H because macOS reserves Cmd+H for
+        // "hide window." Y normally means "redo" on Windows, but
+        // Cmd/Ctrl+Shift+Z is the canonical redo here; the
+        // Windows-style redo binding is sacrificed for the
+        // Quick-Add toggle. The toggle short-circuits BEFORE the
+        // generic Quick-Add key forwarder below so the Y itself
         // doesn't land as a typed character in the modal.
         if event.state == ElementState::Pressed
             && primary_mod(modifiers.state())
-            && matches!(&event.logical_key, Key::Character(s) if s.as_str().eq_ignore_ascii_case("h"))
+            && matches!(&event.logical_key, Key::Character(s) if s.as_str().eq_ignore_ascii_case("y"))
         {
             let with_title = modifiers.state().shift_key();
             self.toggle_quick_add(with_title);

@@ -290,10 +290,10 @@ impl KeptApp {
                     }
                     return true;
                 }
-                if s.eq_ignore_ascii_case("y") {
-                    self.quick_add_redo();
-                    return true;
-                }
+                // (Cmd/Ctrl+Y is the global Quick-Add toggle now,
+                // intercepted in `handle_key` BEFORE this routes
+                // here. Redo inside the modal goes through
+                // Cmd/Ctrl+Shift+Z.)
                 if s.eq_ignore_ascii_case("t") {
                     let pre = self.quick_add.as_ref().map(|s| s.cell.snapshot());
                     let changed = self
