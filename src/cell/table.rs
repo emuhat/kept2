@@ -390,6 +390,18 @@ impl TableCell {
             if (r, c) != self.focused {
                 self.focus_cell(r, c);
             }
+            // App-wide "one selection at a time": retire selections
+            // on every other table entry so a stale highlight from a
+            // previous click doesn't linger after this one. The
+            // target entry's own state is preserved so shift-click
+            // still extends it.
+            for (rr, row) in self.cells.iter_mut().enumerate() {
+                for (cc, entry) in row.iter_mut().enumerate() {
+                    if (rr, cc) != (r, c) {
+                        entry.textbox.clear_selection();
+                    }
+                }
+            }
             if let Some(entry) = self.cell_at_mut(r, c) {
                 let allow_editing = editing && !entry.readonly;
                 return entry

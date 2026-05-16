@@ -751,11 +751,20 @@ impl OutlineCell {
         // Any new click clears any persisted multi-bullet selection.
         self.bullet_selection = None;
 
-        // Envelope header: forward to the read-only cache for selection
-        // drag (same shape as a top-level Reference cell). origin_id is
-        // a sentinel — it's never matched against a bullet — and the
-        // mode flag drives drag_to / mouse_up routing.
+        // App-wide "only one thing is selected at a time" within
+        // this cell: every click retires every text-selection that
+        // ISN'T on the target. The target's own selection state is
+        // preserved so shift-click still extends it.
         if self.point_in_header_band(abs_y) {
+            // Envelope header: forward to the read-only cache for
+            // selection drag (same shape as a top-level Reference
+            // cell). origin_id is a sentinel — it's never matched
+            // against a bullet — and the mode flag drives drag_to /
+            // mouse_up routing. Bullets aren't the target → wipe
+            // every bullet textbox's selection.
+            for b in &mut self.bullets {
+                b.textbox.clear_selection();
+            }
             if let Some(header) = self.reference_header.as_mut() {
                 if let Some(cache) = header.cache_mut() {
                     cache.mouse_down(abs_x, abs_y, modifiers, false);
@@ -768,18 +777,24 @@ impl OutlineCell {
             return true;
         }
 
-        // Click landed in the bullet body of an envelope outline —
-        // retire any leftover highlight inside the header cache so it
-        // doesn't visually compete with the new bullet-side selection.
+        // Click landed in a bullet. Retire selections on every
+        // *other* surface — the envelope header cache (recursively
+        // clears its own title + body) and every other bullet's
+        // textbox — so only the clicked bullet holds a selection
+        // after this.
         if let Some(header) = self.reference_header.as_mut() {
             if let Some(cache) = header.cache_mut() {
                 cache.clear_all_selections();
             }
         }
-
         let idx = self.bullet_idx_at_y(abs_y);
         if idx >= self.bullets.len() {
             return false;
+        }
+        for (i, b) in self.bullets.iter_mut().enumerate() {
+            if i != idx {
+                b.textbox.clear_selection();
+            }
         }
         let id = self.bullets[idx].id;
         self.focused_bullet = id;

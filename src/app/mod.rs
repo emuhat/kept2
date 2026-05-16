@@ -5227,19 +5227,18 @@ impl KeptApp {
                 }
             }
         }
-        // 2. Focused textbox selection → Text payload.
-        let tb_with_sel: Option<&crate::cell::TextBox> = if cell.title_focused {
-            cell.title()
-        } else {
-            cell.kind.body().focused_textbox()
-        };
-        if let Some(tb) = tb_with_sel {
-            if let Some((text, links)) = tb.copy_primary_selection_with_links() {
-                return Some(KeptPayload::Text {
-                    text,
-                    links: SerLink::spans_to_ser(&links),
-                });
-            }
+        // 2. Whichever textbox in the cell currently holds a
+        //    selection → Text payload. The single-selection
+        //    invariant (enforced in mouse_down) means there's at
+        //    most one; `Cell::copy_primary_selection_with_links`
+        //    searches title / body textboxes / embed caches so a
+        //    selection inside an envelope header's read-only embed
+        //    still copies correctly.
+        if let Some((text, links)) = cell.copy_primary_selection_with_links() {
+            return Some(KeptPayload::Text {
+                text,
+                links: SerLink::spans_to_ser(&links),
+            });
         }
         // 3. View-mode whole-cell fallback. Same selection-or-nothing
         // rule the old `copy_to_clipboard` used: only fires when we're

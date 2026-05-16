@@ -544,6 +544,46 @@ impl Cell {
         self.kind.body().copy_text()
     }
 
+    /// Return `(text, links)` for whichever textbox in this cell
+    /// currently holds a non-empty selection — searching every
+    /// surface the cell can hold a selection on: title, body
+    /// textboxes (visited via `for_each_textbox`, which already
+    /// descends into a `Reference` cell's cache), and the envelope
+    /// outline's `reference_header` cache (which isn't part of
+    /// `for_each_textbox` per the asymmetric-cache-descent rule).
+    ///
+    /// Relies on the "only one selection at a time" invariant
+    /// enforced in the mouse_down chain — at most one of the
+    /// textboxes above has a non-empty selection. Used by the copy
+    /// path so a selection inside an embed gets copied even when
+    /// it's not the focused bullet's textbox.
+    pub fn copy_primary_selection_with_links(&self) -> Option<(String, Vec<LinkSpan>)> {
+        if let Some(title) = self.title.as_ref() {
+            if let Some(sel) = title.copy_primary_selection_with_links() {
+                return Some(sel);
+            }
+        }
+        let mut hit: Option<(String, Vec<LinkSpan>)> = None;
+        self.kind.body().for_each_textbox(&mut |tb| {
+            if hit.is_none() {
+                if let Some(sel) = tb.copy_primary_selection_with_links() {
+                    hit = Some(sel);
+                }
+            }
+        });
+        if hit.is_some() {
+            return hit;
+        }
+        if let CellKind::Outline(oc) = &self.kind {
+            if let Some(h) = oc.reference_header() {
+                if let Some(cache) = h.cache_ref() {
+                    return cache.copy_primary_selection_with_links();
+                }
+            }
+        }
+        None
+    }
+
     /// Cell title, if any: the title slot's text with trailing #tags
     /// stripped. None when there is no title slot or the title contains
     /// only tags / whitespace. "Trailing tags" here means committed
@@ -881,18 +921,35 @@ impl Cell {
         modifiers: &Modifiers,
         editing: bool,
     ) -> bool {
-        // If the click lands in the title's vertical band, focus the title;
-        // otherwise focus the body. The title's y_origin/height come from
-        // the last `tick` so an unrendered cell falls through harmlessly.
-        if let Some(title) = self.title.as_mut() {
-            let top = title.y_origin();
-            let bot = top + title.height();
-            if abs_y >= top && abs_y < bot {
-                self.title_focused = true;
+        // If the click lands in the title's vertical band, focus the
+        // title; otherwise focus the body. The title's y_origin /
+        // height come from the last `tick` so an unrendered cell
+        // falls through harmlessly.
+        //
+        // App-wide we present "only one thing selected at a time".
+        // The other-cells cleanup happens in `dispatch_doc_click`;
+        // here we cover the within-cell case: a click on the title
+        // wipes the body's selections (and vice versa) so a stale
+        // highlight never persists across a title↔body click. The
+        // *target* textbox's selection is preserved so shift-click
+        // still extends it.
+        let title_band = self.title.as_ref().map(|t| {
+            let top = t.y_origin();
+            (top, top + t.height())
+        });
+        let on_title = matches!(title_band, Some((top, bot)) if abs_y >= top && abs_y < bot);
+        if on_title {
+            self.kind.body_mut().clear_all_selections();
+            self.title_focused = true;
+            if let Some(title) = self.title.as_mut() {
                 return title.mouse_down(abs_x, abs_y, modifiers, editing);
             }
+            return false;
         }
         self.unfocus_title_drop_if_empty();
+        if let Some(title) = self.title.as_mut() {
+            title.clear_selection();
+        }
         self.kind.body_mut().mouse_down(abs_x, abs_y, modifiers, editing)
     }
 
