@@ -277,6 +277,13 @@ impl OutlineCell {
         &self.bullets
     }
 
+    /// True iff a bullet-range selection is active (multi-bullet
+    /// drag, Ctrl+Right-click subtree select, or programmatic
+    /// `select_subtree`). Distinct from per-textbox text selection.
+    pub fn has_bullet_selection(&self) -> bool {
+        self.bullet_selection.is_some()
+    }
+
     /// Mutable bullet slice for cell-level span operations that
     /// touch every editable surface. Most callers should reach for
     /// the existing tick / edit / split helpers instead — this is
@@ -572,11 +579,26 @@ impl OutlineCell {
         }
 
         // Bullet-range overlay (only when this cell is focused).
+        // Mirrors the text-selection swap in `TextBox::tick`:
+        // `show_caret` is the edit-mode tell, so the highlight hue
+        // tracks mode just like a per-bullet text drag does.
         if focused {
             if let Some((lo, hi)) = active_indices {
                 let mut hl_paint = Paint::default();
                 hl_paint.set_anti_alias(true);
-                hl_paint.set_color(crate::color::accent_blue_selection());
+                // Match the alpha bullet-range view-mode uses
+                // (`accent_blue_selection` bakes in 0x40) so the
+                // mode delta is purely hue, not opacity. Note this
+                // is a different alpha than the per-textbox path
+                // (0x60) — that's a pre-existing convention from
+                // `accent_blue_selection`, kept for visual parity
+                // with the mention popup / sidebar row highlights.
+                let hl_color = if show_caret {
+                    crate::color::text_selection_edit_alpha(0x40)
+                } else {
+                    crate::color::accent_blue_selection()
+                };
+                hl_paint.set_color(hl_color);
                 for i in lo..=hi {
                     if let Some(&(top, bot)) = bullet_y_bands.get(i) {
                         canvas.draw_rect(Rect::new(x, top, x + width, bot), &hl_paint);

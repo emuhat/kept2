@@ -1055,6 +1055,37 @@ impl Cell {
         self.kind.body_mut().place_caret_at_end();
     }
 
+    /// True iff any visible selection exists on this cell — text
+    /// drag on the title, on the body's focused textbox, on any of
+    /// the body's non-focused textboxes (outline bullets, table
+    /// cells, popppop input/output), or an outline bullet-range
+    /// selection. Used when entering edit mode to decide whether
+    /// to keep the existing selection or jump the caret to the
+    /// end. Reference cells' embed cache also contributes — drag
+    /// inside an embedded preview counts.
+    pub fn has_any_selection(&self) -> bool {
+        if let Some(title) = self.title.as_ref() {
+            if title.has_selection() {
+                return true;
+            }
+        }
+        let mut any = false;
+        self.kind.body().for_each_textbox(&mut |tb| {
+            if tb.has_selection() {
+                any = true;
+            }
+        });
+        if any {
+            return true;
+        }
+        if let CellKind::Outline(oc) = &self.kind {
+            if oc.has_bullet_selection() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Drop every visible selection on this cell — title text drag,
     /// body text drag, outline bullet sub-tree highlight, table cell
     /// drag, and any embedded reference cache (recursively, so an

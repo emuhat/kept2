@@ -951,9 +951,20 @@ impl TextBox {
             .collect();
 
         if focused {
+            // `show_caret` doubles as the edit-mode tell: caret only
+            // renders in edit mode. Selection background tracks the
+            // same boundary so the user can see edit vs. view at a
+            // glance from any selection alone.
+            // Same alpha in both modes so the only visual delta
+            // between view and edit selection is the hue.
+            let hl_color = if show_caret {
+                crate::color::text_selection_edit_alpha(0x60)
+            } else {
+                crate::color::accent_blue_alpha(0x60)
+            };
             let mut hl_paint = Paint::default();
             hl_paint.set_anti_alias(true);
-            hl_paint.set_color(crate::color::accent_blue_alpha(0x60));
+            hl_paint.set_color(hl_color);
             for sel in &self.sels.items {
                 if sel.is_collapsed() {
                     continue;

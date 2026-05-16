@@ -732,12 +732,12 @@ impl KeptApp {
     /// Section-header-green accent ring around the focused cell —
     /// subtle when viewing, brighter and thicker when editing. Color
     /// matches the WHAT / WHEN sidebar headers so the active cell
-    /// visually rhymes with the sidebar's section accents. Suppressed
-    /// in single-cell view where the white card backdrop alone marks
-    /// the active area. No-op when `geom` is None.
+    /// visually rhymes with the sidebar's section accents. Drawn in
+    /// every view (including single-cell), since the ring is also
+    /// the edit-mode tell — without it the user can't see when
+    /// they've entered edit mode. No-op when `geom` is None.
     pub(super) fn render_focus_ring(&self, canvas: &Canvas, geom: Option<FocusedCellGeom>) {
-        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch, bar_left_dx }) =
-            geom.filter(|_| !matches!(self.pane().view.view_kind, ViewKind::Cell(_)))
+        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch, bar_left_dx }) = geom
         else {
             return;
         };

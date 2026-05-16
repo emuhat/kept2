@@ -5000,10 +5000,20 @@ impl KeptApp {
                         }
                     }
                     self.pane_mut().editing = true;
-                    // Position caret at the end so typing appends to the cell.
+                    // If the user has an existing selection (text
+                    // drag, bullet-range, etc.) keep it on edit-mode
+                    // entry — they probably want to act on it. With
+                    // no selection, drop the caret at the end so
+                    // typing appends.
                     if let Some(id) = self.pane_mut().focused {
-                        if let Some(c) = self.cell_mut(id) {
-                            c.place_caret_at_end();
+                        let keep_selection = self
+                            .cell(id)
+                            .map(|c| c.has_any_selection())
+                            .unwrap_or(false);
+                        if !keep_selection {
+                            if let Some(c) = self.cell_mut(id) {
+                                c.place_caret_at_end();
+                            }
                         }
                     }
                     self.pane_mut().pending_caret_scroll = true;

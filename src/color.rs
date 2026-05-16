@@ -55,6 +55,12 @@ pub struct Palette {
     pub text_section_header: Color,
     pub sidebar_text_primary: Color,
     pub sidebar_section_header: Color,
+    /// Text-selection background hue when the focused cell is in
+    /// edit mode. View mode keeps using `accent_blue_selection`
+    /// (the blue highlight); edit mode swaps to this mint-aqua so
+    /// the user can tell view vs. edit at a glance from any
+    /// selection alone.
+    pub text_selection_edit: Color,
     pub bullet_marker: Color,
     pub text_ghost: Color,
     pub text_disabled: Color,
@@ -139,6 +145,7 @@ impl Palette {
             text_section_header: Color::from_rgb(21, 183, 94),
             sidebar_text_primary: Color::from_rgb(3, 23, 12),
             sidebar_section_header: Color::from_rgb(21, 183, 94),
+            text_selection_edit: Color::from_rgb(0xc7, 0xf7, 0xe3),
             bullet_marker: Color::from_rgb(16, 137, 70),
             text_ghost: Color::from_rgb(121, 236, 159),
             text_disabled: Color::from_rgb(166, 242, 191),
@@ -212,6 +219,7 @@ impl Palette {
             "text_section_header" => self.text_section_header = value,
             "sidebar_text_primary" => self.sidebar_text_primary = value,
             "sidebar_section_header" => self.sidebar_section_header = value,
+            "text_selection_edit" => self.text_selection_edit = value,
             "bullet_marker" => self.bullet_marker = value,
             "text_ghost" => self.text_ghost = value,
             "text_disabled" => self.text_disabled = value,
@@ -333,6 +341,7 @@ impl Palette {
         row(&mut out, "text_section_header", p.text_section_header);
         row(&mut out, "sidebar_text_primary", p.sidebar_text_primary);
         row(&mut out, "sidebar_section_header", p.sidebar_section_header);
+        row(&mut out, "text_selection_edit", p.text_selection_edit);
         row(&mut out, "bullet_marker", p.bullet_marker);
         row(&mut out, "text_ghost", p.text_ghost);
         row(&mut out, "text_disabled", p.text_disabled);
@@ -675,6 +684,17 @@ pub fn accent_blue_alpha(a: u8) -> Color {
 #[inline]
 pub fn sidebar_section_header_alpha(a: u8) -> Color {
     let c = palette().sidebar_section_header;
+    Color::from_argb(a, c.r(), c.g(), c.b())
+}
+
+/// Edit-mode text-selection background composed with a runtime
+/// alpha. Distinct hue from the view-mode `accent_blue_alpha` so
+/// the user can tell view vs. edit at a glance from a selection
+/// alone — same shape as that helper so the call site swaps one
+/// for the other.
+#[inline]
+pub fn text_selection_edit_alpha(a: u8) -> Color {
+    let c = palette().text_selection_edit;
     Color::from_argb(a, c.r(), c.g(), c.b())
 }
 
