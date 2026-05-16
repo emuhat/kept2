@@ -379,6 +379,13 @@ enum ViewKind {
     /// attention. Filter and sort live in `render_current_stream`,
     /// not in `is_visible_for_view`.
     Current,
+    /// Single-cell view: just `cell_id` in isolation, with no
+    /// surrounding timeline context. Reached by clicking a
+    /// `kept://<cell>` link, navigating from a Reference cell, or
+    /// committing a cell-result from search. Renders through the
+    /// standard cell-stream pipeline; `is_visible_for_view` reduces
+    /// the cell list to one entry.
+    Cell(Uuid),
 }
 
 /// What the user is viewing in the doc area / highlighting in the sidebar.
@@ -428,6 +435,9 @@ impl Query {
     }
     fn current() -> Self {
         Self { view_kind: ViewKind::Current, ast: query::Ast::default() }
+    }
+    fn cell(id: Uuid) -> Self {
+        Self { view_kind: ViewKind::Cell(id), ast: query::Ast::default() }
     }
     #[allow(dead_code)]
     fn from_text(input: &str) -> Self {
@@ -1655,8 +1665,6 @@ pub struct Pane {
     /// Undo coalesce-break for this pane's edit stream. Cross-pane edits
     /// or focus changes set this so the next edit begins a new undo entry.
     coalesce_break: bool,
-    /// Ctrl+F enlarges the focused cell to fill this pane only.
-    focus_mode: bool,
     /// Per-pane back/forward navigation history.
     nav_back: Vec<HistoryEntry>,
     nav_forward: Vec<HistoryEntry>,
@@ -1690,7 +1698,6 @@ impl Pane {
             viewport_height: 0.0,
             pending_caret_scroll: false,
             coalesce_break: false,
-            focus_mode: false,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             last_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
@@ -2261,7 +2268,6 @@ impl KeptApp {
             viewport_height: src.viewport_height,
             pending_caret_scroll: false,
             coalesce_break: true,
-            focus_mode: false,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             last_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
@@ -2314,29 +2320,24 @@ impl KeptApp {
         result
     }
 
-    /// Open a specific cell in the other pane, in focus mode (the
-    /// cell fills the pane like Ctrl+F does locally). Pushes the
-    /// cell's date view, then writes focus / focus_mode directly to
-    /// the destination pane (the active pane is preserved by
-    /// `open_in_other_pane`, so deref-writes go to the wrong pane).
-    /// Returns false when the cell isn't in `self.document.cells` or the
-    /// destination pane was already on the same view.
+    /// Open a specific cell in the other pane, in single-cell view —
+    /// the cell fills the pane like a local Ctrl+F. Pushes
+    /// `Query::cell(cell_id)` on the destination pane's nav stack and
+    /// focuses the cell. (Active pane is preserved by
+    /// `open_in_other_pane`, so deref-writes go to the wrong pane —
+    /// write to the destination index directly.)
+    /// Returns false when the cell isn't in `self.document.cells` or
+    /// the destination pane was already on the same view.
     fn open_cell_in_other_pane(&mut self, cell_id: Uuid) -> bool {
-        let target_date = match self.cell(cell_id) {
-            Some(c) => local_date_for_ms(c.timestamp),
-            None => return false,
-        };
-        let Some(other) = self.open_in_other_pane(Query::date(target_date)) else {
+        if self.cell(cell_id).is_none() {
+            return false;
+        }
+        let Some(other) = self.open_in_other_pane(Query::cell(cell_id)) else {
             return false;
         };
-        // Write to the destination pane directly. View mode by design —
-        // the user is glancing at the cell, not editing it. Focus mode
-        // enlarges the cell to fill the pane so the gesture reads as
-        // "show me this in detail over there."
         let pane = &mut self.panes[other];
         pane.focused = Some(cell_id);
         pane.editing = false;
-        pane.focus_mode = true;
         pane.pending_caret_scroll = true;
         true
     }
@@ -3274,6 +3275,7 @@ impl KeptApp {
                 cell.resurface_after.map_or(true, |t| now_ms >= t)
             }
             ViewKind::Ast => query::matches(&self.pane().view.ast, cell, ctx),
+            ViewKind::Cell(target) => cell.id == target,
         }
     }
 
@@ -3731,10 +3733,6 @@ impl KeptApp {
         self.cell_context_menu = None;
         self.pane_mut().coalesce_break = true;
         self.pane_mut().pending_caret_scroll = true;
-        // Drop focus mode — the new view's focused cell may not be the
-        // same; "fullscreen on a different cell" is jarring after a
-        // back-nav. The user can re-enter focus mode with Ctrl+F.
-        self.pane_mut().focus_mode = false;
     }
 
     /// IDs of cells visible under the active view, in DISPLAY order — newest
@@ -4148,10 +4146,11 @@ impl KeptApp {
         let pane_h = pane_rect.height();
 
         let scale = self.font_scale;
-        // Focus mode pulls the cell out near the pane's left edge with
-        // smaller pad so it visually expands to fill the pane; normal mode
-        // uses MARGIN_X on both sides.
-        let (cells_left, outer_cell_width) = if self.pane_mut().focus_mode {
+        // Single-cell view pulls the cell out near the pane's left edge
+        // with smaller pad so it visually expands to fill the pane;
+        // every other view uses MARGIN_X on both sides.
+        let single_cell = matches!(self.pane().view.view_kind, ViewKind::Cell(_));
+        let (cells_left, outer_cell_width) = if single_cell {
             let left = pane_left + FOCUS_MODE_PAD * scale;
             let outer = (pane_right - left - FOCUS_MODE_PAD * scale).max(80.0);
             (left, outer)
@@ -4239,7 +4238,7 @@ impl KeptApp {
     /// alone marks the active area. No-op when `geom` is None.
     fn render_focus_ring(&self, canvas: &Canvas, geom: Option<FocusedCellGeom>) {
         let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch, bar_left_dx }) =
-            geom.filter(|_| !self.pane().focus_mode)
+            geom.filter(|_| !matches!(self.pane().view.view_kind, ViewKind::Cell(_)))
         else {
             return;
         };
@@ -4346,9 +4345,10 @@ impl KeptApp {
         let mouse_doc_x = self.mouse_pos.0;
         let mouse_doc_y = self.mouse_pos.1 + self.pane_mut().scroll_y;
         match self.pane_mut().view.view_kind.clone() {
-            ViewKind::Ast | ViewKind::Context(_) | ViewKind::Current => {
-                self.render_cell_stream(canvas, layout)
-            }
+            ViewKind::Ast
+            | ViewKind::Context(_)
+            | ViewKind::Current
+            | ViewKind::Cell(_) => self.render_cell_stream(canvas, layout),
             ViewKind::Entity(eid) => {
                 let h = self.render_entity_page(
                     canvas,
@@ -4424,15 +4424,10 @@ impl KeptApp {
         let mut focused_geom: Option<FocusedCellGeom> = None;
 
         // Precompute per-cell visibility and section headers so the
-        // mutable cell loop below doesn't have to re-borrow self.
-        // In focus mode only the focused cell is visible — everything else
-        // is suppressed regardless of the current view's filters.
-        let visible: Vec<bool> = if self.pane_mut().focus_mode {
-            self.document.cells
-                .iter()
-                .map(|c| Some(c.id) == focused_id)
-                .collect()
-        } else {
+        // mutable cell loop below doesn't have to re-borrow self. The
+        // Cell(_) view already filters to a single id via
+        // `is_visible_for_view`; nothing special needed here.
+        let visible: Vec<bool> = {
             let match_ctx = self.match_context();
             self.document.cells
                 .iter()
@@ -4453,9 +4448,7 @@ impl KeptApp {
             ByDate,
             None,
         }
-        let header_mode = if self.pane_mut().focus_mode {
-            HeaderMode::None
-        } else if !matches!(self.pane_mut().view.view_kind, ViewKind::Ast) {
+        let header_mode = if !matches!(self.pane_mut().view.view_kind, ViewKind::Ast) {
             HeaderMode::None
         } else if matches!(
             self.pane_mut().view.ast.include.time,
@@ -5134,18 +5127,26 @@ impl KeptApp {
                     return true;
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("f") => {
-                    // Ctrl+F: enter "focus mode" — render only the focused
-                    // cell at full width. Esc or any sidebar click exits.
-                    if self.pane_mut().focused.is_none() {
+                    // Ctrl+F: push a single-cell view of the focused cell
+                    // onto the nav history. Back (Cmd+[) returns to the
+                    // previous view. No-op if there's no focus, or the
+                    // current view is already that same single cell.
+                    let Some(id) = self.pane_mut().focused else {
+                        return false;
+                    };
+                    let target = Query::cell(id);
+                    if self.pane().view == target {
                         return false;
                     }
-                    if self.pane_mut().focus_mode {
-                        return false;
+                    let pushed = self.push_view(target);
+                    if pushed {
+                        // `push_view` resets focus to the first visible
+                        // cell; restore to the same id we came from
+                        // (it's the only visible cell anyway, but be
+                        // explicit so caret-scroll lands on it).
+                        self.pane_mut().focused = Some(id);
                     }
-                    self.pane_mut().focus_mode = true;
-                    self.pane_mut().scroll_y = 0.0;
-                    self.pane_mut().coalesce_break = true;
-                    return true;
+                    return pushed;
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("e") => {
                     // Ctrl+E: envelope the focused Reference cell.
@@ -5203,14 +5204,10 @@ impl KeptApp {
             match &event.logical_key {
                 // (Context-menu Esc dismissals are handled above
                 // by `dismiss_open_context_menu`.)
-                // Esc exits focus mode first; if it wasn't on, fall through
-                // to the edit→view exit below.
-                Key::Named(NamedKey::Escape) if self.pane_mut().focus_mode => {
-                    self.pane_mut().focus_mode = false;
-                    self.pane_mut().coalesce_break = true;
-                    self.pane_mut().pending_caret_scroll = true;
-                    return true;
-                }
+                // Esc only exits edit mode now — view changes happen
+                // through deliberate nav (Cmd+[ for back, sidebar
+                // clicks, link clicks). A single-cell view stays put
+                // on Esc; press Cmd+[ to back out.
                 Key::Named(NamedKey::Escape) if self.pane_mut().editing => {
                     self.pane_mut().editing = false;
                     self.mention_popup = None;
@@ -7175,7 +7172,11 @@ impl KeptApp {
         }
         if matches!(
             self.pane_mut().view.view_kind,
-            ViewKind::Ast | ViewKind::Context(_) | ViewKind::Entity(_) | ViewKind::Current
+            ViewKind::Ast
+                | ViewKind::Context(_)
+                | ViewKind::Entity(_)
+                | ViewKind::Current
+                | ViewKind::Cell(_)
         ) {
             let doc_y = y + self.pane_mut().scroll_y;
             // Bar hit-test wins over the body — a right-click on the
@@ -7461,7 +7462,6 @@ impl KeptApp {
         y: f32,
         modifiers: &Modifiers,
     ) -> bool {
-        self.pane_mut().focus_mode = false;
         // Sidebar rects are stored in content-space; map mouse to
         // match (sidebar can scroll independently of the doc area).
         let y = y + self.sidebar_scroll.scroll_y;
@@ -8019,11 +8019,10 @@ impl KeptApp {
     /// already showed a "[deleted]" placeholder).
     fn navigate_to_reference(&mut self, target: ReferenceTarget) {
         let cell_id = target.cell_id();
-        let target_date = match self.cell(cell_id) {
-            Some(c) => local_date_for_ms(c.timestamp),
-            None => return,
-        };
-        self.push_view(Query::date(target_date));
+        if self.cell(cell_id).is_none() {
+            return;
+        }
+        self.push_view(Query::cell(cell_id));
         self.pane_mut().focused = Some(cell_id);
         self.pane_mut().editing = false;
         self.pane_mut().pending_caret_scroll = true;
@@ -8067,8 +8066,8 @@ impl KeptApp {
             if let Ok(uuid) = Uuid::parse_str(rest) {
                 let q = if self.entities.entities.iter().any(|e| e.id == uuid) {
                     Some((Query::entity(uuid), None))
-                } else if let Some(cell) = self.cell(uuid) {
-                    Some((Query::date(local_date_for_ms(cell.timestamp)), Some(uuid)))
+                } else if self.cell(uuid).is_some() {
+                    Some((Query::cell(uuid), Some(uuid)))
                 } else {
                     eprintln!("kept: dangling kept:// link: {url}");
                     return;

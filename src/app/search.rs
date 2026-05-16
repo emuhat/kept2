@@ -355,15 +355,17 @@ impl KeptApp {
             self.pane_mut().coalesce_break = true;
             return;
         };
-        if let Some(cell) = self.cell(id) {
-            let target_date = local_date_for_ms(cell.timestamp);
+        if self.cell(id).is_some() {
             // Track the destination pane so the cell-focus / scroll
             // step lands there, since `open_in_other_pane` preserves
             // the *active* pane (the user expects their typing focus
-            // to stay where they were searching from).
+            // to stay where they were searching from). Cell-search
+            // commits land on a single-cell view, not the cell's
+            // owning timeline — the user wanted "just this cell,"
+            // not "this cell in context of its date."
             let dest_pane = if in_other_pane {
-                self.open_in_other_pane(Query::date(target_date))
-            } else if self.push_view(Query::date(target_date)) {
+                self.open_in_other_pane(Query::cell(id))
+            } else if self.push_view(Query::cell(id)) {
                 Some(self.active_pane)
             } else {
                 Some(self.active_pane)
