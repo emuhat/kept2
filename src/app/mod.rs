@@ -21,6 +21,7 @@ use crate::query;
 
 mod context_menus;
 mod mention_popup;
+mod quick_add;
 mod search;
 mod sidebar;
 mod pane;
@@ -1716,6 +1717,9 @@ pub struct KeptApp {
     redo_stack: Vec<UndoOp>,
     last_edit_time: Option<Instant>,
     mention_popup: Option<MentionPopup>,
+    /// Quick-Add modal (Ctrl+H / Ctrl+Shift+H). `Some` while open.
+    /// See `app/quick_add.rs`.
+    quick_add: Option<quick_add::QuickAddState>,
     clipboard: Option<Clipboard>,
     db: Option<Db>,
     /// Right-click context menu over a cell. While `Some`, render a
@@ -2015,6 +2019,7 @@ impl KeptApp {
             redo_stack: Vec::new(),
             last_edit_time: None,
             mention_popup: None,
+            quick_add: None,
             clipboard: Clipboard::new().ok(),
             db,
             cell_context_menu: None,
@@ -2165,6 +2170,7 @@ impl KeptApp {
             || self.panes.iter().any(|p| p.header.focused)
             || self.people_rename.is_some()
             || self.people_add.is_some()
+            || self.quick_add.is_some()
     }
 
     /// True if `x` falls inside the divider's hit slop. Only meaningful
@@ -3978,6 +3984,11 @@ impl KeptApp {
         // `render_pane_header` (see `pane.rs`); they're already
         // painted before this point.
         let _ = width; // kept for symmetry with mention_popup signature
+        // Quick-Add modal sits above the cell stream + panes but
+        // *under* the mention popup, so a `@`/`#` autocomplete
+        // triggered inside the modal renders on top of the modal
+        // (not buried beneath it).
+        self.render_quick_add(canvas, width, height);
         self.render_mention_popup(canvas, width, height);
         self.render_context_menus(canvas, width, height);
         self.render_toast(canvas, width, height);
@@ -4543,6 +4554,26 @@ impl KeptApp {
             && self.dismiss_open_context_menu()
         {
             return true;
+        }
+
+        // Cmd/Ctrl+H — toggle the Quick-Add modal. Shift adds a
+        // title slot. Same key while open commits + closes (the
+        // "yeet" gesture). The toggle short-circuits BEFORE the
+        // generic Quick-Add key forwarder below so the H itself
+        // doesn't land as a typed character in the modal.
+        if event.state == ElementState::Pressed
+            && primary_mod(modifiers.state())
+            && matches!(&event.logical_key, Key::Character(s) if s.as_str().eq_ignore_ascii_case("h"))
+        {
+            let with_title = modifiers.state().shift_key();
+            self.toggle_quick_add(with_title);
+            return true;
+        }
+        // While the Quick-Add modal is open it owns the keyboard.
+        // Routes Esc to commit + close, everything else to the
+        // modal's cell.
+        if self.quick_add.is_some() {
+            return self.handle_quick_add_key(event, modifiers);
         }
 
         // Cmd/Ctrl+L — toggle focus on the active pane's header
@@ -5205,56 +5236,9 @@ impl KeptApp {
     /// (Outline for outline cells, Text otherwise) — that's the
     /// "Ctrl+C with no selection copies the whole cell" affordance.
     fn build_copy_payload(&self) -> Option<crate::clipboard::KeptPayload> {
-        use crate::clipboard::{BulletPayload, KeptPayload, SerLink};
         let id = self.pane().focused?;
         let cell = self.cell(id)?;
-        // 1. Outline with active multi-bullet selection → Outline payload.
-        if !cell.title_focused {
-            if let CellKind::Outline(oc) = &cell.kind {
-                if let Some(rows) = oc.copy_bullet_selection_with_links() {
-                    if !rows.is_empty() {
-                        return Some(KeptPayload::Outline {
-                            bullets: rows
-                                .into_iter()
-                                .map(|(d, t, ls)| BulletPayload {
-                                    depth: d,
-                                    text: t,
-                                    links: SerLink::spans_to_ser(&ls),
-                                })
-                                .collect(),
-                        });
-                    }
-                }
-            }
-        }
-        // 2. Whichever textbox in the cell currently holds a
-        //    selection → Text payload. The single-selection
-        //    invariant (enforced in mouse_down) means there's at
-        //    most one; `Cell::copy_primary_selection_with_links`
-        //    searches title / body textboxes / embed caches so a
-        //    selection inside an envelope header's read-only embed
-        //    still copies correctly.
-        if let Some((text, links)) = cell.copy_primary_selection_with_links() {
-            return Some(KeptPayload::Text {
-                text,
-                links: SerLink::spans_to_ser(&links),
-            });
-        }
-        // 3. View-mode whole-cell fallback. Same selection-or-nothing
-        // rule the old `copy_to_clipboard` used: only fires when we're
-        // NOT in edit mode (so a stray Ctrl+C while editing with no
-        // selection doesn't dump the whole cell into the buffer).
-        if self.pane().editing {
-            return None;
-        }
-        let whole_text = cell.full_text();
-        if whole_text.is_empty() {
-            return None;
-        }
-        Some(KeptPayload::Text {
-            text: whole_text,
-            links: Vec::new(),
-        })
+        build_copy_payload_for_cell(cell, self.pane().editing)
     }
 
     /// Write a `KeptPayload` to the OS clipboard as HTML (with the
@@ -5355,68 +5339,17 @@ impl KeptApp {
         self.paste_from_clipboard_inner(true)
     }
 
-    /// Default paste dispatch — by payload kind.
+    /// Default paste dispatch — by payload kind. Delegates to the
+    /// cell-local `apply_paste_into_cell` so the Quick-Add path
+    /// can share the dispatch without going through document
+    /// focus / dirty machinery.
     fn apply_paste_default(
         &mut self,
         cell_id: Uuid,
         payload: crate::clipboard::KeptPayload,
     ) {
-        use crate::clipboard::{KeptPayload, SerLink};
-        match payload {
-            KeptPayload::Text { text, links } => {
-                self.paste_text_with_links(
-                    cell_id,
-                    &text,
-                    &SerLink::ser_to_spans(links),
-                );
-            }
-            KeptPayload::Outline { bullets } => {
-                // Outline target → insert as siblings. Anything
-                // else → flatten to indented text (preserving link
-                // spans rebased into the flattened string).
-                let is_outline = matches!(
-                    self.cell(cell_id).map(|c| &c.kind),
-                    Some(CellKind::Outline(_))
-                );
-                if is_outline && !self.cell(cell_id).map(|c| c.title_focused).unwrap_or(false) {
-                    if let Some(cell) = self.cell_mut(cell_id) {
-                        if let CellKind::Outline(oc) = &mut cell.kind {
-                            let raw: Vec<(u32, String, Vec<crate::cell::LinkSpan>)> =
-                                bullets
-                                    .into_iter()
-                                    .map(|b| {
-                                        (
-                                            b.depth,
-                                            b.text,
-                                            SerLink::ser_to_spans(b.links),
-                                        )
-                                    })
-                                    .collect();
-                            oc.insert_bullets_after_focused(raw);
-                        }
-                    }
-                } else {
-                    let (text, links) = flatten_outline(&bullets);
-                    self.paste_text_with_links(
-                        cell_id,
-                        &text,
-                        &SerLink::ser_to_spans(links),
-                    );
-                }
-            }
-            KeptPayload::Reference { target, snippet } => {
-                let url = target.to_url();
-                let display = if snippet.trim().is_empty() {
-                    "↗ reference".to_string()
-                } else {
-                    format!("↗ {}", snippet)
-                };
-                let links = vec![crate::cell::LinkSpan {
-                    range: 0..display.len(),
-                    url,
-                }];
-                self.paste_text_with_links(cell_id, &display, &links);
-            }
+        if let Some(cell) = self.cell_mut(cell_id) {
+            apply_paste_into_cell(cell, payload);
         }
     }
 
@@ -5447,25 +5380,16 @@ impl KeptApp {
     }
 
     /// Insert `text` + `links` at the focused caret in `cell_id`.
-    /// Title or body, depending on `title_focused`.
+    /// Thin wrapper around `paste_text_with_links_into_cell`.
     fn paste_text_with_links(
         &mut self,
         cell_id: Uuid,
         text: &str,
         links: &[crate::cell::LinkSpan],
     ) {
-        let Some(cell) = self.cell_mut(cell_id) else {
-            return;
-        };
-        if cell.title_focused {
-            if let Some(title) = cell.title_mut() {
-                title.paste_with_links(text, links);
-                return;
-            }
+        if let Some(cell) = self.cell_mut(cell_id) {
+            paste_text_with_links_into_cell(cell, text, links);
         }
-        // Forward to the body's focused TextBox via the trait
-        // method that lets us reach mutable TextBoxes.
-        cell.paste_into_focused_with_links(text, links);
     }
 
     /// Render the entity page for `entity_id` into the doc area. Returns
@@ -7043,6 +6967,43 @@ impl KeptApp {
         // Any click cancels in-flight kinetic coast on every pane.
         self.kill_all_kinetic();
 
+        // Mention popup wins z-order over EVERYTHING — including
+        // the Quick-Add modal — so a click on its "Add @X" /
+        // "Add #X" row or one of its candidate rows commits the
+        // pick instead of falling through to whatever sits behind
+        // it (including the Quick-Add "click outside the card to
+        // dismiss" path).
+        if self.mention_popup.is_some() {
+            let in_rect =
+                |r: Rect| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+            if let Some(rect) = self.hit_tests.mention_popup.add_row {
+                if in_rect(rect) {
+                    self.commit_add_mention();
+                    return true;
+                }
+            }
+            let row_hit = self
+                .hit_tests
+                .mention_popup
+                .rows
+                .iter()
+                .position(|r| in_rect(*r));
+            if let Some(idx) = row_hit {
+                self.commit_mention_row(idx);
+                return true;
+            }
+            // Miss: dismiss popup and keep routing the click.
+            self.mention_popup = None;
+        }
+
+        // Quick-Add modal is exclusive while open: clicks inside
+        // its card route to the modal's cell, clicks outside
+        // commit + close. Either way the dispatch below doesn't
+        // run.
+        if self.quick_add.is_some() {
+            return self.handle_quick_add_mouse_down(x, y, modifiers);
+        }
+
         // Pane header URL-pill / dropdown click. Wins over body /
         // sidebar dispatch so the user can interact with the pill
         // and its result rows. A click outside any pill or its
@@ -7093,34 +7054,9 @@ impl KeptApp {
             // wherever it normally would (cell focus, sidebar, etc.).
         }
 
-        // Mention popup intercepts left-clicks first: clicking a row
-        // commits that candidate; clicking the "Add @X" / "Add #X" row
-        // creates a new entity / tag and commits it. A click that
-        // misses the popup dismisses it and falls through to whatever
-        // the click would normally do (focus a cell, etc.).
-        if self.mention_popup.is_some() {
-            let in_rect = |r: Rect| {
-                x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
-            };
-            if let Some(rect) = self.hit_tests.mention_popup.add_row {
-                if in_rect(rect) {
-                    self.commit_add_mention();
-                    return true;
-                }
-            }
-            let row_hit = self
-                .hit_tests
-                .mention_popup
-                .rows
-                .iter()
-                .position(|r| in_rect(*r));
-            if let Some(idx) = row_hit {
-                self.commit_mention_row(idx);
-                return true;
-            }
-            // Miss: dismiss popup and continue routing.
-            self.mention_popup = None;
-        }
+        // (Mention-popup hit-tests are handled near the top of
+        // `mouse_down` so they win even when the Quick-Add modal
+        // is open — see the block above the modal early return.)
 
         // Tag context menu intercepts left-clicks: clicking the "Delete
         // tag" row deletes; clicking anywhere else closes the menu and
@@ -8027,6 +7963,11 @@ impl KeptApp {
                 return pane.header.textbox.mouse_drag_to(x, y);
             }
         }
+        // Quick-Add modal is a window-space overlay — its cell
+        // expects window-coords directly (no scroll translate).
+        if let Some(state) = self.quick_add.as_mut() {
+            return state.cell.mouse_drag_to(x, y);
+        }
         let doc_y = y + self.pane_mut().scroll_y;
         if let Some(id) = self.pane_mut().dragging_cell {
             match self.cell_mut(id) {
@@ -8098,6 +8039,9 @@ impl KeptApp {
         if self.dragging_divider {
             self.dragging_divider = false;
             return true;
+        }
+        if let Some(state) = self.quick_add.as_mut() {
+            return state.cell.mouse_up();
         }
         if let Some(idx) = self.header_dragging_pane.take() {
             if let Some(pane) = self.panes.get_mut(idx) {
@@ -8338,6 +8282,124 @@ fn flatten_outline(
         }
     }
     (text, links)
+}
+
+/// Cell-local payload builder. Same logic as
+/// `KeptApp::build_copy_payload` but parameterized on the cell ref
+/// + editing flag, so the Quick-Add modal can build its own copy
+/// payload from its in-flight cell (which isn't in `document.cells`).
+fn build_copy_payload_for_cell(
+    cell: &Cell,
+    editing: bool,
+) -> Option<crate::clipboard::KeptPayload> {
+    use crate::clipboard::{BulletPayload, KeptPayload, SerLink};
+    // 1. Outline with active multi-bullet selection → Outline payload.
+    if !cell.title_focused {
+        if let CellKind::Outline(oc) = &cell.kind {
+            if let Some(rows) = oc.copy_bullet_selection_with_links() {
+                if !rows.is_empty() {
+                    return Some(KeptPayload::Outline {
+                        bullets: rows
+                            .into_iter()
+                            .map(|(d, t, ls)| BulletPayload {
+                                depth: d,
+                                text: t,
+                                links: SerLink::spans_to_ser(&ls),
+                            })
+                            .collect(),
+                    });
+                }
+            }
+        }
+    }
+    // 2. Whichever textbox in the cell currently holds a selection
+    //    → Text payload. The single-selection invariant means
+    //    there's at most one.
+    if let Some((text, links)) = cell.copy_primary_selection_with_links() {
+        return Some(KeptPayload::Text {
+            text,
+            links: SerLink::spans_to_ser(&links),
+        });
+    }
+    // 3. View-mode whole-cell fallback. In edit mode a stray Ctrl+C
+    //    with no selection shouldn't dump the whole cell.
+    if editing {
+        return None;
+    }
+    let whole_text = cell.full_text();
+    if whole_text.is_empty() {
+        return None;
+    }
+    Some(KeptPayload::Text {
+        text: whole_text,
+        links: Vec::new(),
+    })
+}
+
+/// Insert `text` + `links` at the focused caret in `cell`. Title
+/// or body, depending on `cell.title_focused`. Cell-local primitive
+/// shared by `KeptApp::paste_text_with_links` and the Quick-Add
+/// modal's paste path.
+fn paste_text_with_links_into_cell(
+    cell: &mut Cell,
+    text: &str,
+    links: &[crate::cell::LinkSpan],
+) {
+    if cell.title_focused {
+        if let Some(title) = cell.title_mut() {
+            title.paste_with_links(text, links);
+            return;
+        }
+    }
+    cell.paste_into_focused_with_links(text, links);
+}
+
+/// Apply a `KeptPayload` to `cell` as a default paste — same
+/// dispatch as `KeptApp::apply_paste_default` but the
+/// Reference→Reference-cell creation path is left to the caller
+/// (the modal handles References as inline links only; the
+/// document path uses `surface_as_reference` for the alternate
+/// variant). Cell-local so the Quick-Add modal can paste without
+/// going through the focus-and-dirty machinery.
+fn apply_paste_into_cell(cell: &mut Cell, payload: crate::clipboard::KeptPayload) {
+    use crate::clipboard::{KeptPayload, SerLink};
+    match payload {
+        KeptPayload::Text { text, links } => {
+            paste_text_with_links_into_cell(cell, &text, &SerLink::ser_to_spans(links));
+        }
+        KeptPayload::Outline { bullets } => {
+            let is_outline = matches!(cell.kind, CellKind::Outline(_));
+            if is_outline && !cell.title_focused {
+                if let CellKind::Outline(oc) = &mut cell.kind {
+                    let raw: Vec<(u32, String, Vec<crate::cell::LinkSpan>)> = bullets
+                        .into_iter()
+                        .map(|b| (b.depth, b.text, SerLink::ser_to_spans(b.links)))
+                        .collect();
+                    oc.insert_bullets_after_focused(raw);
+                }
+            } else {
+                let (text, links) = flatten_outline(&bullets);
+                paste_text_with_links_into_cell(
+                    cell,
+                    &text,
+                    &SerLink::ser_to_spans(links),
+                );
+            }
+        }
+        KeptPayload::Reference { target, snippet } => {
+            let url = target.to_url();
+            let display = if snippet.trim().is_empty() {
+                "↗ reference".to_string()
+            } else {
+                format!("↗ {}", snippet)
+            };
+            let links = vec![crate::cell::LinkSpan {
+                range: 0..display.len(),
+                url,
+            }];
+            paste_text_with_links_into_cell(cell, &display, &links);
+        }
+    }
 }
 
 fn bar_color_for_cell(cell: &Cell, now_ms: i64) -> skia_safe::Color {

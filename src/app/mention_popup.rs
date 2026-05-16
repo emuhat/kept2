@@ -82,6 +82,10 @@ enum MentionSource {
     /// Ctrl+K popup). `pane_idx` is the pane the focused header
     /// belongs to.
     PaneHeader { pane_idx: usize },
+    /// The Quick-Add modal's in-flight cell. There's at most one
+    /// Quick-Add open at a time, so the source needs no
+    /// disambiguator beyond the variant tag.
+    QuickAdd,
 }
 
 /// Subsequence fuzzy match. Returns `(score, matched_byte_positions)` if every
@@ -489,10 +493,26 @@ impl KeptApp {
 
     pub(super) fn try_open_mention_popup(&mut self, kind: MentionKind) {
         let trigger = kind.trigger();
-        // Prefer the focused pane header when it has the keyboard
-        // focus — typing in the URL-bar pill never goes through
-        // cell.handle_key, so the cell-source path would be a no-op
-        // here.
+        // Highest priority: the Quick-Add modal. Its cell isn't in
+        // `document.cells`, so the Cell-source path would miss it
+        // entirely. Modal-source wires through `self.quick_add`.
+        if let Some(state) = self.quick_add.as_ref() {
+            if let Some((text, caret)) = state.cell.focused_text_and_caret() {
+                if caret > 0 && text.get(caret - 1..caret) == Some(trigger) {
+                    self.mention_popup = Some(MentionPopup {
+                        source: MentionSource::QuickAdd,
+                        kind,
+                        anchor_byte: caret - 1,
+                        query: String::new(),
+                        selected: 0,
+                    });
+                }
+            }
+            return;
+        }
+        // Next: the focused pane header — typing in the URL-bar
+        // pill never goes through cell.handle_key, so the
+        // cell-source path would be a no-op here.
         if let Some(idx) = self.panes.iter().position(|p| p.header.focused) {
             let tb = &self.panes[idx].header.textbox;
             let text = tb.text();
@@ -582,6 +602,11 @@ impl KeptApp {
                     let caret = p.header.textbox.primary_caret().map(|(_, h)| h)?;
                     Some((p.header.textbox.text().to_string(), caret))
                 }),
+            MentionSource::QuickAdd => self.quick_add.as_ref().and_then(|s| {
+                s.cell
+                    .focused_text_and_caret()
+                    .map(|(t, c)| (t.to_string(), c))
+            }),
         };
         let Some((text, caret)) = cur else {
             self.mention_popup = None;
@@ -661,6 +686,17 @@ impl KeptApp {
                     return;
                 };
                 (x, bot)
+            }
+            MentionSource::QuickAdd => {
+                let Some(state) = self.quick_add.as_ref() else { return };
+                // The modal's cell renders in window-space (the
+                // overlay isn't doc-translated), so its
+                // `anchor_doc_pos` is already a window-space point
+                // — no scroll subtraction needed.
+                let Some((x, y)) = state.cell.anchor_doc_pos(anchor_byte) else {
+                    return;
+                };
+                (x, y)
             }
         };
 
@@ -849,6 +885,27 @@ impl KeptApp {
                     format!("@{slug}"),
                 );
             }
+            MentionSource::QuickAdd => {
+                // Same link-insertion shape as the Cell arm, but
+                // mutating the modal's in-flight cell and pushing
+                // its pre-snapshot onto the modal's own undo
+                // stack so Ctrl+Z inside the modal walks back over
+                // the mention insert.
+                let pre = match self.quick_add.as_ref() {
+                    Some(s) => s.cell.snapshot(),
+                    None => return,
+                };
+                let url = format!("kept://{}", source_id);
+                if let Some(s) = self.quick_add.as_mut() {
+                    s.cell.replace_focused_with_link(start..end, chosen_name, url);
+                }
+                if let Some(s) = self.quick_add.as_mut() {
+                    let post = s.cell.snapshot();
+                    if !pre.doc_eq(&post) {
+                        s.record_edit(pre);
+                    }
+                }
+            }
         }
     }
 
@@ -887,6 +944,21 @@ impl KeptApp {
             }
             MentionSource::PaneHeader { .. } => {
                 self.replace_search_or_cell_text(source, start, end, replacement);
+            }
+            MentionSource::QuickAdd => {
+                let pre = match self.quick_add.as_ref() {
+                    Some(s) => s.cell.snapshot(),
+                    None => return,
+                };
+                if let Some(s) = self.quick_add.as_mut() {
+                    s.cell.replace_focused_with_tag(start..end, replacement);
+                }
+                if let Some(s) = self.quick_add.as_mut() {
+                    let post = s.cell.snapshot();
+                    if !pre.doc_eq(&post) {
+                        s.record_edit(pre);
+                    }
+                }
             }
         }
     }
@@ -932,6 +1004,21 @@ impl KeptApp {
                         tb.set_caret_at(start + replacement.len());
                     }
                     pane.header.selected = None;
+                }
+            }
+            MentionSource::QuickAdd => {
+                let pre = match self.quick_add.as_ref() {
+                    Some(s) => s.cell.snapshot(),
+                    None => return,
+                };
+                if let Some(s) = self.quick_add.as_mut() {
+                    s.cell.replace_focused_with_text(start..end, replacement);
+                }
+                if let Some(s) = self.quick_add.as_mut() {
+                    let post = s.cell.snapshot();
+                    if !pre.doc_eq(&post) {
+                        s.record_edit(pre);
+                    }
                 }
             }
         }
