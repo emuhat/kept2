@@ -15,7 +15,7 @@ use super::TextBox;
 /// bullet sub-tree within an outline (root bullet + its contiguous deeper-
 /// depth followers). Cheap to copy; passed by value through navigation /
 /// snapshot paths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceTarget {
     WholeCell(Uuid),
     Subtree { cell_id: Uuid, bullet_id: Uuid },

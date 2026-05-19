@@ -9,6 +9,7 @@ use crate::cell::{
     parse_inline_tags, Bullet, Cell, CellKind, OutlineCell, PlainCell, PopPopCell,
     ReferenceCell, ReferenceTarget, TableCell, TextBox,
 };
+use crate::thread::{Thread, ThreadId, ThreadMembership};
 
 /// Resolved database path: env override → OS data dir → CWD fallback.
 pub fn db_path() -> PathBuf {
@@ -187,6 +188,36 @@ impl Db {
                 "BEGIN;
                  ALTER TABLE cells ADD COLUMN scratch INTEGER NOT NULL DEFAULT 0;
                  PRAGMA user_version = 8;
+                 COMMIT;",
+            )?;
+        }
+        if version < 9 {
+            // v8 → v9: manual threads. `thread_memberships` uses
+            // `bullet_id IS NULL` to mean "whole cell" (mirroring the
+            // `ReferenceTarget::{WholeCell, Subtree}` shape — see
+            // `src/cell/reference.rs`). Cell-delete cascades through
+            // FK; bullet deletes don't reach SQL so dangling rows are
+            // expected and rendered as missing-reference placeholders.
+            self.conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE threads (
+                     id          BLOB PRIMARY KEY,
+                     title       TEXT NOT NULL,
+                     created_at  INTEGER NOT NULL,
+                     edited_at   INTEGER NOT NULL,
+                     closed_at   INTEGER
+                 );
+                 CREATE TABLE thread_memberships (
+                     thread_id   BLOB NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                     cell_id     BLOB NOT NULL REFERENCES cells(id)   ON DELETE CASCADE,
+                     bullet_id   BLOB,
+                     attached_at INTEGER NOT NULL
+                 );
+                 CREATE UNIQUE INDEX thread_memberships_unique
+                     ON thread_memberships (thread_id, cell_id, IFNULL(bullet_id, x''));
+                 CREATE INDEX thread_memberships_by_cell
+                     ON thread_memberships (cell_id);
+                 PRAGMA user_version = 9;
                  COMMIT;",
             )?;
         }
@@ -939,6 +970,314 @@ impl Db {
             params![id.as_bytes().to_vec()],
         )?;
         Ok(())
+    }
+
+    // ----- threads -----------------------------------------------------
+
+    /// Every thread known to the DB. Caller filters by `closed_at` when
+    /// it wants the open-only view (the "Show inactive" toggle pattern).
+    /// Ordered by `created_at ASC` so list views are stable across loads.
+    pub fn all_threads(&self) -> rusqlite::Result<Vec<Thread>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, created_at, edited_at, closed_at \
+             FROM threads ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                Ok(Thread {
+                    id: Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::nil()),
+                    title: row.get(1)?,
+                    created_at: row.get(2)?,
+                    edited_at: row.get(3)?,
+                    closed_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    #[allow(dead_code)]
+    pub fn thread_by_id(&self, id: ThreadId) -> rusqlite::Result<Option<Thread>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, created_at, edited_at, closed_at \
+             FROM threads WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![id.as_bytes().to_vec()], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                Ok(Thread {
+                    id: Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::nil()),
+                    title: row.get(1)?,
+                    created_at: row.get(2)?,
+                    edited_at: row.get(3)?,
+                    closed_at: row.get(4)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Insert-or-replace a thread row. Caller is responsible for bumping
+    /// `edited_at` when the thread's user-visible state changes (title,
+    /// close/reopen). We don't auto-touch it on every save — `closed_at`
+    /// transitions, for example, want the user's commit timestamp.
+    pub fn upsert_thread(&mut self, thread: &Thread) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO threads (id, title, created_at, edited_at, closed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(id) DO UPDATE SET \
+                 title = excluded.title, \
+                 edited_at = excluded.edited_at, \
+                 closed_at = excluded.closed_at",
+            params![
+                thread.id.as_bytes().to_vec(),
+                thread.title,
+                thread.created_at,
+                thread.edited_at,
+                thread.closed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_thread(&mut self, id: ThreadId) -> rusqlite::Result<()> {
+        // FK cascade drops thread_memberships rows for us.
+        self.conn.execute(
+            "DELETE FROM threads WHERE id = ?1",
+            params![id.as_bytes().to_vec()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thread_closed_at(
+        &mut self,
+        id: ThreadId,
+        closed_at: Option<i64>,
+        edited_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE threads SET closed_at = ?2, edited_at = ?3 WHERE id = ?1",
+            params![id.as_bytes().to_vec(), closed_at, edited_at],
+        )?;
+        Ok(())
+    }
+
+    /// Every membership in the DB. Small enough to load into memory once
+    /// at startup (and after each mutation) the same way entities are.
+    pub fn all_thread_memberships(&self) -> rusqlite::Result<Vec<ThreadMembership>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT thread_id, cell_id, bullet_id, attached_at \
+             FROM thread_memberships ORDER BY attached_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let thread_bytes: Vec<u8> = row.get(0)?;
+                let cell_bytes: Vec<u8> = row.get(1)?;
+                let bullet_bytes: Option<Vec<u8>> = row.get(2)?;
+                let attached_at: i64 = row.get(3)?;
+                let cell_id = Uuid::from_slice(&cell_bytes).unwrap_or_else(|_| Uuid::nil());
+                let target = match bullet_bytes
+                    .and_then(|b| Uuid::from_slice(&b).ok())
+                {
+                    Some(bullet_id) => ReferenceTarget::Subtree { cell_id, bullet_id },
+                    None => ReferenceTarget::WholeCell(cell_id),
+                };
+                Ok(ThreadMembership {
+                    thread_id: Uuid::from_slice(&thread_bytes)
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    target,
+                    attached_at,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Attach a target to a thread. Idempotent — duplicate attach is a
+    /// no-op (the unique index covers `(thread_id, cell_id, bullet_id)`
+    /// with `NULL` collapsed to an empty-blob sentinel).
+    pub fn attach_thread(
+        &mut self,
+        thread_id: ThreadId,
+        target: ReferenceTarget,
+        attached_at: i64,
+    ) -> rusqlite::Result<()> {
+        let (cell_id, bullet_id) = split_target(target);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO thread_memberships \
+                (thread_id, cell_id, bullet_id, attached_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                thread_id.as_bytes().to_vec(),
+                cell_id.as_bytes().to_vec(),
+                bullet_id.map(|id| id.as_bytes().to_vec()),
+                attached_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Drop any Subtree memberships at this cell whose bullet_id is
+    /// NOT in `valid_bullet_ids`. Called from the persistence flush
+    /// after a cell save to sweep ghosts left by hard-deletes
+    /// (bullet selection → Delete), cut-without-paste, or any path
+    /// where a bullet disappears without an explicit transfer.
+    /// Whole-cell memberships are unaffected — the cells FK cascade
+    /// already keeps those consistent. No-op when the cell has no
+    /// subtree memberships.
+    pub fn reconcile_subtree_memberships(
+        &mut self,
+        cell_id: Uuid,
+        valid_bullet_ids: &[Uuid],
+    ) -> rusqlite::Result<usize> {
+        // Pull every subtree row at this cell. Filter in memory so
+        // we don't have to build a SQL IN-list for the bullet ids
+        // (the list is small in practice and this runs once per
+        // cell save).
+        let cell_bytes = cell_id.as_bytes().to_vec();
+        let valid: std::collections::HashSet<Uuid> =
+            valid_bullet_ids.iter().copied().collect();
+        let stale: Vec<Vec<u8>> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT bullet_id FROM thread_memberships \
+                 WHERE cell_id = ?1 AND bullet_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![cell_bytes.clone()], |row| {
+                let b: Vec<u8> = row.get(0)?;
+                Ok(b)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|bytes| {
+                    Uuid::from_slice(bytes)
+                        .map(|u| !valid.contains(&u))
+                        .unwrap_or(true)
+                })
+                .collect()
+        };
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut removed = 0usize;
+        for bullet_bytes in &stale {
+            removed += tx.execute(
+                "DELETE FROM thread_memberships \
+                 WHERE cell_id = ?1 AND bullet_id = ?2",
+                params![cell_bytes, bullet_bytes],
+            )?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Replace every membership at `(cell_id, bullet_id)` with the
+    /// given `(thread_id, attached_at)` list. Used by the undo of a
+    /// bullet merge to restore a snapshotted pre-merge state. Empty
+    /// `memberships` simply detaches the bullet from every thread.
+    pub fn set_bullet_memberships(
+        &mut self,
+        cell_id: Uuid,
+        bullet_id: Uuid,
+        memberships: &[(ThreadId, i64)],
+    ) -> rusqlite::Result<()> {
+        let cell_bytes = cell_id.as_bytes().to_vec();
+        let bullet_bytes = bullet_id.as_bytes().to_vec();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM thread_memberships \
+             WHERE cell_id = ?1 AND bullet_id = ?2",
+            params![cell_bytes, bullet_bytes],
+        )?;
+        for (thread_id, attached_at) in memberships {
+            tx.execute(
+                "INSERT OR IGNORE INTO thread_memberships \
+                    (thread_id, cell_id, bullet_id, attached_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    thread_id.as_bytes().to_vec(),
+                    cell_bytes,
+                    bullet_bytes,
+                    attached_at,
+                ],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// Move every membership pointing at `(cell_id, from_bullet)`
+    /// to `(cell_id, into_bullet)`. Used when two bullets are
+    /// merged in the editor — without this, threads attached to
+    /// the disappearing bullet silently orphan because the unique
+    /// index keys on `bullet_id`. Idempotent w.r.t. dedup: if a
+    /// thread already attaches the `into` bullet, the `from`
+    /// duplicate is dropped instead of double-inserting.
+    pub fn move_bullet_memberships(
+        &mut self,
+        cell_id: Uuid,
+        from_bullet: Uuid,
+        into_bullet: Uuid,
+    ) -> rusqlite::Result<()> {
+        if from_bullet == into_bullet {
+            return Ok(());
+        }
+        let cell_bytes = cell_id.as_bytes().to_vec();
+        let from_bytes = from_bullet.as_bytes().to_vec();
+        let into_bytes = into_bullet.as_bytes().to_vec();
+        let tx = self.conn.transaction()?;
+        // Idempotent transfer: ensure each thread that touches the
+        // from-bullet also touches the into-bullet, then drop the
+        // from-side rows in bulk.
+        tx.execute(
+            "INSERT OR IGNORE INTO thread_memberships \
+                (thread_id, cell_id, bullet_id, attached_at) \
+             SELECT thread_id, cell_id, ?3, attached_at \
+             FROM thread_memberships \
+             WHERE cell_id = ?1 AND bullet_id = ?2",
+            params![cell_bytes, from_bytes, into_bytes],
+        )?;
+        tx.execute(
+            "DELETE FROM thread_memberships \
+             WHERE cell_id = ?1 AND bullet_id = ?2",
+            params![cell_bytes, from_bytes],
+        )?;
+        tx.commit()
+    }
+
+    pub fn detach_thread(
+        &mut self,
+        thread_id: ThreadId,
+        target: ReferenceTarget,
+    ) -> rusqlite::Result<()> {
+        let (cell_id, bullet_id) = split_target(target);
+        match bullet_id {
+            Some(bid) => self.conn.execute(
+                "DELETE FROM thread_memberships \
+                 WHERE thread_id = ?1 AND cell_id = ?2 AND bullet_id = ?3",
+                params![
+                    thread_id.as_bytes().to_vec(),
+                    cell_id.as_bytes().to_vec(),
+                    bid.as_bytes().to_vec(),
+                ],
+            )?,
+            None => self.conn.execute(
+                "DELETE FROM thread_memberships \
+                 WHERE thread_id = ?1 AND cell_id = ?2 AND bullet_id IS NULL",
+                params![
+                    thread_id.as_bytes().to_vec(),
+                    cell_id.as_bytes().to_vec(),
+                ],
+            )?,
+        };
+        Ok(())
+    }
+}
+
+fn split_target(target: ReferenceTarget) -> (Uuid, Option<Uuid>) {
+    match target {
+        ReferenceTarget::WholeCell(cell_id) => (cell_id, None),
+        ReferenceTarget::Subtree { cell_id, bullet_id } => (cell_id, Some(bullet_id)),
     }
 }
 
@@ -2321,5 +2660,310 @@ mod tests {
         assert!(remaining.contains(&new_scratch_id), "fresh scratch survives");
         assert!(remaining.contains(&old_regular_id), "old regular cells aren't touched");
         assert!(!remaining.contains(&old_scratch_id), "expired scratch is gone");
+    }
+
+    // ----- threads -------------------------------------------------------
+
+    fn fresh_thread(title: &str) -> Thread {
+        let now = now_epoch_ms();
+        Thread {
+            id: Uuid::new_v4(),
+            title: title.to_string(),
+            created_at: now,
+            edited_at: now,
+            closed_at: None,
+        }
+    }
+
+    #[test]
+    fn round_trip_thread_create_list_delete() {
+        let mut db = open_in_memory_db();
+        let t = fresh_thread("alpha");
+        db.upsert_thread(&t).expect("upsert");
+        let listed = db.all_threads().expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, t.id);
+        assert_eq!(listed[0].title, "alpha");
+        db.delete_thread(t.id).expect("delete");
+        assert!(db.all_threads().expect("list").is_empty());
+    }
+
+    #[test]
+    fn attach_detach_whole_cell_and_subtree() {
+        let tf = typeface();
+        let mut db = open_in_memory_db();
+        let cell = Cell::new(tf.clone(), "host".to_string());
+        let cell_id = cell.id;
+        let bullet_id = Uuid::new_v4();
+        db.save_cell(&cell).expect("save");
+        let t = fresh_thread("x");
+        db.upsert_thread(&t).expect("upsert");
+        db.attach_thread(t.id, ReferenceTarget::WholeCell(cell_id), 100)
+            .expect("attach whole");
+        db.attach_thread(
+            t.id,
+            ReferenceTarget::Subtree { cell_id, bullet_id },
+            200,
+        )
+        .expect("attach subtree");
+        let mems = db.all_thread_memberships().expect("list");
+        assert_eq!(mems.len(), 2);
+        let mut targets: Vec<_> = mems.iter().map(|m| m.target).collect();
+        targets.sort_by_key(|t| match t {
+            ReferenceTarget::WholeCell(_) => 0,
+            ReferenceTarget::Subtree { .. } => 1,
+        });
+        assert!(matches!(targets[0], ReferenceTarget::WholeCell(c) if c == cell_id));
+        assert!(matches!(
+            targets[1],
+            ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
+                if c == cell_id && b == bullet_id
+        ));
+        db.detach_thread(t.id, ReferenceTarget::WholeCell(cell_id))
+            .expect("detach whole");
+        let after = db.all_thread_memberships().expect("list");
+        assert_eq!(after.len(), 1);
+        assert!(matches!(after[0].target, ReferenceTarget::Subtree { .. }));
+    }
+
+    #[test]
+    fn attach_is_idempotent() {
+        let tf = typeface();
+        let mut db = open_in_memory_db();
+        let cell = Cell::new(tf.clone(), "host".to_string());
+        let cell_id = cell.id;
+        db.save_cell(&cell).expect("save");
+        let t = fresh_thread("x");
+        db.upsert_thread(&t).expect("upsert");
+        db.attach_thread(t.id, ReferenceTarget::WholeCell(cell_id), 100)
+            .expect("attach 1");
+        db.attach_thread(t.id, ReferenceTarget::WholeCell(cell_id), 200)
+            .expect("attach 2");
+        assert_eq!(db.all_thread_memberships().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn cell_delete_cascades_memberships() {
+        let tf = typeface();
+        let mut db = open_in_memory_db();
+        let cell = Cell::new(tf.clone(), "host".to_string());
+        let cell_id = cell.id;
+        db.save_cell(&cell).expect("save");
+        let t = fresh_thread("x");
+        db.upsert_thread(&t).expect("upsert");
+        db.attach_thread(t.id, ReferenceTarget::WholeCell(cell_id), 1)
+            .expect("attach");
+        db.delete_cell(cell_id).expect("delete cell");
+        assert!(
+            db.all_thread_memberships().expect("list").is_empty(),
+            "FK cascade should drop memberships when the host cell is deleted"
+        );
+    }
+
+    #[test]
+    fn thread_delete_cascades_memberships() {
+        let tf = typeface();
+        let mut db = open_in_memory_db();
+        let cell = Cell::new(tf.clone(), "host".to_string());
+        let cell_id = cell.id;
+        db.save_cell(&cell).expect("save");
+        let t = fresh_thread("x");
+        db.upsert_thread(&t).expect("upsert");
+        db.attach_thread(t.id, ReferenceTarget::WholeCell(cell_id), 1)
+            .expect("attach");
+        db.delete_thread(t.id).expect("delete thread");
+        assert!(db.all_thread_memberships().expect("list").is_empty());
+    }
+
+    #[test]
+    fn reconcile_subtree_memberships_drops_only_orphans() {
+        let tf = typeface();
+        let mut db = open_in_memory_db();
+        let cell = Cell::new(tf.clone(), "host".to_string());
+        let cell_id = cell.id;
+        db.save_cell(&cell).expect("save");
+        let t = fresh_thread("alpha");
+        db.upsert_thread(&t).expect("upsert");
+        let live_bullet = Uuid::new_v4();
+        let dead_bullet = Uuid::new_v4();
+        // Whole-cell + live-bullet membership stay; dead-bullet drops.
+        db.attach_thread(t.id, ReferenceTarget::WholeCell(cell_id), 10)
+            .expect("attach whole");
+        db.attach_thread(
+            t.id,
+            ReferenceTarget::Subtree { cell_id, bullet_id: live_bullet },
+            20,
+        )
+        .expect("attach live");
+        db.attach_thread(
+            t.id,
+            ReferenceTarget::Subtree { cell_id, bullet_id: dead_bullet },
+            30,
+        )
+        .expect("attach dead");
+        let removed = db
+            .reconcile_subtree_memberships(cell_id, &[live_bullet])
+            .expect("reconcile");
+        assert_eq!(removed, 1);
+        let mems = db.all_thread_memberships().expect("list");
+        assert_eq!(mems.len(), 2);
+        let targets: Vec<_> = mems.iter().map(|m| m.target).collect();
+        assert!(targets.iter().any(|t| matches!(t, ReferenceTarget::WholeCell(c) if *c == cell_id)));
+        assert!(targets.iter().any(|t| matches!(
+            t,
+            ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
+                if *c == cell_id && *b == live_bullet
+        )));
+    }
+
+    #[test]
+    fn set_bullet_memberships_round_trips_via_move_then_restore() {
+        // Models the undo of a bullet merge: move from->into, then
+        // restore both sides from snapshots taken pre-merge.
+        let tf = typeface();
+        let mut db = open_in_memory_db();
+        let cell = Cell::new(tf.clone(), "host".to_string());
+        let cell_id = cell.id;
+        db.save_cell(&cell).expect("save");
+        let t1 = fresh_thread("alpha");
+        let t2 = fresh_thread("beta");
+        let t3 = fresh_thread("gamma");
+        db.upsert_thread(&t1).expect("upsert t1");
+        db.upsert_thread(&t2).expect("upsert t2");
+        db.upsert_thread(&t3).expect("upsert t3");
+        let from = Uuid::new_v4();
+        let into = Uuid::new_v4();
+        // Pre-merge: from has t1 + t2; into has t2 + t3.
+        // (t2 overlaps; dedupe will trigger on move.)
+        db.attach_thread(
+            t1.id,
+            ReferenceTarget::Subtree { cell_id, bullet_id: from },
+            10,
+        )
+        .expect("attach t1@from");
+        db.attach_thread(
+            t2.id,
+            ReferenceTarget::Subtree { cell_id, bullet_id: from },
+            20,
+        )
+        .expect("attach t2@from");
+        db.attach_thread(
+            t2.id,
+            ReferenceTarget::Subtree { cell_id, bullet_id: into },
+            30,
+        )
+        .expect("attach t2@into");
+        db.attach_thread(
+            t3.id,
+            ReferenceTarget::Subtree { cell_id, bullet_id: into },
+            40,
+        )
+        .expect("attach t3@into");
+        // Snapshot pre-merge state.
+        let pre_from: Vec<(Uuid, i64)> = vec![(t1.id, 10), (t2.id, 20)];
+        let pre_into: Vec<(Uuid, i64)> = vec![(t2.id, 30), (t3.id, 40)];
+        // Do the move.
+        db.move_bullet_memberships(cell_id, from, into).expect("move");
+        // Now restore both ends — undo path.
+        db.set_bullet_memberships(cell_id, from, &pre_from)
+            .expect("restore from");
+        db.set_bullet_memberships(cell_id, into, &pre_into)
+            .expect("restore into");
+        let mems = db.all_thread_memberships().expect("list");
+        assert_eq!(mems.len(), 4);
+        let at_from: Vec<_> = mems
+            .iter()
+            .filter(|m| matches!(
+                m.target,
+                ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
+                    if c == cell_id && b == from
+            ))
+            .map(|m| (m.thread_id, m.attached_at))
+            .collect();
+        let mut at_from_sorted = at_from.clone();
+        at_from_sorted.sort_by_key(|(_, a)| *a);
+        assert_eq!(at_from_sorted, vec![(t1.id, 10), (t2.id, 20)]);
+        let at_into: Vec<_> = mems
+            .iter()
+            .filter(|m| matches!(
+                m.target,
+                ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
+                    if c == cell_id && b == into
+            ))
+            .map(|m| (m.thread_id, m.attached_at))
+            .collect();
+        let mut at_into_sorted = at_into.clone();
+        at_into_sorted.sort_by_key(|(_, a)| *a);
+        assert_eq!(at_into_sorted, vec![(t2.id, 30), (t3.id, 40)]);
+    }
+
+    #[test]
+    fn move_bullet_memberships_transfers_and_dedupes() {
+        let tf = typeface();
+        let mut db = open_in_memory_db();
+        let cell = Cell::new(tf.clone(), "host".to_string());
+        let cell_id = cell.id;
+        db.save_cell(&cell).expect("save");
+        let t1 = fresh_thread("alpha");
+        let t2 = fresh_thread("beta");
+        db.upsert_thread(&t1).expect("upsert t1");
+        db.upsert_thread(&t2).expect("upsert t2");
+        let from = Uuid::new_v4();
+        let into = Uuid::new_v4();
+        // t1 attached at `from` only — transfers cleanly.
+        db.attach_thread(
+            t1.id,
+            ReferenceTarget::Subtree { cell_id, bullet_id: from },
+            10,
+        )
+        .expect("attach t1@from");
+        // t2 attached at BOTH from and into — dedupe should drop
+        // the from-side row instead of duplicating.
+        db.attach_thread(
+            t2.id,
+            ReferenceTarget::Subtree { cell_id, bullet_id: from },
+            20,
+        )
+        .expect("attach t2@from");
+        db.attach_thread(
+            t2.id,
+            ReferenceTarget::Subtree { cell_id, bullet_id: into },
+            30,
+        )
+        .expect("attach t2@into");
+        db.move_bullet_memberships(cell_id, from, into)
+            .expect("move");
+        let mems = db.all_thread_memberships().expect("list");
+        // 2 rows expected: t1@into, t2@into. The duplicate t2@from
+        // collapses into the existing t2@into.
+        assert_eq!(mems.len(), 2);
+        for m in &mems {
+            assert!(matches!(
+                m.target,
+                ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
+                    if c == cell_id && b == into
+            ));
+        }
+        let thread_ids: std::collections::HashSet<_> =
+            mems.iter().map(|m| m.thread_id).collect();
+        assert!(thread_ids.contains(&t1.id));
+        assert!(thread_ids.contains(&t2.id));
+    }
+
+    #[test]
+    fn set_thread_closed_at_round_trips() {
+        let mut db = open_in_memory_db();
+        let t = fresh_thread("x");
+        db.upsert_thread(&t).expect("upsert");
+        let now = now_epoch_ms();
+        db.set_thread_closed_at(t.id, Some(now), now)
+            .expect("close");
+        let back = db.thread_by_id(t.id).expect("by id").expect("present");
+        assert_eq!(back.closed_at, Some(now));
+        db.set_thread_closed_at(t.id, None, now + 1)
+            .expect("reopen");
+        let back = db.thread_by_id(t.id).expect("by id").expect("present");
+        assert!(back.closed_at.is_none());
+        assert_eq!(back.edited_at, now + 1);
     }
 }

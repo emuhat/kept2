@@ -4,8 +4,85 @@ use skia_safe::{
 use uuid::Uuid;
 
 use crate::cell::{Cell, CellKind, ReferenceTarget};
+use crate::thread::ThreadId;
 
 use super::{HitTestState, clamp_rect_to_viewport, fit_text_ellipsized};
+
+/// Hit rects emitted by the shared `threads_group` helper. Same shape
+/// for both `CellContextMenu` and `BarContextMenu` — the bar menu
+/// just never asks for the subtree row.
+#[derive(Default)]
+pub(super) struct ThreadsGroupHits {
+    pub(super) attach_whole: Option<Rect>,
+    pub(super) attach_subtree: Option<Rect>,
+    pub(super) detach: Vec<(ThreadId, ReferenceTarget, Rect)>,
+}
+
+/// How many rows `threads_group` will emit, used to size the menu
+/// rect before rendering. Paired with `threads_group` so the height
+/// calc and the render loop can't drift.
+pub(super) fn threads_group_row_count(
+    is_scratch: bool,
+    show_whole_attach: bool,
+    has_subtree: bool,
+    attached_count: usize,
+) -> usize {
+    if is_scratch {
+        return 0;
+    }
+    (if show_whole_attach { 1 } else { 0 })
+        + (if has_subtree { 1 } else { 0 })
+        + attached_count
+}
+
+/// Render the Threads group of a context menu: whole-cell "Attach to
+/// thread…" + optional subtree "Attach '<snippet>' to thread…" + one
+/// "Detach from <title>" row per existing membership, terminated by
+/// a separator. Suppressed on scratch cells.
+///
+/// `emit_row` and `emit_separator` mirror the local closures both
+/// menus already define for their other groups; passed by reference
+/// so this helper inherits the caller's row geometry / colors / etc.
+/// without re-deriving any of it. The detach rows carry their own
+/// `ReferenceTarget` so a single click can route the right membership
+/// even when a thread has both whole-cell and subtree attachments.
+pub(super) fn threads_group(
+    is_scratch: bool,
+    show_whole_attach: bool,
+    subtree_snippet: Option<&str>,
+    attached: &[(ThreadId, ReferenceTarget, String)],
+    row_top: &mut f32,
+    emit_row: &impl Fn(&mut f32, &str, Color, Color) -> Rect,
+    emit_separator: &impl Fn(&mut f32),
+) -> ThreadsGroupHits {
+    let mut hits = ThreadsGroupHits::default();
+    if is_scratch {
+        return hits;
+    }
+    let row_color = crate::color::text_menu_row();
+    let hover = crate::color::embed_hover();
+    if show_whole_attach {
+        hits.attach_whole = Some(emit_row(row_top, "Attach to thread…", row_color, hover));
+    }
+    if let Some(snip) = subtree_snippet {
+        let label = format!("Attach '{}' to thread…", snip);
+        hits.attach_subtree = Some(emit_row(row_top, &label, row_color, hover));
+    }
+    for (tid, target, title) in attached {
+        // Disambiguate when a thread has both whole-cell and subtree
+        // attachments to the same cell — without the suffix the two
+        // detach rows would be indistinguishable.
+        let suffix = match target {
+            ReferenceTarget::Subtree { .. } => " (subtree)",
+            ReferenceTarget::WholeCell(_) => "",
+        };
+        let label = format!("Detach from {}{}", title, suffix);
+        let rect = emit_row(row_top, &label, row_color, hover);
+        hits.detach.push((*tid, *target, rect));
+    }
+    emit_separator(row_top);
+    hits
+}
 
 /// Per-frame context the menu render methods need from `KeptApp`. Pure
 /// data slice — the menus take this by mutable reference instead of
@@ -172,12 +249,39 @@ fn draw_menu_row(
 }
 
 impl CellContextMenu {
+    /// What the primary "Attach to thread…" row should operate on.
+    /// Always whole-cell semantics, mirroring the Surface row above
+    /// it: for a Reference source, preserve the reference's target
+    /// (so re-attaching a Subtree reference keeps the subtree
+    /// pointer); otherwise a WholeCell of the resolved source.
+    pub(super) fn whole_attach_target(&self) -> ReferenceTarget {
+        self.source_reference_target
+            .unwrap_or(ReferenceTarget::WholeCell(self.reference_origin_cell_id))
+    }
+
+    /// Target for the secondary "Attach '<snippet>' to thread…" row.
+    /// Returns `Some` only when the right-click landed on a bullet
+    /// that lives in *this* cell's outline (not inside a nested
+    /// embed — mirrors the surface-subtree gate).
+    pub(super) fn subtree_attach_target(&self) -> Option<ReferenceTarget> {
+        let origin = self.bullet_origin_cell_id?;
+        let bid = self.bullet_id?;
+        if origin != self.cell_id {
+            return None;
+        }
+        Some(ReferenceTarget::Subtree {
+            cell_id: origin,
+            bullet_id: bid,
+        })
+    }
+
     pub(super) fn render(
         &self,
         canvas: &Canvas,
         view_w: f32,
         view_h: f32,
         cell: &Cell,
+        attached_threads: &[(ThreadId, ReferenceTarget, String)],
         ctx: &mut MenuRenderCtx<'_>,
     ) {
         let scale = ctx.font_scale;
@@ -236,11 +340,26 @@ impl CellContextMenu {
         if target_resurface_present {
             action_count += 1;
         }
-        // Two group separators (Surface | Snooze | Close/Mutate)
-        // for regular cells. Scratch cells skip the Surface group
-        // entirely → one fewer row group and one fewer separator.
+        // Threads group is shared with the bar menu — see
+        // `threads_group` for layout. Cell-body menu: when the
+        // right-click landed on a bullet inside this cell, the menu
+        // is bullet-scoped — show only the subtree Attach row, hide
+        // the whole-cell variant. Whole-cell attach lives on the
+        // bar (left-edge) menu. When the click missed a bullet (or
+        // hit a Reference cell, etc.), the whole-cell row is the
+        // only relevant action.
+        let has_subtree_attach = self.subtree_attach_target().is_some();
+        let show_whole_attach = !has_subtree_attach;
+        action_count += threads_group_row_count(
+            is_scratch,
+            show_whole_attach,
+            has_subtree_attach,
+            attached_threads.len(),
+        );
+        // Group separators: Surface | Snooze | Threads | Close. Scratch
+        // skips the Surface AND Threads groups → one fewer separator each.
         let separator_h = pad;
-        let separator_count: usize = if is_scratch { 1 } else { 2 };
+        let separator_count: usize = if is_scratch { 1 } else { 3 };
         let menu_h = pad
             + action_h * action_count as f32
             + separator_h * separator_count as f32
@@ -374,7 +493,23 @@ impl CellContextMenu {
 
         emit_separator(&mut row_top);
 
-        // ----- Group 3: Close (state change, scoped to body context) -----
+        // ----- Group 3: Threads (shared with the bar menu) -----
+        let subtree_snippet = if has_subtree_attach {
+            Some(self.bullet_snippet.as_deref().unwrap_or("[empty]"))
+        } else {
+            None
+        };
+        let threads_hits = threads_group(
+            is_scratch,
+            show_whole_attach,
+            subtree_snippet,
+            attached_threads,
+            &mut row_top,
+            &emit_row,
+            &emit_separator,
+        );
+
+        // ----- Group 4: Close (state change, scoped to body context) -----
         // Whole-cell shape transforms (Envelope / Unwrap) live on
         // the BarContextMenu now — they're whole-cell operations
         // and don't belong in a bullet-specific menu.
@@ -416,6 +551,9 @@ impl CellContextMenu {
         ctx.hit_tests.cell_menu.snooze = snooze_rects;
         ctx.hit_tests.cell_menu.unsnooze = unsnooze_rect;
         ctx.hit_tests.cell_menu.snooze_targets_bullet = snooze_targets_bullet;
+        ctx.hit_tests.cell_menu.attach_thread = threads_hits.attach_whole;
+        ctx.hit_tests.cell_menu.attach_thread_subtree = threads_hits.attach_subtree;
+        ctx.hit_tests.cell_menu.detach_thread = threads_hits.detach;
     }
 }
 
@@ -431,6 +569,7 @@ impl BarContextMenu {
         view_w: f32,
         view_h: f32,
         cell: &Cell,
+        attached_threads: &[(ThreadId, ReferenceTarget, String)],
         ctx: &mut MenuRenderCtx<'_>,
     ) {
         let scale = ctx.font_scale;
@@ -470,10 +609,15 @@ impl BarContextMenu {
             action_count += 1; // Surface as reference
             action_count += 1; // Copy reference
         }
+        // Threads group is shared with the cell menu — see
+        // `threads_group`. Bar menu is the whole-cell home: always
+        // show the whole-cell Attach row, never the subtree row.
+        action_count +=
+            threads_group_row_count(is_scratch, true, false, attached_threads.len());
         action_count += 1; // Delete cell
         // Separators: info | surface+copyref (or move-to-timeline) |
-        // snoozes | [shape (envelope/unwrap)] | delete.
-        let mut separator_count: usize = 3;
+        // snoozes | [shape (envelope/unwrap)] | threads | delete.
+        let mut separator_count: usize = if is_scratch { 3 } else { 4 };
         if has_shape_group {
             separator_count += 1;
         }
@@ -642,7 +786,18 @@ impl BarContextMenu {
             emit_separator(&mut row_top);
         }
 
-        // ----- Group 5: Delete (destructive, last) -----
+        // ----- Group 5: Threads (shared with the cell menu) -----
+        let threads_hits = threads_group(
+            is_scratch,
+            true,  // whole-cell Attach is the bar menu's reason for offering threads
+            None,  // bar menu has no subtree variant
+            attached_threads,
+            &mut row_top,
+            &emit_row,
+            &emit_separator,
+        );
+
+        // ----- Group 6: Delete (destructive, last) -----
         let delete_rect = emit_row(
             &mut row_top,
             "Delete cell",
@@ -657,6 +812,14 @@ impl BarContextMenu {
         ctx.hit_tests.bar_menu.unsnooze = unsnooze_rect;
         ctx.hit_tests.bar_menu.envelope = envelope_rect;
         ctx.hit_tests.bar_menu.unwrap = unwrap_rect;
+        ctx.hit_tests.bar_menu.attach_thread = threads_hits.attach_whole;
+        // Bar menu never asks for a subtree row; the field is unused here.
+        debug_assert!(threads_hits.attach_subtree.is_none());
+        ctx.hit_tests.bar_menu.detach_thread = threads_hits
+            .detach
+            .into_iter()
+            .map(|(tid, _, rect)| (tid, rect))
+            .collect();
         ctx.hit_tests.bar_menu.delete = Some(delete_rect);
     }
 }

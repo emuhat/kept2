@@ -57,6 +57,13 @@ pub struct BulletPayload {
     pub depth: u32,
     pub text: String,
     pub links: Vec<SerLink>,
+    /// Thread ids attached to this bullet's subtree at copy time.
+    /// On paste, the freshly-allocated destination bullet id gets
+    /// attached to each thread. `#[serde(default)]` for backward
+    /// compatibility with payloads written before the field existed
+    /// and for non-Kept clipboard sources (HTML, plain text).
+    #[serde(default)]
+    pub thread_ids: Vec<Uuid>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -418,6 +425,7 @@ fn walk_html(
                     depth: depth as u32,
                     text: trimmed,
                     links: adjusted,
+                    thread_ids: Vec::new(),
                 });
             }
             // Nested <ul>/<ol> inside this <li> are one level deeper.
@@ -608,6 +616,7 @@ pub fn from_plain_text(text: &str) -> KeptPayload {
                         depth,
                         text: strip_bullet_prefix(trimmed).to_string(),
                         links: Vec::new(),
+                        thread_ids: Vec::new(),
                     })
                 }
             })
@@ -690,16 +699,19 @@ mod tests {
                     depth: 0,
                     text: "alpha".into(),
                     links: vec![],
+                    thread_ids: vec![],
                 },
                 BulletPayload {
                     depth: 1,
                     text: "beta".into(),
                     links: vec![ser_link(0, 4, "https://x.com/")],
+                    thread_ids: vec![],
                 },
                 BulletPayload {
                     depth: 0,
                     text: "gamma".into(),
                     links: vec![],
+                    thread_ids: vec![],
                 },
             ],
         };
@@ -837,9 +849,9 @@ mod tests {
     fn html_outline_emits_nested_ul_for_nested_bullets() {
         let p = KeptPayload::Outline {
             bullets: vec![
-                BulletPayload { depth: 0, text: "alpha".into(), links: vec![] },
-                BulletPayload { depth: 1, text: "beta".into(), links: vec![] },
-                BulletPayload { depth: 0, text: "gamma".into(), links: vec![] },
+                BulletPayload { depth: 0, text: "alpha".into(), links: vec![], thread_ids: vec![] },
+                BulletPayload { depth: 1, text: "beta".into(), links: vec![], thread_ids: vec![] },
+                BulletPayload { depth: 0, text: "gamma".into(), links: vec![], thread_ids: vec![] },
             ],
         };
         let html = to_html(&p);
@@ -862,9 +874,9 @@ mod tests {
     #[test]
     fn html_outline_roundtrip_without_marker_preserves_depths() {
         let original = vec![
-            BulletPayload { depth: 0, text: "alpha".into(), links: vec![] },
-            BulletPayload { depth: 1, text: "beta".into(), links: vec![] },
-            BulletPayload { depth: 0, text: "gamma".into(), links: vec![] },
+            BulletPayload { depth: 0, text: "alpha".into(), links: vec![], thread_ids: vec![] },
+            BulletPayload { depth: 1, text: "beta".into(), links: vec![], thread_ids: vec![] },
+            BulletPayload { depth: 0, text: "gamma".into(), links: vec![], thread_ids: vec![] },
         ];
         let p = KeptPayload::Outline { bullets: original.clone() };
         let html = to_html(&p);

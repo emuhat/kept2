@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use arboard::Clipboard;
 use uuid::{Uuid, uuid};
 use skia_safe::{
-    Canvas, Font, FontMgr, Paint, PaintStyle, PathEffect, Point, Rect, Typeface,
+    BlurStyle, Canvas, Font, FontMgr, MaskFilter, Paint, PaintStyle, PathEffect, Point, Rect,
+    Typeface,
 };
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
@@ -12,12 +13,14 @@ use winit::{
 };
 
 use crate::cell::{
-    self, Cell, CellKind, CellSnapshot, ReferenceTarget, TextBox, now_epoch_ms, primary_mod,
+    self, Cell, CellKind, CellSnapshot, EmbeddedReference, ReferenceTarget, TextBox,
+    now_epoch_ms, primary_mod,
 };
 use crate::document::{Context, Document};
 use crate::entity_cache::EntityCache;
 use crate::persist::{ContextRef, Db, db_path};
 use crate::query;
+use crate::thread::{Thread, ThreadId, ThreadMembership};
 
 mod context_menus;
 mod mention_popup;
@@ -128,11 +131,19 @@ struct HitTestState {
     entity_page: EntityPageHits,
     people_page: PeoplePageHits,
     mention_popup: MentionPopupHits,
+    thread_picker: ThreadPickerHits,
+    thread_page: ThreadPageHits,
+    thread_list_page: ThreadListPageHits,
     /// Per-frame list of (cell_id, left-bar rect) populated by
     /// `render_cell_stream`. The bar is the "select whole cell"
     /// click target and the anchor for the bar context menu
     /// (Delete, info, cell-level Snooze).
     cell_bars: Vec<(Uuid, Rect)>,
+    /// Inline "in threads" chip rects below each cell that has at
+    /// least one whole-cell membership. Click navigates to the
+    /// chip's thread page. Recorded in doc-space (cell stream
+    /// already translated). Per-bullet chips live separately.
+    cell_thread_chips: Vec<(ThreadId, Rect)>,
     /// Per-pane URL-bar pill rect (window coords), populated by
     /// `render_pane_header`. Clicks on this rect focus the pane's
     /// `header.textbox` for editing.
@@ -141,6 +152,52 @@ struct HitTestState {
     /// `header_results[i] = (pane_idx, rects)` where the index into
     /// `rects` matches `pane.header.cached_results[i]`.
     header_results: Vec<(usize, Vec<Rect>)>,
+}
+
+/// What a click on a thread-picker row commits to.
+#[derive(Clone, Copy, Debug)]
+enum PickerRow {
+    /// Top row when the query is non-empty: create a new thread with
+    /// the query as its title and attach the target (or just create
+    /// and navigate, when the picker was opened without a target).
+    CreateNew,
+    /// Click attaches the target to this existing thread. The
+    /// `ThreadId` is captured for completeness and future use; the
+    /// commit path currently looks it up by row index from the same
+    /// filter the render used.
+    #[allow(dead_code)]
+    Existing(ThreadId),
+}
+
+#[derive(Default)]
+struct ThreadPickerHits {
+    /// Per-row rects in render order. Click commits.
+    rows: Vec<(PickerRow, Rect)>,
+    /// Whole-overlay rect — clicks outside dismiss.
+    menu: Option<Rect>,
+}
+
+#[derive(Default)]
+struct ThreadPageHits {
+    /// Title rect (click → enter rename).
+    title: Option<Rect>,
+    /// Close/Reopen toggle rect.
+    close_toggle: Option<Rect>,
+    /// Per-member embed card rects — click opens the original.
+    members: Vec<(ReferenceTarget, Rect)>,
+    /// Per-member "Detach" affordance rect (matched to `members[i]`
+    /// by index).
+    detach_buttons: Vec<Rect>,
+}
+
+#[derive(Default)]
+struct ThreadListPageHits {
+    /// "Show inactive" toggle pill at the top right.
+    show_inactive_toggle: Option<Rect>,
+    /// Per-row rects (one per visible thread).
+    rows: Vec<(ThreadId, Rect)>,
+    /// "+ New thread…" footer row — opens the picker in create-only mode.
+    add_row: Option<Rect>,
 }
 
 #[derive(Default)]
@@ -153,6 +210,9 @@ struct SidebarHits {
     tags: Vec<(String, Rect)>,
     /// PAGES section row rects — dispatched to `push_view(...)`.
     pages: Vec<(PageKind, Rect)>,
+    /// Per-thread row rects under the THREADS section. Click opens
+    /// `ViewKind::Thread(id)`.
+    threads: Vec<(ThreadId, Rect)>,
     /// Relative-week rows (This Week, Last Week) above the date list.
     /// Each entry is the time filter the click should activate.
     weeks: Vec<(query::TimeFilter, Rect)>,
@@ -230,6 +290,19 @@ struct CellMenuHits {
     /// `cell_context_menu.bullet_id`; when false, they target the
     /// cell.
     snooze_targets_bullet: bool,
+    /// Whole-cell "Attach to thread…" row — opens the picker for
+    /// `WholeCell(cell_id)` (or the preserved Reference target).
+    /// Always present except on scratch cells.
+    attach_thread: Option<Rect>,
+    /// Subtree "Attach '<snippet>' to thread…" row — opens the
+    /// picker for the bullet's subtree. Only present when the
+    /// right-click landed on a bullet in this cell.
+    attach_thread_subtree: Option<Rect>,
+    /// "Detach from <title>" rows — one per membership the right-
+    /// click implicates. Each row carries its own target so a
+    /// single click detaches the right one even when a thread has
+    /// both whole-cell and subtree attachments here.
+    detach_thread: Vec<(ThreadId, ReferenceTarget, Rect)>,
 }
 
 /// Right-click on a cell's left-edge bar opens this menu. Always
@@ -259,6 +332,11 @@ struct BarMenuHits {
     /// back into a bare Reference. `Some` only when the bar menu
     /// opened on an envelope outline.
     unwrap: Option<Rect>,
+    /// "Attach to thread…" — whole-cell semantics; opens the picker.
+    /// Always present except on scratch.
+    attach_thread: Option<Rect>,
+    /// "Detach from <title>" rows — one per whole-cell membership.
+    detach_thread: Vec<(ThreadId, Rect)>,
     delete: Option<Rect>,
 }
 
@@ -286,6 +364,14 @@ struct MentionPopupHits {
     /// query produced no matches. Mouse-only — keyboard Enter never
     /// reaches it (Enter without a match dismisses without commit).
     add_row: Option<Rect>,
+    /// Full popup card rect — used by `mouse_down` to keep
+    /// outside-clicks from dismissing the popup while the user is
+    /// clicking inside the ThreadAttach text input.
+    menu: Option<Rect>,
+    /// Input band rect (ThreadAttach mode only). Clicks here move
+    /// the caret / start a selection inside the embedded TextBox
+    /// instead of committing a row.
+    input_band: Option<Rect>,
 }
 
 #[derive(Default)]
@@ -332,6 +418,8 @@ enum PageKind {
     /// Transient scratch timeline. Auto-deletes notes older than
     /// `SCRATCH_TTL_MS`; not findable, not linkable.
     Scratch,
+    /// "All threads" list view (clicked from the THREADS header row).
+    ThreadList,
 }
 
 /// In-progress inline rename of a People-page row. While `Some`, the row's
@@ -376,6 +464,13 @@ enum ViewKind {
     /// while this view is active are scratch-flagged. See
     /// `Cmd/Ctrl+S` to enter.
     Scratch,
+    /// "All threads" list page, structurally analogous to People.
+    /// Rendered through the same named-list machinery as People.
+    ThreadList,
+    /// Single thread page: title + the thread's members rendered as
+    /// embed previews. Members are pointers into the timeline; the
+    /// view does not own content.
+    Thread(Uuid),
 }
 
 /// What the user is viewing in the doc area / highlighting in the sidebar.
@@ -431,6 +526,12 @@ impl Query {
     }
     fn cell(id: Uuid) -> Self {
         Self { view_kind: ViewKind::Cell(id), ast: query::Ast::default() }
+    }
+    fn thread_list() -> Self {
+        Self { view_kind: ViewKind::ThreadList, ast: query::Ast::default() }
+    }
+    fn thread(id: Uuid) -> Self {
+        Self { view_kind: ViewKind::Thread(id), ast: query::Ast::default() }
     }
     fn from_text(input: &str) -> Self {
         Self { view_kind: ViewKind::Ast, ast: query::parse(input) }
@@ -525,6 +626,12 @@ enum UndoOp {
         cell_id: Uuid,
         pre: CellSnapshot,
         post: CellSnapshot,
+        /// Bullet merges that happened as part of this edit gesture
+        /// (e.g. Backspace at start of a bullet → merge into prev).
+        /// Each entry captures the pre-merge thread memberships at
+        /// both ends so undo restores them and redo re-runs the
+        /// move. Empty for ops that don't merge bullets.
+        bullet_merges: Vec<BulletMergeUndo>,
     },
     InsertCell {
         cell_id: Uuid,
@@ -660,6 +767,62 @@ enum UndoOp {
         post: CellSnapshot,
         pre_focused: Option<Uuid>,
     },
+    /// Thread create from the thread-list view (no attachment in the
+    /// same gesture — picker that creates + attaches uses
+    /// `CreateAndAttachThread` instead). Undo deletes the row;
+    /// redo re-inserts.
+    CreateThread { thread: Thread },
+    /// Thread delete. Captures the thread row + every membership row
+    /// so undo restores them all. Memberships are dropped by FK
+    /// cascade on the DB delete, but the in-memory list mirrors
+    /// them, so we re-attach each one explicitly on undo.
+    #[allow(dead_code)] // No UI affordance for delete yet (close suffices); kept for v2.
+    DeleteThread {
+        thread: Thread,
+        memberships: Vec<ThreadMembership>,
+    },
+    /// Thread title rename. Symmetric.
+    RenameThread {
+        thread_id: ThreadId,
+        prev: String,
+        new: String,
+        /// Captured so we can restore `edited_at` on undo (the original
+        /// op bumped it; we want the undone state to look exactly like
+        /// it did pre-edit).
+        prev_edited_at: i64,
+        new_edited_at: i64,
+    },
+    /// Thread close / reopen toggle. `prev` and `new` are
+    /// `Option<i64>` epoch ms — `Some(t)` = closed at `t`, `None` = open.
+    SetThreadClosedAt {
+        thread_id: ThreadId,
+        prev: Option<i64>,
+        new: Option<i64>,
+        prev_edited_at: i64,
+        new_edited_at: i64,
+    },
+    /// Attach an existing thread to a target. Symmetric — undo
+    /// detaches.
+    AttachThread {
+        thread_id: ThreadId,
+        target: ReferenceTarget,
+        attached_at: i64,
+    },
+    /// Detach a target from a thread. Undo re-attaches at
+    /// `attached_at` so the original order is preserved on redo.
+    DetachThread {
+        thread_id: ThreadId,
+        target: ReferenceTarget,
+        attached_at: i64,
+    },
+    /// Combined create-thread + attach-target, recorded as a single
+    /// undo entry so Ctrl+Z reverses the whole gesture (the user
+    /// thinks of "Attach to new thread X" as one action, not two).
+    CreateAndAttachThread {
+        thread: Thread,
+        target: ReferenceTarget,
+        attached_at: i64,
+    },
 }
 
 /// Which direction an `UndoOp::apply` is going. Undo restores the pre
@@ -671,6 +834,24 @@ enum UndoOp {
 enum UndoDir {
     Undo,
     Redo,
+}
+
+/// One bullet merge captured for undo/redo. Stores the pre-merge
+/// memberships at both ends so the undo path can restore them
+/// verbatim (we can't reconstruct `into`'s original memberships
+/// from the post-merge state — they're indistinguishable from the
+/// ones moved over from `from`).
+#[derive(Clone)]
+struct BulletMergeUndo {
+    cell_id: Uuid,
+    from: Uuid,
+    into: Uuid,
+    /// `(thread_id, attached_at)` rows that existed at `(cell, from)`
+    /// before the merge.
+    pre_from: Vec<(ThreadId, i64)>,
+    /// `(thread_id, attached_at)` rows that existed at `(cell, into)`
+    /// before the merge.
+    pre_into: Vec<(ThreadId, i64)>,
 }
 
 impl UndoOp {
@@ -688,7 +869,12 @@ impl UndoOp {
     /// just swapping a snapshot.
     fn apply(&self, app: &mut KeptApp, dir: UndoDir) {
         match self {
-            Self::CellEdit { cell_id, pre, post } => {
+            Self::CellEdit {
+                cell_id,
+                pre,
+                post,
+                bullet_merges,
+            } => {
                 let snap = match dir {
                     UndoDir::Undo => pre,
                     UndoDir::Redo => post,
@@ -696,6 +882,44 @@ impl UndoOp {
                 app.pane_mut().focused = Some(*cell_id);
                 if let Some(c) = app.cell_mut(*cell_id) {
                     c.restore(snap.clone());
+                }
+                // Reverse / re-apply any bullet-membership transfers
+                // bundled with this edit. Undo restores both bullets'
+                // pre-merge memberships verbatim; redo replays the
+                // move_bullet_memberships call.
+                if !bullet_merges.is_empty() {
+                    if let Some(db) = app.db.as_mut() {
+                        match dir {
+                            UndoDir::Undo => {
+                                // Walk merges in reverse so chained
+                                // merges (rare but possible via
+                                // coalesced edits) unwind in the
+                                // reverse order they were applied.
+                                for m in bullet_merges.iter().rev() {
+                                    let _ = db.set_bullet_memberships(
+                                        m.cell_id,
+                                        m.from,
+                                        &m.pre_from,
+                                    );
+                                    let _ = db.set_bullet_memberships(
+                                        m.cell_id,
+                                        m.into,
+                                        &m.pre_into,
+                                    );
+                                }
+                            }
+                            UndoDir::Redo => {
+                                for m in bullet_merges.iter() {
+                                    let _ = db.move_bullet_memberships(
+                                        m.cell_id,
+                                        m.from,
+                                        m.into,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    app.reload_threads();
                 }
             }
             Self::InsertCell {
@@ -968,6 +1192,133 @@ impl UndoOp {
                 }
                 app.document.dirty_cells.insert(*cell_id);
                 app.pane_mut().focused = focused;
+            }
+            Self::CreateThread { thread } => {
+                match dir {
+                    UndoDir::Undo => {
+                        if let Some(db) = app.db.as_mut() {
+                            let _ = db.delete_thread(thread.id);
+                        }
+                    }
+                    UndoDir::Redo => {
+                        if let Some(db) = app.db.as_mut() {
+                            let _ = db.upsert_thread(thread);
+                        }
+                    }
+                }
+                app.reload_threads();
+            }
+            Self::DeleteThread { thread, memberships } => {
+                match dir {
+                    UndoDir::Undo => {
+                        if let Some(db) = app.db.as_mut() {
+                            let _ = db.upsert_thread(thread);
+                            for m in memberships {
+                                let _ = db.attach_thread(
+                                    m.thread_id,
+                                    m.target,
+                                    m.attached_at,
+                                );
+                            }
+                        }
+                    }
+                    UndoDir::Redo => {
+                        if let Some(db) = app.db.as_mut() {
+                            // FK cascade also drops memberships.
+                            let _ = db.delete_thread(thread.id);
+                        }
+                    }
+                }
+                app.reload_threads();
+            }
+            Self::RenameThread {
+                thread_id,
+                prev,
+                new,
+                prev_edited_at,
+                new_edited_at,
+            } => {
+                let (title, edited_at) = match dir {
+                    UndoDir::Undo => (prev, *prev_edited_at),
+                    UndoDir::Redo => (new, *new_edited_at),
+                };
+                if let Some(db) = app.db.as_mut() {
+                    if let Ok(Some(mut t)) = db.thread_by_id(*thread_id) {
+                        t.title = title.clone();
+                        t.edited_at = edited_at;
+                        let _ = db.upsert_thread(&t);
+                    }
+                }
+                app.reload_threads();
+            }
+            Self::SetThreadClosedAt {
+                thread_id,
+                prev,
+                new,
+                prev_edited_at,
+                new_edited_at,
+            } => {
+                let (closed_at, edited_at) = match dir {
+                    UndoDir::Undo => (*prev, *prev_edited_at),
+                    UndoDir::Redo => (*new, *new_edited_at),
+                };
+                if let Some(db) = app.db.as_mut() {
+                    let _ = db.set_thread_closed_at(*thread_id, closed_at, edited_at);
+                }
+                app.reload_threads();
+            }
+            Self::AttachThread {
+                thread_id,
+                target,
+                attached_at,
+            } => {
+                if let Some(db) = app.db.as_mut() {
+                    match dir {
+                        UndoDir::Undo => {
+                            let _ = db.detach_thread(*thread_id, *target);
+                        }
+                        UndoDir::Redo => {
+                            let _ = db.attach_thread(*thread_id, *target, *attached_at);
+                        }
+                    }
+                }
+                app.reload_threads();
+            }
+            Self::DetachThread {
+                thread_id,
+                target,
+                attached_at,
+            } => {
+                if let Some(db) = app.db.as_mut() {
+                    match dir {
+                        UndoDir::Undo => {
+                            let _ = db.attach_thread(*thread_id, *target, *attached_at);
+                        }
+                        UndoDir::Redo => {
+                            let _ = db.detach_thread(*thread_id, *target);
+                        }
+                    }
+                }
+                app.reload_threads();
+            }
+            Self::CreateAndAttachThread {
+                thread,
+                target,
+                attached_at,
+            } => {
+                if let Some(db) = app.db.as_mut() {
+                    match dir {
+                        UndoDir::Undo => {
+                            // FK cascade clears the membership too.
+                            let _ = db.delete_thread(thread.id);
+                        }
+                        UndoDir::Redo => {
+                            let _ = db.upsert_thread(thread);
+                            let _ = db.attach_thread(thread.id, *target, *attached_at);
+                        }
+                    }
+                }
+                app.reload_threads();
             }
         }
     }
@@ -1834,6 +2185,68 @@ pub struct KeptApp {
     /// in flight (even when the scroller's dragging slot was
     /// already cleared by the end-pass).
     pan_drag: bool,
+    /// Persistent preview caches for the active list-of-references
+    /// page (Person page's "REFERENCED IN", Thread page's "MEMBERS").
+    /// Each entry's `EmbeddedReference` owns its cache across frames
+    /// so drag-select inside an embed survives the next render, and
+    /// scrolling doesn't rebuild every cache. `page_embeds_for`
+    /// identifies which page the list was built for — when a page
+    /// switch happens, the list is rebuilt from the new source's
+    /// targets, but caches for unchanged `ReferenceTarget`s are
+    /// salvaged across the rebuild. See `refresh_page_embeds`.
+    page_embeds: Vec<EmbeddedReference>,
+    page_embeds_for: Option<PageEmbedSource>,
+    /// In-memory mirror of the DB's `threads` table. Refreshed via
+    /// `reload_threads()` after every attach / detach / create /
+    /// delete / rename / close. Same invalidation discipline as
+    /// `entities`.
+    threads: Vec<Thread>,
+    /// In-memory mirror of `thread_memberships`. Small enough to scan
+    /// linearly for "which threads include this target" / "which
+    /// targets belong to this thread" — no per-key index in v1.
+    thread_memberships: Vec<ThreadMembership>,
+    /// `Some` while the thread picker overlay is open (right-click →
+    /// Attach to thread…). Holds the target the user is attaching plus
+    /// the live text-input state for filter + create-new.
+    thread_picker: Option<ThreadPickerState>,
+    /// True while the user is mouse-dragging inside the mention
+    /// popup's thread-attach input band. Drives drag-select forward
+    /// in `mouse_drag_to`; cleared on `mouse_up`.
+    mention_input_dragging: bool,
+    /// `Some` while the thread page's title is being inline-edited.
+    /// Mirrors the `people_rename` pattern.
+    thread_rename: Option<ThreadRenameState>,
+}
+
+/// State for the inline thread-title rename on the thread page.
+struct ThreadRenameState {
+    thread_id: ThreadId,
+    input: TextBox,
+}
+
+/// State for the "Attach to thread…" picker overlay. Filters open
+/// threads case-insensitively and, when no exact match exists, offers
+/// "Create new" at the top of the list. Single-select; Enter commits,
+/// Esc cancels.
+struct ThreadPickerState {
+    /// What the user is attaching. `None` means the picker was opened
+    /// in "create a fresh thread" mode (from the thread-list view) —
+    /// commit creates the thread and navigates to it instead of
+    /// attaching anything.
+    target: Option<ReferenceTarget>,
+    input: TextBox,
+    anchor: (f32, f32),
+    /// Index into the filtered list (0 = "Create new" row when present).
+    highlight: usize,
+}
+
+/// Which page the shared `page_embeds` cache was last built for.
+/// Used to detect page-switch (full rebuild) vs. same-page re-render
+/// (tick existing caches in place).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageEmbedSource {
+    Entity(Uuid),
+    Thread(ThreadId),
 }
 
 /// Which surface's `Scroller` a pan-drag is bound to. Sidebar gets
@@ -1970,6 +2383,17 @@ impl KeptApp {
         // cache from the existing data.
         let entities = EntityCache::load(db.as_ref(), &cells);
 
+        // Initial threads load — same pattern as entities. Small enough
+        // to keep entirely in memory and refresh after every mutation.
+        let (threads, thread_memberships) = match db.as_ref() {
+            Some(d) => {
+                let ts = d.all_threads().unwrap_or_default();
+                let ms = d.all_thread_memberships().unwrap_or_default();
+                (ts, ms)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+
         // Sweep: drop any closed context whose window contains no cells.
         // These are leftovers from earlier rotations on already-empty
         // contexts; the current code path no longer creates them.
@@ -2085,6 +2509,13 @@ impl KeptApp {
             mouse_pos: (-1.0, -1.0),
             tentative_pan: None,
             pan_drag: false,
+            page_embeds: Vec::new(),
+            page_embeds_for: None,
+            threads,
+            thread_memberships,
+            thread_picker: None,
+            thread_rename: None,
+            mention_input_dragging: false,
         }
     }
 
@@ -3161,6 +3592,66 @@ impl KeptApp {
         total_h
     }
 
+    /// Rebuild / refresh the shared page-embed cache for a Person or
+    /// Thread page. Salvages caches by `target` across rebuilds so
+    /// drag-select state and `Cell` allocations survive scroll and
+    /// membership-set churn. The result is consumed by
+    /// `render_entity_page` and `render_thread_page`; both iterate
+    /// `self.page_embeds` rather than building caches inline.
+    fn refresh_page_embeds(
+        &mut self,
+        source: PageEmbedSource,
+        targets: &[ReferenceTarget],
+    ) {
+        // Drain existing caches into a target-keyed map so we can
+        // preserve them across the rebuild. Same-page re-renders hit
+        // every entry; cross-page navigation drops the misses.
+        let mut salvage: std::collections::HashMap<ReferenceTarget, EmbeddedReference> =
+            std::collections::HashMap::with_capacity(self.page_embeds.len());
+        for entry in self.page_embeds.drain(..) {
+            salvage.insert(entry.target(), entry);
+        }
+        let mut next: Vec<EmbeddedReference> = Vec::with_capacity(targets.len());
+        for &t in targets {
+            next.push(
+                salvage
+                    .remove(&t)
+                    .unwrap_or_else(|| EmbeddedReference::new(t)),
+            );
+        }
+        self.page_embeds = next;
+        self.page_embeds_for = Some(source);
+
+        // Tick each entry: if the source cell's `edited_at` no longer
+        // matches the cache key, rebuild via `build_reference_cache`.
+        // `build_reference_cache` borrows `&self`, so look up the
+        // source index first and then mutate.
+        for i in 0..self.page_embeds.len() {
+            let target = self.page_embeds[i].target();
+            let source_idx = self
+                .document
+                .cells
+                .iter()
+                .position(|c| c.id == target.cell_id());
+            let source_edited_at = source_idx.map(|idx| self.document.cells[idx].edited_at);
+            if self.page_embeds[i].cache_is_stale_for(source_edited_at) {
+                let new_cache = source_idx
+                    .and_then(|idx| self.build_reference_cache(idx, target, 0));
+                self.page_embeds[i].install_cache(new_cache, source_edited_at);
+            }
+        }
+    }
+
+    /// Drop the page-embed cache. Currently unused — the cache is
+    /// overwritten on every page render, so memory stays bounded
+    /// even without explicit clearing. Kept as a hook for a future
+    /// `push_view`-driven eager clear if profiling shows a problem.
+    #[allow(dead_code)]
+    fn clear_page_embeds(&mut self) {
+        self.page_embeds.clear();
+        self.page_embeds_for = None;
+    }
+
     /// Debounced persistence flush. Called once per frame from `tick`,
     /// outside the per-pane loop (dirty cells are global, not per-pane).
     fn maybe_flush_persistence(&mut self) {
@@ -3238,6 +3729,590 @@ impl KeptApp {
             .refresh(self.db.as_ref(), &self.document.cells);
     }
 
+    /// Open the thread-picker overlay anchored at `(anchor_x, anchor_y)`.
+    /// `target = Some(t)` means "attach this target on commit";
+    /// `target = None` means "create a fresh thread and navigate
+    /// to it" (used from the thread-list page). Dismisses any open
+    /// context menu so we don't paint two floating cards.
+    fn open_thread_picker(
+        &mut self,
+        target: Option<ReferenceTarget>,
+        anchor_x: f32,
+        anchor_y: f32,
+    ) {
+        self.dismiss_open_context_menu();
+        self.thread_picker = Some(ThreadPickerState {
+            target,
+            input: TextBox::new(self.typeface.clone(), String::new()),
+            anchor: (anchor_x, anchor_y),
+            highlight: 0,
+        });
+    }
+
+    /// Number of rows currently visible in the thread picker
+    /// (Create-new row + filtered existing threads). Needed by
+    /// move + commit to clamp the highlight index.
+    fn thread_picker_row_count(&self) -> usize {
+        let Some(picker) = self.thread_picker.as_ref() else {
+            return 0;
+        };
+        let query = picker.input.text();
+        let q_lower = query.to_lowercase();
+        let q_trim = query.trim();
+        let filtered = self
+            .threads
+            .iter()
+            .filter(|t| t.closed_at.is_none())
+            .filter(|t| q_lower.is_empty() || t.title.to_lowercase().contains(&q_lower))
+            .count()
+            .min(8);
+        let exact_match = self
+            .threads
+            .iter()
+            .any(|t| t.title.eq_ignore_ascii_case(q_trim));
+        let show_create_new = !q_trim.is_empty() && !exact_match;
+        filtered + if show_create_new { 1 } else { 0 }
+    }
+
+    /// Move the picker highlight by `delta`, wrapping at the ends.
+    fn thread_picker_move(&mut self, delta: i32) {
+        let n = self.thread_picker_row_count();
+        if n == 0 {
+            return;
+        }
+        if let Some(p) = self.thread_picker.as_mut() {
+            let cur = (p.highlight.min(n - 1)) as i32;
+            let nxt = (cur + delta).rem_euclid(n as i32) as usize;
+            p.highlight = nxt;
+        }
+    }
+
+    /// Commit the highlighted thread-picker row. Take()s the picker
+    /// state; chooses create-new vs existing based on the row at
+    /// `highlight`. Idempotent on duplicate attach.
+    fn commit_thread_picker(&mut self) {
+        let picker = match self.thread_picker.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let query = picker.input.text().trim().to_string();
+        let target = picker.target;
+        // Recompute the same filtered list the render used so the
+        // highlight index points at the right thing.
+        let q_lower = query.to_lowercase();
+        let mut filtered: Vec<ThreadId> = self
+            .threads
+            .iter()
+            .filter(|t| t.closed_at.is_none())
+            .filter(|t| q_lower.is_empty() || t.title.to_lowercase().contains(&q_lower))
+            .map(|t| t.id)
+            .collect();
+        // Match the render's sort.
+        filtered.sort_by(|a, b| {
+            let ta = self
+                .threads
+                .iter()
+                .find(|t| t.id == *a)
+                .map(|t| t.title.to_lowercase())
+                .unwrap_or_default();
+            let tb = self
+                .threads
+                .iter()
+                .find(|t| t.id == *b)
+                .map(|t| t.title.to_lowercase())
+                .unwrap_or_default();
+            ta.cmp(&tb)
+        });
+        filtered.truncate(8);
+        let exact_match = self
+            .threads
+            .iter()
+            .any(|t| t.title.eq_ignore_ascii_case(&query));
+        let show_create_new = !query.is_empty() && !exact_match;
+
+        let mut idx = picker.highlight;
+        if show_create_new {
+            if idx == 0 {
+                match target {
+                    Some(t) => {
+                        if let Some(_id) = self.create_and_attach_thread(query, t) {}
+                    }
+                    None => {
+                        if let Some(id) = self.create_thread(query) {
+                            self.push_view(Query::thread(id));
+                        }
+                    }
+                }
+                return;
+            }
+            idx -= 1;
+        }
+        let Some(tid) = filtered.get(idx).copied() else {
+            return;
+        };
+        match target {
+            Some(t) => self.attach_to_thread(tid, t),
+            None => {
+                self.push_view(Query::thread(tid));
+            }
+        }
+    }
+
+    /// Click dispatcher for the thread-picker overlay. Returns true
+    /// if the click was consumed (row commit or outside-dismiss).
+    fn dispatch_thread_picker_click(&mut self, x: f32, y: f32) -> bool {
+        if self.thread_picker.is_none() {
+            return false;
+        }
+        let menu = self.hit_tests.thread_picker.menu;
+        let row_hit = self
+            .hit_tests
+            .thread_picker
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, (_, r))| {
+                x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+            })
+            .map(|(i, _)| i);
+        if let Some(i) = row_hit {
+            if let Some(p) = self.thread_picker.as_mut() {
+                p.highlight = i;
+            }
+            self.commit_thread_picker();
+            return true;
+        }
+        // Click outside the overlay dismisses without committing.
+        if let Some(r) = menu {
+            if !(x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+                self.thread_picker = None;
+                return true;
+            }
+        }
+        // Click inside the menu but not on a row — swallow so it
+        // doesn't fall through to the doc.
+        true
+    }
+
+    /// Reload the in-memory threads + memberships from the DB. Called
+    /// after every thread mutation. Same invalidation discipline as
+    /// `refresh_entities`.
+    fn reload_threads(&mut self) {
+        if let Some(db) = self.db.as_ref() {
+            self.threads = db.all_threads().unwrap_or_default();
+            self.thread_memberships = db.all_thread_memberships().unwrap_or_default();
+        } else {
+            self.threads.clear();
+            self.thread_memberships.clear();
+        }
+    }
+
+    /// Paint a single-line "↳ %FA · %Bu" row of clickable thread
+    /// chips at `(x, y)` inside the cell body. Returns the height
+    /// the row consumed so the caller can extend the cell's `h`.
+    /// Each chip's rect is pushed into `hit_tests_builder` for
+    /// click-to-navigate dispatch. `leader` prefixes the row
+    /// ("↳ " for whole-cell, "↳ bullets in " for the aggregated
+    /// subtree row).
+    fn render_cell_thread_chips(
+        &mut self,
+        canvas: &Canvas,
+        x: f32,
+        y: f32,
+        width: f32,
+        leader: &str,
+        chips: &[(ThreadId, String)],
+    ) -> f32 {
+        let scale = self.font_scale;
+        let row_pad_top = 4.0 * scale;
+        let row_pad_bot = 2.0 * scale;
+        let font = Font::from_typeface(&self.typeface, 11.0 * scale);
+        let (_, m) = font.metrics();
+        // Glyphs span [y + row_pad_top, y + row_pad_top + (-ascent + descent)];
+        // baseline sits at glyph-top - ascent (ascent is negative).
+        let glyph_top = y + row_pad_top;
+        let glyph_bot = glyph_top + (-m.ascent) + m.descent;
+        let baseline = glyph_top + (-m.ascent);
+        let mut muted = Paint::default();
+        muted.set_anti_alias(true);
+        muted.set_color(crate::color::text_muted_grey());
+        let mouse = self.mouse_pos;
+
+        let mut cx = x;
+        canvas.draw_str(leader, Point::new(cx, baseline), &font, &muted);
+        cx += font.measure_str(leader, Some(&muted)).0;
+
+        for (i, (tid, ab)) in chips.iter().enumerate() {
+            if i > 0 {
+                let sep = " · ";
+                canvas.draw_str(sep, Point::new(cx, baseline), &font, &muted);
+                cx += font.measure_str(sep, Some(&muted)).0;
+            }
+            let label = format!("%{}", ab);
+            let chip_color = crate::color::thread_chip_color(tid.as_bytes());
+            let mut chip_paint = Paint::default();
+            chip_paint.set_anti_alias(true);
+            chip_paint.set_color(chip_color);
+            let label_w = font.measure_str(&label, Some(&chip_paint)).0;
+            // Tight hit rect around the actual glyph band — see the
+            // `glyph_top`/`glyph_bot` derivation above. Add a 1px
+            // outset for Fitts.
+            let hit_rect = Rect::new(
+                cx - 1.0,
+                glyph_top - 1.0,
+                cx + label_w + 1.0,
+                glyph_bot + 1.0,
+            );
+            let hovered = mouse.0 >= hit_rect.left
+                && mouse.0 <= hit_rect.right
+                && mouse.1 >= hit_rect.top
+                && mouse.1 <= hit_rect.bottom;
+            canvas.draw_str(&label, Point::new(cx, baseline), &font, &chip_paint);
+            if hovered {
+                let underline_y = baseline + 1.0;
+                canvas.draw_line(
+                    Point::new(cx, underline_y),
+                    Point::new(cx + label_w, underline_y),
+                    &chip_paint,
+                );
+            }
+            self.hit_tests_builder
+                .cell_thread_chips
+                .push((*tid, hit_rect));
+            cx += label_w;
+            if cx > x + width - 12.0 * scale && i + 1 < chips.len() {
+                canvas.draw_str(" …", Point::new(cx, baseline), &font, &muted);
+                break;
+            }
+        }
+        -m.ascent + m.descent + row_pad_top + row_pad_bot
+    }
+
+    /// `(thread_id, abbrev)` pairs for every WHOLE-CELL membership on
+    /// `cell_id`, ordered alphabetically by thread title (stable
+    /// per-frame). Empty when the cell has no thread memberships.
+    /// Bullet-level memberships are not surfaced here — see
+    /// `bullet_subtree_thread_chips` for that aggregated row.
+    fn whole_cell_thread_chips(&self, cell_id: Uuid) -> Vec<(ThreadId, String)> {
+        let target = ReferenceTarget::WholeCell(cell_id);
+        let mut chips: Vec<(ThreadId, String, String)> = self
+            .thread_memberships
+            .iter()
+            .filter(|m| m.target == target)
+            .filter_map(|m| {
+                self.threads
+                    .iter()
+                    .find(|t| t.id == m.thread_id)
+                    .map(|t| (m.thread_id, t.title.clone(), thread_chip_abbrev(&t.title)))
+            })
+            .collect();
+        chips.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        chips.into_iter().map(|(id, _, ab)| (id, ab)).collect()
+    }
+
+    /// `bullet_id → Vec<(thread_id, abbrev)>` for every Subtree
+    /// membership inside `cell_id`. Empty map = no per-bullet chips
+    /// this frame. Fed into `OutlineCell::set_bullet_chips` before
+    /// `cell.tick` so the outline can paint chip rows inline beneath
+    /// each attached bullet.
+    fn bullet_thread_chip_map(
+        &self,
+        cell_id: Uuid,
+    ) -> std::collections::HashMap<Uuid, Vec<(ThreadId, String)>> {
+        let mut map: std::collections::HashMap<Uuid, Vec<(ThreadId, String)>> =
+            std::collections::HashMap::new();
+        for m in self.thread_memberships.iter() {
+            let (host, bid) = match m.target {
+                ReferenceTarget::Subtree { cell_id: c, bullet_id }
+                    if c == cell_id =>
+                {
+                    (c, bullet_id)
+                }
+                _ => continue,
+            };
+            let _ = host;
+            let title = match self.threads.iter().find(|t| t.id == m.thread_id) {
+                Some(t) => t.title.clone(),
+                None => continue,
+            };
+            let abbrev = thread_chip_abbrev(&title);
+            map.entry(bid).or_default().push((m.thread_id, abbrev));
+        }
+        // Sort each bullet's chip list alphabetically by title so the
+        // render is stable across frames. Re-derive the title for
+        // sort because we didn't carry it through.
+        for v in map.values_mut() {
+            v.sort_by(|a, b| {
+                let ta = self
+                    .threads
+                    .iter()
+                    .find(|t| t.id == a.0)
+                    .map(|t| t.title.to_lowercase())
+                    .unwrap_or_default();
+                let tb = self
+                    .threads
+                    .iter()
+                    .find(|t| t.id == b.0)
+                    .map(|t| t.title.to_lowercase())
+                    .unwrap_or_default();
+                ta.cmp(&tb)
+            });
+        }
+        map
+    }
+
+    /// Threads attached to a given target. Used by the context menu's
+    /// "Detach from <title>" submenu rows and (eventually) the in-line
+    /// "in threads" pip on cells.
+    fn threads_for_target(&self, target: ReferenceTarget) -> Vec<ThreadId> {
+        self.thread_memberships
+            .iter()
+            .filter(|m| m.target == target)
+            .map(|m| m.thread_id)
+            .collect()
+    }
+
+    /// Open threads ordered by title (case-insensitive). Closed
+    /// threads filtered out — `show_inactive_cells` is the global
+    /// "show archived" toggle and applies here too.
+    fn visible_threads(&self) -> Vec<&Thread> {
+        let mut ts: Vec<&Thread> = self
+            .threads
+            .iter()
+            .filter(|t| self.show_inactive_cells || t.closed_at.is_none())
+            .collect();
+        ts.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        ts
+    }
+
+    /// Create a fresh thread row with the given title. Records a
+    /// `CreateThread` undo entry and reloads the in-memory mirror.
+    fn create_thread(&mut self, title: String) -> Option<ThreadId> {
+        let now = now_epoch_ms();
+        let thread = Thread {
+            id: Uuid::new_v4(),
+            title,
+            created_at: now,
+            edited_at: now,
+            closed_at: None,
+        };
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.upsert_thread(&thread) {
+                eprintln!("kept: create_thread failed: {e}");
+                return None;
+            }
+        }
+        let id = thread.id;
+        self.undo_stack.push(UndoOp::CreateThread { thread });
+        self.redo_stack.clear();
+        self.reload_threads();
+        Some(id)
+    }
+
+    /// Attach a target to an existing thread. Idempotent — duplicate
+    /// attach is a DB no-op (via `INSERT OR IGNORE`) and pushes no
+    /// undo entry.
+    fn attach_to_thread(&mut self, thread_id: ThreadId, target: ReferenceTarget) {
+        if self
+            .thread_memberships
+            .iter()
+            .any(|m| m.thread_id == thread_id && m.target == target)
+        {
+            return;
+        }
+        let attached_at = now_epoch_ms();
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.attach_thread(thread_id, target, attached_at) {
+                eprintln!("kept: attach_thread failed: {e}");
+                return;
+            }
+        }
+        self.undo_stack.push(UndoOp::AttachThread {
+            thread_id,
+            target,
+            attached_at,
+        });
+        self.redo_stack.clear();
+        self.reload_threads();
+    }
+
+    /// Combined create-thread + attach gesture (used by the picker
+    /// when the user picks "Create new"). Pushes a single undo entry.
+    fn create_and_attach_thread(
+        &mut self,
+        title: String,
+        target: ReferenceTarget,
+    ) -> Option<ThreadId> {
+        let now = now_epoch_ms();
+        let thread = Thread {
+            id: Uuid::new_v4(),
+            title,
+            created_at: now,
+            edited_at: now,
+            closed_at: None,
+        };
+        let id = thread.id;
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.upsert_thread(&thread) {
+                eprintln!("kept: create_and_attach_thread upsert failed: {e}");
+                return None;
+            }
+            if let Err(e) = db.attach_thread(id, target, now) {
+                eprintln!("kept: create_and_attach_thread attach failed: {e}");
+                let _ = db.delete_thread(id);
+                return None;
+            }
+        }
+        self.undo_stack.push(UndoOp::CreateAndAttachThread {
+            thread,
+            target,
+            attached_at: now,
+        });
+        self.redo_stack.clear();
+        self.reload_threads();
+        Some(id)
+    }
+
+    /// Detach a target from a thread. Captures the original
+    /// `attached_at` so undo restores attachment order.
+    fn detach_from_thread(&mut self, thread_id: ThreadId, target: ReferenceTarget) {
+        let attached_at = match self
+            .thread_memberships
+            .iter()
+            .find(|m| m.thread_id == thread_id && m.target == target)
+        {
+            Some(m) => m.attached_at,
+            None => return,
+        };
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.detach_thread(thread_id, target) {
+                eprintln!("kept: detach_thread failed: {e}");
+                return;
+            }
+        }
+        self.undo_stack.push(UndoOp::DetachThread {
+            thread_id,
+            target,
+            attached_at,
+        });
+        self.redo_stack.clear();
+        self.reload_threads();
+    }
+
+    /// Rename a thread. Returns true if anything actually changed (so
+    /// the caller can skip pushing an undo entry on a no-op commit).
+    fn rename_thread(&mut self, thread_id: ThreadId, new_title: String) -> bool {
+        let (prev_title, prev_edited_at) = match self.threads.iter().find(|t| t.id == thread_id) {
+            Some(t) => (t.title.clone(), t.edited_at),
+            None => return false,
+        };
+        if prev_title == new_title {
+            return false;
+        }
+        let new_edited_at = now_epoch_ms();
+        if let Some(db) = self.db.as_mut() {
+            if let Ok(Some(mut t)) = db.thread_by_id(thread_id) {
+                t.title = new_title.clone();
+                t.edited_at = new_edited_at;
+                if let Err(e) = db.upsert_thread(&t) {
+                    eprintln!("kept: rename_thread failed: {e}");
+                    return false;
+                }
+            }
+        }
+        self.undo_stack.push(UndoOp::RenameThread {
+            thread_id,
+            prev: prev_title,
+            new: new_title,
+            prev_edited_at,
+            new_edited_at,
+        });
+        self.redo_stack.clear();
+        self.reload_threads();
+        true
+    }
+
+    /// Toggle thread close / reopen. `closed_at = Some(now)` closes;
+    /// `None` reopens.
+    fn set_thread_closed(&mut self, thread_id: ThreadId, close: bool) {
+        let (prev, prev_edited_at) =
+            match self.threads.iter().find(|t| t.id == thread_id) {
+                Some(t) => (t.closed_at, t.edited_at),
+                None => return,
+            };
+        let new_edited_at = now_epoch_ms();
+        let new = if close { Some(new_edited_at) } else { None };
+        if prev == new {
+            return;
+        }
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.set_thread_closed_at(thread_id, new, new_edited_at) {
+                eprintln!("kept: set_thread_closed failed: {e}");
+                return;
+            }
+        }
+        self.undo_stack.push(UndoOp::SetThreadClosedAt {
+            thread_id,
+            prev,
+            new,
+            prev_edited_at,
+            new_edited_at,
+        });
+        self.redo_stack.clear();
+        self.reload_threads();
+    }
+
+    /// Begin an inline rename of the thread's title. Replaces the
+    /// static title render with an editable `TextBox` until commit.
+    fn start_thread_rename(&mut self, thread_id: ThreadId) {
+        let title = match self.threads.iter().find(|t| t.id == thread_id) {
+            Some(t) => t.title.clone(),
+            None => return,
+        };
+        let mut input = TextBox::new(self.typeface.clone(), title);
+        input.select_all();
+        self.thread_rename = Some(ThreadRenameState { thread_id, input });
+    }
+
+    /// Commit (or cancel-with-empty) the in-progress thread rename.
+    fn commit_thread_rename(&mut self) {
+        let Some(rs) = self.thread_rename.take() else {
+            return;
+        };
+        let new_title = rs.input.text().trim().to_string();
+        if new_title.is_empty() {
+            return;
+        }
+        self.rename_thread(rs.thread_id, new_title);
+    }
+
+    /// Delete a thread (and via FK cascade, all memberships). Captures
+    /// the row + every membership so undo restores everything.
+    /// Currently no UI exposes this (close suffices for V1); kept for
+    /// the v2 right-click-row-delete affordance.
+    #[allow(dead_code)]
+    fn delete_thread(&mut self, thread_id: ThreadId) {
+        let thread = match self.threads.iter().find(|t| t.id == thread_id).cloned() {
+            Some(t) => t,
+            None => return,
+        };
+        let memberships: Vec<ThreadMembership> = self
+            .thread_memberships
+            .iter()
+            .filter(|m| m.thread_id == thread_id)
+            .copied()
+            .collect();
+        if let Some(db) = self.db.as_mut() {
+            if let Err(e) = db.delete_thread(thread_id) {
+                eprintln!("kept: delete_thread failed: {e}");
+                return;
+            }
+        }
+        self.undo_stack.push(UndoOp::DeleteThread { thread, memberships });
+        self.redo_stack.clear();
+        self.reload_threads();
+    }
+
     fn writable_context_id(&self) -> Option<Uuid> {
         self.document.contexts
             .iter()
@@ -3302,6 +4377,11 @@ impl KeptApp {
                 .and_then(|e| e.primary_cell_id)
                 .map_or(false, |pid| pid == cell.id),
             ViewKind::People => false,
+            // ThreadList and Thread pages are bespoke renders, same as
+            // People / Entity — no cells participate in the standard
+            // stream.
+            ViewKind::ThreadList => false,
+            ViewKind::Thread(_) => false,
             // Current is just another filter: cells from the last
             // CURRENT_WINDOW_DAYS whose snooze (if set) has already
             // elapsed. Open-ness is already enforced by the
@@ -3874,6 +4954,33 @@ impl KeptApp {
                 if let Err(e) = db.save_cell(cell) {
                     eprintln!("kept: save_cell failed for {id}: {e}");
                 }
+                // Reconcile thread memberships against the cell's
+                // current bullet ids — any subtree row whose
+                // bullet_id no longer lives in this outline (hard
+                // delete via selection, cut without paste, etc.)
+                // gets cleaned up. Whole-cell rows are guaranteed
+                // valid by the cells FK cascade.
+                if let crate::cell::CellKind::Outline(oc) = &cell.kind {
+                    let bullet_ids: Vec<Uuid> =
+                        oc.bullets().iter().map(|b| b.id()).collect();
+                    if let Err(e) =
+                        db.reconcile_subtree_memberships(id, &bullet_ids)
+                    {
+                        eprintln!(
+                            "kept: reconcile_subtree_memberships failed for {id}: {e}",
+                        );
+                    }
+                } else {
+                    // Non-outline cell — no bullets, so any subtree
+                    // membership at this cell is by definition stale.
+                    if let Err(e) =
+                        db.reconcile_subtree_memberships(id, &[])
+                    {
+                        eprintln!(
+                            "kept: reconcile_subtree_memberships failed for {id}: {e}",
+                        );
+                    }
+                }
             }
         }
         for id in self.document.pending_context_deletes.drain() {
@@ -3892,6 +4999,11 @@ impl KeptApp {
         // Entity caches may have shifted from save/delete cell hooks
         // (`#person`-tagged saves upsert; cell deletes detach). Reload.
         self.refresh_entities();
+        // Thread membership table may have shrunk via reconcile
+        // sweep above OR via cell-delete FK cascade — refresh the
+        // in-memory mirror so chip rendering / picker filtering
+        // stay accurate.
+        self.reload_threads();
     }
 
     fn set_font_scale(&mut self, scale: f32) -> bool {
@@ -4059,6 +5171,7 @@ impl KeptApp {
         self.render_quick_add(canvas, width, height);
         self.render_mention_popup(canvas, width, height);
         self.render_context_menus(canvas, width, height);
+        self.render_thread_picker(canvas, width, height);
         self.render_toast(canvas, width, height);
 
         // Publish this frame's hit-test rects. Every render method writes
@@ -4100,31 +5213,246 @@ impl KeptApp {
             menu.render(canvas, width, height, &mut ctx);
         }
         // Cell menu: needs the cell the menu was opened on to format
-        // its info rows + the active-toggle labels.
+        // its info rows + the active-toggle labels. The menu is
+        // scoped — when the right-click landed on a bullet in this
+        // cell the menu speaks subtree (only subtree Attach + only
+        // subtree Detach rows); otherwise whole-cell. Whole-cell
+        // attach on a bullet-hit case stays accessible from the
+        // bar (left-edge) menu.
         if let Some(menu) = self.cell_context_menu.as_ref() {
             if let Some(cell) = self.document.cell(menu.cell_id) {
+                let scoped_target = menu
+                    .subtree_attach_target()
+                    .unwrap_or_else(|| menu.whole_attach_target());
+                let attached: Vec<(ThreadId, ReferenceTarget, String)> = self
+                    .threads_for_target(scoped_target)
+                    .into_iter()
+                    .filter_map(|tid| {
+                        self.threads
+                            .iter()
+                            .find(|t| t.id == tid)
+                            .map(|t| (tid, scoped_target, t.title.clone()))
+                    })
+                    .collect();
                 let mut ctx = MenuRenderCtx {
                     font_scale: self.font_scale,
                     typeface: &self.typeface,
                     mouse_pos: self.mouse_pos,
                     hit_tests: &mut self.hit_tests_builder,
                 };
-                menu.render(canvas, width, height, cell, &mut ctx);
+                menu.render(canvas, width, height, cell, &attached, &mut ctx);
             }
         }
         // Bar menu: whole-cell operations. Same shape as cell menu —
-        // needs the cell for timestamps + the Unsnooze visibility.
+        // needs the cell for timestamps + the Unsnooze visibility,
+        // plus the whole-cell thread memberships for Detach rows.
         if let Some(menu) = self.bar_context_menu.as_ref() {
             if let Some(cell) = self.document.cell(menu.cell_id) {
+                let target = ReferenceTarget::WholeCell(menu.cell_id);
+                let attached: Vec<(ThreadId, ReferenceTarget, String)> = self
+                    .threads_for_target(target)
+                    .into_iter()
+                    .filter_map(|tid| {
+                        self.threads
+                            .iter()
+                            .find(|t| t.id == tid)
+                            .map(|t| (tid, target, t.title.clone()))
+                    })
+                    .collect();
                 let mut ctx = MenuRenderCtx {
                     font_scale: self.font_scale,
                     typeface: &self.typeface,
                     mouse_pos: self.mouse_pos,
                     hit_tests: &mut self.hit_tests_builder,
                 };
-                menu.render(canvas, width, height, cell, &mut ctx);
+                menu.render(canvas, width, height, cell, &attached, &mut ctx);
             }
         }
+    }
+
+    /// Render the thread-picker overlay (right-click → Attach to
+    /// thread…). Single-line text input on top, "Create new" row
+    /// when the query is non-empty and not an exact match, then a
+    /// case-insensitive filtered list of open threads. Records hit
+    /// rects so `mouse_down` can dispatch row clicks and dismiss on
+    /// outside clicks.
+    fn render_thread_picker(&mut self, canvas: &Canvas, view_w: f32, view_h: f32) {
+        let Some(picker) = self.thread_picker.as_ref() else {
+            return;
+        };
+        let scale = self.font_scale;
+        let pad = 6.0 * scale;
+        let row_h = 26.0 * scale;
+        let input_h = 28.0 * scale;
+        let menu_w = 280.0 * scale;
+        let query = picker.input.text();
+        let q_lower = query.to_lowercase();
+        let q_trim = query.trim().to_string();
+        // Filter threads (open only) by case-insensitive contains.
+        let mut filtered: Vec<&Thread> = self
+            .threads
+            .iter()
+            .filter(|t| t.closed_at.is_none())
+            .filter(|t| q_lower.is_empty() || t.title.to_lowercase().contains(&q_lower))
+            .collect();
+        filtered.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        let exact_match = filtered
+            .iter()
+            .any(|t| t.title.eq_ignore_ascii_case(&q_trim));
+        // Show "Create new" row when the user has typed something
+        // that isn't already a thread title. Hide on empty input.
+        let show_create_new = !q_trim.is_empty() && !exact_match;
+
+        let cap = 8usize;
+        let visible_count = filtered.len().min(cap);
+        let row_count = visible_count + if show_create_new { 1 } else { 0 };
+        let menu_h = pad + input_h + pad + row_h * row_count as f32 + pad;
+        let rect = clamp_rect_to_viewport(
+            Rect::new(
+                picker.anchor.0,
+                picker.anchor.1,
+                picker.anchor.0 + menu_w,
+                picker.anchor.1 + menu_h,
+            ),
+            view_w,
+            view_h,
+            4.0,
+        );
+
+        // Card backdrop (matches cell-menu chrome).
+        let radius = 6.0 * scale;
+        let mut shadow = Paint::default();
+        shadow.set_anti_alias(true);
+        shadow.set_color(crate::color::shadow_menu());
+        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 8.0, false));
+        canvas.draw_round_rect(
+            Rect::new(rect.left, rect.top + 2.0, rect.right, rect.bottom + 2.0),
+            radius,
+            radius,
+            &shadow,
+        );
+        let mut bg = Paint::default();
+        bg.set_anti_alias(true);
+        bg.set_color(crate::color::bg_card());
+        canvas.draw_round_rect(rect, radius, radius, &bg);
+        let mut border = Paint::default();
+        border.set_anti_alias(true);
+        border.set_style(PaintStyle::Stroke);
+        border.set_stroke_width(1.0);
+        border.set_color(crate::color::menu_border());
+        canvas.draw_round_rect(rect, radius, radius, &border);
+
+        // Input label band.
+        let input_top = rect.top + pad;
+        let input_left = rect.left + pad;
+        let input_right = rect.right - pad;
+        let label_font = Font::from_typeface(&self.typeface, 13.0 * scale);
+        let (_, lm) = label_font.metrics();
+        let prompt: &str = if query.is_empty() {
+            "Attach to thread…"
+        } else {
+            &query
+        };
+        let mut prompt_paint = Paint::default();
+        prompt_paint.set_anti_alias(true);
+        prompt_paint.set_color(if query.is_empty() {
+            crate::color::text_muted_grey()
+        } else {
+            crate::color::text_primary()
+        });
+        let baseline = input_top + (input_h + (-lm.ascent) - lm.descent) * 0.5;
+        canvas.draw_str(
+            prompt,
+            Point::new(input_left, baseline),
+            &label_font,
+            &prompt_paint,
+        );
+        // Hairline under the input.
+        let mut div = Paint::default();
+        div.set_anti_alias(false);
+        div.set_color(crate::color::hairline_divider());
+        canvas.draw_line(
+            Point::new(input_left, input_top + input_h + pad * 0.5),
+            Point::new(input_right, input_top + input_h + pad * 0.5),
+            &div,
+        );
+
+        let mut hit_rows: Vec<(PickerRow, Rect)> = Vec::with_capacity(row_count);
+        let mut row_top = input_top + input_h + pad;
+        let mouse = self.mouse_pos;
+        let emit = |row_top_ref: &mut f32,
+                        label: &str,
+                        highlighted: bool,
+                        kind: PickerRow,
+                        rows: &mut Vec<(PickerRow, Rect)>| {
+            let r = Rect::new(
+                rect.left + pad * 0.5,
+                *row_top_ref,
+                rect.right - pad * 0.5,
+                *row_top_ref + row_h,
+            );
+            let hovered = mouse.0 >= r.left
+                && mouse.0 <= r.right
+                && mouse.1 >= r.top
+                && mouse.1 <= r.bottom;
+            if highlighted || hovered {
+                let mut p = Paint::default();
+                p.set_anti_alias(true);
+                p.set_color(if highlighted {
+                    crate::color::accent_blue_selection()
+                } else {
+                    crate::color::hover_faint()
+                });
+                canvas.draw_round_rect(r, 4.0 * scale, 4.0 * scale, &p);
+            }
+            let mut tp = Paint::default();
+            tp.set_anti_alias(true);
+            tp.set_color(crate::color::text_menu_row());
+            let baseline = r.top + (row_h + (-lm.ascent) - lm.descent) * 0.5;
+            canvas.draw_str(
+                label,
+                Point::new(r.left + pad, baseline),
+                &label_font,
+                &tp,
+            );
+            rows.push((kind, r));
+            *row_top_ref += row_h;
+        };
+
+        let mut row_idx = 0usize;
+        if show_create_new {
+            let label = format!("+ Create thread \"{}\"", q_trim);
+            let hl = picker.highlight == row_idx;
+            emit(&mut row_top, &label, hl, PickerRow::CreateNew, &mut hit_rows);
+            row_idx += 1;
+        }
+        for t in filtered.iter().take(cap) {
+            let hl = picker.highlight == row_idx;
+            emit(
+                &mut row_top,
+                &t.title,
+                hl,
+                PickerRow::Existing(t.id),
+                &mut hit_rows,
+            );
+            row_idx += 1;
+        }
+        // Empty state: nothing to pick and nothing to create.
+        if row_idx == 0 {
+            let mut tp = Paint::default();
+            tp.set_anti_alias(true);
+            tp.set_color(crate::color::text_muted_grey());
+            let baseline = row_top + (row_h + (-lm.ascent) - lm.descent) * 0.5;
+            canvas.draw_str(
+                "No threads yet — type a title to create one.",
+                Point::new(rect.left + pad, baseline),
+                &label_font,
+                &tp,
+            );
+        }
+
+        self.hit_tests_builder.thread_picker.rows = hit_rows;
+        self.hit_tests_builder.thread_picker.menu = Some(rect);
     }
 
     /// Draw the transient confirmation pill, if active. Bottom-center
@@ -4440,6 +5768,8 @@ impl KeptApp {
                 // an outstanding immutable borrow on `self.pane_mut().view`.
                 let include_tags = self.pane_mut().view.ast.include.tags.clone();
                 let show_inactive = self.show_inactive_cells;
+                let cell_id_here = self.document.cells[i].id;
+                let bullet_chip_map = self.bullet_thread_chip_map(cell_id_here);
                 let cell = &mut self.document.cells[i];
                 let filter = compute_outline_bullet_filter(
                     cell,
@@ -4449,16 +5779,52 @@ impl KeptApp {
                 if let CellKind::Outline(oc) = &mut cell.kind {
                     oc.set_bullet_filter(filter);
                     oc.set_show_inactive(show_inactive);
+                    oc.set_bullet_chips(bullet_chip_map);
                 }
-                cell.tick(
+                let h = cell.tick(
                     rec_canvas,
                     body_x,
                     cell_y,
                     body_w,
                     render_focused,
                     show_caret,
+                );
+                // Drain chip hit rects emitted by the outline this
+                // frame and feed them into the central click-routing
+                // store. Doc-space; same dispatcher as cell-level chips.
+                // (Bullet merges are drained inside `record_edit`
+                // immediately after the edit gesture so the undo op
+                // can capture pre-merge membership snapshots.)
+                if let CellKind::Outline(oc) = &mut cell.kind {
+                    for (tid, rect) in oc.take_chip_hits() {
+                        self.hit_tests_builder
+                            .cell_thread_chips
+                            .push((tid, rect));
+                    }
+                }
+                h
+            };
+
+            // Inline "in threads" chip row for whole-cell memberships.
+            // Per-bullet chips render inline inside the outline (see
+            // OutlineCell::set_bullet_chips) — no aggregated row here.
+            // The bar + outline grow to enclose the row because they
+            // use the post-chip `h` below.
+            let cell_id_for_chips = self.document.cells[i].id;
+            let whole_chips = self.whole_cell_thread_chips(cell_id_for_chips);
+            let chip_h = if whole_chips.is_empty() {
+                0.0
+            } else {
+                self.render_cell_thread_chips(
+                    rec_canvas,
+                    body_x,
+                    cell_y + h,
+                    body_w,
+                    "↗ ",
+                    &whole_chips,
                 )
             };
+            let h = h + chip_h;
 
             // Capture the focused cell's pane-local geometry. The
             // backdrop and ring (drawn outside the recording onto
@@ -4780,6 +6146,7 @@ impl KeptApp {
                 match event.text.as_deref() {
                     Some("@") => self.try_open_mention_popup(MentionKind::Person),
                     Some("#") => self.try_open_mention_popup(MentionKind::Tag),
+                    Some("%") => self.try_open_mention_popup(MentionKind::Thread),
                     _ => {}
                 }
             }
@@ -4814,6 +6181,69 @@ impl KeptApp {
                     return true;
                 }
                 return rs.input.handle_key(event, modifiers);
+            }
+        }
+
+        // Thread title inline rename: same shape as the People-page
+        // rename. Esc / Enter commit; everything else flows into the
+        // embedded TextBox.
+        if event.state == ElementState::Pressed && self.thread_rename.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
+                    self.commit_thread_rename();
+                    return true;
+                }
+                _ => {}
+            }
+            let clipboard = self.clipboard.as_mut();
+            if let Some(rs) = self.thread_rename.as_mut() {
+                if apply_clipboard_shortcut(
+                    &mut rs.input,
+                    clipboard,
+                    event,
+                    modifiers.state(),
+                    true,
+                ) {
+                    return true;
+                }
+                return rs.input.handle_key(event, modifiers);
+            }
+        }
+
+        // Thread picker overlay owns the keyboard while open. Enter
+        // commits the highlighted row; Up/Down move the highlight;
+        // everything else falls through to the TextBox.
+        if event.state == ElementState::Pressed && self.thread_picker.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Enter) => {
+                    self.commit_thread_picker();
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.thread_picker_move(-1);
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.thread_picker_move(1);
+                    return true;
+                }
+                _ => {}
+            }
+            let clipboard = self.clipboard.as_mut();
+            if let Some(p) = self.thread_picker.as_mut() {
+                if apply_clipboard_shortcut(
+                    &mut p.input,
+                    clipboard,
+                    event,
+                    modifiers.state(),
+                    true,
+                ) {
+                    p.highlight = 0;
+                    return true;
+                }
+                let consumed = p.input.handle_key(event, modifiers);
+                p.highlight = 0;
+                return consumed;
             }
         }
 
@@ -4865,6 +6295,37 @@ impl KeptApp {
                     return true;
                 }
                 _ => {}
+            }
+            // Thread-attach picker mode: forward everything else to
+            // the embedded TextBox (caret nav, selection, clipboard,
+            // typing, backspace, delete). Esc / Enter / Tab / Up /
+            // Down were already intercepted above so they don't reach
+            // the input. Other modes fall through to let the cell /
+            // header / quick-add TextBox handle the keystroke.
+            if self.is_thread_attach_picker_open() {
+                let clipboard = self.clipboard.as_mut();
+                if let Some(p) = self.mention_popup.as_mut() {
+                    if let Some(input) = p.attach_input.as_mut() {
+                        if apply_clipboard_shortcut(
+                            input,
+                            clipboard,
+                            event,
+                            modifiers.state(),
+                            true,
+                        ) {
+                            self.sync_mention_popup();
+                            return true;
+                        }
+                        let consumed = input.handle_key(event, modifiers);
+                        self.sync_mention_popup();
+                        if consumed {
+                            return true;
+                        }
+                    }
+                }
+                // Picker is exclusive while open — swallow stray
+                // keys so they don't hit the cell underneath.
+                return true;
             }
         }
 
@@ -5329,6 +6790,7 @@ impl KeptApp {
                 match event.text.as_deref() {
                     Some("@") => self.try_open_mention_popup(MentionKind::Person),
                     Some("#") => self.try_open_mention_popup(MentionKind::Tag),
+                    Some("%") => self.try_open_mention_popup(MentionKind::Thread),
                     _ => {}
                 }
             }
@@ -5345,7 +6807,25 @@ impl KeptApp {
     fn build_copy_payload(&self) -> Option<crate::clipboard::KeptPayload> {
         let id = self.pane().focused?;
         let cell = self.cell(id)?;
-        build_copy_payload_for_cell(cell, self.pane().editing)
+        let editing = self.pane().editing;
+        // Look up subtree thread memberships per source bullet so
+        // the payload carries them across the clipboard. Paste-side
+        // re-attaches the threads to the freshly-allocated bullet
+        // ids.
+        let lookup =
+            |bid: Uuid| -> Vec<Uuid> {
+                self.thread_memberships
+                    .iter()
+                    .filter_map(|m| match m.target {
+                        ReferenceTarget::Subtree {
+                            cell_id: c,
+                            bullet_id,
+                        } if c == id && bullet_id == bid => Some(m.thread_id),
+                        _ => None,
+                    })
+                    .collect()
+            };
+        build_copy_payload_for_cell(cell, editing, Some(&lookup))
     }
 
     /// Write a `KeptPayload` to the OS clipboard as HTML (with the
@@ -5455,8 +6935,38 @@ impl KeptApp {
         cell_id: Uuid,
         payload: crate::clipboard::KeptPayload,
     ) {
-        if let Some(cell) = self.cell_mut(cell_id) {
-            apply_paste_into_cell(cell, payload);
+        let bullet_threads: Vec<(Uuid, Vec<Uuid>)> = if let Some(cell) = self.cell_mut(cell_id) {
+            apply_paste_into_cell(cell, payload).bullet_threads
+        } else {
+            Vec::new()
+        };
+        // Re-attach the source-side subtree threads to the freshly
+        // allocated destination bullet ids. Skips threads that no
+        // longer exist (the source could have deleted them in
+        // between copy and paste). Idempotent attach.
+        if !bullet_threads.is_empty() {
+            let now = now_epoch_ms();
+            let mut attached = 0usize;
+            if let Some(db) = self.db.as_mut() {
+                for (new_bullet_id, threads) in &bullet_threads {
+                    for thread_id in threads {
+                        let target = ReferenceTarget::Subtree {
+                            cell_id,
+                            bullet_id: *new_bullet_id,
+                        };
+                        if let Err(e) = db.attach_thread(*thread_id, target, now) {
+                            eprintln!(
+                                "kept: paste-attach thread failed: {e}",
+                            );
+                        } else {
+                            attached += 1;
+                        }
+                    }
+                }
+            }
+            if attached > 0 {
+                self.reload_threads();
+            }
         }
     }
 
@@ -5738,7 +7248,16 @@ impl KeptApp {
             .collect();
         mentions.sort_by_key(|&(_, t)| std::cmp::Reverse(t));
 
-        if !mentions.is_empty() {
+        // Build the per-page target list and route through the shared
+        // page-embed cache so selection state survives scroll / re-render
+        // (replaces the per-frame rebuild flagged in FOLLOWUPS.md).
+        let targets: Vec<ReferenceTarget> = mentions
+            .iter()
+            .map(|&(idx, _)| ReferenceTarget::WholeCell(self.document.cells[idx].id))
+            .collect();
+        self.refresh_page_embeds(PageEmbedSource::Entity(entity_id), &targets);
+
+        if !self.page_embeds.is_empty() {
             y += ENTITY_SECTION_GAP * scale;
             let mut ref_header_paint = Paint::default();
             ref_header_paint.set_anti_alias(true);
@@ -5756,34 +7275,45 @@ impl KeptApp {
             let body_x = cells_left + inset;
             let body_w = (content_width - 2.0 * inset).max(40.0);
 
-            for (target_idx, _) in mentions {
-                let target_cell_id = self.document.cells[target_idx].id;
-                let target_ts = self.document.cells[target_idx].timestamp;
-                // Fresh cache per frame — no selection persistence on the
-                // entity page (acceptable for v1; click-to-navigate covers
-                // the main interaction).
-                let mut maybe_cache = self.build_reference_cache(
-                    target_idx,
-                    ReferenceTarget::WholeCell(target_cell_id),
-                    0,
-                );
-                let body_h = match &mut maybe_cache {
-                    Some(cache) => self.tick_embedded_cell(
-                        canvas, cache, body_x, y + pad, body_w, false,
-                    ),
-                    None => self.render_embed_placeholder(
-                        canvas,
-                        "↗ [unrenderable]",
-                        body_x,
-                        y + pad,
-                        body_w,
-                        scale,
+            for i in 0..self.page_embeds.len() {
+                let target = self.page_embeds[i].target();
+                let target_cell_id = target.cell_id();
+                let target_ts = self
+                    .document
+                    .cells
+                    .iter()
+                    .find(|c| c.id == target_cell_id)
+                    .map(|c| c.timestamp);
+                // Detach the cache so we can call `&self` render
+                // methods, then re-attach after.
+                let detached = self.page_embeds[i].detach_cache();
+                let (body_h, restored) = match detached {
+                    Some(mut cache) => {
+                        let h = self.tick_embedded_cell(
+                            canvas, &mut cache, body_x, y + pad, body_w, false,
+                        );
+                        (h, Some(cache))
+                    }
+                    None => (
+                        self.render_embed_placeholder(
+                            canvas,
+                            "↗ [unrenderable]",
+                            body_x,
+                            y + pad,
+                            body_w,
+                            scale,
+                        ),
+                        None,
                     ),
                 };
-                let footer_text = format!(
-                    "↗ originally {}",
-                    format_date_label(local_date_for_ms(target_ts))
-                );
+                self.page_embeds[i].attach_cache(restored);
+                let footer_text = match target_ts {
+                    Some(ts) => format!(
+                        "↗ originally {}",
+                        format_date_label(local_date_for_ms(ts))
+                    ),
+                    None => "↗ source missing".to_string(),
+                };
                 let total_h = self.draw_embed_wrapper(
                     canvas,
                     cells_left,
@@ -5803,6 +7333,469 @@ impl KeptApp {
                 y += total_h + CELL_GAP;
             }
         }
+
+        y - MARGIN_TOP
+    }
+
+    /// Render the Thread page: title + metadata + Close/Reopen
+    /// toggle + member previews. Mirrors `render_entity_page` —
+    /// uses the shared `page_embeds` cache so drag-select state
+    /// inside member embeds survives scrolls and re-renders.
+    fn render_thread_page(
+        &mut self,
+        canvas: &Canvas,
+        thread_id: ThreadId,
+        cells_left: f32,
+        content_width: f32,
+        scale: f32,
+        mouse_doc_x: f32,
+        mouse_doc_y: f32,
+    ) -> f32 {
+        let thread = match self.threads.iter().find(|t| t.id == thread_id).cloned() {
+            Some(t) => t,
+            None => {
+                let font = Font::from_typeface(&self.typeface, ENTITY_META_FONT_SIZE * scale);
+                let (_, fm) = font.metrics();
+                let mut paint = Paint::default();
+                paint.set_anti_alias(true);
+                paint.set_color(crate::color::text_section_header());
+                canvas.draw_str(
+                    "Thread not found",
+                    Point::new(cells_left, MARGIN_TOP + (-fm.ascent)),
+                    &font,
+                    &paint,
+                );
+                return -fm.ascent + fm.descent + 60.0 * scale;
+            }
+        };
+
+        let mut y = MARGIN_TOP;
+
+        // ----- Title (click → rename) -----
+        let title_font = Font::from_typeface(&self.typeface, ENTITY_TITLE_FONT_SIZE * scale);
+        let (_, tm) = title_font.metrics();
+        let mut title_paint = Paint::default();
+        title_paint.set_anti_alias(true);
+        title_paint.set_color(crate::color::text_primary());
+
+        let renaming = matches!(
+            self.thread_rename.as_ref(),
+            Some(rs) if rs.thread_id == thread_id
+        );
+        if renaming {
+            // Inline TextBox for the title rename.
+            let pad_x = 6.0 * scale;
+            if let Some(rs) = self.thread_rename.as_mut() {
+                let h = rs.input.tick(
+                    canvas,
+                    cells_left,
+                    y,
+                    content_width - pad_x * 2.0,
+                    true,
+                    true,
+                );
+                y += h;
+            }
+        } else {
+            canvas.draw_str(
+                &thread.title,
+                Point::new(cells_left, y + (-tm.ascent)),
+                &title_font,
+                &title_paint,
+            );
+            let title_w = title_font
+                .measure_str(&thread.title, Some(&title_paint))
+                .0;
+            let title_rect = Rect::new(
+                cells_left,
+                y,
+                (cells_left + title_w).min(cells_left + content_width),
+                y + (-tm.ascent) + tm.descent,
+            );
+            self.hit_tests_builder.thread_page.title = Some(title_rect);
+            y += -tm.ascent + tm.descent;
+        }
+
+        // ----- Metadata + Close toggle -----
+        let meta_font = Font::from_typeface(&self.typeface, ENTITY_META_FONT_SIZE * scale);
+        let (_, mm) = meta_font.metrics();
+        let mut meta_paint = Paint::default();
+        meta_paint.set_anti_alias(true);
+        meta_paint.set_color(crate::color::text_muted_warm());
+        y += 4.0 * scale;
+        let meta_baseline = y + (-mm.ascent);
+        let meta = format!(
+            "thread · created {} · edited {}",
+            format_date_label(local_date_for_ms(thread.created_at)),
+            format_date_label(local_date_for_ms(thread.edited_at))
+        );
+        canvas.draw_str(
+            &meta,
+            Point::new(cells_left, meta_baseline),
+            &meta_font,
+            &meta_paint,
+        );
+        // Right-aligned Close / Reopen toggle.
+        let is_open = thread.closed_at.is_none();
+        let toggle_w = 34.0 * scale;
+        let toggle_h = 18.0 * scale;
+        let label = if is_open { "open" } else { "closed" };
+        let label_w = meta_font.measure_str(label, Some(&meta_paint)).0;
+        let toggle_right = cells_left + content_width;
+        let toggle_left = toggle_right - toggle_w;
+        let label_right = toggle_left - 8.0 * scale;
+        let label_x = label_right - label_w;
+        canvas.draw_str(
+            label,
+            Point::new(label_x, meta_baseline),
+            &meta_font,
+            &meta_paint,
+        );
+        let band_top = meta_baseline + mm.ascent;
+        let band_bot = meta_baseline + mm.descent;
+        let band_mid = (band_top + band_bot) * 0.5;
+        let toggle_rect = Rect::new(
+            toggle_left,
+            band_mid - toggle_h * 0.5,
+            toggle_left + toggle_w,
+            band_mid + toggle_h * 0.5,
+        );
+        let toggle_hovered = mouse_doc_x >= toggle_rect.left
+            && mouse_doc_x <= toggle_rect.right
+            && mouse_doc_y >= toggle_rect.top
+            && mouse_doc_y <= toggle_rect.bottom;
+        draw_toggle(canvas, toggle_rect, is_open, toggle_hovered);
+        self.hit_tests_builder.thread_page.close_toggle = Some(toggle_rect);
+        y += -mm.ascent + mm.descent;
+        y += ENTITY_SECTION_GAP * scale;
+
+        // ----- MEMBERS section -----
+        let memberships: Vec<ThreadMembership> = {
+            let mut ms: Vec<ThreadMembership> = self
+                .thread_memberships
+                .iter()
+                .filter(|m| m.thread_id == thread_id)
+                .copied()
+                .collect();
+            ms.sort_by(|a, b| b.attached_at.cmp(&a.attached_at));
+            ms
+        };
+        let header_font =
+            Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
+        let (_, hm) = header_font.metrics();
+        let mut header_paint = Paint::default();
+        header_paint.set_anti_alias(true);
+        header_paint.set_color(crate::color::text_section_header());
+        canvas.draw_str(
+            "MEMBERS",
+            Point::new(cells_left, y + (-hm.ascent)),
+            &header_font,
+            &header_paint,
+        );
+        y += -hm.ascent + hm.descent + ENTITY_SECTION_HEADER_GAP * scale;
+
+        if memberships.is_empty() {
+            let mut hint = Paint::default();
+            hint.set_anti_alias(true);
+            hint.set_color(crate::color::text_muted_grey());
+            canvas.draw_str(
+                "No items attached yet. Right-click any cell or bullet → Attach to thread…",
+                Point::new(cells_left, y + (-mm.ascent)),
+                &meta_font,
+                &hint,
+            );
+            y += -mm.ascent + mm.descent;
+            return y - MARGIN_TOP;
+        }
+
+        // Route through the shared page-embed cache so drag-select
+        // state survives scroll / re-render. Same machinery as the
+        // Person page's REFERENCED IN section.
+        let targets: Vec<ReferenceTarget> = memberships.iter().map(|m| m.target).collect();
+        self.refresh_page_embeds(PageEmbedSource::Thread(thread_id), &targets);
+
+        let inset = EMBED_INSET * scale;
+        let pad = EMBED_PAD * scale;
+        let body_x = cells_left + inset;
+        let body_w = (content_width - 2.0 * inset).max(40.0);
+
+        self.hit_tests_builder.thread_page.members.clear();
+        self.hit_tests_builder.thread_page.detach_buttons.clear();
+
+        for i in 0..self.page_embeds.len() {
+            let target = self.page_embeds[i].target();
+            let attached_at = memberships
+                .get(i)
+                .map(|m| m.attached_at)
+                .unwrap_or(thread.edited_at);
+            let detached = self.page_embeds[i].detach_cache();
+            let (body_h, restored) = match detached {
+                Some(mut cache) => {
+                    let h = self.tick_embedded_cell(
+                        canvas, &mut cache, body_x, y + pad, body_w, false,
+                    );
+                    (h, Some(cache))
+                }
+                None => (
+                    self.render_embed_placeholder(
+                        canvas,
+                        "↗ [unrenderable]",
+                        body_x,
+                        y + pad,
+                        body_w,
+                        scale,
+                    ),
+                    None,
+                ),
+            };
+            self.page_embeds[i].attach_cache(restored);
+            let footer_text = format!(
+                "↗ attached {}",
+                format_date_label(local_date_for_ms(attached_at))
+            );
+            let total_h = self.draw_embed_wrapper(
+                canvas,
+                cells_left,
+                y,
+                content_width,
+                body_x,
+                body_h,
+                &footer_text,
+                scale,
+                [0.0, 0.0, 0.0, 0.0],
+                false,
+            );
+            // Member card rect → click navigates to source.
+            let member_rect = Rect::new(
+                cells_left,
+                y,
+                cells_left + content_width,
+                y + total_h,
+            );
+            self.hit_tests_builder
+                .thread_page
+                .members
+                .push((target, member_rect));
+            // Detach button: small pill at top-right of the card.
+            let btn_w = 60.0 * scale;
+            let btn_h = 18.0 * scale;
+            let btn_rect = Rect::new(
+                member_rect.right - btn_w - pad,
+                member_rect.top + pad,
+                member_rect.right - pad,
+                member_rect.top + pad + btn_h,
+            );
+            let btn_hovered = mouse_doc_x >= btn_rect.left
+                && mouse_doc_x <= btn_rect.right
+                && mouse_doc_y >= btn_rect.top
+                && mouse_doc_y <= btn_rect.bottom;
+            let mut btn_bg = Paint::default();
+            btn_bg.set_anti_alias(true);
+            btn_bg.set_color(crate::color::dark_alpha(if btn_hovered { 0x18 } else { 0x08 }));
+            canvas.draw_round_rect(btn_rect, 4.0 * scale, 4.0 * scale, &btn_bg);
+            let mut btn_text = Paint::default();
+            btn_text.set_anti_alias(true);
+            btn_text.set_color(crate::color::text_muted_warm_deep());
+            let label = "Detach";
+            let lw = meta_font.measure_str(label, Some(&btn_text)).0;
+            let lbl_baseline =
+                btn_rect.top + (btn_h + (-mm.ascent) - mm.descent) * 0.5;
+            canvas.draw_str(
+                label,
+                Point::new(btn_rect.left + (btn_w - lw) * 0.5, lbl_baseline),
+                &meta_font,
+                &btn_text,
+            );
+            self.hit_tests_builder.thread_page.detach_buttons.push(btn_rect);
+            y += total_h + CELL_GAP;
+        }
+
+        y - MARGIN_TOP
+    }
+
+    /// Render the Threads list page: same visual treatment as the
+    /// People page — title + "Show inactive" toggle, alphabetical
+    /// rows with hover chrome, a footer row to create a fresh
+    /// thread. Click a row to open the thread page; click "+ New
+    /// thread…" to open the picker in title-only mode.
+    ///
+    /// Mirrors `render_people_page` line-for-line on layout so the
+    /// two views feel like siblings. A shared `render_named_list_page`
+    /// helper is the natural cleanup — the row chrome, hover, and
+    /// rect-recording pass are identical — but extraction is a
+    /// separate refactor task (CODE_REVIEW.md flags the People page
+    /// for cleanup independently).
+    fn render_thread_list_page(
+        &mut self,
+        canvas: &Canvas,
+        cells_left: f32,
+        content_width: f32,
+        scale: f32,
+        mouse_doc_x: f32,
+        mouse_doc_y: f32,
+    ) -> f32 {
+        let mut y = MARGIN_TOP;
+
+        // ----- Title + "Show inactive" toggle -----
+        let title_font =
+            Font::from_typeface(&self.typeface, ENTITY_TITLE_FONT_SIZE * scale);
+        let (_, tm) = title_font.metrics();
+        let mut title_paint = Paint::default();
+        title_paint.set_anti_alias(true);
+        title_paint.set_color(crate::color::text_primary());
+        let title_baseline = y + (-tm.ascent);
+        canvas.draw_str(
+            "Threads",
+            Point::new(cells_left, title_baseline),
+            &title_font,
+            &title_paint,
+        );
+        // Same toggle widget the People page uses, same layout math.
+        let toggle_w = 34.0 * scale;
+        let toggle_h = 18.0 * scale;
+        let label_font = Font::from_typeface(&self.typeface, ENTITY_META_FONT_SIZE * scale);
+        let (_, lm) = label_font.metrics();
+        let mut label_paint = Paint::default();
+        label_paint.set_anti_alias(true);
+        label_paint.set_color(crate::color::text_muted_warm());
+        let label = "Show inactive";
+        let label_w = label_font.measure_str(label, Some(&label_paint)).0;
+        let toggle_right = cells_left + content_width;
+        let toggle_left = toggle_right - toggle_w;
+        let label_x = toggle_left - 8.0 * scale - label_w;
+        let title_band_top = title_baseline + tm.ascent;
+        let title_band_bot = title_baseline + tm.descent;
+        let title_band_mid = (title_band_top + title_band_bot) * 0.5;
+        let label_baseline = title_band_mid + (-lm.ascent + lm.descent) * 0.5 - lm.descent;
+        canvas.draw_str(
+            label,
+            Point::new(label_x, label_baseline),
+            &label_font,
+            &label_paint,
+        );
+        let toggle_rect = Rect::new(
+            toggle_left,
+            title_band_mid - toggle_h * 0.5,
+            toggle_left + toggle_w,
+            title_band_mid + toggle_h * 0.5,
+        );
+        let toggle_hovered = mouse_doc_x >= toggle_rect.left
+            && mouse_doc_x <= toggle_rect.right
+            && mouse_doc_y >= toggle_rect.top
+            && mouse_doc_y <= toggle_rect.bottom;
+        // The threads list piggybacks on `show_inactive_cells` (the
+        // global archived-cells toggle) — same semantics, same flag
+        // closed threads use elsewhere (sidebar, picker).
+        draw_toggle(canvas, toggle_rect, self.show_inactive_cells, toggle_hovered);
+        self.hit_tests_builder.thread_list_page.show_inactive_toggle = Some(toggle_rect);
+
+        y += -tm.ascent + tm.descent + 24.0 * scale;
+
+        // Sorted snapshot — case-insensitive by title, with closed
+        // threads either filtered out or rendered dim.
+        let show_inactive = self.show_inactive_cells;
+        let mut threads: Vec<(String, ThreadId, bool, usize)> = self
+            .threads
+            .iter()
+            .filter(|t| show_inactive || t.closed_at.is_none())
+            .map(|t| {
+                let n = self
+                    .thread_memberships
+                    .iter()
+                    .filter(|m| m.thread_id == t.id)
+                    .count();
+                (t.title.clone(), t.id, t.closed_at.is_none(), n)
+            })
+            .collect();
+        threads.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+
+        let row_h = PEOPLE_ROW_H * scale;
+        let row_pad_x = PEOPLE_ROW_PAD_X * scale;
+        let row_w = content_width;
+        let row_font =
+            Font::from_typeface(&self.typeface, PEOPLE_ROW_FONT_SIZE * scale);
+        let (_, rm) = row_font.metrics();
+        let text_baseline_offset = (row_h + (-rm.ascent) - rm.descent) * 0.5;
+
+        let mut text_paint = Paint::default();
+        text_paint.set_anti_alias(true);
+        text_paint.set_color(crate::color::text_primary());
+        let mut inactive_paint = Paint::default();
+        inactive_paint.set_anti_alias(true);
+        inactive_paint.set_color(crate::color::text_section_header());
+        let mut divider_paint = Paint::default();
+        divider_paint.set_anti_alias(true);
+        divider_paint.set_color(crate::color::hover_faint());
+        divider_paint.set_stroke_width(1.0);
+        let mut hover_paint = Paint::default();
+        hover_paint.set_anti_alias(true);
+        hover_paint.set_color(crate::color::dark_alpha(0x14));
+
+        self.hit_tests_builder.thread_list_page.rows.clear();
+
+        for (title, tid, is_open, member_count) in &threads {
+            let row_rect = Rect::new(cells_left, y, cells_left + row_w, y + row_h);
+            let hovered = mouse_doc_x >= row_rect.left
+                && mouse_doc_x <= row_rect.right
+                && mouse_doc_y >= row_rect.top
+                && mouse_doc_y <= row_rect.bottom;
+            if hovered {
+                canvas.draw_rect(row_rect, &hover_paint);
+            }
+            let baseline = row_rect.top + text_baseline_offset;
+            let paint = if *is_open { &text_paint } else { &inactive_paint };
+            canvas.draw_str(
+                title,
+                Point::new(row_rect.left + row_pad_x, baseline),
+                &row_font,
+                paint,
+            );
+            // Member count, right-aligned in the row.
+            let count_label = match member_count {
+                0 => "no members".to_string(),
+                1 => "1 member".to_string(),
+                n => format!("{} members", n),
+            };
+            let cw = label_font.measure_str(&count_label, Some(&label_paint)).0;
+            let count_baseline = baseline + (rm.descent - lm.descent);
+            canvas.draw_str(
+                &count_label,
+                Point::new(row_rect.right - row_pad_x - cw, count_baseline),
+                &label_font,
+                &label_paint,
+            );
+            canvas.draw_line(
+                Point::new(row_rect.left, row_rect.bottom),
+                Point::new(row_rect.right, row_rect.bottom),
+                &divider_paint,
+            );
+            self.hit_tests_builder
+                .thread_list_page
+                .rows
+                .push((*tid, row_rect));
+            y += row_h;
+        }
+
+        // "+ New thread…" footer row. Click opens the picker in
+        // create-only mode (target = None) — commit creates the
+        // thread and navigates to its page.
+        let footer_rect = Rect::new(cells_left, y, cells_left + row_w, y + row_h);
+        let footer_hovered = mouse_doc_x >= footer_rect.left
+            && mouse_doc_x <= footer_rect.right
+            && mouse_doc_y >= footer_rect.top
+            && mouse_doc_y <= footer_rect.bottom;
+        if footer_hovered {
+            canvas.draw_rect(footer_rect, &hover_paint);
+        }
+        let footer_baseline = footer_rect.top + text_baseline_offset;
+        canvas.draw_str(
+            "+ New thread…",
+            Point::new(footer_rect.left + row_pad_x, footer_baseline),
+            &row_font,
+            &inactive_paint,
+        );
+        self.hit_tests_builder.thread_list_page.add_row = Some(footer_rect);
+        y += row_h;
 
         y - MARGIN_TOP
     }
@@ -6134,12 +8127,13 @@ impl KeptApp {
     /// menu, and by any flow that wants to be sure no menu is
     /// stuck on screen.
     fn dismiss_open_context_menu(&mut self) -> bool {
-        // `|` (not `||`) so all four `take()`s evaluate — that
+        // `|` (not `||`) so all five `take()`s evaluate — that
         // way no menu lingers even if multiple were somehow open.
         self.cell_context_menu.take().is_some()
             | self.bar_context_menu.take().is_some()
             | self.tag_context_menu.take().is_some()
             | self.people_context_menu.take().is_some()
+            | self.thread_picker.take().is_some()
     }
 
     /// anchored at window-space `(x, y)`. Precomputes deletability
@@ -6417,7 +8411,53 @@ impl KeptApp {
         let Some(cell_id) = self.pane_mut().focused else { return };
         let now = Instant::now();
 
-        let can_coalesce = !self.pane_mut().coalesce_break
+        // Drain any bullet merges the cell's outline accumulated
+        // during this edit gesture. We capture their pre-merge
+        // membership state BEFORE running the DB move so undo can
+        // reverse cleanly.
+        let pending_merges: Vec<(Uuid, Uuid)> = self
+            .document
+            .cells
+            .iter_mut()
+            .find(|c| c.id == cell_id)
+            .and_then(|c| match &mut c.kind {
+                CellKind::Outline(oc) => Some(oc.take_bullet_merges()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let merge_undos: Vec<BulletMergeUndo> = pending_merges
+            .iter()
+            .map(|(from, into)| BulletMergeUndo {
+                cell_id,
+                from: *from,
+                into: *into,
+                pre_from: self.bullet_memberships_snapshot(cell_id, *from),
+                pre_into: self.bullet_memberships_snapshot(cell_id, *into),
+            })
+            .collect();
+        // Apply the moves now that we've snapshotted the pre-merge
+        // state. The undo data carries everything needed to restore
+        // both ends without re-deriving from current DB state.
+        if !merge_undos.is_empty() {
+            if let Some(db) = self.db.as_mut() {
+                for m in &merge_undos {
+                    if let Err(e) =
+                        db.move_bullet_memberships(m.cell_id, m.from, m.into)
+                    {
+                        eprintln!(
+                            "kept: move_bullet_memberships failed: {e}",
+                        );
+                    }
+                }
+            }
+            self.reload_threads();
+        }
+
+        // Merges break coalescing — a discrete bullet-structural
+        // gesture shouldn't fold into a previous typing burst's
+        // undo entry.
+        let can_coalesce = merge_undos.is_empty()
+            && !self.pane_mut().coalesce_break
             && self
                 .last_edit_time
                 .map(|t| now.duration_since(t) < COALESCE_INTERVAL)
@@ -6436,6 +8476,7 @@ impl KeptApp {
                 cell_id,
                 pre,
                 post,
+                bullet_merges: merge_undos,
             });
         }
 
@@ -6444,6 +8485,25 @@ impl KeptApp {
         self.pane_mut().coalesce_break = false;
 
         self.touch_cell(cell_id);
+    }
+
+    /// `(thread_id, attached_at)` rows currently attached to a
+    /// specific bullet. Used by `record_edit` to snapshot
+    /// pre-merge state for undo.
+    fn bullet_memberships_snapshot(
+        &self,
+        cell_id: Uuid,
+        bullet_id: Uuid,
+    ) -> Vec<(ThreadId, i64)> {
+        self.thread_memberships
+            .iter()
+            .filter(|m| matches!(
+                m.target,
+                ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
+                    if c == cell_id && b == bullet_id
+            ))
+            .map(|m| (m.thread_id, m.attached_at))
+            .collect()
     }
 
     fn undo(&mut self) -> bool {
@@ -7214,6 +9274,32 @@ impl KeptApp {
                 self.commit_mention_row(idx);
                 return true;
             }
+            // ThreadAttach input band: forward the click to the
+            // embedded TextBox so caret / drag-select work like a
+            // normal text field. Bare clicks elsewhere inside the
+            // popup card are swallowed (no row to commit, no input
+            // to address) so the click doesn't dismiss; only clicks
+            // *outside* the popup dismiss.
+            if let Some(band) = self.hit_tests.mention_popup.input_band {
+                if in_rect(band) {
+                    if let Some(p) = self.mention_popup.as_mut() {
+                        if let Some(input) = p.attach_input.as_mut() {
+                            input.mouse_down(x, y, modifiers, true);
+                            self.header_dragging_pane = None;
+                            self.mention_input_dragging = true;
+                        }
+                    }
+                    return true;
+                }
+            }
+            if let Some(menu) = self.hit_tests.mention_popup.menu {
+                if in_rect(menu) {
+                    // Click inside the popup card but not on a row
+                    // or the input — swallow so the popup stays open
+                    // and the click doesn't fall through.
+                    return true;
+                }
+            }
             // Miss: dismiss popup and keep routing the click.
             self.mention_popup = None;
         }
@@ -7224,6 +9310,12 @@ impl KeptApp {
         // run.
         if self.quick_add.is_some() {
             return self.handle_quick_add_mouse_down(x, y, modifiers);
+        }
+
+        // Thread picker is exclusive while open: row clicks commit,
+        // outside clicks dismiss. Mirrors the Quick-Add gate.
+        if self.thread_picker.is_some() {
+            return self.dispatch_thread_picker_click(x, y);
         }
 
         // Pane header URL-pill / dropdown click. Wins over body /
@@ -7467,7 +9559,14 @@ impl KeptApp {
                     PageKind::People => open(self, Query::people()),
                     PageKind::Current => open(self, Query::current()),
                     PageKind::Scratch => open(self, Query::scratch()),
+                    PageKind::ThreadList => open(self, Query::thread_list()),
                 };
+            }
+        }
+        for (tid, rect) in self.hit_tests.sidebar.threads.clone() {
+            if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                self.cell_context_menu = None;
+                return open(self, Query::thread(tid));
             }
         }
         // Context rows first (they're indented inside dates so their bbox
@@ -7636,6 +9735,36 @@ impl KeptApp {
                     return true;
                 }
             }
+            // "Attach to thread…" (whole-cell from the bar menu).
+            if let Some(rect) = self.hit_tests.bar_menu.attach_thread {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.bar_context_menu.take() {
+                        let target = ReferenceTarget::WholeCell(menu.cell_id);
+                        self.open_thread_attach_picker(
+                            target,
+                            (menu.anchor_x, menu.anchor_y),
+                        );
+                    }
+                    return true;
+                }
+            }
+            // "Detach from <title>" rows (whole-cell).
+            let bar_detach_hit = self
+                .hit_tests
+                .bar_menu
+                .detach_thread
+                .iter()
+                .find(|(_, rect)| {
+                    x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+                })
+                .map(|(tid, _)| *tid);
+            if let Some(tid) = bar_detach_hit {
+                if let Some(menu) = self.bar_context_menu.take() {
+                    let target = ReferenceTarget::WholeCell(menu.cell_id);
+                    self.detach_from_thread(tid, target);
+                }
+                return true;
+            }
             self.bar_context_menu = None;
         }
         // Cell context menu dispatch: click row dispatches, miss
@@ -7754,6 +9883,51 @@ impl KeptApp {
                     return true;
                 }
             }
+            // "Attach to thread…" (whole-cell) — open the shared
+            // mention popup in thread-attach mode.
+            if let Some(rect) = self.hit_tests.cell_menu.attach_thread {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        let target = menu.whole_attach_target();
+                        self.open_thread_attach_picker(
+                            target,
+                            (menu.anchor_x, menu.anchor_y),
+                        );
+                    }
+                    return true;
+                }
+            }
+            // "Attach '<snippet>' to thread…" (subtree) — only present
+            // when the right-click landed on a bullet in this cell.
+            if let Some(rect) = self.hit_tests.cell_menu.attach_thread_subtree {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        if let Some(target) = menu.subtree_attach_target() {
+                            self.open_thread_attach_picker(
+                                target,
+                                (menu.anchor_x, menu.anchor_y),
+                            );
+                        }
+                    }
+                    return true;
+                }
+            }
+            // "Detach from <title>" rows. Each row carries its own
+            // target so we hit exactly the right membership.
+            let detach_hit = self
+                .hit_tests
+                .cell_menu
+                .detach_thread
+                .iter()
+                .find(|(_, _, rect)| {
+                    x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+                })
+                .map(|(tid, target, _)| (*tid, *target));
+            if let Some((tid, target)) = detach_hit {
+                self.cell_context_menu = None;
+                self.detach_from_thread(tid, target);
+                return true;
+            }
             self.cell_context_menu = None;
         }
 
@@ -7797,6 +9971,113 @@ impl KeptApp {
                 .map(|(id, _)| *id);
             if let Some(target_cell_id) = hit {
                 self.navigate_to_reference(ReferenceTarget::WholeCell(target_cell_id));
+                return true;
+            }
+        }
+
+        // Thread-list page: Show-inactive toggle, per-thread rows,
+        // "+ New thread…" footer row.
+        if matches!(self.pane_mut().view.view_kind, ViewKind::ThreadList) {
+            if let Some(rect) = self.hit_tests.thread_list_page.show_inactive_toggle {
+                if x >= rect.left
+                    && x <= rect.right
+                    && doc_y >= rect.top
+                    && doc_y <= rect.bottom
+                {
+                    self.show_inactive_cells = !self.show_inactive_cells;
+                    return true;
+                }
+            }
+            let row_hit = self
+                .hit_tests
+                .thread_list_page
+                .rows
+                .iter()
+                .find(|(_, r)| {
+                    x >= r.left && x <= r.right && doc_y >= r.top && doc_y <= r.bottom
+                })
+                .map(|(id, _)| *id);
+            if let Some(tid) = row_hit {
+                self.push_view(Query::thread(tid));
+                return true;
+            }
+            if let Some(rect) = self.hit_tests.thread_list_page.add_row {
+                if x >= rect.left
+                    && x <= rect.right
+                    && doc_y >= rect.top
+                    && doc_y <= rect.bottom
+                {
+                    // Open the picker in create-only mode anchored
+                    // near the footer click.
+                    self.open_thread_picker(None, rect.left, rect.top);
+                    return true;
+                }
+            }
+        }
+
+        // Thread-page clicks: title (rename), close/reopen toggle,
+        // member detach button, member card (navigate to source).
+        if let ViewKind::Thread(tid) = self.pane_mut().view.view_kind {
+            // Commit any in-progress rename first if the click landed
+            // outside it (handled here for simplicity — same shape as
+            // people_rename which commits inside this same dispatch).
+            let title_hit = self
+                .hit_tests
+                .thread_page
+                .title
+                .map(|r| {
+                    x >= r.left && x <= r.right && doc_y >= r.top && doc_y <= r.bottom
+                })
+                .unwrap_or(false);
+            if self.thread_rename.is_some() && !title_hit {
+                self.commit_thread_rename();
+            }
+            if title_hit {
+                self.start_thread_rename(tid);
+                return true;
+            }
+            if let Some(rect) = self.hit_tests.thread_page.close_toggle {
+                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom
+                {
+                    let currently_open = self
+                        .threads
+                        .iter()
+                        .find(|t| t.id == tid)
+                        .map(|t| t.closed_at.is_none())
+                        .unwrap_or(true);
+                    self.set_thread_closed(tid, currently_open);
+                    return true;
+                }
+            }
+            // Detach buttons first (they sit inside member cards).
+            let detach_hit = self
+                .hit_tests
+                .thread_page
+                .detach_buttons
+                .iter()
+                .position(|r| {
+                    x >= r.left && x <= r.right && doc_y >= r.top && doc_y <= r.bottom
+                });
+            if let Some(i) = detach_hit {
+                if let Some((target, _)) = self.hit_tests.thread_page.members.get(i).copied() {
+                    self.detach_from_thread(tid, target);
+                }
+                return true;
+            }
+            let member_hit = self
+                .hit_tests
+                .thread_page
+                .members
+                .iter()
+                .find(|(_, rect)| {
+                    x >= rect.left
+                        && x <= rect.right
+                        && doc_y >= rect.top
+                        && doc_y <= rect.bottom
+                })
+                .map(|(target, _)| *target);
+            if let Some(target) = member_hit {
+                self.navigate_to_reference(target);
                 return true;
             }
         }
@@ -7882,6 +10163,26 @@ impl KeptApp {
                 }
             }
             return false;
+        }
+
+        // "In threads" chip row: click navigates to that thread.
+        // Checked before the bar so a chip click doesn't fall
+        // through to "select the whole cell" (chips sit inside the
+        // bar's vertical band — same hit zone otherwise).
+        let chip_hit = self
+            .hit_tests
+            .cell_thread_chips
+            .iter()
+            .find(|(_, rect)| {
+                x >= rect.left
+                    && x <= rect.right
+                    && doc_y >= rect.top
+                    && doc_y <= rect.bottom
+            })
+            .map(|(tid, _)| *tid);
+        if let Some(tid) = chip_hit {
+            self.push_view(Query::thread(tid));
+            return true;
         }
 
         // Bar hit-test before falling through to the cell body. A
@@ -8129,6 +10430,8 @@ impl KeptApp {
             if let Ok(uuid) = Uuid::parse_str(rest) {
                 let q = if self.entities.entities.iter().any(|e| e.id == uuid) {
                     Some((Query::entity(uuid), None))
+                } else if self.threads.iter().any(|t| t.id == uuid) {
+                    Some((Query::thread(uuid), None))
                 } else if self.cell(uuid).is_some() {
                     Some((Query::cell(uuid), Some(uuid)))
                 } else {
@@ -8202,6 +10505,18 @@ impl KeptApp {
                 return pane.header.textbox.mouse_drag_to(x, y);
             }
         }
+        // Thread-attach picker input drag-select. The popup floats
+        // in window space — coordinates passed in are already
+        // window-space, no translate needed.
+        if self.mention_input_dragging {
+            if let Some(p) = self.mention_popup.as_mut() {
+                if let Some(input) = p.attach_input.as_mut() {
+                    return input.mouse_drag_to(x, y);
+                }
+            }
+            // Popup gone mid-drag — clear the flag.
+            self.mention_input_dragging = false;
+        }
         // Quick-Add modal is a window-space overlay — its cell
         // expects window-coords directly (no scroll translate).
         if let Some(state) = self.quick_add.as_mut() {
@@ -8219,6 +10534,10 @@ impl KeptApp {
     }
 
     pub fn mouse_up(&mut self) -> bool {
+        // End any in-flight thread-picker input drag. The TextBox
+        // itself has no separate "drag end" event — it leaves the
+        // selection in place when we stop forwarding mouse_drag_to.
+        self.mention_input_dragging = false;
         // Tentative Alt-drag that never crossed the threshold —
         // commit it now as a plain Alt+click by replaying the
         // deferred dispatch on the matching surface. Sidebar
@@ -8527,9 +10846,14 @@ fn flatten_outline(
 /// `KeptApp::build_copy_payload` but parameterized on the cell ref
 /// + editing flag, so the Quick-Add modal can build its own copy
 /// payload from its in-flight cell (which isn't in `document.cells`).
+/// `thread_lookup`, when supplied, is called per source bullet id
+/// to fill `BulletPayload::thread_ids` so the destination paste can
+/// re-attach the threads to the new bullet ids. Quick-Add passes
+/// `None` (its cell has no threads).
 fn build_copy_payload_for_cell(
     cell: &Cell,
     editing: bool,
+    thread_lookup: Option<&dyn Fn(Uuid) -> Vec<Uuid>>,
 ) -> Option<crate::clipboard::KeptPayload> {
     use crate::clipboard::{BulletPayload, KeptPayload, SerLink};
     // 1. Outline with active multi-bullet selection → Outline payload.
@@ -8540,10 +10864,13 @@ fn build_copy_payload_for_cell(
                     return Some(KeptPayload::Outline {
                         bullets: rows
                             .into_iter()
-                            .map(|(d, t, ls)| BulletPayload {
+                            .map(|(d, t, ls, src_id)| BulletPayload {
                                 depth: d,
                                 text: t,
                                 links: SerLink::spans_to_ser(&ls),
+                                thread_ids: thread_lookup
+                                    .map(|f| f(src_id))
+                                    .unwrap_or_default(),
                             })
                             .collect(),
                     });
@@ -8593,6 +10920,20 @@ fn paste_text_with_links_into_cell(
     cell.paste_into_focused_with_links(text, links);
 }
 
+/// Result of `apply_paste_into_cell`. Carries any side-channel
+/// data the caller may want to act on after the paste lands.
+/// Currently: outline pastes that included `thread_ids` per bullet
+/// produce `(new_bullet_id, &[ThreadId])` pairs so the app can
+/// re-attach those threads to the freshly-allocated bullets.
+#[derive(Default)]
+struct PasteResult {
+    /// `(new_bullet_id, thread_ids)` — empty for non-Outline pastes
+    /// and for outline pastes whose source carried no thread ids.
+    /// Quick-Add ignores this (its cell isn't in `document.cells`
+    /// yet, so memberships would dangle).
+    bullet_threads: Vec<(Uuid, Vec<Uuid>)>,
+}
+
 /// Apply a `KeptPayload` to `cell` as a default paste — same
 /// dispatch as `KeptApp::apply_paste_default` but the
 /// Reference→Reference-cell creation path is left to the caller
@@ -8600,8 +10941,12 @@ fn paste_text_with_links_into_cell(
 /// document path uses `surface_as_reference` for the alternate
 /// variant). Cell-local so the Quick-Add modal can paste without
 /// going through the focus-and-dirty machinery.
-fn apply_paste_into_cell(cell: &mut Cell, payload: crate::clipboard::KeptPayload) {
+fn apply_paste_into_cell(
+    cell: &mut Cell,
+    payload: crate::clipboard::KeptPayload,
+) -> PasteResult {
     use crate::clipboard::{KeptPayload, SerLink};
+    let mut result = PasteResult::default();
     match payload {
         KeptPayload::Text { text, links } => {
             paste_text_with_links_into_cell(cell, &text, &SerLink::ser_to_spans(links));
@@ -8609,12 +10954,26 @@ fn apply_paste_into_cell(cell: &mut Cell, payload: crate::clipboard::KeptPayload
         KeptPayload::Outline { bullets } => {
             let is_outline = matches!(cell.kind, CellKind::Outline(_));
             if is_outline && !cell.title_focused {
+                // Snapshot the thread ids parallel to bullet order
+                // so we can pair them with the new bullet ids
+                // returned by the outline. Skipped (empty) for
+                // payloads from non-Kept sources.
+                let thread_ids_per_bullet: Vec<Vec<Uuid>> =
+                    bullets.iter().map(|b| b.thread_ids.clone()).collect();
                 if let CellKind::Outline(oc) = &mut cell.kind {
                     let raw: Vec<(u32, String, Vec<crate::cell::LinkSpan>)> = bullets
                         .into_iter()
                         .map(|b| (b.depth, b.text, SerLink::ser_to_spans(b.links)))
                         .collect();
-                    oc.insert_bullets_after_focused(raw);
+                    let new_ids = oc.insert_bullets_after_focused(raw);
+                    for (new_id, threads) in new_ids
+                        .into_iter()
+                        .zip(thread_ids_per_bullet.into_iter())
+                    {
+                        if !threads.is_empty() {
+                            result.bullet_threads.push((new_id, threads));
+                        }
+                    }
                 }
             } else {
                 let (text, links) = flatten_outline(&bullets);
@@ -8639,6 +10998,7 @@ fn apply_paste_into_cell(cell: &mut Cell, payload: crate::clipboard::KeptPayload
             paste_text_with_links_into_cell(cell, &display, &links);
         }
     }
+    result
 }
 
 fn bar_color_for_cell(cell: &Cell, now_ms: i64) -> skia_safe::Color {
@@ -8875,6 +11235,94 @@ fn snippet(text: &str) -> String {
     }
     let truncated: String = collapsed.chars().take(29).collect();
     format!("{}…", truncated)
+}
+
+/// Compact 2-char label for a thread, used by the inline "in
+/// threads" chip row. CamelCase ("FarmAnimals") and multi-word
+/// ("farm animals", "farm-animals") titles take the first letter
+/// of each of the first two tokens; single-word titles take the
+/// first two chars. Case preserved either way so visually-
+/// distinct titles read as distinct chips. Collisions are
+/// tolerated — the chip is a quick recognition aid, not a
+/// global identifier.
+fn thread_chip_abbrev(title: &str) -> String {
+    // Tokenize on whitespace, ASCII punctuation, and camelCase
+    // boundaries (lower→upper). Empty / digits-only tokens drop
+    // out so a title like "thread-1" doesn't yield "t1".
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for ch in title.chars() {
+        let boundary = ch.is_whitespace()
+            || (ch.is_ascii_punctuation() && ch != '_' && ch != '\'')
+            || ch == '_';
+        if boundary {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if prev_lower && ch.is_uppercase() && !cur.is_empty() {
+            tokens.push(std::mem::take(&mut cur));
+        }
+        cur.push(ch);
+        prev_lower = ch.is_lowercase();
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    let letter_tokens: Vec<&String> = tokens
+        .iter()
+        .filter(|t| t.chars().next().map_or(false, |c| c.is_alphabetic()))
+        .collect();
+    if letter_tokens.len() >= 2 {
+        let a = letter_tokens[0].chars().next().unwrap();
+        let b = letter_tokens[1].chars().next().unwrap();
+        return format!("{a}{b}");
+    }
+    let mut chars = title.chars().filter(|c| !c.is_whitespace());
+    let a = chars.next();
+    let b = chars.next();
+    match (a, b) {
+        (Some(a), Some(b)) => format!("{a}{b}"),
+        (Some(a), None) => format!("{a}"),
+        _ => "?".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod chip_tests {
+    use super::thread_chip_abbrev;
+    #[test]
+    fn camelcase_picks_each_initial() {
+        assert_eq!(thread_chip_abbrev("FarmAnimals"), "FA");
+        assert_eq!(thread_chip_abbrev("MyLongThreadName"), "ML");
+    }
+    #[test]
+    fn single_word_takes_first_two_chars() {
+        assert_eq!(thread_chip_abbrev("Bundle"), "Bu");
+        assert_eq!(thread_chip_abbrev("test"), "te");
+    }
+    #[test]
+    fn whitespace_splits_into_word_initials() {
+        assert_eq!(thread_chip_abbrev("farm animals"), "fa");
+        assert_eq!(thread_chip_abbrev("the brown fox"), "tb");
+    }
+    #[test]
+    fn punctuation_splits() {
+        assert_eq!(thread_chip_abbrev("farm-animals"), "fa");
+        assert_eq!(thread_chip_abbrev("farm_animals"), "fa");
+    }
+    #[test]
+    fn digits_dont_become_initials() {
+        assert_eq!(thread_chip_abbrev("thread-1"), "th");
+    }
+    #[test]
+    fn edge_cases() {
+        assert_eq!(thread_chip_abbrev(""), "?");
+        assert_eq!(thread_chip_abbrev("A"), "A");
+    }
 }
 
 /// Walk into `cell` looking for an outline whose bullets cover `doc_y`,

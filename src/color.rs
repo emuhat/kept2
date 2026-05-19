@@ -707,6 +707,32 @@ pub fn accent_blue_alpha(a: u8) -> Color {
     Color::from_argb(a, c.r(), c.g(), c.b())
 }
 
+/// Stable display color for an inline thread chip. Hashes the
+/// UUID bytes into a fixed 8-tone palette so the same thread
+/// always paints the same hue across renders / sessions / devices.
+/// Collisions are tolerated — the chip is a quick recognition aid,
+/// and the abbreviated label disambiguates within a cell.
+pub fn thread_chip_color(id_bytes: &[u8]) -> Color {
+    // Hand-picked muted tones — saturated enough to read as
+    // "colorful" but not so loud they pull the eye off cell text.
+    const PALETTE: &[(u8, u8, u8)] = &[
+        (0xC0, 0x52, 0x4A), // brick
+        (0xB8, 0x6F, 0x2E), // tan-orange
+        (0x8E, 0x7A, 0x1F), // olive
+        (0x4F, 0x8A, 0x3F), // moss green
+        (0x2E, 0x88, 0x88), // teal
+        (0x3D, 0x6E, 0xB4), // slate blue
+        (0x83, 0x55, 0xB7), // purple
+        (0xB0, 0x4C, 0x86), // magenta
+    ];
+    let mut h: u32 = 0;
+    for b in id_bytes {
+        h = h.wrapping_mul(31).wrapping_add(*b as u32);
+    }
+    let (r, g, b) = PALETTE[(h as usize) % PALETTE.len()];
+    Color::from_argb(0xFF, r, g, b)
+}
+
 /// Sidebar section-header color composed with a runtime alpha.
 /// Used by the focus ring so the active cell pops in the same hue
 /// as the WHAT / WHEN section labels.

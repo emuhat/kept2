@@ -7,6 +7,7 @@ mod document;
 mod entity_cache;
 mod persist;
 mod query;
+mod thread;
 
 use std::{
     ffi::CString,

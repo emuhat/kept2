@@ -386,7 +386,9 @@ impl KeptApp {
     /// a document cell. Returns true when something was written.
     fn quick_add_copy(&mut self) -> bool {
         let payload = match self.quick_add.as_ref() {
-            Some(s) => super::build_copy_payload_for_cell(&s.cell, true),
+            // Quick-Add cells aren't in `document.cells` yet, so
+            // they have no thread memberships to carry — None.
+            Some(s) => super::build_copy_payload_for_cell(&s.cell, true, None),
             None => None,
         };
         let Some(payload) = payload else { return false };
@@ -469,7 +471,11 @@ impl KeptApp {
         }
         let pre = self.quick_add.as_ref().map(|s| s.cell.snapshot());
         if let Some(state) = self.quick_add.as_mut() {
-            super::apply_paste_into_cell(&mut state.cell, payload);
+            // PasteResult.bullet_threads ignored: the modal cell
+            // isn't in `document.cells` yet, so attaching
+            // memberships now would dangle. The cell's promotion
+            // path could one day attach pending threads on flush.
+            let _ = super::apply_paste_into_cell(&mut state.cell, payload);
         }
         if let (Some(pre), Some(state)) = (pre, self.quick_add.as_mut()) {
             let post = state.cell.snapshot();

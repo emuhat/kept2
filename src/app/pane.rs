@@ -640,6 +640,13 @@ impl KeptApp {
                     None => format!("cell:{}", cid),
                 }
             }
+            ViewKind::ThreadList => "threads".into(),
+            ViewKind::Thread(tid) => self
+                .threads
+                .iter()
+                .find(|t| t.id == *tid)
+                .map(|t| format!("thread:{}", t.title))
+                .unwrap_or_else(|| "thread".into()),
         }
     }
 
@@ -677,6 +684,29 @@ impl KeptApp {
             ViewKind::People => {
                 let h = self.render_people_page(
                     canvas,
+                    layout.cells_left,
+                    layout.content_width,
+                    scale,
+                    mouse_doc_x,
+                    mouse_doc_y,
+                );
+                MARGIN_TOP + h + CELL_GAP
+            }
+            ViewKind::ThreadList => {
+                let h = self.render_thread_list_page(
+                    canvas,
+                    layout.cells_left,
+                    layout.content_width,
+                    scale,
+                    mouse_doc_x,
+                    mouse_doc_y,
+                );
+                MARGIN_TOP + h + CELL_GAP
+            }
+            ViewKind::Thread(tid) => {
+                let h = self.render_thread_page(
+                    canvas,
+                    tid,
                     layout.cells_left,
                     layout.content_width,
                     scale,

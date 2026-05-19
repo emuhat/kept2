@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
-use skia_safe::{Canvas, Font, Paint, Rect, Typeface};
+use skia_safe::{Canvas, Font, Paint, Point, Rect, Typeface};
 use uuid::Uuid;
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
@@ -183,6 +183,28 @@ pub struct OutlineCell {
     /// render; ignored unless `reference_header.is_some()`.
     header_y_origin: f32,
     header_height: f32,
+    /// Per-bullet thread chips for the inline "in <thread>" row
+    /// rendered below each attached bullet. The app layer
+    /// repopulates this every frame from `thread_memberships`
+    /// before calling `tick`. Each value is `(thread_id, abbrev)`
+    /// — the abbrev is what the chip renders, the id drives
+    /// click-to-navigate. Empty map = no per-bullet chips.
+    bullet_chips: std::collections::HashMap<Uuid, Vec<(Uuid, String)>>,
+    /// Hit rects emitted by the chip rows during the last `tick`.
+    /// `(thread_id, doc-space rect)`. App layer drains via
+    /// `take_chip_hits()` once per frame and routes clicks to
+    /// `push_view(Query::thread(_))`.
+    chip_hits: Vec<(Uuid, Rect)>,
+    /// Bullet merges that happened since the last drain.
+    /// `(from_id, into_id)` — the from-bullet's text was appended
+    /// into the into-bullet and removed from the list. App layer
+    /// drains via `take_bullet_merges()` and moves any thread
+    /// memberships at `from_id` over to `into_id` so the merged
+    /// content keeps its thread attachments. Hard deletes (via
+    /// `delete_bullet_selection`) are NOT recorded here — those
+    /// are explicit user action and the memberships are expected
+    /// to dangle until a future reconcile pass.
+    pending_bullet_merges: Vec<(Uuid, Uuid)>,
 }
 
 impl OutlineCell {
@@ -211,6 +233,9 @@ impl OutlineCell {
             reference_header: None,
             header_y_origin: 0.0,
             header_height: 0.0,
+            bullet_chips: std::collections::HashMap::new(),
+            chip_hits: Vec::new(),
+            pending_bullet_merges: Vec::new(),
         }
     }
 
@@ -270,6 +295,9 @@ impl OutlineCell {
             reference_header,
             header_y_origin: 0.0,
             header_height: 0.0,
+            bullet_chips: std::collections::HashMap::new(),
+            chip_hits: Vec::new(),
+            pending_bullet_merges: Vec::new(),
         }
     }
 
@@ -336,6 +364,33 @@ impl OutlineCell {
     /// value doesn't persist after the toggle flips.
     pub fn set_show_inactive(&mut self, on: bool) {
         self.show_inactive = on;
+    }
+
+    /// Per-frame mirror of the app's thread-membership state, sliced
+    /// to the bullets in this outline. App layer rebuilds the map
+    /// before each tick from `thread_memberships`; outline reads it
+    /// while rendering each bullet to inject the inline chip row.
+    /// Empty map = no per-bullet chips this frame.
+    pub fn set_bullet_chips(
+        &mut self,
+        chips: std::collections::HashMap<Uuid, Vec<(Uuid, String)>>,
+    ) {
+        self.bullet_chips = chips;
+    }
+
+    /// Drain the chip hit rects emitted by the most recent `tick`.
+    /// App layer calls this once per frame after `cell.tick` returns
+    /// and feeds the rects into its central hit-test store.
+    pub fn take_chip_hits(&mut self) -> Vec<(Uuid, Rect)> {
+        std::mem::take(&mut self.chip_hits)
+    }
+
+    /// Drain bullet-merge events recorded since the last call.
+    /// `(from_id, into_id)` — caller should move any thread
+    /// memberships pointing at `from_id` over to `into_id` so
+    /// merged content keeps its thread attachments.
+    pub fn take_bullet_merges(&mut self) -> Vec<(Uuid, Uuid)> {
+        std::mem::take(&mut self.pending_bullet_merges)
     }
 
     /// Bullet IDs whose text contains any of `include_tags` (inline
@@ -426,12 +481,31 @@ impl OutlineCell {
         }) {
             return idx;
         }
+        // Gap hit: drag-selecting downward through a bullet that has
+        // a chip row attached will cross the y-range BETWEEN that
+        // bullet's text-bottom and the next bullet's text-top. The
+        // strict text-band check above misses it, so without this
+        // fallback the drag head jumps to the LAST bullet and pulls
+        // the whole tail of the outline into the selection. Treat
+        // the gap as "belongs to the bullet immediately above."
+        let visible_bullets: Vec<usize> =
+            (0..self.bullets.len()).filter(|&i| visible(i)).collect();
+        for w in visible_bullets.windows(2) {
+            let i = w[0];
+            let j = w[1];
+            let bot_i = self.bullets[i].textbox.y_origin()
+                + self.bullets[i].textbox.height();
+            let top_j = self.bullets[j].textbox.y_origin();
+            if abs_y >= bot_i && abs_y < top_j {
+                return i;
+            }
+        }
         if abs_y < self.y_origin {
-            (0..self.bullets.len()).find(|&i| visible(i)).unwrap_or(0)
+            visible_bullets.first().copied().unwrap_or(0)
         } else {
-            (0..self.bullets.len())
-                .rev()
-                .find(|&i| visible(i))
+            visible_bullets
+                .last()
+                .copied()
                 .unwrap_or_else(|| self.bullets.len().saturating_sub(1))
         }
     }
@@ -537,6 +611,28 @@ impl OutlineCell {
         let mut bullet_y_bands: Vec<(f32, f32)> = Vec::with_capacity(self.bullets.len());
         let suppress_caret = active_indices.is_some();
         let mut cur_y = y;
+        // Snapshot the chip lookup table indexed by bullet position
+        // — we need it inside the `iter_mut()` loop below where
+        // `&mut self.bullets` precludes touching `self.bullet_chips`
+        // directly. Cheap: usually empty, otherwise one Vec clone per
+        // bullet.
+        let chips_by_idx: Vec<Vec<(Uuid, String)>> = self
+            .bullets
+            .iter()
+            .map(|b| {
+                self.bullet_chips
+                    .get(&b.id)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+        let mut new_chip_hits: Vec<(Uuid, Rect)> = Vec::new();
+        let chip_font =
+            Font::from_typeface(&self.typeface, 11.0 * self.font_scale);
+        let (_, chip_metrics) = chip_font.metrics();
+        let mut chip_muted = Paint::default();
+        chip_muted.set_anti_alias(true);
+        chip_muted.set_color(crate::color::text_muted_grey());
         // Bullet-range highlight is opaque — same as per-textbox
         // selection — so the bullet content has to render ON TOP of
         // the highlight, not beneath it. We do this in one pass:
@@ -610,10 +706,85 @@ impl OutlineCell {
             if bullet_inactive {
                 canvas.restore();
             }
-            bullet_y_bands.push((cur_y, cur_y + drawn_h));
-            cur_y += drawn_h;
+            // Inline thread chip row below this bullet's text,
+            // indented to match the bullet's text-x. Painted only
+            // when the app layer registered chips for this bullet
+            // id this frame.
+            let chips = &chips_by_idx[idx];
+            let chip_h = if chips.is_empty() {
+                0.0
+            } else {
+                let row_pad_top = 2.0 * self.font_scale;
+                let row_pad_bot = 2.0 * self.font_scale;
+                // Glyphs span [row_top + row_pad_top, +(-ascent +
+                // descent)]; baseline = top - ascent (ascent is
+                // negative, so this moves down past the top).
+                let glyph_top = cur_y + drawn_h + row_pad_top;
+                let glyph_bot = glyph_top + (-chip_metrics.ascent)
+                    + chip_metrics.descent;
+                let baseline = glyph_top + (-chip_metrics.ascent);
+                let leader = "↗ ";
+                let mut cx = text_x;
+                canvas.draw_str(
+                    leader,
+                    Point::new(cx, baseline),
+                    &chip_font,
+                    &chip_muted,
+                );
+                cx += chip_font.measure_str(leader, Some(&chip_muted)).0;
+                for (i, (tid, abbrev)) in chips.iter().enumerate() {
+                    if i > 0 {
+                        let sep = " · ";
+                        canvas.draw_str(
+                            sep,
+                            Point::new(cx, baseline),
+                            &chip_font,
+                            &chip_muted,
+                        );
+                        cx += chip_font.measure_str(sep, Some(&chip_muted)).0;
+                    }
+                    let label = format!("%{}", abbrev);
+                    let chip_color = crate::color::thread_chip_color(tid.as_bytes());
+                    let mut chip_paint = Paint::default();
+                    chip_paint.set_anti_alias(true);
+                    chip_paint.set_color(chip_color);
+                    let label_w =
+                        chip_font.measure_str(&label, Some(&chip_paint)).0;
+                    canvas.draw_str(
+                        &label,
+                        Point::new(cx, baseline),
+                        &chip_font,
+                        &chip_paint,
+                    );
+                    let hit = Rect::new(
+                        cx - 1.0,
+                        glyph_top - 1.0,
+                        cx + label_w + 1.0,
+                        glyph_bot + 1.0,
+                    );
+                    new_chip_hits.push((*tid, hit));
+                    cx += label_w;
+                    if cx > text_x + text_w - 12.0 * self.font_scale
+                        && i + 1 < chips.len()
+                    {
+                        canvas.draw_str(
+                            " …",
+                            Point::new(cx, baseline),
+                            &chip_font,
+                            &chip_muted,
+                        );
+                        break;
+                    }
+                }
+                -chip_metrics.ascent + chip_metrics.descent
+                    + row_pad_top
+                    + row_pad_bot
+            };
+            bullet_y_bands.push((cur_y, cur_y + drawn_h + chip_h));
+            cur_y += drawn_h + chip_h;
         }
 
+        self.chip_hits = new_chip_hits;
         self.height = cur_y - y;
         self.height
     }
@@ -1054,20 +1225,20 @@ impl OutlineCell {
     pub fn insert_bullets_after_focused(
         &mut self,
         bullets: Vec<(u32, String, Vec<crate::cell::LinkSpan>)>,
-    ) {
+    ) -> Vec<Uuid> {
         if bullets.is_empty() {
-            return;
+            return Vec::new();
         }
         if self.bullet_selection.is_some() {
             self.delete_bullet_selection();
         }
         let Some(insert_at) = self.focused_index() else {
-            return;
+            return Vec::new();
         };
         let focused_depth = self.bullets[insert_at].depth;
         let min_rel = bullets.iter().map(|(d, _, _)| *d).min().unwrap_or(0);
         let scale = self.font_scale;
-        let mut new_focus: Option<Uuid> = None;
+        let mut new_ids: Vec<Uuid> = Vec::with_capacity(bullets.len());
         for (offset, (rel_depth, text, links)) in bullets.into_iter().enumerate() {
             let abs_depth = focused_depth + (rel_depth - min_rel);
             let id = Uuid::now_v7();
@@ -1085,24 +1256,26 @@ impl OutlineCell {
                     resurface_after: None,
                 },
             );
-            if new_focus.is_none() {
-                new_focus = Some(id);
-            }
+            new_ids.push(id);
         }
-        if let Some(id) = new_focus {
-            self.focused_bullet = id;
+        if let Some(first) = new_ids.first() {
+            self.focused_bullet = *first;
         }
+        new_ids
     }
 
-    /// Bullet-selection copy, but returning `(rel_depth, text, links)`
-    /// for each selected bullet so the clipboard layer can build a
+    /// Bullet-selection copy, but returning
+    /// `(rel_depth, text, links, source_bullet_id)` for each
+    /// selected bullet so the clipboard layer can build a
     /// structured `KeptPayload::Outline`. Depths are rebased so the
     /// shallowest selected bullet is 0; nested items keep their
-    /// relative offset. Returns None when no bullet selection is
-    /// active (caller falls back to TextBox-selection copy).
+    /// relative offset. The source id lets callers look up
+    /// per-bullet metadata (thread memberships) at copy time.
+    /// Returns None when no bullet selection is active (caller
+    /// falls back to TextBox-selection copy).
     pub fn copy_bullet_selection_with_links(
         &self,
-    ) -> Option<Vec<(u32, String, Vec<LinkSpan>)>> {
+    ) -> Option<Vec<(u32, String, Vec<LinkSpan>, Uuid)>> {
         let sel = self.bullet_selection?;
         let ai = self.bullet_idx_by_id(sel.anchor_id)?;
         let hi = self.bullet_idx_by_id(sel.head_id)?;
@@ -1115,7 +1288,7 @@ impl OutlineCell {
             let rel = b.depth - min_depth;
             let text = b.textbox.text().to_string();
             let links: Vec<LinkSpan> = b.textbox.links().to_vec();
-            out.push((rel, text, links));
+            out.push((rel, text, links, b.id));
         }
         Some(out)
     }
@@ -1780,6 +1953,7 @@ impl OutlineCell {
         }
         let prev_idx = idx - 1;
         let prev_id = self.bullets[prev_idx].id;
+        let from_id = self.bullets[idx].id;
         let prev_len = self.bullets[prev_idx].textbox.text().len();
         let merged_text = self.bullets[idx].textbox.text().to_string();
         let merged_links = self.bullets[idx].textbox.links().to_vec();
@@ -1789,6 +1963,11 @@ impl OutlineCell {
             .append_with_links(&merged_text, merged_links);
         prev.textbox.set_caret_at(prev_len);
         self.focused_bullet = prev_id;
+        // Record the merge so the app layer can move thread
+        // memberships from `from_id` (gone) over to `prev_id`
+        // (survives). Without this, attaching a thread to C and
+        // backspacing C into B silently orphans the membership.
+        self.pending_bullet_merges.push((from_id, prev_id));
         true
     }
 

@@ -2,6 +2,7 @@ use skia_safe::{Canvas, Font, Paint, PaintStyle, Point, Rect, Typeface};
 use uuid::Uuid;
 
 use super::{HitTestState, KeptApp, clamp_rect_to_viewport};
+use crate::thread::ThreadId;
 
 /// Per-frame context the mention-popup render needs from `KeptApp`.
 /// Used by `MentionPopup::render` (S8: explicit subsystem scope). The
@@ -44,7 +45,7 @@ const MENTION_FREQUENCY_CAP: i32 = 12;
 pub(super) struct MentionPopup {
     /// What the popup is anchored to: a focused cell's text or the search
     /// bar's input. Drives sync, render-anchor, and commit behavior.
-    source: MentionSource,
+    pub(super) source: MentionSource,
     /// Whether this popup is for `@`-person mentions or `#`-tag tags.
     /// Determines candidate source (`person_mention_candidates` vs
     /// `tag_mention_candidates`), trigger character, prefix glyph in
@@ -53,30 +54,45 @@ pub(super) struct MentionPopup {
     /// Byte position of the trigger character (`@` or `#`) in the
     /// source's text.
     anchor_byte: usize,
-    /// Currently typed query (text after the trigger, no whitespace).
+    /// Currently typed query. For text-anchored modes this mirrors
+    /// the substring after the trigger character (kept in sync by
+    /// `sync_mention_popup`). For ThreadAttach mode the
+    /// `attach_input` `TextBox` is the authoritative store and
+    /// `query` is just its `.text()` snapshot.
     query: String,
-    /// Index of the highlighted item in the filtered list.
-    selected: usize,
+    /// Index of the highlighted item in the filtered list. `None`
+    /// while the query is empty — no row is pre-selected on open,
+    /// so an accidental Enter doesn't commit the first candidate.
+    /// Set to `Some(0)` the moment the user types a character or
+    /// presses an arrow key.
+    selected: Option<usize>,
+    /// Standalone text input — `Some` only for ThreadAttach mode,
+    /// where the popup has no backing TextBox in the document. The
+    /// input renders inside the query band and owns its own caret /
+    /// selection / clipboard behavior just like a cell title.
+    pub(super) attach_input: Option<crate::cell::TextBox>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum MentionKind {
     Person,
     Tag,
+    Thread,
 }
 
 impl MentionKind {
     /// The trigger character that opens this popup kind.
-    fn trigger(self) -> &'static str {
+    pub(super) fn trigger(self) -> &'static str {
         match self {
             MentionKind::Person => "@",
             MentionKind::Tag => "#",
+            MentionKind::Thread => "%",
         }
     }
 }
 
 #[derive(Clone, Copy)]
-enum MentionSource {
+pub(super) enum MentionSource {
     Cell { cell_id: Uuid, bullet_id: Option<Uuid> },
     /// The pane's URL-bar pill (replaces the old standalone
     /// Ctrl+K popup). `pane_idx` is the pane the focused header
@@ -86,6 +102,14 @@ enum MentionSource {
     /// Quick-Add open at a time, so the source needs no
     /// disambiguator beyond the variant tag.
     QuickAdd,
+    /// The "Attach to thread…" picker (right-click → menu row).
+    /// No backing text — commit goes through `attach_to_thread`
+    /// against `target`, anchored where the menu was. Only
+    /// `MentionKind::Thread` opens with this source.
+    ThreadAttach {
+        target: crate::cell::ReferenceTarget,
+        anchor: (f32, f32),
+    },
 }
 
 /// Subsequence fuzzy match. Returns `(score, matched_byte_positions)` if every
@@ -159,6 +183,27 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
 
 /// Rank `names` by fuzzy match against `query`. Empty query returns
 /// the names in their input order. Mention count contributes a small
+/// Bring `selected` in line with the current query + visible count.
+/// Empty query → no selection (so a stray Enter doesn't commit the
+/// first row the user happens to be hovering); non-empty query →
+/// `Some(0)` if there was no prior selection, else clamped into
+/// `[0, count - 1]`. Skipped entirely when `count == 0` — the
+/// caller already won't read the index in that case.
+fn reconcile_selected(selected: &mut Option<usize>, query: &str, count: usize) {
+    if query.is_empty() {
+        *selected = None;
+        return;
+    }
+    if count == 0 {
+        return;
+    }
+    match selected {
+        None => *selected = Some(0),
+        Some(i) if *i >= count => *selected = Some(count - 1),
+        _ => {}
+    }
+}
+
 /// capped bonus (so frequently-mentioned people tie-break above
 /// rare ones without overwhelming a clearly-better fuzzy match).
 /// Returns `(name, match_indices, mention_count)` for each surviving
@@ -225,7 +270,7 @@ impl MentionPopup {
     /// `candidates` list — both involve borrows of cell / search /
     /// entity state that the popup itself doesn't need to hold.
     pub(super) fn render(
-        &self,
+        &mut self,
         canvas: &Canvas,
         view_w: f32,
         view_h: f32,
@@ -257,7 +302,13 @@ impl MentionPopup {
         } else {
             visible
         };
-        let popup_h = (row_count as f32) * row_h + pad * 2.0;
+        // ThreadAttach has no backing text source, so we render a
+        // visible "query band" at the top of the popup. Other modes
+        // surface the query via the user's typed `@`/`#`/`%` chars
+        // in the cell text underneath.
+        let show_query_band = matches!(self.source, MentionSource::ThreadAttach { .. });
+        let query_band_h = if show_query_band { row_h } else { 0.0 };
+        let popup_h = (row_count as f32) * row_h + query_band_h + pad * 2.0;
 
         // Anchor below the trigger char, then clamp into the viewport
         // so a popup near the right or bottom edge doesn't paint past
@@ -308,12 +359,73 @@ impl MentionPopup {
         let row_text_height = -m.ascent + m.descent;
         let text_offset_in_row = (row_h - row_text_height) * 0.5 + (-m.ascent);
 
+        // ThreadAttach query band: hosts a real `TextBox` so caret,
+        // selection, arrow nav, clipboard, etc. behave like any
+        // other editable text in the app. Other popup modes show
+        // their query in the underlying cell text instead.
+        if show_query_band {
+            let band_top = popup_y + pad;
+            let band_left = popup_x + 12.0 * scale;
+            let band_right = popup_x + popup_w - 12.0 * scale;
+            let band_w = (band_right - band_left).max(40.0);
+            // Placeholder paints when the input is empty so the band
+            // doesn't read as a blank strip. Drawn behind the input
+            // so the caret still lands on top.
+            let input_is_empty = self
+                .attach_input
+                .as_ref()
+                .map(|tb| tb.text().is_empty())
+                .unwrap_or(true);
+            if input_is_empty {
+                let mut placeholder_paint = Paint::default();
+                placeholder_paint.set_anti_alias(true);
+                placeholder_paint.set_color(crate::color::text_muted_grey());
+                let baseline = band_top + text_offset_in_row;
+                canvas.draw_str(
+                    "Find or create thread…",
+                    Point::new(band_left, baseline),
+                    &body_font,
+                    &placeholder_paint,
+                );
+            }
+            if let Some(input) = self.attach_input.as_mut() {
+                // TextBox treats `y` as the TOP of the text band
+                // (glyphs span [y, y + ascent..descent]). Center the
+                // band inside the row by insetting half the slack.
+                let tb_y = band_top + (row_h - row_text_height) * 0.5;
+                input.tick(canvas, band_left, tb_y, band_w, true, true);
+            }
+            // Hairline under the band.
+            let mut div = Paint::default();
+            div.set_anti_alias(false);
+            div.set_color(crate::color::hairline_divider());
+            let line_y = band_top + row_h - 0.5;
+            canvas.draw_line(
+                Point::new(popup_x + pad, line_y),
+                Point::new(popup_x + popup_w - pad, line_y),
+                &div,
+            );
+            ctx.hit_tests.mention_popup.input_band = Some(Rect::new(
+                popup_x + pad,
+                band_top,
+                popup_x + popup_w - pad,
+                band_top + row_h,
+            ));
+        }
+        let body_top = popup_y + pad + query_band_h;
+        // Record the full popup rect so `mouse_down` can distinguish
+        // clicks inside the popup (which should be consumed) from
+        // clicks outside (which dismiss). Important for the picker:
+        // clicks in the input band must reach the TextBox, not
+        // fall through to the cell.
+        ctx.hit_tests.mention_popup.menu = Some(popup_rect);
+
         if items.is_empty() {
             // Hint row.
             let mut hint_paint = Paint::default();
             hint_paint.set_anti_alias(true);
             hint_paint.set_color(crate::color::text_muted_grey());
-            let hint_y = popup_y + pad;
+            let hint_y = body_top;
             let baseline = hint_y + text_offset_in_row;
             let label = if query.is_empty() {
                 "Type to search…".to_string()
@@ -350,8 +462,12 @@ impl MentionPopup {
                 text_paint.set_anti_alias(true);
                 text_paint.set_color(crate::color::text_primary());
                 let baseline = add_y + text_offset_in_row;
+                let label = match kind {
+                    MentionKind::Thread => format!("Create thread \"{}\"", query),
+                    _ => format!("Add {}{}", kind.trigger(), query),
+                };
                 canvas.draw_str(
-                    format!("Add {}{}", kind.trigger(), query),
+                    label,
                     Point::new(popup_x + 12.0 * scale, baseline),
                     &body_font,
                     &text_paint,
@@ -373,8 +489,12 @@ impl MentionPopup {
         hl_paint.set_anti_alias(true);
         hl_paint.set_color(crate::color::accent_blue_selection());
 
-        let sel_idx = selected.min(visible - 1);
-        let mut row_y = popup_y + pad;
+        // `sel_idx = None` means the user hasn't typed or arrow-
+        // keyed yet — render no highlight band so an accidental
+        // Enter doesn't commit anything. Mouse hover still works
+        // independently.
+        let sel_idx = selected.map(|s| s.min(visible - 1));
+        let mut row_y = body_top;
         for (i, (item, matches, mention_count)) in items.iter().take(visible).enumerate() {
             let row_rect = Rect::new(
                 popup_x + 4.0 * scale,
@@ -387,16 +507,23 @@ impl MentionPopup {
                 && mouse.0 <= row_rect.right
                 && mouse.1 >= row_rect.top
                 && mouse.1 <= row_rect.bottom;
-            if i == sel_idx || mouse_hover {
+            if sel_idx == Some(i) || mouse_hover {
                 canvas.draw_round_rect(row_rect, 4.0 * scale, 4.0 * scale, &hl_paint);
             }
             let baseline = row_y + text_offset_in_row;
             let text_x = popup_x + 12.0 * scale;
-            // Render the trigger in dim, then alternate dim / match-paint
-            // runs across the suggestion's letters.
-            let trigger = kind.trigger();
-            let trigger_w = body_font.measure_str(trigger, Some(&dim_paint)).0;
-            canvas.draw_str(trigger, Point::new(text_x, baseline), &body_font, &dim_paint);
+            // Thread suggestions render the bare title — the `%`
+            // prefix is a keyboard convention, not a piece of the
+            // name. Person / Tag suggestions keep their prefix so
+            // the popup reads as a real `@name` / `#tag` token.
+            let trigger_w = if matches!(kind, MentionKind::Thread) {
+                0.0
+            } else {
+                let trigger = kind.trigger();
+                let w = body_font.measure_str(trigger, Some(&dim_paint)).0;
+                canvas.draw_str(trigger, Point::new(text_x, baseline), &body_font, &dim_paint);
+                w
+            };
             draw_runs_with_matches(
                 canvas,
                 item,
@@ -483,12 +610,82 @@ impl KeptApp {
             .collect()
     }
 
+    /// Thread candidates for the `%`-autocomplete popup.
+    /// `(title, is_open, member_count)` — closed threads stay in the
+    /// list but flow through the same `is_active` downweight the
+    /// person popup uses, so an active match always beats a closed
+    /// one. Member count substitutes for "mention frequency" — a
+    /// thread the user has been steadily adding to ranks above a
+    /// barely-used one when fuzzy scores tie.
+    fn thread_mention_candidates(&self) -> Vec<(String, bool, usize)> {
+        let mut out: Vec<(String, bool, usize)> = self
+            .threads
+            .iter()
+            .map(|t| {
+                let n = self
+                    .thread_memberships
+                    .iter()
+                    .filter(|m| m.thread_id == t.id)
+                    .count();
+                (t.title.clone(), t.closed_at.is_none(), n)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        out
+    }
+
+    /// `(title, thread_id)` for every thread, sorted alphabetically.
+    /// Used by `commit_thread_mention` to resolve the chosen title
+    /// back to an id at commit time.
+    fn thread_entries(&self) -> Vec<(String, ThreadId)> {
+        let mut out: Vec<(String, ThreadId)> = self
+            .threads
+            .iter()
+            .map(|t| (t.title.clone(), t.id))
+            .collect();
+        out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        out
+    }
+
     /// Pick the candidate set for the popup's current kind.
     fn mention_candidates_for(&self, kind: MentionKind) -> Vec<(String, bool, usize)> {
         match kind {
             MentionKind::Person => self.person_mention_candidates(),
             MentionKind::Tag => self.tag_mention_candidates(),
+            MentionKind::Thread => self.thread_mention_candidates(),
         }
+    }
+
+    /// Open the mention popup in "thread attach" mode for the given
+    /// target. Anchored at `(x, y)` in window coords (typically the
+    /// right-click position). The picker owns its own query string
+    /// (no backing text), so key events go through
+    /// `handle_thread_attach_key` instead of the cell text path.
+    pub(super) fn open_thread_attach_picker(
+        &mut self,
+        target: crate::cell::ReferenceTarget,
+        anchor: (f32, f32),
+    ) {
+        self.dismiss_open_context_menu();
+        let input = crate::cell::TextBox::new(self.typeface.clone(), String::new());
+        self.mention_popup = Some(MentionPopup {
+            source: MentionSource::ThreadAttach { target, anchor },
+            kind: MentionKind::Thread,
+            anchor_byte: 0,
+            query: String::new(),
+            selected: None,
+            attach_input: Some(input),
+        });
+    }
+
+    /// True iff the currently-open popup is the thread-attach
+    /// picker. Used by the key router to forward keystrokes to the
+    /// embedded TextBox instead of an underlying cell.
+    pub(super) fn is_thread_attach_picker_open(&self) -> bool {
+        matches!(
+            self.mention_popup.as_ref().map(|p| p.source),
+            Some(MentionSource::ThreadAttach { .. })
+        )
     }
 
     pub(super) fn try_open_mention_popup(&mut self, kind: MentionKind) {
@@ -504,7 +701,8 @@ impl KeptApp {
                         kind,
                         anchor_byte: caret - 1,
                         query: String::new(),
-                        selected: 0,
+                        selected: None,
+                        attach_input: None,
                     });
                 }
             }
@@ -528,7 +726,8 @@ impl KeptApp {
                 kind,
                 anchor_byte: caret - 1,
                 query: String::new(),
-                selected: 0,
+                selected: None,
+                attach_input: None,
             });
             return;
         }
@@ -564,7 +763,8 @@ impl KeptApp {
             kind,
             anchor_byte: caret - 1,
             query: String::new(),
-            selected: 0,
+            selected: None,
+            attach_input: None,
         });
     }
 
@@ -578,6 +778,26 @@ impl KeptApp {
             };
             (popup.anchor_byte, popup.source, popup.kind)
         };
+        // ThreadAttach owns its own TextBox; mirror its current
+        // text into `p.query` so the filter + commit paths read a
+        // single source of truth, then clamp the highlight.
+        if matches!(source, MentionSource::ThreadAttach { .. }) {
+            let next_query = self
+                .mention_popup
+                .as_ref()
+                .and_then(|p| p.attach_input.as_ref())
+                .map(|tb| tb.text().to_string())
+                .unwrap_or_default();
+            let candidates = self.mention_candidates_for(kind);
+            if let Some(p) = self.mention_popup.as_mut() {
+                p.query = next_query;
+                let count = filter_mentions(&candidates, &p.query)
+                    .len()
+                    .min(MENTION_POPUP_MAX_VISIBLE);
+                reconcile_selected(&mut p.selected, &p.query, count);
+            }
+            return;
+        }
         // Pull the current `(text, caret)` from whichever source is anchored.
         let cur: Option<(String, usize)> = match source {
             MentionSource::Cell { cell_id, bullet_id } => {
@@ -607,6 +827,7 @@ impl KeptApp {
                     .focused_text_and_caret()
                     .map(|(t, c)| (t.to_string(), c))
             }),
+            MentionSource::ThreadAttach { .. } => unreachable!("handled above"),
         };
         let Some((text, caret)) = cur else {
             self.mention_popup = None;
@@ -643,11 +864,7 @@ impl KeptApp {
                 .len()
                 .min(MENTION_POPUP_MAX_VISIBLE);
             p.query = query;
-            if count == 0 {
-                p.selected = 0;
-            } else if p.selected >= count {
-                p.selected = count - 1;
-            }
+            reconcile_selected(&mut p.selected, &p.query, count);
         }
     }
 
@@ -698,12 +915,16 @@ impl KeptApp {
                 };
                 (x, y)
             }
+            MentionSource::ThreadAttach { anchor, .. } => anchor,
         };
 
         let candidates = self.mention_candidates_for(kind);
 
-        // Phase 2: re-borrow the popup and delegate to its render method.
-        let Some(popup) = self.mention_popup.as_ref() else {
+        // Phase 2: re-borrow the popup and delegate to its render
+        // method. `&mut` because the ThreadAttach picker needs to
+        // tick its embedded TextBox during render (caret + selection
+        // are part of the per-frame paint).
+        let Some(popup) = self.mention_popup.as_mut() else {
             return;
         };
         let mut ctx = MentionRenderCtx {
@@ -729,24 +950,46 @@ impl KeptApp {
         if count == 0 {
             return;
         }
-        let cur = p.selected.min(count - 1) as i32;
+        // First arrow press out of "no selection" lands on row 0
+        // regardless of direction — there's no prior position to
+        // step relative to.
+        let cur = match p.selected {
+            Some(i) => i.min(count - 1) as i32,
+            None => {
+                p.selected = Some(0);
+                return;
+            }
+        };
         let new = ((cur + delta).rem_euclid(count as i32)) as usize;
-        p.selected = new;
+        p.selected = Some(new);
     }
 
     /// Commit the highlighted item from the mention popup. For person
     /// (`@`) mentions, replaces `@query` with the person's title and
     /// attaches a `kept://<source-cell-id>` link span. For tag (`#`)
     /// mentions, replaces `#query` with the literal `#tagname` as plain
-    /// text — the title's tag-extraction pass picks it up. Both record
-    /// one undo entry.
+    /// text — the title's tag-extraction pass picks it up. For thread
+    /// (`%`) mentions, replaces `%query` with the thread's title +
+    /// `kept://<thread-id>` link AND attaches the cell to the thread.
+    /// All record one undo entry.
     pub(super) fn commit_mention(&mut self) -> bool {
+        // Bail without committing when no row is selected — empty
+        // query + Enter should be a no-op (matches the user's
+        // "don't pre-match the first row" expectation). Take()
+        // dismisses the popup either way; the empty-query path
+        // returns the popup to None without inserting anything.
         let Some(popup) = self.mention_popup.take() else {
             return false;
         };
+        let Some(selected_idx) = popup.selected else {
+            // Put the popup back — empty Enter shouldn't dismiss
+            // the picker; the user can keep typing.
+            self.mention_popup = Some(popup);
+            return true;
+        };
         let candidates = self.mention_candidates_for(popup.kind);
         let filtered = filter_mentions(&candidates, &popup.query);
-        let Some(selected) = filtered.get(popup.selected) else {
+        let Some(selected) = filtered.get(selected_idx) else {
             return true;
         };
         let chosen_name = selected.0.clone();
@@ -768,6 +1011,22 @@ impl KeptApp {
             MentionKind::Tag => {
                 self.commit_tag_mention(popup.source, start, end, chosen_name);
             }
+            MentionKind::Thread => {
+                let entries = self.thread_entries();
+                let Some((_, thread_id)) =
+                    entries.iter().find(|(n, _)| n == &chosen_name)
+                else {
+                    return true;
+                };
+                let thread_id = *thread_id;
+                self.commit_thread_mention(
+                    popup.source,
+                    start,
+                    end,
+                    chosen_name,
+                    thread_id,
+                );
+            }
         }
         self.pane_mut().coalesce_break = true;
         true
@@ -777,7 +1036,7 @@ impl KeptApp {
     /// selected index and runs the same path as keyboard Enter.
     pub(super) fn commit_mention_row(&mut self, idx: usize) -> bool {
         if let Some(p) = self.mention_popup.as_mut() {
-            p.selected = idx;
+            p.selected = Some(idx);
         }
         self.commit_mention()
     }
@@ -831,9 +1090,99 @@ impl KeptApp {
             MentionKind::Tag => {
                 self.commit_tag_mention(popup.source, start, end, query);
             }
+            MentionKind::Thread => {
+                // Brand-new thread → create it, then run the standard
+                // commit path so the same insert + attach happens.
+                let Some(new_id) = self.create_thread(query.clone()) else {
+                    return false;
+                };
+                self.commit_thread_mention(popup.source, start, end, query, new_id);
+            }
         }
         self.pane_mut().coalesce_break = true;
         true
+    }
+
+    /// Insert a thread mention: a clickable `kept://<thread_id>` link
+    /// in the source text plus an attachment of the containing cell
+    /// (or bullet, for ThreadAttach picker source) to the thread.
+    /// Pane-header source is text-only — search doesn't speak thread
+    /// syntax yet — so it falls back to a slug-style insert.
+    fn commit_thread_mention(
+        &mut self,
+        source: MentionSource,
+        start: usize,
+        end: usize,
+        chosen_name: String,
+        thread_id: ThreadId,
+    ) {
+        let url = format!("kept://{}", thread_id);
+        match source {
+            MentionSource::Cell { cell_id, bullet_id: _ } => {
+                let pre = match self.cell(cell_id) {
+                    Some(c) => c.snapshot(),
+                    None => return,
+                };
+                if let Some(c) = self.cell_mut(cell_id) {
+                    c.replace_focused_with_link(start..end, chosen_name, url);
+                }
+                if let Some(c) = self.cell(cell_id) {
+                    let post = c.snapshot();
+                    if !pre.doc_eq(&post) {
+                        let saved_focused = self.pane_mut().focused;
+                        self.pane_mut().focused = Some(cell_id);
+                        self.record_edit(pre, post);
+                        self.pane_mut().focused = saved_focused.or(Some(cell_id));
+                    }
+                }
+                // The mention also creates a real attachment so the
+                // thread page actually contains the cell. Idempotent
+                // — a second `%` mention of the same thread is a
+                // no-op on the memberships table.
+                self.attach_to_thread(
+                    thread_id,
+                    crate::cell::ReferenceTarget::WholeCell(cell_id),
+                );
+            }
+            MentionSource::PaneHeader { .. } => {
+                let slug = chosen_name
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join("_");
+                self.replace_search_or_cell_text(
+                    source,
+                    start,
+                    end,
+                    format!("%{slug}"),
+                );
+            }
+            MentionSource::QuickAdd => {
+                let pre = match self.quick_add.as_ref() {
+                    Some(s) => s.cell.snapshot(),
+                    None => return,
+                };
+                if let Some(s) = self.quick_add.as_mut() {
+                    s.cell.replace_focused_with_link(start..end, chosen_name, url);
+                }
+                if let Some(s) = self.quick_add.as_mut() {
+                    let post = s.cell.snapshot();
+                    if !pre.doc_eq(&post) {
+                        s.record_edit(pre);
+                    }
+                }
+                // Quick-Add's cell isn't in `document.cells` yet, so
+                // we don't attach here — the cell gains an
+                // attachment only after it flushes into the timeline
+                // (a future improvement; for now Quick-Add `%`
+                // mentions are link-only).
+            }
+            MentionSource::ThreadAttach { target, .. } => {
+                // Right-click → Attach picker. No text to replace;
+                // commit means "attach this target to the chosen
+                // thread."
+                self.attach_to_thread(thread_id, target);
+            }
+        }
     }
 
     /// Insert a person mention: a clickable `kept://<entity_id>` link
@@ -906,6 +1255,11 @@ impl KeptApp {
                     }
                 }
             }
+            MentionSource::ThreadAttach { .. } => {
+                // Person mentions never open with ThreadAttach source —
+                // that source is exclusive to `MentionKind::Thread`.
+                debug_assert!(false, "person mention from ThreadAttach source");
+            }
         }
     }
 
@@ -959,6 +1313,9 @@ impl KeptApp {
                         s.record_edit(pre);
                     }
                 }
+            }
+            MentionSource::ThreadAttach { .. } => {
+                debug_assert!(false, "tag mention from ThreadAttach source");
             }
         }
     }
@@ -1020,6 +1377,9 @@ impl KeptApp {
                         s.record_edit(pre);
                     }
                 }
+            }
+            MentionSource::ThreadAttach { .. } => {
+                debug_assert!(false, "text replace from ThreadAttach source");
             }
         }
     }

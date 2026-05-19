@@ -8,6 +8,7 @@ use super::{
     HitTestState, KeptApp, PageKind, Query, SIDEBAR_HEADER_FONT_SIZE, SIDEBAR_WIDTH, Scroller,
     ViewKind, draw_toggle, format_date_label, local_date_for_ms,
 };
+use crate::thread::Thread;
 
 /// Per-frame context the sidebar renderer needs from `KeptApp`. The
 /// sidebar has no state struct — it renders a synthesized view over
@@ -26,6 +27,11 @@ pub(super) struct SidebarRenderCtx<'a> {
     /// `&Document` borrow shape that's compatible with the rest of the
     /// render pass.
     pub(super) tag_names: Vec<String>,
+    /// Open threads (and closed ones when `show_inactive_cells`)
+    /// sorted alphabetically for the THREADS section. Owned clones
+    /// (Threads are tiny — title + 5 ints) so the borrow shape is
+    /// disjoint from `&mut self.sidebar_scroll`.
+    pub(super) threads: Vec<Thread>,
     /// Sidebar's own kinetic scroller — read scroll_y, set max, draw
     /// the scrollbar.
     pub(super) scroll: &'a mut Scroller,
@@ -309,6 +315,59 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         }
     }
 
+    // ----- THREADS section -----
+    // Header row is itself clickable — opens the "all threads" list
+    // view (analogous to the People page). Per-thread rows below
+    // open the individual thread page.
+    y += date_gap;
+    let threads_header_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + header_h);
+    let threads_header_active = matches!(ctx.view.view_kind, ViewKind::ThreadList);
+    let threads_header_hovered = in_row(threads_header_rect);
+    if threads_header_active {
+        let mut p = Paint::default();
+        p.set_anti_alias(true);
+        p.set_color(crate::color::accent_blue_selection());
+        canvas.draw_round_rect(threads_header_rect, radius, radius, &p);
+    } else if threads_header_hovered {
+        let mut p = Paint::default();
+        p.set_anti_alias(true);
+        p.set_color(crate::color::hover_faint());
+        canvas.draw_round_rect(threads_header_rect, radius, radius, &p);
+    }
+    canvas.draw_str(
+        "THREADS",
+        Point::new(pad_x, y + (-hm.ascent)),
+        &header_font,
+        &header_paint,
+    );
+    ctx.hit_tests.sidebar.pages.push((PageKind::ThreadList, threads_header_rect));
+    y += header_h;
+
+    for t in &ctx.threads {
+        let row_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
+        let active = matches!(ctx.view.view_kind, ViewKind::Thread(id) if id == t.id);
+        // Dim closed threads so they read as muted when the Show
+        // inactive toggle has surfaced them. Active highlight still
+        // wins.
+        let label = if t.closed_at.is_some() {
+            format!("· {} (closed)", t.title)
+        } else {
+            format!("· {}", t.title)
+        };
+        draw_sidebar_row(
+            canvas,
+            row_rect,
+            &label,
+            active,
+            in_row(row_rect),
+            radius,
+            pad_x,
+            &row_font,
+        );
+        ctx.hit_tests.sidebar.threads.push((t.id, row_rect));
+        y += date_h + item_gap;
+    }
+
     // ---- PAGES section (bottom) ----
     // Single-item section in v1 (People). Lives at the bottom so
     // CONTEXTS and TAGS — the daily working surfaces — own the
@@ -396,6 +455,7 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
 impl KeptApp {
     pub(super) fn render_sidebar(&mut self, canvas: &Canvas, height: f32) {
         let tag_names = self.all_tag_names_in_memory();
+        let threads: Vec<Thread> = self.visible_threads().into_iter().cloned().collect();
         // Access view via direct field path (self.panes[i].view) rather
         // than the Deref-to-active-pane shortcut so the borrow disjoins
         // from `&mut self.sidebar_scroll` / `&mut self.hit_tests_builder`.
@@ -408,6 +468,7 @@ impl KeptApp {
             document: &self.document,
             show_inactive_cells: self.show_inactive_cells,
             tag_names,
+            threads,
             scroll: &mut self.sidebar_scroll,
             hit_tests: &mut self.hit_tests_builder,
         };
