@@ -303,6 +303,8 @@ struct CellMenuHits {
     /// single click detaches the right one even when a thread has
     /// both whole-cell and subtree attachments here.
     detach_thread: Vec<(ThreadId, ReferenceTarget, Rect)>,
+    /// "Send to Inbox" (when inbox=false) or "Release from Inbox" (when true).
+    inbox_toggle: Option<Rect>,
 }
 
 /// Right-click on a cell's left-edge bar opens this menu. Always
@@ -337,6 +339,8 @@ struct BarMenuHits {
     attach_thread: Option<Rect>,
     /// "Detach from <title>" rows — one per whole-cell membership.
     detach_thread: Vec<(ThreadId, Rect)>,
+    /// "Send to Inbox" / "Release from Inbox" toggle.
+    inbox_toggle: Option<Rect>,
     delete: Option<Rect>,
 }
 
@@ -411,6 +415,9 @@ enum NewCellKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PageKind {
     People,
+    /// Notes that need attention: yeeted items, snooze-expired items,
+    /// and anything manually sent to inbox.
+    Inbox,
     /// Non-chronological "what's on my plate right now" pile.
     /// Surfaces snooze-expired cells/bullets plus recently-inserted
     /// reference / envelope cells.
@@ -447,6 +454,9 @@ enum ViewKind {
     Context(Uuid),
     Entity(Uuid),
     People,
+    /// Items with `inbox=true` — yeeted notes, notes that came back
+    /// from snooze, and anything manually sent here.
+    Inbox,
     /// Non-chronological pile of items currently competing for
     /// attention. Filter and sort live in `render_current_stream`,
     /// not in `is_visible_for_view`.
@@ -517,6 +527,9 @@ impl Query {
     #[allow(dead_code)]
     fn people() -> Self {
         Self { view_kind: ViewKind::People, ast: query::Ast::default() }
+    }
+    fn inbox() -> Self {
+        Self { view_kind: ViewKind::Inbox, ast: query::Ast::default() }
     }
     fn current() -> Self {
         Self { view_kind: ViewKind::Current, ast: query::Ast::default() }
@@ -722,11 +735,20 @@ enum UndoOp {
         new: Option<i64>,
     },
     /// Snooze / clear-snooze on a cell. Sets `Cell.resurface_after`
-    /// to `prev` or `new`. Pure metadata; no `edited_at` bump.
+    /// and simultaneously updates `Cell.inbox` (snoozing clears inbox;
+    /// un-snoozing sets it). Pure metadata; no `edited_at` bump.
     SetCellResurface {
         cell_id: Uuid,
         prev: Option<i64>,
         new: Option<i64>,
+        prev_inbox: bool,
+        new_inbox: bool,
+    },
+    /// Toggle a cell's inbox membership. Pure metadata — no `edited_at` bump.
+    SetCellInbox {
+        cell_id: Uuid,
+        prev: bool,
+        new: bool,
     },
     /// Bullet close/reopen (cascades to its sub-outline via
     /// `compute_effective_open`). Bullet ids are unique within a
@@ -802,11 +824,13 @@ enum UndoOp {
         new_edited_at: i64,
     },
     /// Attach an existing thread to a target. Symmetric — undo
-    /// detaches.
+    /// detaches. Also clears inbox on the host cell (undo restores it).
     AttachThread {
         thread_id: ThreadId,
         target: ReferenceTarget,
         attached_at: i64,
+        /// The host cell's inbox value before the attach set it false.
+        prev_inbox: bool,
     },
     /// Detach a target from a thread. Undo re-attaches at
     /// `attached_at` so the original order is preserved on redo.
@@ -818,10 +842,13 @@ enum UndoOp {
     /// Combined create-thread + attach-target, recorded as a single
     /// undo entry so Ctrl+Z reverses the whole gesture (the user
     /// thinks of "Attach to new thread X" as one action, not two).
+    /// Also clears inbox on the host cell (undo restores it).
     CreateAndAttachThread {
         thread: Thread,
         target: ReferenceTarget,
         attached_at: i64,
+        /// The host cell's inbox value before the attach set it false.
+        prev_inbox: bool,
     },
 }
 
@@ -1122,13 +1149,24 @@ impl UndoOp {
                     // edited_at (would distort attention sort).
                 }
             }
-            Self::SetCellResurface { cell_id, prev, new } => {
+            Self::SetCellResurface { cell_id, prev, new, prev_inbox, new_inbox } => {
+                let (target, target_inbox) = match dir {
+                    UndoDir::Undo => (*prev, *prev_inbox),
+                    UndoDir::Redo => (*new, *new_inbox),
+                };
+                if let Some(idx) = app.cell_idx(*cell_id) {
+                    app.document.cells[idx].resurface_after = target;
+                    app.document.cells[idx].inbox = target_inbox;
+                    app.mark_cell_dirty(*cell_id);
+                }
+            }
+            Self::SetCellInbox { cell_id, prev, new } => {
                 let target = match dir {
                     UndoDir::Undo => *prev,
                     UndoDir::Redo => *new,
                 };
                 if let Some(idx) = app.cell_idx(*cell_id) {
-                    app.document.cells[idx].resurface_after = target;
+                    app.document.cells[idx].inbox = target;
                     app.mark_cell_dirty(*cell_id);
                 }
             }
@@ -1271,6 +1309,7 @@ impl UndoOp {
                 thread_id,
                 target,
                 attached_at,
+                prev_inbox,
             } => {
                 if let Some(db) = app.db.as_mut() {
                     match dir {
@@ -1281,6 +1320,18 @@ impl UndoOp {
                             let _ = db.attach_thread(*thread_id, *target, *attached_at);
                         }
                     }
+                }
+                let cell_id = match target {
+                    ReferenceTarget::WholeCell(id) => *id,
+                    ReferenceTarget::Subtree { cell_id, .. } => *cell_id,
+                };
+                let inbox_target = match dir {
+                    UndoDir::Undo => *prev_inbox,
+                    UndoDir::Redo => false,
+                };
+                if let Some(idx) = app.cell_idx(cell_id) {
+                    app.document.cells[idx].inbox = inbox_target;
+                    app.mark_cell_dirty(cell_id);
                 }
                 app.reload_threads();
             }
@@ -1305,6 +1356,7 @@ impl UndoOp {
                 thread,
                 target,
                 attached_at,
+                prev_inbox,
             } => {
                 if let Some(db) = app.db.as_mut() {
                     match dir {
@@ -1317,6 +1369,18 @@ impl UndoOp {
                             let _ = db.attach_thread(thread.id, *target, *attached_at);
                         }
                     }
+                }
+                let cell_id = match target {
+                    ReferenceTarget::WholeCell(id) => *id,
+                    ReferenceTarget::Subtree { cell_id, .. } => *cell_id,
+                };
+                let inbox_target = match dir {
+                    UndoDir::Undo => *prev_inbox,
+                    UndoDir::Redo => false,
+                };
+                if let Some(idx) = app.cell_idx(cell_id) {
+                    app.document.cells[idx].inbox = inbox_target;
+                    app.mark_cell_dirty(cell_id);
                 }
                 app.reload_threads();
             }
@@ -3293,6 +3357,7 @@ impl KeptApp {
                     None,
                     None,
                     false,
+                    false,
                 );
                 cache.set_font_scale(scale);
                 cache
@@ -3326,6 +3391,7 @@ impl KeptApp {
                     source.context_hint_id,
                     None,
                     None,
+                    false,
                     false,
                 );
                 cache.set_font_scale(scale);
@@ -4126,10 +4192,23 @@ impl KeptApp {
                 return;
             }
         }
+        // Clear inbox on the host cell (thread attachment = note is organized).
+        let cell_id = match target {
+            ReferenceTarget::WholeCell(id) => id,
+            ReferenceTarget::Subtree { cell_id, .. } => cell_id,
+        };
+        let prev_inbox = self.cell_idx(cell_id)
+            .map(|idx| self.document.cells[idx].inbox)
+            .unwrap_or(false);
+        if let Some(idx) = self.cell_idx(cell_id) {
+            self.document.cells[idx].inbox = false;
+            self.mark_cell_dirty(cell_id);
+        }
         self.undo_stack.push(UndoOp::AttachThread {
             thread_id,
             target,
             attached_at,
+            prev_inbox,
         });
         self.redo_stack.clear();
         self.reload_threads();
@@ -4162,10 +4241,23 @@ impl KeptApp {
                 return None;
             }
         }
+        // Clear inbox on the host cell.
+        let cell_id = match target {
+            ReferenceTarget::WholeCell(cid) => cid,
+            ReferenceTarget::Subtree { cell_id, .. } => cell_id,
+        };
+        let prev_inbox = self.cell_idx(cell_id)
+            .map(|idx| self.document.cells[idx].inbox)
+            .unwrap_or(false);
+        if let Some(idx) = self.cell_idx(cell_id) {
+            self.document.cells[idx].inbox = false;
+            self.mark_cell_dirty(cell_id);
+        }
         self.undo_stack.push(UndoOp::CreateAndAttachThread {
             thread,
             target,
             attached_at: now,
+            prev_inbox,
         });
         self.redo_stack.clear();
         self.reload_threads();
@@ -4376,6 +4468,7 @@ impl KeptApp {
                 .and_then(|e| e.primary_cell_id)
                 .map_or(false, |pid| pid == cell.id),
             ViewKind::People => false,
+            ViewKind::Inbox => cell.inbox,
             // ThreadList and Thread pages are bespoke renders, same as
             // People / Entity — no cells participate in the standard
             // stream.
@@ -4387,6 +4480,9 @@ impl KeptApp {
             // is_open() guard above. Goes through the standard
             // cell-stream render path like Ast/Context.
             ViewKind::Current => {
+                if cell.inbox {
+                    return false;
+                }
                 let now_ms = crate::cell::now_epoch_ms();
                 let cutoff = now_ms - CURRENT_WINDOW_MS;
                 if cell.timestamp < cutoff {
@@ -5113,6 +5209,8 @@ impl KeptApp {
         // Cheap when the file's mtime hasn't changed.
         crate::color::maybe_reload();
         canvas.clear(crate::color::bg_page());
+        // Promote snooze-expired cells to inbox=true.
+        self.check_snooze_promotions();
         // Scratch TTL re-prune: once per `SCRATCH_PRUNE_INTERVAL`
         // of session wall time. Cheap when nothing's expired
         // (indexed SQL scan). Drops the returned ids from the
@@ -8223,16 +8321,59 @@ impl KeptApp {
         if prev == when {
             return false;
         }
+        let prev_inbox = self.document.cells[idx].inbox;
+        // Snoozing (setting a future time) clears inbox;
+        // manually un-snoozing (clearing) returns note to inbox.
+        let new_inbox = when.is_none();
         self.document.cells[idx].resurface_after = when;
+        self.document.cells[idx].inbox = new_inbox;
         self.mark_cell_dirty(cell_id);
         self.undo_stack.push(UndoOp::SetCellResurface {
             cell_id,
             prev,
             new: when,
+            prev_inbox,
+            new_inbox,
         });
         self.redo_stack.clear();
         self.pane_mut().coalesce_break = true;
         true
+    }
+
+    /// Flip a cell's inbox membership. Pushes an undo entry.
+    /// Returns false if the cell doesn't exist or already has that state.
+    fn set_cell_inbox(&mut self, cell_id: Uuid, inbox: bool) -> bool {
+        let Some(idx) = self.cell_idx(cell_id) else {
+            return false;
+        };
+        let prev = self.document.cells[idx].inbox;
+        if prev == inbox {
+            return false;
+        }
+        self.document.cells[idx].inbox = inbox;
+        self.mark_cell_dirty(cell_id);
+        self.undo_stack.push(UndoOp::SetCellInbox { cell_id, prev, new: inbox });
+        self.redo_stack.clear();
+        true
+    }
+
+    /// Promote any cells whose snooze has expired (resurface_after <= now)
+    /// to inbox=true. Called once per frame; cheap when nothing needs promotion.
+    /// Does NOT push undo entries — this is automatic system behavior.
+    fn check_snooze_promotions(&mut self) {
+        let now_ms = now_epoch_ms();
+        let mut dirty_ids: Vec<Uuid> = Vec::new();
+        for cell in &mut self.document.cells {
+            if let Some(t) = cell.resurface_after {
+                if now_ms >= t && !cell.inbox {
+                    cell.inbox = true;
+                    dirty_ids.push(cell.id);
+                }
+            }
+        }
+        for id in dirty_ids {
+            self.mark_cell_dirty(id);
+        }
     }
 
     /// Flip a single bullet's `closed_at` (the "close sub-outline"
@@ -8937,6 +9078,7 @@ impl KeptApp {
         let closed_at = self.document.cells[idx].closed_at;
         let resurface_after = self.document.cells[idx].resurface_after;
         let scratch = self.document.cells[idx].scratch;
+        let inbox = self.document.cells[idx].inbox;
 
         // Build the new Outline cell directly so we can hand-pick the
         // id / timestamp (replace-in-place semantics). Cell::from_parts
@@ -8953,6 +9095,7 @@ impl KeptApp {
             closed_at,
             resurface_after,
             scratch,
+            inbox,
         );
         new_cell.set_font_scale(self.font_scale);
         let post = new_cell.snapshot();
@@ -9000,6 +9143,7 @@ impl KeptApp {
         let closed_at = self.document.cells[idx].closed_at;
         let resurface_after = self.document.cells[idx].resurface_after;
         let scratch = self.document.cells[idx].scratch;
+        let inbox = self.document.cells[idx].inbox;
 
         let mut new_cell = Cell::from_parts(
             cell_id,
@@ -9014,6 +9158,7 @@ impl KeptApp {
             closed_at,
             resurface_after,
             scratch,
+            inbox,
         );
         new_cell.set_font_scale(self.font_scale);
         let post = new_cell.snapshot();
@@ -9138,6 +9283,7 @@ impl KeptApp {
             ViewKind::Ast
                 | ViewKind::Context(_)
                 | ViewKind::Entity(_)
+                | ViewKind::Inbox
                 | ViewKind::Current
                 | ViewKind::Cell(_)
                 | ViewKind::Scratch
@@ -9556,6 +9702,7 @@ impl KeptApp {
                 self.cell_context_menu = None;
                 return match kind {
                     PageKind::People => open(self, Query::people()),
+                    PageKind::Inbox => open(self, Query::inbox()),
                     PageKind::Current => open(self, Query::current()),
                     PageKind::Scratch => open(self, Query::scratch()),
                     PageKind::ThreadList => open(self, Query::thread_list()),
@@ -9764,6 +9911,16 @@ impl KeptApp {
                 }
                 return true;
             }
+            // "Send to Inbox" / "Release from Inbox"
+            if let Some(rect) = self.hit_tests.bar_menu.inbox_toggle {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.bar_context_menu.take() {
+                        let current = self.cell(menu.cell_id).map(|c| c.inbox).unwrap_or(false);
+                        self.set_cell_inbox(menu.cell_id, !current);
+                    }
+                    return true;
+                }
+            }
             self.bar_context_menu = None;
         }
         // Cell context menu dispatch: click row dispatches, miss
@@ -9926,6 +10083,16 @@ impl KeptApp {
                 self.cell_context_menu = None;
                 self.detach_from_thread(tid, target);
                 return true;
+            }
+            // "Send to Inbox" / "Release from Inbox"
+            if let Some(rect) = self.hit_tests.cell_menu.inbox_toggle {
+                if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                    if let Some(menu) = self.cell_context_menu.take() {
+                        let current = self.cell(menu.cell_id).map(|c| c.inbox).unwrap_or(false);
+                        self.set_cell_inbox(menu.cell_id, !current);
+                    }
+                    return true;
+                }
             }
             self.cell_context_menu = None;
         }

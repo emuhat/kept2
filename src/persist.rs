@@ -221,6 +221,16 @@ impl Db {
                  COMMIT;",
             )?;
         }
+        if version < 10 {
+            // v9 → v10: Inbox flag. Existing cells default to 0 (not in inbox).
+            // Yeet and snooze-expiry set it to 1 at runtime going forward.
+            self.conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE cells ADD COLUMN inbox INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 10;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 
@@ -424,7 +434,7 @@ impl Db {
 
     pub fn load_cells(&self, typeface: &Typeface) -> rusqlite::Result<Vec<Cell>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, body, edited_at, context_hint_id, scratch \
+            "SELECT id, timestamp, body, edited_at, context_hint_id, scratch, inbox \
              FROM cells ORDER BY timestamp ASC",
         )?;
         let rows = stmt
@@ -435,6 +445,7 @@ impl Db {
                 let edited_at: i64 = row.get(3)?;
                 let hint_bytes: Option<Vec<u8>> = row.get(4)?;
                 let scratch: i64 = row.get(5)?;
+                let inbox: i64 = row.get(6)?;
                 let id = Uuid::from_slice(&id_bytes).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
                         0,
@@ -452,12 +463,12 @@ impl Db {
                     })?),
                     None => None,
                 };
-                Ok((id, timestamp, body, edited_at, hint, scratch != 0))
+                Ok((id, timestamp, body, edited_at, hint, scratch != 0, inbox != 0))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut cells = Vec::with_capacity(rows.len());
-        for (id, timestamp, body_json, edited_at, hint, scratch) in rows {
+        for (id, timestamp, body_json, edited_at, hint, scratch, inbox) in rows {
             let pc: PersistedCell = serde_json::from_str(&body_json).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     0,
@@ -493,6 +504,7 @@ impl Db {
             let kind = body_to_kind(pc.body, typeface);
             cells.push(Cell::from_parts(
                 id, kind, title, timestamp, edited_at, hint, closed_at, resurface_after, scratch,
+                inbox,
             ));
         }
         Ok(cells)
@@ -530,14 +542,15 @@ impl Db {
         let hint_bytes = cell.context_hint_id.map(|u| u.as_bytes().to_vec());
         let cell_id_bytes = cell.id.as_bytes().to_vec();
         self.conn.execute(
-            "INSERT INTO cells (id, timestamp, body, edited_at, context_hint_id, scratch) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+            "INSERT INTO cells (id, timestamp, body, edited_at, context_hint_id, scratch, inbox) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT(id) DO UPDATE SET \
                  timestamp = excluded.timestamp, \
                  body = excluded.body, \
                  edited_at = excluded.edited_at, \
                  context_hint_id = excluded.context_hint_id, \
-                 scratch = excluded.scratch",
+                 scratch = excluded.scratch, \
+                 inbox = excluded.inbox",
             params![
                 cell_id_bytes,
                 cell.timestamp,
@@ -545,6 +558,7 @@ impl Db {
                 cell.edited_at,
                 hint_bytes,
                 if cell.scratch { 1_i64 } else { 0_i64 },
+                if cell.inbox { 1_i64 } else { 0_i64 },
             ],
         )?;
         let names = tag_names_from_persisted(&pc);
@@ -1310,6 +1324,9 @@ struct PersistedCell {
     /// at epoch ms `t`. Absent for non-snoozed cells.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resurface_after: Option<i64>,
+    /// Inbox membership. Default false (absent from JSON for older rows).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    inbox: bool,
     #[serde(flatten)]
     body: CellBody,
 }
@@ -1479,6 +1496,7 @@ fn persisted_cell_from(cell: &Cell) -> PersistedCell {
         active: cell.is_open(),
         closed_at: cell.closed_at,
         resurface_after: cell.resurface_after,
+        inbox: cell.inbox,
         body: cell_to_body(cell),
     }
 }
@@ -2110,6 +2128,7 @@ mod tests {
             if !pc.active { Some(cell.edited_at) } else { None }
         });
         let resurface_after = pc.resurface_after;
+        let inbox = pc.inbox;
         let kind = body_to_kind(pc.body, typeface);
         Cell::from_parts(
             cell.id,
@@ -2121,6 +2140,7 @@ mod tests {
             closed_at,
             resurface_after,
             cell.scratch,
+            inbox,
         )
     }
 
@@ -2241,6 +2261,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         let back = round_trip(&cell, &tf);
         match (&cell.kind, &back.kind) {
@@ -2303,6 +2324,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
         );
         let back = round_trip(&cell, &tf);
@@ -2419,6 +2441,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
         );
         let back = round_trip(&cell, &tf);

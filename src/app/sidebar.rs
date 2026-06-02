@@ -157,6 +157,19 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         &header_paint,
     );
     y += header_h;
+    let inbox_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
+    draw_sidebar_row(
+        canvas,
+        inbox_rect,
+        "Inbox",
+        matches!(ctx.view.view_kind, ViewKind::Inbox),
+        in_row(inbox_rect),
+        radius,
+        pad_x,
+        &row_font,
+    );
+    ctx.hit_tests.sidebar.pages.push((PageKind::Inbox, inbox_rect));
+    y += date_h + item_gap;
     let current_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
     draw_sidebar_row(
         canvas,

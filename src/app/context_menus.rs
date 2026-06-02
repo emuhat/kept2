@@ -316,6 +316,9 @@ impl CellContextMenu {
                 action_count += 1; // Surface subtree
             }
         }
+        if !is_scratch {
+            action_count += 1; // Send to Inbox / Release from Inbox
+        }
         action_count += 1; // Close / Reopen (cell)
         if has_bullet_toggle {
             action_count += 1; // Close / Reopen (bullet)
@@ -509,10 +512,18 @@ impl CellContextMenu {
             &emit_separator,
         );
 
-        // ----- Group 4: Close (state change, scoped to body context) -----
-        // Whole-cell shape transforms (Envelope / Unwrap) live on
-        // the BarContextMenu now — they're whole-cell operations
-        // and don't belong in a bullet-specific menu.
+        // ----- Group 4: Inbox + Close -----
+        let inbox_toggle_rect = if !is_scratch {
+            let label = if cell.inbox { "Release from Inbox" } else { "Send to Inbox" };
+            Some(emit_row(
+                &mut row_top,
+                label,
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ))
+        } else {
+            None
+        };
         let cell_active_label = if cell.is_open() { "Close" } else { "Reopen" };
         let toggle_cell_active_rect = emit_row(
             &mut row_top,
@@ -554,6 +565,7 @@ impl CellContextMenu {
         ctx.hit_tests.cell_menu.attach_thread = threads_hits.attach_whole;
         ctx.hit_tests.cell_menu.attach_thread_subtree = threads_hits.attach_subtree;
         ctx.hit_tests.cell_menu.detach_thread = threads_hits.detach;
+        ctx.hit_tests.cell_menu.inbox_toggle = inbox_toggle_rect;
     }
 }
 
@@ -614,6 +626,9 @@ impl BarContextMenu {
         // show the whole-cell Attach row, never the subtree row.
         action_count +=
             threads_group_row_count(is_scratch, true, false, attached_threads.len());
+        if !is_scratch {
+            action_count += 1; // Send to Inbox / Release from Inbox
+        }
         action_count += 1; // Delete cell
         // Separators: info | surface+copyref (or move-to-timeline) |
         // snoozes | [shape (envelope/unwrap)] | threads | delete.
@@ -797,7 +812,18 @@ impl BarContextMenu {
             &emit_separator,
         );
 
-        // ----- Group 6: Delete (destructive, last) -----
+        // ----- Group 6: Inbox toggle + Delete (destructive, last) -----
+        let inbox_toggle_rect = if !is_scratch {
+            let label = if cell.inbox { "Release from Inbox" } else { "Send to Inbox" };
+            Some(emit_row(
+                &mut row_top,
+                label,
+                crate::color::text_menu_row(),
+                crate::color::embed_hover(),
+            ))
+        } else {
+            None
+        };
         let delete_rect = emit_row(
             &mut row_top,
             "Delete cell",
@@ -820,6 +846,7 @@ impl BarContextMenu {
             .into_iter()
             .map(|(tid, _, rect)| (tid, rect))
             .collect();
+        ctx.hit_tests.bar_menu.inbox_toggle = inbox_toggle_rect;
         ctx.hit_tests.bar_menu.delete = Some(delete_rect);
     }
 }

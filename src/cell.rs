@@ -58,6 +58,10 @@ pub struct CellSnapshot {
     /// Scratch flag. Carried so undo/redo of a Move-to-Timeline
     /// action (whenever we add it) can flip the bit back.
     pub scratch: bool,
+    /// Whether this cell appears in the Inbox view. Set automatically
+    /// on yeet and on snooze-expiry; cleared on thread attach and on
+    /// snooze. Also manually toggled via "Send to Inbox" / "Release from Inbox".
+    pub inbox: bool,
 }
 
 #[derive(Clone)]
@@ -159,6 +163,10 @@ pub struct Cell {
     /// `SCRATCH_TTL_MS`. Flipped to false by the "Move to Timeline"
     /// bar-menu action which also re-stamps the timestamp.
     pub scratch: bool,
+    /// Whether this cell appears in the Inbox view. Set automatically
+    /// on yeet and on snooze-expiry; cleared on thread attach and on
+    /// snooze. Also manually toggled via "Send to Inbox" / "Release from Inbox".
+    pub inbox: bool,
 }
 
 pub enum CellKind {
@@ -288,6 +296,7 @@ impl Cell {
             closed_at: None,
             resurface_after: None,
             scratch: false,
+            inbox: false,
         }
     }
 
@@ -308,6 +317,7 @@ impl Cell {
             closed_at: None,
             resurface_after: None,
             scratch: false,
+            inbox: false,
         }
     }
 
@@ -328,6 +338,7 @@ impl Cell {
             closed_at: None,
             resurface_after: None,
             scratch: false,
+            inbox: false,
         }
     }
 
@@ -352,6 +363,7 @@ impl Cell {
             closed_at: None,
             resurface_after: None,
             scratch: false,
+            inbox: false,
         }
     }
 
@@ -366,6 +378,7 @@ impl Cell {
         closed_at: Option<i64>,
         resurface_after: Option<i64>,
         scratch: bool,
+        inbox: bool,
     ) -> Self {
         Self {
             id,
@@ -382,6 +395,7 @@ impl Cell {
             closed_at,
             resurface_after,
             scratch,
+            inbox,
         }
     }
 
@@ -482,6 +496,7 @@ impl Cell {
             snap.closed_at,
             snap.resurface_after,
             snap.scratch,
+            snap.inbox,
         )
     }
 
@@ -1239,6 +1254,7 @@ impl Cell {
             closed_at: self.closed_at,
             resurface_after: self.resurface_after,
             scratch: self.scratch,
+            inbox: self.inbox,
         }
     }
 
@@ -1253,6 +1269,7 @@ impl Cell {
         self.closed_at = snap.closed_at;
         self.resurface_after = snap.resurface_after;
         self.scratch = snap.scratch;
+        self.inbox = snap.inbox;
         self.title = snap.title.map(|tbs| {
             let typeface = self.body_typeface();
             let mut tb = TextBox::new(typeface, String::new());

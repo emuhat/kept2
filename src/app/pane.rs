@@ -621,6 +621,7 @@ impl KeptApp {
                 .map(|e| format!("@{}", e.display_name))
                 .unwrap_or_else(|| "@entity".into()),
             ViewKind::People => "people".into(),
+            ViewKind::Inbox => "inbox".into(),
             ViewKind::Current => "current".into(),
             ViewKind::Scratch => "scratch".into(),
             ViewKind::Cell(cid) => {
@@ -666,6 +667,7 @@ impl KeptApp {
         match self.pane_mut().view.view_kind.clone() {
             ViewKind::Ast
             | ViewKind::Context(_)
+            | ViewKind::Inbox
             | ViewKind::Current
             | ViewKind::Cell(_)
             | ViewKind::Scratch => self.render_cell_stream(canvas, layout),

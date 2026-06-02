@@ -167,6 +167,7 @@ impl KeptApp {
         state.cell.timestamp = now;
         state.cell.edited_at = now;
         state.cell.context_hint_id = self.writable_context_id();
+        state.cell.inbox = true;
         let new_id = state.cell.id;
         let snapshot = state.cell.snapshot();
         let pre_focused = self.pane().focused;
