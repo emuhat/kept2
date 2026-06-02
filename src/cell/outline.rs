@@ -186,8 +186,8 @@ pub struct OutlineCell {
     /// Per-bullet thread chips for the inline "in <thread>" row
     /// rendered below each attached bullet. The app layer
     /// repopulates this every frame from `thread_memberships`
-    /// before calling `tick`. Each value is `(thread_id, abbrev)`
-    /// — the abbrev is what the chip renders, the id drives
+    /// before calling `tick`. Each value is `(thread_id, title)`
+    /// — the title is what the chip renders, the id drives
     /// click-to-navigate. Empty map = no per-bullet chips.
     bullet_chips: std::collections::HashMap<Uuid, Vec<(Uuid, String)>>,
     /// Hit rects emitted by the chip rows during the last `tick`.
@@ -732,7 +732,7 @@ impl OutlineCell {
                     &chip_muted,
                 );
                 cx += chip_font.measure_str(leader, Some(&chip_muted)).0;
-                for (i, (tid, abbrev)) in chips.iter().enumerate() {
+                for (i, (tid, title)) in chips.iter().enumerate() {
                     if i > 0 {
                         let sep = " · ";
                         canvas.draw_str(
@@ -743,7 +743,7 @@ impl OutlineCell {
                         );
                         cx += chip_font.measure_str(sep, Some(&chip_muted)).0;
                     }
-                    let label = format!("%{}", abbrev);
+                    let label = format!("%{}", title);
                     let chip_color = crate::color::thread_chip_color(tid.as_bytes());
                     let mut chip_paint = Paint::default();
                     chip_paint.set_anti_alias(true);

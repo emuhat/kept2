@@ -3907,7 +3907,7 @@ impl KeptApp {
         }
     }
 
-    /// Paint a single-line "↳ %FA · %Bu" row of clickable thread
+    /// Paint a single-line "↳ %FarmAnimals · %Bundling" row of clickable thread
     /// chips at `(x, y)` inside the cell body. Returns the height
     /// the row consumed so the caller can extend the cell's `h`.
     /// Each chip's rect is pushed into `hit_tests_builder` for
@@ -3988,14 +3988,14 @@ impl KeptApp {
         -m.ascent + m.descent + row_pad_top + row_pad_bot
     }
 
-    /// `(thread_id, abbrev)` pairs for every WHOLE-CELL membership on
+    /// `(thread_id, title)` pairs for every WHOLE-CELL membership on
     /// `cell_id`, ordered alphabetically by thread title (stable
     /// per-frame). Empty when the cell has no thread memberships.
     /// Bullet-level memberships are not surfaced here — see
     /// `bullet_subtree_thread_chips` for that aggregated row.
     fn whole_cell_thread_chips(&self, cell_id: Uuid) -> Vec<(ThreadId, String)> {
         let target = ReferenceTarget::WholeCell(cell_id);
-        let mut chips: Vec<(ThreadId, String, String)> = self
+        let mut chips: Vec<(ThreadId, String)> = self
             .thread_memberships
             .iter()
             .filter(|m| m.target == target)
@@ -4003,14 +4003,14 @@ impl KeptApp {
                 self.threads
                     .iter()
                     .find(|t| t.id == m.thread_id)
-                    .map(|t| (m.thread_id, t.title.clone(), thread_chip_abbrev(&t.title)))
+                    .map(|t| (m.thread_id, t.title.clone()))
             })
             .collect();
         chips.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-        chips.into_iter().map(|(id, _, ab)| (id, ab)).collect()
+        chips
     }
 
-    /// `bullet_id → Vec<(thread_id, abbrev)>` for every Subtree
+    /// `bullet_id → Vec<(thread_id, title)>` for every Subtree
     /// membership inside `cell_id`. Empty map = no per-bullet chips
     /// this frame. Fed into `OutlineCell::set_bullet_chips` before
     /// `cell.tick` so the outline can paint chip rows inline beneath
@@ -4035,8 +4035,7 @@ impl KeptApp {
                 Some(t) => t.title.clone(),
                 None => continue,
             };
-            let abbrev = thread_chip_abbrev(&title);
-            map.entry(bid).or_default().push((m.thread_id, abbrev));
+            map.entry(bid).or_default().push((m.thread_id, title));
         }
         // Sort each bullet's chip list alphabetically by title so the
         // render is stable across frames. Re-derive the title for
@@ -11235,94 +11234,6 @@ fn snippet(text: &str) -> String {
     }
     let truncated: String = collapsed.chars().take(29).collect();
     format!("{}…", truncated)
-}
-
-/// Compact 2-char label for a thread, used by the inline "in
-/// threads" chip row. CamelCase ("FarmAnimals") and multi-word
-/// ("farm animals", "farm-animals") titles take the first letter
-/// of each of the first two tokens; single-word titles take the
-/// first two chars. Case preserved either way so visually-
-/// distinct titles read as distinct chips. Collisions are
-/// tolerated — the chip is a quick recognition aid, not a
-/// global identifier.
-fn thread_chip_abbrev(title: &str) -> String {
-    // Tokenize on whitespace, ASCII punctuation, and camelCase
-    // boundaries (lower→upper). Empty / digits-only tokens drop
-    // out so a title like "thread-1" doesn't yield "t1".
-    let mut tokens: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut prev_lower = false;
-    for ch in title.chars() {
-        let boundary = ch.is_whitespace()
-            || (ch.is_ascii_punctuation() && ch != '_' && ch != '\'')
-            || ch == '_';
-        if boundary {
-            if !cur.is_empty() {
-                tokens.push(std::mem::take(&mut cur));
-            }
-            prev_lower = false;
-            continue;
-        }
-        if prev_lower && ch.is_uppercase() && !cur.is_empty() {
-            tokens.push(std::mem::take(&mut cur));
-        }
-        cur.push(ch);
-        prev_lower = ch.is_lowercase();
-    }
-    if !cur.is_empty() {
-        tokens.push(cur);
-    }
-    let letter_tokens: Vec<&String> = tokens
-        .iter()
-        .filter(|t| t.chars().next().map_or(false, |c| c.is_alphabetic()))
-        .collect();
-    if letter_tokens.len() >= 2 {
-        let a = letter_tokens[0].chars().next().unwrap();
-        let b = letter_tokens[1].chars().next().unwrap();
-        return format!("{a}{b}");
-    }
-    let mut chars = title.chars().filter(|c| !c.is_whitespace());
-    let a = chars.next();
-    let b = chars.next();
-    match (a, b) {
-        (Some(a), Some(b)) => format!("{a}{b}"),
-        (Some(a), None) => format!("{a}"),
-        _ => "?".to_string(),
-    }
-}
-
-#[cfg(test)]
-mod chip_tests {
-    use super::thread_chip_abbrev;
-    #[test]
-    fn camelcase_picks_each_initial() {
-        assert_eq!(thread_chip_abbrev("FarmAnimals"), "FA");
-        assert_eq!(thread_chip_abbrev("MyLongThreadName"), "ML");
-    }
-    #[test]
-    fn single_word_takes_first_two_chars() {
-        assert_eq!(thread_chip_abbrev("Bundle"), "Bu");
-        assert_eq!(thread_chip_abbrev("test"), "te");
-    }
-    #[test]
-    fn whitespace_splits_into_word_initials() {
-        assert_eq!(thread_chip_abbrev("farm animals"), "fa");
-        assert_eq!(thread_chip_abbrev("the brown fox"), "tb");
-    }
-    #[test]
-    fn punctuation_splits() {
-        assert_eq!(thread_chip_abbrev("farm-animals"), "fa");
-        assert_eq!(thread_chip_abbrev("farm_animals"), "fa");
-    }
-    #[test]
-    fn digits_dont_become_initials() {
-        assert_eq!(thread_chip_abbrev("thread-1"), "th");
-    }
-    #[test]
-    fn edge_cases() {
-        assert_eq!(thread_chip_abbrev(""), "?");
-        assert_eq!(thread_chip_abbrev("A"), "A");
-    }
 }
 
 /// Walk into `cell` looking for an outline whose bullets cover `doc_y`,
