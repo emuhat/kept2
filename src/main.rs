@@ -91,8 +91,7 @@ impl ApplicationHandler for Application {
 
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
         match cause {
-            winit::event::StartCause::ResumeTimeReached { .. }
-            | winit::event::StartCause::Init => {
+            winit::event::StartCause::ResumeTimeReached { .. } | winit::event::StartCause::Init => {
                 self.env.window.request_redraw();
             }
             _ => {}

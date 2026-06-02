@@ -308,8 +308,11 @@ impl Palette {
             let value = if let Some(rest) = raw_value
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
-                .or_else(|| raw_value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-            {
+                .or_else(|| {
+                    raw_value
+                        .strip_prefix('\'')
+                        .and_then(|s| s.strip_suffix('\''))
+                }) {
                 rest
             } else {
                 match raw_value.find('#') {
@@ -336,8 +339,12 @@ impl Palette {
     pub fn defaults_yaml() -> String {
         let p = Self::defaults();
         let mut out = String::new();
-        out.push_str("# kept color palette — edit this file and the running app picks up changes\n");
-        out.push_str("# within ~250ms. Hex colors: `#rrggbb` (opaque) or `#rrggbbaa` (with alpha).\n");
+        out.push_str(
+            "# kept color palette — edit this file and the running app picks up changes\n",
+        );
+        out.push_str(
+            "# within ~250ms. Hex colors: `#rrggbb` (opaque) or `#rrggbbaa` (with alpha).\n",
+        );
         out.push_str("# Lines starting with `#` are comments. Blank lines are fine.\n");
         out.push_str("# Unknown keys are warned about on stderr; malformed lines are skipped.\n\n");
 
@@ -378,7 +385,11 @@ impl Palette {
         out.push_str("\n# Accent (focus / selection)\n");
         row(&mut out, "accent_blue", p.accent_blue);
         row(&mut out, "accent_blue_selection", p.accent_blue_selection);
-        row(&mut out, "accent_blue_pane_border", p.accent_blue_pane_border);
+        row(
+            &mut out,
+            "accent_blue_pane_border",
+            p.accent_blue_pane_border,
+        );
         row(&mut out, "accent_blue_focus_edit", p.accent_blue_focus_edit);
 
         out.push_str("\n# Reference embeds\n");
@@ -565,8 +576,7 @@ pub fn maybe_reload() {
     let Ok(mtime) = meta.modified() else {
         return;
     };
-    let mtime_lock =
-        LAST_MTIME.get_or_init(|| RwLock::new(None));
+    let mtime_lock = LAST_MTIME.get_or_init(|| RwLock::new(None));
     if Some(mtime) == *mtime_lock.read().expect("mtime lock") {
         return;
     }
@@ -929,4 +939,3 @@ mod tests {
         assert_eq!(parsed.bg_card, defaults.bg_card);
     }
 }
-

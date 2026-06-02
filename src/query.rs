@@ -443,9 +443,7 @@ pub fn resolve_persons(
             if kind != "person" {
                 continue;
             }
-            if normalize_entity_token(alias).contains(&needle)
-                && !out.contains(entity_id)
-            {
+            if normalize_entity_token(alias).contains(&needle) && !out.contains(entity_id) {
                 out.push(*entity_id);
             }
         }
@@ -503,13 +501,22 @@ mod tests {
         assert_eq!(
             ast.include.entities,
             vec![
-                EntityRef { kind: EntityKind::Person, id: "sam".into() },
-                EntityRef { kind: EntityKind::Person, id: "mike".into() },
+                EntityRef {
+                    kind: EntityKind::Person,
+                    id: "sam".into()
+                },
+                EntityRef {
+                    kind: EntityKind::Person,
+                    id: "mike".into()
+                },
             ]
         );
         assert_eq!(
             ast.exclude.entities,
-            vec![EntityRef { kind: EntityKind::Person, id: "bot".into() }]
+            vec![EntityRef {
+                kind: EntityKind::Person,
+                id: "bot".into()
+            }]
         );
     }
 
@@ -563,7 +570,10 @@ mod tests {
         assert_eq!(ast.include.time, Some(TimeFilter::Today));
         assert_eq!(
             ast.include.entities,
-            vec![EntityRef { kind: EntityKind::Person, id: "mike".into() }]
+            vec![EntityRef {
+                kind: EntityKind::Person,
+                id: "mike".into()
+            }]
         );
         assert_eq!(ast.text, "crash");
     }
@@ -707,9 +717,11 @@ mod tests {
     fn resolve_alias_wins_over_fallback() {
         let alias_entity = Uuid::now_v7();
         let fallback_entity = Uuid::now_v7();
-        let alias_index = vec![
-            ("patrick_foy".to_string(), alias_entity, "person".to_string()),
-        ];
+        let alias_index = vec![(
+            "patrick_foy".to_string(),
+            alias_entity,
+            "person".to_string(),
+        )];
         let title_fallback = vec![(fallback_entity, "patrickfoy".to_string())];
         let got = resolve_persons(&[person_ref("patrick")], &alias_index, &title_fallback);
         assert_eq!(got, vec![alias_entity]);
@@ -794,8 +806,14 @@ mod tests {
         // Use noon UTC to dodge timezone edge cases — the local date for
         // both is the same calendar day no matter the host TZ.
         use chrono::TimeZone;
-        let jan1_noon = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap().timestamp_millis();
-        let jan2_noon = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 12, 0, 0).unwrap().timestamp_millis();
+        let jan1_noon = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let jan2_noon = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 2, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
         let cell1 = make_cell("note", None, jan1_noon);
         let cell2 = make_cell("note", None, jan2_noon);
         // The cell's local date may differ from UTC date in some TZs.
@@ -845,7 +863,10 @@ mod tests {
             person_targets: vec![bob_id],
             person_excludes: Vec::new(),
         };
-        assert!(matches(&ast, &cell, &ctx_alice), "kept link to Alice → match");
+        assert!(
+            matches(&ast, &cell, &ctx_alice),
+            "kept link to Alice → match"
+        );
         assert!(
             !matches(&ast, &cell, &ctx_bob),
             "kept link is to Alice, not Bob → no match"
@@ -857,10 +878,7 @@ mod tests {
         let cell = make_cell("Some Body Of Text", None, 0);
         let ctx = empty_ctx(day(2026, 1, 1));
         assert!(matches(&parse("body of"), &cell, &ctx), "substring hit");
-        assert!(
-            matches(&parse("BODY OF"), &cell, &ctx),
-            "case-insensitive"
-        );
+        assert!(matches(&parse("BODY OF"), &cell, &ctx), "case-insensitive");
         assert!(
             !matches(&parse("missing"), &cell, &ctx),
             "no substring → no match"
@@ -872,9 +890,7 @@ mod tests {
         // Two refs: `@patrick` (alias-hits), `@dana` (alias-misses → fallback).
         let patrick_id = Uuid::now_v7();
         let dana_id = Uuid::now_v7();
-        let alias_index = vec![
-            ("patrick_foy".to_string(), patrick_id, "person".to_string()),
-        ];
+        let alias_index = vec![("patrick_foy".to_string(), patrick_id, "person".to_string())];
         let title_fallback = vec![(dana_id, "danadoe".to_string())];
         let got = resolve_persons(
             &[person_ref("patrick"), person_ref("dana")],

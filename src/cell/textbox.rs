@@ -13,10 +13,10 @@ use winit::{
 };
 
 use super::common::{
-    Affinity, BODY_FONT_SIZE, CARET_WIDTH, Edit, HEADING_FONT_SCALE, LinkSpan,
-    MULTI_CLICK_DIST, MULTI_CLICK_INTERVAL, Selection, Selections, TextBoxSnapshot,
-    is_kept_tag_url, line_edge_mod, primary_mod, tag_name_from_url, tag_url_for,
-    transform_index, transform_index_closed_end, word_mod,
+    Affinity, BODY_FONT_SIZE, CARET_WIDTH, Edit, HEADING_FONT_SCALE, LinkSpan, MULTI_CLICK_DIST,
+    MULTI_CLICK_INTERVAL, Selection, Selections, TextBoxSnapshot, is_kept_tag_url, line_edge_mod,
+    primary_mod, tag_name_from_url, tag_url_for, transform_index, transform_index_closed_end,
+    word_mod,
 };
 use super::wrap::{
     draw_line_with_links, find_line_at, find_word_at, find_word_left_of, find_word_right_of,
@@ -470,8 +470,8 @@ impl TextBox {
         // Collect (li, top_local, is_heading) per paragraph-starting body line.
         let mut entries: Vec<(usize, f32, bool)> = Vec::new();
         for (li, line) in self.body_lines.iter().enumerate() {
-            let starts_paragraph = line.start == 0
-                || matches!(bytes.get(line.start.saturating_sub(1)), Some(&b'\n'));
+            let starts_paragraph =
+                line.start == 0 || matches!(bytes.get(line.start.saturating_sub(1)), Some(&b'\n'));
             if !starts_paragraph {
                 continue;
             }
@@ -483,11 +483,7 @@ impl TextBox {
         // Bottom = next entry's top; for the last entry, the bottom of the
         // final visual line in body_lines (line_bands.last().bottom).
         let mut out = Vec::with_capacity(entries.len());
-        let total_bottom_local = self
-            .line_bands
-            .last()
-            .map(|&(_, b)| b)
-            .unwrap_or(0.0);
+        let total_bottom_local = self.line_bands.last().map(|&(_, b)| b).unwrap_or(0.0);
         for (i, &(_li, top_local, is_heading)) in entries.iter().enumerate() {
             let bot_local = entries
                 .get(i + 1)
@@ -629,7 +625,9 @@ impl TextBox {
     }
 
     pub fn link_at(&self, byte: usize) -> Option<&LinkSpan> {
-        self.links.iter().find(|l| byte >= l.range.start && byte < l.range.end)
+        self.links
+            .iter()
+            .find(|l| byte >= l.range.start && byte < l.range.end)
     }
 
     pub fn links(&self) -> &[LinkSpan] {
@@ -690,7 +688,6 @@ impl TextBox {
         Some((text, links))
     }
 
-
     /// Returns the cut text and removes it from the textbox via `apply_edit`
     /// (so undo records the change).
     pub fn cut_primary_selection(&mut self) -> String {
@@ -729,8 +726,7 @@ impl TextBox {
             self.paste(s);
             return;
         }
-        let mut starts: Vec<Range<usize>> =
-            self.sels.items.iter().map(|sel| sel.range()).collect();
+        let mut starts: Vec<Range<usize>> = self.sels.items.iter().map(|sel| sel.range()).collect();
         starts.sort_by_key(|r| r.start);
         let mut insert_starts: Vec<usize> = Vec::with_capacity(starts.len());
         let mut cum: isize = 0;
@@ -773,8 +769,7 @@ impl TextBox {
         // `a_i + cumulative_growth_from_prior_selections`. Compute
         // those landing offsets first, then do the insertion, then add
         // `LinkSpan`s relative to each landing offset.
-        let mut starts: Vec<Range<usize>> =
-            self.sels.items.iter().map(|sel| sel.range()).collect();
+        let mut starts: Vec<Range<usize>> = self.sels.items.iter().map(|sel| sel.range()).collect();
         starts.sort_by_key(|r| r.start);
         let mut insert_starts: Vec<usize> = Vec::with_capacity(starts.len());
         let mut cum: isize = 0;
@@ -901,8 +896,7 @@ impl TextBox {
             };
             let step = -m.ascent + m.descent + m.leading;
             let extra = step * 0.25;
-            let line_advance = step + extra
-                + self.line_extra_below.get(li).copied().unwrap_or(0.0);
+            let line_advance = step + extra + self.line_extra_below.get(li).copied().unwrap_or(0.0);
             // top = cur_local; bottom = top + line_advance.
             self.line_bands.push((cur_local, cur_local + line_advance));
             cur_local += line_advance;
@@ -984,10 +978,10 @@ impl TextBox {
                     } else {
                         &body_font
                     };
-                    let x0 = x
-                        + line_x_at_offset(line_text, s - line.start, main_font, &text_paint);
-                    let x1 = x
-                        + line_x_at_offset(line_text, e - line.start, main_font, &text_paint);
+                    let x0 =
+                        x + line_x_at_offset(line_text, s - line.start, main_font, &text_paint);
+                    let x1 =
+                        x + line_x_at_offset(line_text, e - line.start, main_font, &text_paint);
                     let baseline = baselines_local[li] + y;
                     let m = line_metrics_for(li);
                     let top = baseline + m.ascent;
@@ -1074,12 +1068,7 @@ impl TextBox {
                     } else {
                         &body_font
                     };
-                    x + line_x_at_offset(
-                        line_text,
-                        prefix_end - line.start,
-                        main_font,
-                        &text_paint,
-                    )
+                    x + line_x_at_offset(line_text, prefix_end - line.start, main_font, &text_paint)
                 };
                 let m = line_metrics_for(li);
                 let top = baseline + m.ascent;
@@ -1210,8 +1199,7 @@ impl TextBox {
         // click would fall through to the multi-cursor handler below
         // and the click would visibly do nothing.
         let plain_in_view = !editing && !mods.shift_key() && !mods.alt_key();
-        let modified_in_edit =
-            editing && primary_mod(mods) && !mods.shift_key() && !mods.alt_key();
+        let modified_in_edit = editing && primary_mod(mods) && !mods.shift_key() && !mods.alt_key();
         let alt_open = mods.alt_key() && !mods.shift_key() && !primary_mod(mods);
         if plain_in_view || modified_in_edit || alt_open {
             if let Some(link) = self.link_at(idx) {
@@ -1258,8 +1246,13 @@ impl TextBox {
             return true;
         }
 
-        let (anchor, head, head_aff, kind) =
-            resolve_click_unit(&self.text, &self.body_lines, idx, affinity, self.click_count);
+        let (anchor, head, head_aff, kind) = resolve_click_unit(
+            &self.text,
+            &self.body_lines,
+            idx,
+            affinity,
+            self.click_count,
+        );
 
         if mods.alt_key() {
             self.sels.items.push(Selection {
@@ -1767,7 +1760,8 @@ impl TextBox {
         let start = edit.range.start;
         let del = edit.range.end - edit.range.start;
         let ins = edit.replacement.len();
-        self.text.replace_range(edit.range.clone(), &edit.replacement);
+        self.text
+            .replace_range(edit.range.clone(), &edit.replacement);
         for sel in &mut self.sels.items {
             sel.anchor = transform_index(sel.anchor, start, del, ins);
             sel.head = transform_index(sel.head, start, del, ins);
@@ -1876,11 +1870,7 @@ fn detect_urls(s: &str) -> Vec<(Range<usize>, String)> {
         } else if s[i..].starts_with("http://") {
             7
         } else {
-            i += s[i..]
-                .chars()
-                .next()
-                .map(|c| c.len_utf8())
-                .unwrap_or(1);
+            i += s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
             continue;
         };
         let scheme_start = i;

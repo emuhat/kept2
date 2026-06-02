@@ -22,9 +22,9 @@ pub use body::CellBody;
 pub use common::{
     KEPT_TAG_SCHEME, LinkSpan, TextBoxSnapshot, is_kept_tag_url, now_epoch_ms, tag_name_from_url,
 };
-pub use outline::{Bullet, OutlineCell, OutlineSnapshot};
 #[cfg(test)]
 pub use outline::BulletSnapshot;
+pub use outline::{Bullet, OutlineCell, OutlineSnapshot};
 pub use plain::PlainCell;
 pub use poppop::PopPopCell;
 pub use reference::{EmbeddedReference, ReferenceCell, ReferenceTarget};
@@ -33,7 +33,6 @@ pub use textbox::TextBox;
 
 pub(crate) use common::{INACTIVE_ALPHA, TITLE_BODY_GAP, open_url, primary_mod};
 pub use wrap::parse_inline_tags;
-
 
 // ---------------------------------------------------------------------------
 // Cell — the public cell type. Either a plain text editor (`TextBox`) or an
@@ -96,9 +95,10 @@ impl CellSnapshot {
             (CellSnapshotKind::Outline(a), CellSnapshotKind::Outline(b)) => {
                 a.reference_header == b.reference_header
                     && a.bullets.len() == b.bullets.len()
-                    && a.bullets.iter().zip(b.bullets.iter()).all(|(x, y)| {
-                        x.depth == y.depth && x.textbox.text == y.textbox.text
-                    })
+                    && a.bullets
+                        .iter()
+                        .zip(b.bullets.iter())
+                        .all(|(x, y)| x.depth == y.depth && x.textbox.text == y.textbox.text)
             }
             (CellSnapshotKind::PopPop(a), CellSnapshotKind::PopPop(b)) => a.text == b.text,
             (CellSnapshotKind::Table(a), CellSnapshotKind::Table(b)) => {
@@ -113,7 +113,6 @@ impl CellSnapshot {
             _ => false,
         }
     }
-
 }
 
 pub struct Cell {
@@ -521,19 +520,16 @@ impl Cell {
     /// Replace `range` with `text` in the focused editable slot (title
     /// when focused, otherwise the kind's focused inner element) and link
     /// the inserted text to `url`.
-    pub fn replace_focused_with_link(
-        &mut self,
-        range: Range<usize>,
-        text: String,
-        url: String,
-    ) {
+    pub fn replace_focused_with_link(&mut self, range: Range<usize>, text: String, url: String) {
         if self.title_focused {
             if let Some(title) = self.title.as_mut() {
                 title.replace_with_link(range, text, url);
             }
             return;
         }
-        self.kind.body_mut().replace_at_focused_with_link(range, text, url);
+        self.kind
+            .body_mut()
+            .replace_at_focused_with_link(range, text, url);
     }
 
     /// Plain-text variant of `replace_focused_with_link` — replaces
@@ -546,7 +542,9 @@ impl Cell {
             }
             return;
         }
-        self.kind.body_mut().replace_at_focused_with_text(range, text);
+        self.kind
+            .body_mut()
+            .replace_at_focused_with_text(range, text);
     }
 
     /// Replace `range` in the focused editable slot with `text` (which
@@ -561,7 +559,9 @@ impl Cell {
             }
             return;
         }
-        self.kind.body_mut().replace_at_focused_with_tag(range, text);
+        self.kind
+            .body_mut()
+            .replace_at_focused_with_tag(range, text);
     }
 
     pub fn copy_text(&self) -> String {
@@ -736,9 +736,9 @@ impl Cell {
         // with no span is just text and never defers (it never would
         // have made a tag in the first place).
         let in_tag = |links: &[LinkSpan], caret: usize| -> bool {
-            links.iter().any(|l| {
-                is_kept_tag_url(&l.url) && caret > l.range.start && caret <= l.range.end
-            })
+            links
+                .iter()
+                .any(|l| is_kept_tag_url(&l.url) && caret > l.range.start && caret <= l.range.end)
         };
         if self.title_focused {
             let Some(title) = self.title.as_ref() else {
@@ -792,8 +792,6 @@ impl Cell {
         self.kind.body_mut().take_pending_link_url()
     }
 
-
-
     /// Every link URL in the cell — title (if any) + body. Used by the
     /// query executor to resolve `kept://<uuid>` references. Reference
     /// cells contribute none (their `all_link_urls_into` is overridden
@@ -822,11 +820,7 @@ impl Cell {
     /// Same dispatch shape as `paste_text` but reaches each cell
     /// kind's focused TextBox to call `paste_with_links` (no URL
     /// auto-detection — link metadata is authoritative).
-    pub fn paste_into_focused_with_links(
-        &mut self,
-        text: &str,
-        links: &[LinkSpan],
-    ) {
+    pub fn paste_into_focused_with_links(&mut self, text: &str, links: &[LinkSpan]) {
         if self.title_focused {
             if let Some(title) = self.title.as_mut() {
                 title.paste_with_links(text, links);
@@ -851,9 +845,7 @@ impl Cell {
         // caret is suppressed.
         // An empty title that nobody's editing is just visual padding —
         // drop it so the cell collapses back to body-only.
-        if !self.title_focused
-            && self.title.as_ref().map(|t| t.is_empty()).unwrap_or(false)
-        {
+        if !self.title_focused && self.title.as_ref().map(|t| t.is_empty()).unwrap_or(false) {
             self.title = None;
         }
         let title_focused = self.title_focused;
@@ -925,9 +917,7 @@ impl Cell {
                 }
                 // Enter inside the title commits + drops into the body. The
                 // title is single-line; newlines belong in the body.
-                Key::Named(NamedKey::Enter)
-                    if !mods.shift_key() && self.title_focused =>
-                {
+                Key::Named(NamedKey::Enter) if !mods.shift_key() && self.title_focused => {
                     self.unfocus_title_drop_if_empty();
                     self.place_caret_at_start_of_body();
                     return true;
@@ -982,7 +972,9 @@ impl Cell {
         if let Some(title) = self.title.as_mut() {
             title.clear_selection();
         }
-        self.kind.body_mut().mouse_down(abs_x, abs_y, modifiers, editing)
+        self.kind
+            .body_mut()
+            .mouse_down(abs_x, abs_y, modifiers, editing)
     }
 
     pub fn mouse_drag_to(&mut self, abs_x: f32, abs_y: f32) -> bool {
@@ -1312,10 +1304,8 @@ mod tests {
         let mut tb = TextBox::new(typeface(), "head | LINK".to_string());
         tb.add_link(7..11, "https://example.com/".to_string());
         tb.set_caret_at(5); // split at the '|'
-        let mut oc = OutlineCell::from_bullets(
-            typeface(),
-            vec![Bullet::new(Uuid::now_v7(), tb, 0)],
-        );
+        let mut oc =
+            OutlineCell::from_bullets(typeface(), vec![Bullet::new(Uuid::now_v7(), tb, 0)]);
         oc.split_focused_for_test();
         let bullets = oc.bullets();
         assert_eq!(bullets.len(), 2);
@@ -1368,7 +1358,10 @@ mod tests {
         let mut tb = TextBox::new(typeface(), String::new());
         let url = "https://example.com/".to_string();
         // Selection ranges are byte offsets in `s` (the pasted text).
-        let span = LinkSpan { range: 6..11, url: url.clone() };
+        let span = LinkSpan {
+            range: 6..11,
+            url: url.clone(),
+        };
         tb.paste_with_links("hello world", &[span]);
         let links = tb.links();
         assert_eq!(links.len(), 1, "explicit link span survived paste");
@@ -1421,7 +1414,8 @@ mod tests {
 
         let snap = oc.snapshot();
         assert_eq!(
-            snap.bullets[0].closed_at, Some(42),
+            snap.bullets[0].closed_at,
+            Some(42),
             "BulletSnapshot carries closed_at"
         );
 
@@ -1503,10 +1497,7 @@ mod tests {
         // session-only and rebuilds lazily). A snapshot-then-restore
         // recovers both the header and the bullet text exactly.
         let target_id = Uuid::now_v7();
-        let mut oc = OutlineCell::with_envelope(
-            typeface(),
-            ReferenceTarget::WholeCell(target_id),
-        );
+        let mut oc = OutlineCell::with_envelope(typeface(), ReferenceTarget::WholeCell(target_id));
         let bullet_id = oc.bullets()[0].id();
         oc.replace_in_bullet_with_text(bullet_id, 0..0, "my note".to_string());
 
@@ -1531,10 +1522,7 @@ mod tests {
         // freshly-created envelope before the user typed anything.
         // Carrying a header target counts as content.
         let target_id = Uuid::now_v7();
-        let oc = OutlineCell::with_envelope(
-            typeface(),
-            ReferenceTarget::WholeCell(target_id),
-        );
+        let oc = OutlineCell::with_envelope(typeface(), ReferenceTarget::WholeCell(target_id));
         assert!(!oc.is_empty());
     }
 
@@ -1545,10 +1533,7 @@ mod tests {
         // cell. The cache field is left empty here — `build_reference_cache`
         // populates it (recursively) during the build pass.
         let target_id = Uuid::now_v7();
-        let mut oc = OutlineCell::with_envelope(
-            typeface(),
-            ReferenceTarget::WholeCell(target_id),
-        );
+        let mut oc = OutlineCell::with_envelope(typeface(), ReferenceTarget::WholeCell(target_id));
         let bid = oc.bullets()[0].id();
         oc.replace_in_bullet_with_text(bid, 0..0, "envelope notes".to_string());
         let kind = CellKind::Outline(oc);
@@ -1606,10 +1591,8 @@ mod tests {
         // Select "BRAVO" (bytes 6..11). Head at end so the caret lands
         // there after delete.
         tb.select_range(6, 11);
-        let mut oc = OutlineCell::from_bullets(
-            typeface(),
-            vec![Bullet::new(Uuid::now_v7(), tb, 0)],
-        );
+        let mut oc =
+            OutlineCell::from_bullets(typeface(), vec![Bullet::new(Uuid::now_v7(), tb, 0)]);
         oc.split_focused_for_test();
         let bullets = oc.bullets();
         assert_eq!(bullets.len(), 2, "split produced two bullets");
@@ -1631,10 +1614,7 @@ mod tests {
         tb.add_link(7..11, "https://example.com/".to_string());
         tb.set_caret_at(9);
         let bullet_id = Uuid::now_v7();
-        let mut oc = OutlineCell::from_bullets(
-            typeface(),
-            vec![Bullet::new(bullet_id, tb, 0)],
-        );
+        let mut oc = OutlineCell::from_bullets(typeface(), vec![Bullet::new(bullet_id, tb, 0)]);
         let pre = oc.snapshot();
         // Simulate what split_focused does: shorten this bullet's text and
         // append a new bullet with the suffix. The original's `links` Vec
@@ -1790,8 +1770,11 @@ mod tests {
         // `#u` lives at bytes 6..8; replace with `#urgent`.
         tb.replace_with_tag(6..8, "#urgent".to_string());
         assert_eq!(tb.text(), "Notes #urgent");
-        let tag_links: Vec<&LinkSpan> =
-            tb.links().iter().filter(|l| is_kept_tag_url(&l.url)).collect();
+        let tag_links: Vec<&LinkSpan> = tb
+            .links()
+            .iter()
+            .filter(|l| is_kept_tag_url(&l.url))
+            .collect();
         assert_eq!(tag_links.len(), 1);
         assert_eq!(tag_links[0].url, "kept-tag://urgent");
         assert_eq!(tb.heading_tag_names(), vec!["urgent".to_string()]);
@@ -1817,8 +1800,11 @@ mod tests {
         );
         assert!(tb.links().iter().all(|l| !is_kept_tag_url(&l.url)));
         tb.replace_with_tag(6..8, "#urgent".to_string());
-        let tag_links: Vec<&LinkSpan> =
-            tb.links().iter().filter(|l| is_kept_tag_url(&l.url)).collect();
+        let tag_links: Vec<&LinkSpan> = tb
+            .links()
+            .iter()
+            .filter(|l| is_kept_tag_url(&l.url))
+            .collect();
         assert_eq!(tag_links.len(), 1);
         assert_eq!(tag_links[0].range, 6..13);
     }
@@ -1833,7 +1819,10 @@ mod tests {
         tb.set_force_heading(true);
         tb.migrate_tags_from_text();
         let tag_count = |tb: &TextBox| -> usize {
-            tb.links().iter().filter(|l| is_kept_tag_url(&l.url)).count()
+            tb.links()
+                .iter()
+                .filter(|l| is_kept_tag_url(&l.url))
+                .count()
         };
         assert_eq!(tag_count(&tb), 1);
         assert_eq!(tb.heading_tag_names(), vec!["urgent".to_string()]);
@@ -1918,7 +1907,9 @@ mod tests {
         // Every emitted line should fit (allowing the very last to be
         // short; the final piece is the remainder).
         for line in &out {
-            let w = font.measure_str(&long[line.start..line.end], Some(&paint)).0;
+            let w = font
+                .measure_str(&long[line.start..line.end], Some(&paint))
+                .0;
             assert!(
                 w <= 100.0 || (line.end - line.start) <= 1,
                 "line width {} exceeds max_width 100",
@@ -2003,10 +1994,11 @@ mod tests {
         // engine and they emit no output (the row stays blank). Whatever
         // follows still evaluates with the engine state untouched.
         let mut e = ::poppop::Engine::new();
-        let (out, errs) = super::poppop::compute_poppop_output("# rent calc\nx = 1200\nx * 12\n", &mut e);
+        let (out, errs) =
+            super::poppop::compute_poppop_output("# rent calc\nx = 1200\nx * 12\n", &mut e);
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0], "");      // comment row
-        assert_eq!(out[1], "1200");  // x = 1200 binds + emits the value
+        assert_eq!(out[0], ""); // comment row
+        assert_eq!(out[1], "1200"); // x = 1200 binds + emits the value
         assert_eq!(out[2], "14400"); // x * 12 sees x = 1200
         assert!(errs.is_empty());
     }
@@ -2018,10 +2010,7 @@ mod tests {
         // result. All three are committed because of the trailing newline.
         let mut e = ::poppop::Engine::new();
         let (out, errs) = super::poppop::compute_poppop_output("\n1 +\n3 + 4\n", &mut e);
-        assert_eq!(
-            out,
-            vec![String::new(), String::new(), "7".to_string()]
-        );
+        assert_eq!(out, vec![String::new(), String::new(), "7".to_string()]);
         // Only the `1 +` line (paragraph 1) errors. Blank lines don't
         // hit the engine; valid lines don't error.
         assert_eq!(errs.len(), 1);
@@ -2275,10 +2264,7 @@ mod tests {
     fn all_tag_names_picks_up_outline_bullet_tags() {
         let mut tb = TextBox::new(typeface(), "buy milk #shopping".to_string());
         tb.migrate_tags_from_text();
-        let oc = OutlineCell::from_bullets(
-            typeface(),
-            vec![Bullet::new(Uuid::now_v7(), tb, 0)],
-        );
+        let oc = OutlineCell::from_bullets(typeface(), vec![Bullet::new(Uuid::now_v7(), tb, 0)]);
         let mut cell = Cell::new(typeface(), String::new());
         cell.kind = CellKind::Outline(oc);
         let tags = cell.all_tag_names();
@@ -2328,11 +2314,7 @@ mod tests {
         // Expected match for `urgent`: bullets 0,1,2 (subtree of 0) and
         // bullet 4 (its own subtree). Bullet 3 stays out.
         let mk = |t: &str, d: u32| {
-            Bullet::new(
-                Uuid::now_v7(),
-                TextBox::new(typeface(), t.to_string()),
-                d,
-            )
+            Bullet::new(Uuid::now_v7(), TextBox::new(typeface(), t.to_string()), d)
         };
         let bullets = vec![
             mk("root #urgent", 0),
@@ -2416,13 +2398,25 @@ mod tests {
     #[test]
     fn table_snapshot_round_trip() {
         let mut tc = TableCell::new(typeface());
-        tc.cell_at_mut(0, 0).unwrap().textbox.replace_text("alpha".to_string());
-        tc.cell_at_mut(1, 2).unwrap().textbox.replace_text("hello".to_string());
+        tc.cell_at_mut(0, 0)
+            .unwrap()
+            .textbox
+            .replace_text("alpha".to_string());
+        tc.cell_at_mut(1, 2)
+            .unwrap()
+            .textbox
+            .replace_text("hello".to_string());
         tc.cell_at_mut(2, 0).unwrap().readonly = true;
         let snap = tc.snapshot();
         // Mutate after snapshot.
-        tc.cell_at_mut(0, 0).unwrap().textbox.replace_text("DIFFERENT".to_string());
-        tc.cell_at_mut(1, 2).unwrap().textbox.replace_text(String::new());
+        tc.cell_at_mut(0, 0)
+            .unwrap()
+            .textbox
+            .replace_text("DIFFERENT".to_string());
+        tc.cell_at_mut(1, 2)
+            .unwrap()
+            .textbox
+            .replace_text(String::new());
         tc.cell_at_mut(2, 0).unwrap().readonly = false;
         // Restore.
         tc.restore(snap);

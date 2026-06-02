@@ -392,19 +392,9 @@ impl super::body::CellBody for ReferenceCell {
     ) {
     }
 
-    fn replace_at_focused_with_text(
-        &mut self,
-        _range: std::ops::Range<usize>,
-        _text: String,
-    ) {
-    }
+    fn replace_at_focused_with_text(&mut self, _range: std::ops::Range<usize>, _text: String) {}
 
-    fn replace_at_focused_with_tag(
-        &mut self,
-        _range: std::ops::Range<usize>,
-        _text: String,
-    ) {
-    }
+    fn replace_at_focused_with_tag(&mut self, _range: std::ops::Range<usize>, _text: String) {}
 
     fn add_link_to_first(&mut self, _range: std::ops::Range<usize>, _url: String) {}
 

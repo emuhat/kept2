@@ -54,9 +54,7 @@ pub(super) fn search_results(
         .cells
         .iter()
         .filter(|c| {
-            (c.is_open() || show_inactive_cells)
-                && !c.scratch
-                && query::matches(&ast, c, &ctx)
+            (c.is_open() || show_inactive_cells) && !c.scratch && query::matches(&ast, c, &ctx)
         })
         .collect();
     hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -68,7 +66,10 @@ pub(super) fn search_results(
 /// centering). Falls back to the head of the cell text when the
 /// residual is empty.
 pub(super) fn result_snippet(text: &str, query: &str) -> String {
-    let flat: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
     let residual = query::parse(query).text;
     let lower = flat.to_lowercase();
     let needle = residual.to_lowercase();
@@ -87,6 +88,10 @@ pub(super) fn result_snippet(text: &str, query: &str) -> String {
         .take(end_chars - start_chars)
         .collect();
     let prefix = if start_chars > 0 { "…" } else { "" };
-    let suffix = if end_chars < flat.chars().count() { "…" } else { "" };
+    let suffix = if end_chars < flat.chars().count() {
+        "…"
+    } else {
+        ""
+    };
     format!("{prefix}{snippet}{suffix}")
 }

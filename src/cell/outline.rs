@@ -13,7 +13,9 @@ use winit::{
 };
 
 use super::TextBox;
-use super::common::{BODY_FONT_SIZE, INACTIVE_ALPHA, LinkSpan, TextBoxSnapshot, primary_mod, word_mod};
+use super::common::{
+    BODY_FONT_SIZE, INACTIVE_ALPHA, LinkSpan, TextBoxSnapshot, primary_mod, word_mod,
+};
 use super::reference::{EmbeddedReference, ReferenceTarget};
 
 const BULLET_INDENT: f32 = 22.0;
@@ -263,10 +265,7 @@ impl OutlineCell {
         bullets: Vec<Bullet>,
         reference_header: Option<EmbeddedReference>,
     ) -> Self {
-        let focused_bullet = bullets
-            .first()
-            .map(|b| b.id)
-            .unwrap_or_else(Uuid::now_v7);
+        let focused_bullet = bullets.first().map(|b| b.id).unwrap_or_else(Uuid::now_v7);
         let bullets = if bullets.is_empty() {
             let id = Uuid::now_v7();
             vec![Bullet {
@@ -340,7 +339,10 @@ impl OutlineCell {
         if self.reference_header.is_none() || self.header_height <= 0.0 {
             return None;
         }
-        Some((self.header_y_origin, self.header_y_origin + self.header_height))
+        Some((
+            self.header_y_origin,
+            self.header_y_origin + self.header_height,
+        ))
     }
 
     /// Stash the header band's geometry. Called by the app layer's
@@ -488,13 +490,11 @@ impl OutlineCell {
         // fallback the drag head jumps to the LAST bullet and pulls
         // the whole tail of the outline into the selection. Treat
         // the gap as "belongs to the bullet immediately above."
-        let visible_bullets: Vec<usize> =
-            (0..self.bullets.len()).filter(|&i| visible(i)).collect();
+        let visible_bullets: Vec<usize> = (0..self.bullets.len()).filter(|&i| visible(i)).collect();
         for w in visible_bullets.windows(2) {
             let i = w[0];
             let j = w[1];
-            let bot_i = self.bullets[i].textbox.y_origin()
-                + self.bullets[i].textbox.height();
+            let bot_i = self.bullets[i].textbox.y_origin() + self.bullets[i].textbox.height();
             let top_j = self.bullets[j].textbox.y_origin();
             if abs_y >= bot_i && abs_y < top_j {
                 return i;
@@ -531,7 +531,9 @@ impl OutlineCell {
     }
 
     fn focused_index(&self) -> Option<usize> {
-        self.bullets.iter().position(|b| b.id == self.focused_bullet)
+        self.bullets
+            .iter()
+            .position(|b| b.id == self.focused_bullet)
     }
 
     pub fn tick(
@@ -619,16 +621,10 @@ impl OutlineCell {
         let chips_by_idx: Vec<Vec<(Uuid, String)>> = self
             .bullets
             .iter()
-            .map(|b| {
-                self.bullet_chips
-                    .get(&b.id)
-                    .cloned()
-                    .unwrap_or_default()
-            })
+            .map(|b| self.bullet_chips.get(&b.id).cloned().unwrap_or_default())
             .collect();
         let mut new_chip_hits: Vec<(Uuid, Rect)> = Vec::new();
-        let chip_font =
-            Font::from_typeface(&self.typeface, 11.0 * self.font_scale);
+        let chip_font = Font::from_typeface(&self.typeface, 11.0 * self.font_scale);
         let (_, chip_metrics) = chip_font.metrics();
         let mut chip_muted = Paint::default();
         chip_muted.set_anti_alias(true);
@@ -696,12 +692,18 @@ impl OutlineCell {
             // Selection (highlight) for the active bullet whenever the cell is
             // focused. Caret only when also editing.
             let bullet_focused = is_focused_bullet && !suppress_caret;
-            let bullet_show_caret = show_caret && !suppress_caret && bullet.id == self.focused_bullet;
+            let bullet_show_caret =
+                show_caret && !suppress_caret && bullet.id == self.focused_bullet;
             // `tick` re-runs `layout` internally; the second call is
             // a no-op (cached lines reused when width hasn't
             // changed) so the prelayout above is essentially free.
             let drawn_h = bullet.textbox.tick(
-                canvas, text_x, cur_y, text_w, bullet_focused, bullet_show_caret,
+                canvas,
+                text_x,
+                cur_y,
+                text_w,
+                bullet_focused,
+                bullet_show_caret,
             );
             if bullet_inactive {
                 canvas.restore();
@@ -720,27 +722,16 @@ impl OutlineCell {
                 // descent)]; baseline = top - ascent (ascent is
                 // negative, so this moves down past the top).
                 let glyph_top = cur_y + drawn_h + row_pad_top;
-                let glyph_bot = glyph_top + (-chip_metrics.ascent)
-                    + chip_metrics.descent;
+                let glyph_bot = glyph_top + (-chip_metrics.ascent) + chip_metrics.descent;
                 let baseline = glyph_top + (-chip_metrics.ascent);
                 let leader = "↗ ";
                 let mut cx = text_x;
-                canvas.draw_str(
-                    leader,
-                    Point::new(cx, baseline),
-                    &chip_font,
-                    &chip_muted,
-                );
+                canvas.draw_str(leader, Point::new(cx, baseline), &chip_font, &chip_muted);
                 cx += chip_font.measure_str(leader, Some(&chip_muted)).0;
                 for (i, (tid, title)) in chips.iter().enumerate() {
                     if i > 0 {
                         let sep = " · ";
-                        canvas.draw_str(
-                            sep,
-                            Point::new(cx, baseline),
-                            &chip_font,
-                            &chip_muted,
-                        );
+                        canvas.draw_str(sep, Point::new(cx, baseline), &chip_font, &chip_muted);
                         cx += chip_font.measure_str(sep, Some(&chip_muted)).0;
                     }
                     let label = format!("%{}", title);
@@ -748,14 +739,8 @@ impl OutlineCell {
                     let mut chip_paint = Paint::default();
                     chip_paint.set_anti_alias(true);
                     chip_paint.set_color(chip_color);
-                    let label_w =
-                        chip_font.measure_str(&label, Some(&chip_paint)).0;
-                    canvas.draw_str(
-                        &label,
-                        Point::new(cx, baseline),
-                        &chip_font,
-                        &chip_paint,
-                    );
+                    let label_w = chip_font.measure_str(&label, Some(&chip_paint)).0;
+                    canvas.draw_str(&label, Point::new(cx, baseline), &chip_font, &chip_paint);
                     let hit = Rect::new(
                         cx - 1.0,
                         glyph_top - 1.0,
@@ -764,21 +749,12 @@ impl OutlineCell {
                     );
                     new_chip_hits.push((*tid, hit));
                     cx += label_w;
-                    if cx > text_x + text_w - 12.0 * self.font_scale
-                        && i + 1 < chips.len()
-                    {
-                        canvas.draw_str(
-                            " …",
-                            Point::new(cx, baseline),
-                            &chip_font,
-                            &chip_muted,
-                        );
+                    if cx > text_x + text_w - 12.0 * self.font_scale && i + 1 < chips.len() {
+                        canvas.draw_str(" …", Point::new(cx, baseline), &chip_font, &chip_muted);
                         break;
                     }
                 }
-                -chip_metrics.ascent + chip_metrics.descent
-                    + row_pad_top
-                    + row_pad_bot
+                -chip_metrics.ascent + chip_metrics.descent + row_pad_top + row_pad_bot
             };
             bullet_y_bands.push((cur_y, cur_y + drawn_h + chip_h));
             cur_y += drawn_h + chip_h;
@@ -848,9 +824,7 @@ impl OutlineCell {
                     if typed {
                         self.delete_bullet_selection();
                         let focused_id = self.focused_bullet;
-                        if let Some(bullet) =
-                            self.bullets.iter_mut().find(|b| b.id == focused_id)
-                        {
+                        if let Some(bullet) = self.bullets.iter_mut().find(|b| b.id == focused_id) {
                             bullet.textbox.handle_key(event, modifiers);
                         }
                         return true;
@@ -876,9 +850,7 @@ impl OutlineCell {
                     };
                 }
                 Key::Named(NamedKey::Backspace)
-                    if !primary_mod(mods)
-                        && !word_mod(mods)
-                        && self.focused_at_text_start() =>
+                    if !primary_mod(mods) && !word_mod(mods) && self.focused_at_text_start() =>
                 {
                     return self.merge_focused_into_prev();
                 }
@@ -1481,7 +1453,9 @@ impl OutlineCell {
             return;
         }
         let escalate = self.bullet_selection.is_some() || {
-            let Some(idx) = self.focused_index() else { return };
+            let Some(idx) = self.focused_index() else {
+                return;
+            };
             let tb = &self.bullets[idx].textbox;
             let len = tb.text().len();
             let text_fully_selected = match tb.primary_caret() {
@@ -1514,10 +1488,16 @@ impl OutlineCell {
     /// True iff `bullet_selection` is set and spans the first
     /// bullet through the last (regardless of anchor/head order).
     fn bullet_selection_covers_all(&self) -> bool {
-        let Some(sel) = self.bullet_selection else { return false };
+        let Some(sel) = self.bullet_selection else {
+            return false;
+        };
         let pos_of = |id: Uuid| self.bullets.iter().position(|b| b.id == id);
-        let Some(a) = pos_of(sel.anchor_id) else { return false };
-        let Some(h) = pos_of(sel.head_id) else { return false };
+        let Some(a) = pos_of(sel.anchor_id) else {
+            return false;
+        };
+        let Some(h) = pos_of(sel.head_id) else {
+            return false;
+        };
         let lo = a.min(h);
         let hi = a.max(h);
         lo == 0 && hi + 1 == self.bullets.len()
@@ -1876,7 +1856,9 @@ impl OutlineCell {
 
     fn extend_bullet_selection_up(&mut self) -> bool {
         let head_id = self.bullet_selection.as_ref().map(|s| s.head_id);
-        let Some(head_id) = head_id else { return false; };
+        let Some(head_id) = head_id else {
+            return false;
+        };
         let Some(head_idx) = self.bullet_idx_by_id(head_id) else {
             return false;
         };
@@ -1893,7 +1875,9 @@ impl OutlineCell {
 
     fn extend_bullet_selection_down(&mut self) -> bool {
         let head_id = self.bullet_selection.as_ref().map(|s| s.head_id);
-        let Some(head_id) = head_id else { return false; };
+        let Some(head_id) = head_id else {
+            return false;
+        };
         let Some(head_idx) = self.bullet_idx_by_id(head_id) else {
             return false;
         };
@@ -1946,8 +1930,7 @@ impl OutlineCell {
         // Refuse to merge if focused has children — would orphan them. The user
         // can outdent the children first, or delete them.
         let my_depth = self.bullets[idx].depth;
-        let has_children = idx + 1 < self.bullets.len()
-            && self.bullets[idx + 1].depth > my_depth;
+        let has_children = idx + 1 < self.bullets.len() && self.bullets[idx + 1].depth > my_depth;
         if has_children {
             return false;
         }
@@ -1959,8 +1942,7 @@ impl OutlineCell {
         let merged_links = self.bullets[idx].textbox.links().to_vec();
         self.bullets.remove(idx);
         let prev = &mut self.bullets[prev_idx];
-        prev.textbox
-            .append_with_links(&merged_text, merged_links);
+        prev.textbox.append_with_links(&merged_text, merged_links);
         prev.textbox.set_caret_at(prev_len);
         self.focused_bullet = prev_id;
         // Record the merge so the app layer can move thread
@@ -2018,13 +2000,7 @@ impl super::body::CellBody for OutlineCell {
         OutlineCell::handle_key(self, event, modifiers)
     }
 
-    fn mouse_down(
-        &mut self,
-        abs_x: f32,
-        abs_y: f32,
-        modifiers: &Modifiers,
-        editing: bool,
-    ) -> bool {
+    fn mouse_down(&mut self, abs_x: f32, abs_y: f32, modifiers: &Modifiers, editing: bool) -> bool {
         OutlineCell::mouse_down(self, abs_x, abs_y, modifiers, editing)
     }
 
@@ -2114,11 +2090,7 @@ impl super::body::CellBody for OutlineCell {
         OutlineCell::paste_text(self, s);
     }
 
-    fn paste_with_links(
-        &mut self,
-        text: &str,
-        links: &[super::common::LinkSpan],
-    ) {
+    fn paste_with_links(&mut self, text: &str, links: &[super::common::LinkSpan]) {
         if self.bullet_selection.is_some() {
             self.delete_bullet_selection();
         }
@@ -2127,12 +2099,7 @@ impl super::body::CellBody for OutlineCell {
         }
     }
 
-    fn replace_at_focused_with_link(
-        &mut self,
-        range: Range<usize>,
-        text: String,
-        url: String,
-    ) {
+    fn replace_at_focused_with_link(&mut self, range: Range<usize>, text: String, url: String) {
         let bid = OutlineCell::focused_bullet_id(self);
         self.replace_in_bullet_with_link(bid, range, text, url);
     }

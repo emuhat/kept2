@@ -227,12 +227,7 @@ pub(crate) fn transform_index(i: usize, start: usize, del: usize, ins: usize) ->
 /// Like `transform_index`, but with left-gravity at the boundary: an
 /// insertion exactly at `i` does not push `i` forward. Used for link end
 /// positions so typing right after a link doesn't extend it.
-pub(crate) fn transform_index_closed_end(
-    i: usize,
-    start: usize,
-    del: usize,
-    ins: usize,
-) -> usize {
+pub(crate) fn transform_index_closed_end(i: usize, start: usize, del: usize, ins: usize) -> usize {
     if i < start {
         i
     } else if i == start && del == 0 {

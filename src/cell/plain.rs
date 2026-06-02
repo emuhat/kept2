@@ -68,13 +68,7 @@ impl CellBody for PlainCell {
         self.body.handle_key(event, modifiers)
     }
 
-    fn mouse_down(
-        &mut self,
-        abs_x: f32,
-        abs_y: f32,
-        modifiers: &Modifiers,
-        editing: bool,
-    ) -> bool {
+    fn mouse_down(&mut self, abs_x: f32, abs_y: f32, modifiers: &Modifiers, editing: bool) -> bool {
         self.body.mouse_down(abs_x, abs_y, modifiers, editing)
     }
 
@@ -155,20 +149,11 @@ impl CellBody for PlainCell {
         self.body.paste(s);
     }
 
-    fn paste_with_links(
-        &mut self,
-        text: &str,
-        links: &[super::common::LinkSpan],
-    ) {
+    fn paste_with_links(&mut self, text: &str, links: &[super::common::LinkSpan]) {
         self.body.paste_with_links(text, links);
     }
 
-    fn replace_at_focused_with_link(
-        &mut self,
-        range: Range<usize>,
-        text: String,
-        url: String,
-    ) {
+    fn replace_at_focused_with_link(&mut self, range: Range<usize>, text: String, url: String) {
         self.body.replace_with_link(range, text, url);
     }
 

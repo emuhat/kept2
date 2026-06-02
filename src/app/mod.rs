@@ -2,19 +2,19 @@ use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
-use uuid::{Uuid, uuid};
 use skia_safe::{
     BlurStyle, Canvas, Font, FontMgr, MaskFilter, Paint, PaintStyle, PathEffect, Point, Rect,
     Typeface,
 };
+use uuid::{Uuid, uuid};
 use winit::{
     event::{ElementState, KeyEvent, Modifiers},
     keyboard::{Key, NamedKey},
 };
 
 use crate::cell::{
-    self, Cell, CellKind, CellSnapshot, EmbeddedReference, ReferenceTarget, TextBox,
-    now_epoch_ms, primary_mod,
+    self, Cell, CellKind, CellSnapshot, EmbeddedReference, ReferenceTarget, TextBox, now_epoch_ms,
+    primary_mod,
 };
 use crate::document::{Context, Document};
 use crate::entity_cache::EntityCache;
@@ -24,10 +24,10 @@ use crate::thread::{Thread, ThreadId, ThreadMembership};
 
 mod context_menus;
 mod mention_popup;
+mod pane;
 mod quick_add;
 mod search;
 mod sidebar;
-mod pane;
 use pane::{FocusedCellGeom, PANE_HEADER_H, PaneLayout};
 
 use context_menus::{
@@ -253,11 +253,23 @@ const CELL_BAR_GAP: f32 = FOCUS_PAD;
 /// surfaces. Index alignment matters: `CellMenuHits.snooze[i]` is the
 /// rect for `SNOOZE_PRESETS[i]`.
 const SNOOZE_PRESETS: [(crate::attention::SnoozePreset, &str); 6] = [
-    (crate::attention::SnoozePreset::LaterToday, "Snooze: Later today"),
+    (
+        crate::attention::SnoozePreset::LaterToday,
+        "Snooze: Later today",
+    ),
     (crate::attention::SnoozePreset::Tomorrow, "Snooze: Tomorrow"),
-    (crate::attention::SnoozePreset::NextWeek, "Snooze: Next week"),
-    (crate::attention::SnoozePreset::NextMonth, "Snooze: Next month"),
-    (crate::attention::SnoozePreset::NextQuarter, "Snooze: Next quarter"),
+    (
+        crate::attention::SnoozePreset::NextWeek,
+        "Snooze: Next week",
+    ),
+    (
+        crate::attention::SnoozePreset::NextMonth,
+        "Snooze: Next month",
+    ),
+    (
+        crate::attention::SnoozePreset::NextQuarter,
+        "Snooze: Next quarter",
+    ),
     (crate::attention::SnoozePreset::Someday, "Snooze: Someday"),
 ];
 
@@ -356,7 +368,6 @@ struct PeopleMenuHits {
     /// click is suppressed).
     delete: Option<Rect>,
 }
-
 
 #[derive(Default)]
 struct MentionPopupHits {
@@ -499,55 +510,97 @@ impl Query {
         Self::default()
     }
     fn context(id: Uuid) -> Self {
-        Self { view_kind: ViewKind::Context(id), ast: query::Ast::default() }
+        Self {
+            view_kind: ViewKind::Context(id),
+            ast: query::Ast::default(),
+        }
     }
     fn date(d: chrono::NaiveDate) -> Self {
         let mut ast = query::Ast::default();
         ast.include.time = Some(query::TimeFilter::Day(d));
-        Self { view_kind: ViewKind::Ast, ast }
+        Self {
+            view_kind: ViewKind::Ast,
+            ast,
+        }
     }
     fn this_week() -> Self {
         let mut ast = query::Ast::default();
         ast.include.time = Some(query::TimeFilter::ThisWeek);
-        Self { view_kind: ViewKind::Ast, ast }
+        Self {
+            view_kind: ViewKind::Ast,
+            ast,
+        }
     }
     fn last_week() -> Self {
         let mut ast = query::Ast::default();
         ast.include.time = Some(query::TimeFilter::LastWeek);
-        Self { view_kind: ViewKind::Ast, ast }
+        Self {
+            view_kind: ViewKind::Ast,
+            ast,
+        }
     }
     fn tag(name: String) -> Self {
         let mut ast = query::Ast::default();
         ast.include.tags = vec![name.to_lowercase()];
-        Self { view_kind: ViewKind::Ast, ast }
+        Self {
+            view_kind: ViewKind::Ast,
+            ast,
+        }
     }
     fn entity(id: Uuid) -> Self {
-        Self { view_kind: ViewKind::Entity(id), ast: query::Ast::default() }
+        Self {
+            view_kind: ViewKind::Entity(id),
+            ast: query::Ast::default(),
+        }
     }
     #[allow(dead_code)]
     fn people() -> Self {
-        Self { view_kind: ViewKind::People, ast: query::Ast::default() }
+        Self {
+            view_kind: ViewKind::People,
+            ast: query::Ast::default(),
+        }
     }
     fn inbox() -> Self {
-        Self { view_kind: ViewKind::Inbox, ast: query::Ast::default() }
+        Self {
+            view_kind: ViewKind::Inbox,
+            ast: query::Ast::default(),
+        }
     }
     fn current() -> Self {
-        Self { view_kind: ViewKind::Current, ast: query::Ast::default() }
+        Self {
+            view_kind: ViewKind::Current,
+            ast: query::Ast::default(),
+        }
     }
     fn scratch() -> Self {
-        Self { view_kind: ViewKind::Scratch, ast: query::Ast::default() }
+        Self {
+            view_kind: ViewKind::Scratch,
+            ast: query::Ast::default(),
+        }
     }
     fn cell(id: Uuid) -> Self {
-        Self { view_kind: ViewKind::Cell(id), ast: query::Ast::default() }
+        Self {
+            view_kind: ViewKind::Cell(id),
+            ast: query::Ast::default(),
+        }
     }
     fn thread_list() -> Self {
-        Self { view_kind: ViewKind::ThreadList, ast: query::Ast::default() }
+        Self {
+            view_kind: ViewKind::ThreadList,
+            ast: query::Ast::default(),
+        }
     }
     fn thread(id: Uuid) -> Self {
-        Self { view_kind: ViewKind::Thread(id), ast: query::Ast::default() }
+        Self {
+            view_kind: ViewKind::Thread(id),
+            ast: query::Ast::default(),
+        }
     }
     fn from_text(input: &str) -> Self {
-        Self { view_kind: ViewKind::Ast, ast: query::parse(input) }
+        Self {
+            view_kind: ViewKind::Ast,
+            ast: query::parse(input),
+        }
     }
     /// Context id when in Context view; None otherwise. Convenience for
     /// the prev/next-context navigation that only operates in that view.
@@ -923,25 +976,15 @@ impl UndoOp {
                                 // coalesced edits) unwind in the
                                 // reverse order they were applied.
                                 for m in bullet_merges.iter().rev() {
-                                    let _ = db.set_bullet_memberships(
-                                        m.cell_id,
-                                        m.from,
-                                        &m.pre_from,
-                                    );
-                                    let _ = db.set_bullet_memberships(
-                                        m.cell_id,
-                                        m.into,
-                                        &m.pre_into,
-                                    );
+                                    let _ =
+                                        db.set_bullet_memberships(m.cell_id, m.from, &m.pre_from);
+                                    let _ =
+                                        db.set_bullet_memberships(m.cell_id, m.into, &m.pre_into);
                                 }
                             }
                             UndoDir::Redo => {
                                 for m in bullet_merges.iter() {
-                                    let _ = db.move_bullet_memberships(
-                                        m.cell_id,
-                                        m.from,
-                                        m.into,
-                                    );
+                                    let _ = db.move_bullet_memberships(m.cell_id, m.from, m.into);
                                 }
                             }
                         }
@@ -1011,12 +1054,7 @@ impl UndoOp {
                     );
                 }
                 UndoDir::Redo => {
-                    app.apply_rotation(
-                        *closed_id,
-                        *new_end_time,
-                        new_context,
-                        new_view.clone(),
-                    );
+                    app.apply_rotation(*closed_id, *new_end_time, new_context, new_view.clone());
                 }
             },
             Self::ResetContextStart {
@@ -1030,7 +1068,12 @@ impl UndoOp {
                     UndoDir::Undo => (*prev_start, prev_view),
                     UndoDir::Redo => (*new_start, new_view),
                 };
-                if let Some(c) = app.document.contexts.iter_mut().find(|c| c.id == *context_id) {
+                if let Some(c) = app
+                    .document
+                    .contexts
+                    .iter_mut()
+                    .find(|c| c.id == *context_id)
+                {
                     c.start_time = start;
                 }
                 app.document.mark_context_dirty(*context_id);
@@ -1085,12 +1128,9 @@ impl UndoOp {
                             // inactive between create and undo, that's a
                             // separate SetEntityActive op on the stack with
                             // its own redo.)
-                            if let Err(e) = db.insert_person_entity_with_id(
-                                *entity_id,
-                                name,
-                                true,
-                                *created_at,
-                            ) {
+                            if let Err(e) =
+                                db.insert_person_entity_with_id(*entity_id, name, true, *created_at)
+                            {
                                 eprintln!("kept: redo create-entity failed: {e}");
                             }
                         }
@@ -1127,7 +1167,11 @@ impl UndoOp {
                 }
                 app.refresh_entities();
             }
-            Self::SetEntityActive { entity_id, prev, new } => {
+            Self::SetEntityActive {
+                entity_id,
+                prev,
+                new,
+            } => {
                 let target = match dir {
                     UndoDir::Undo => *prev,
                     UndoDir::Redo => *new,
@@ -1149,7 +1193,13 @@ impl UndoOp {
                     // edited_at (would distort attention sort).
                 }
             }
-            Self::SetCellResurface { cell_id, prev, new, prev_inbox, new_inbox } => {
+            Self::SetCellResurface {
+                cell_id,
+                prev,
+                new,
+                prev_inbox,
+                new_inbox,
+            } => {
                 let (target, target_inbox) = match dir {
                     UndoDir::Undo => (*prev, *prev_inbox),
                     UndoDir::Redo => (*new, *new_inbox),
@@ -1246,17 +1296,16 @@ impl UndoOp {
                 }
                 app.reload_threads();
             }
-            Self::DeleteThread { thread, memberships } => {
+            Self::DeleteThread {
+                thread,
+                memberships,
+            } => {
                 match dir {
                     UndoDir::Undo => {
                         if let Some(db) = app.db.as_mut() {
                             let _ = db.upsert_thread(thread);
                             for m in memberships {
-                                let _ = db.attach_thread(
-                                    m.thread_id,
-                                    m.target,
-                                    m.attached_at,
-                                );
+                                let _ = db.attach_thread(m.thread_id, m.target, m.attached_at);
                             }
                         }
                     }
@@ -1824,8 +1873,7 @@ impl Scroller {
         let track_len = (track_bot - track_top).max(1.0);
         let raw_thumb = (viewport_h / content_h) * track_len;
         let thumb_h = raw_thumb.max(SCROLLBAR_MIN_THUMB).min(track_len);
-        let thumb_top =
-            track_top + (self.scroll_y / self.max_scroll) * (track_len - thumb_h);
+        let thumb_top = track_top + (self.scroll_y / self.max_scroll) * (track_len - thumb_h);
         let thumb_bot = thumb_top + thumb_h;
 
         // Wide-bar centerline anchors hover detection (and thin-bar
@@ -1988,8 +2036,7 @@ impl Scroller {
         let raw_thumb = (g.viewport_h / g.content_h.max(1.0)) * track_len;
         let thumb_h = raw_thumb.max(SCROLLBAR_MIN_THUMB).min(track_len);
         let scroll_range = (track_len - thumb_h).max(1.0);
-        let thumb_top = g.track_top
-            + (self.scroll_y / self.max_scroll.max(1.0)) * scroll_range;
+        let thumb_top = g.track_top + (self.scroll_y / self.max_scroll.max(1.0)) * scroll_range;
         Some(y - thumb_top)
     }
 
@@ -2321,7 +2368,6 @@ enum PanTarget {
     Pane(usize),
     Sidebar,
 }
-
 
 /// Pre-commit state for an Alt-drag gesture — captured at mouse_down,
 /// promoted to `PanDrag` once the cursor moves more than
@@ -2918,8 +2964,12 @@ impl KeptApp {
                 let div_x =
                     pane_area_left + pane_area_w * self.split_ratio.clamp(SPLIT_MIN, SPLIT_MAX);
                 let half_t = DIVIDER_THICKNESS * 0.5;
-                self.panes[0].last_rect =
-                    Rect::new(pane_area_left, 0.0, (div_x - half_t).max(pane_area_left), height);
+                self.panes[0].last_rect = Rect::new(
+                    pane_area_left,
+                    0.0,
+                    (div_x - half_t).max(pane_area_left),
+                    height,
+                );
                 self.panes[1].last_rect = Rect::new(
                     (div_x + half_t).min(pane_area_left + pane_area_w),
                     0.0,
@@ -2946,10 +2996,7 @@ impl KeptApp {
         let mut p = Paint::default();
         p.set_anti_alias(true);
         p.set_color(color);
-        canvas.draw_rect(
-            Rect::new(div_x - half_t, 0.0, div_x + half_t, height),
-            &p,
-        );
+        canvas.draw_rect(Rect::new(div_x - half_t, 0.0, div_x + half_t, height), &p);
     }
 
     /// Stroke a 2 px accent border around the active pane. No-op for
@@ -2998,7 +3045,11 @@ impl KeptApp {
         let body_y = y + pad;
         let body_w = (width - 2.0 * inset).max(40.0);
 
-        let target_idx = self.document.cells.iter().position(|c| c.id == target.cell_id());
+        let target_idx = self
+            .document
+            .cells
+            .iter()
+            .position(|c| c.id == target.cell_id());
 
         // Decide what kind of preview to render and refresh the cache on
         // the reference cell if the source's edited_at has changed.
@@ -3043,27 +3094,25 @@ impl KeptApp {
         };
 
         let body_h = match preview {
-            PreviewKind::Placeholder(msg) => self.render_embed_placeholder(
-                canvas, msg, body_x, body_y, body_w, scale,
-            ),
+            PreviewKind::Placeholder(msg) => {
+                self.render_embed_placeholder(canvas, msg, body_x, body_y, body_w, scale)
+            }
             PreviewKind::Cached => {
                 // Detach the cache from the host so the &mut borrow on
                 // `self.document.cells` ends, then route through
                 // `tick_embedded_cell` (which needs &self for the
                 // wrapper / placeholder helpers and recurses on
                 // envelope-outline caches). Re-attach afterwards.
-                let detached = if let CellKind::Reference(rc) =
-                    &mut self.document.cells[ref_idx].kind
-                {
-                    rc.detach_cache()
-                } else {
-                    None
-                };
+                let detached =
+                    if let CellKind::Reference(rc) = &mut self.document.cells[ref_idx].kind {
+                        rc.detach_cache()
+                    } else {
+                        None
+                    };
                 let mut h = 0.0;
                 if let Some(mut cache) = detached {
-                    h = self.tick_embedded_cell(
-                        canvas, &mut cache, body_x, body_y, body_w, focused,
-                    );
+                    h = self
+                        .tick_embedded_cell(canvas, &mut cache, body_x, body_y, body_w, focused);
                     if let CellKind::Reference(rc) = &mut self.document.cells[ref_idx].kind {
                         rc.attach_cache(Some(cache));
                     }
@@ -3164,8 +3213,7 @@ impl KeptApp {
             _ => None,
         };
         let Some(target) = target else {
-            return self.document.cells[cell_idx]
-                .tick(canvas, x, y, width, focused, show_caret);
+            return self.document.cells[cell_idx].tick(canvas, x, y, width, focused, show_caret);
         };
 
         let scale = self.font_scale;
@@ -3175,7 +3223,11 @@ impl KeptApp {
         let body_y_inner = body_y + pad;
         let body_w_inner = (width - 2.0 * inset).max(40.0);
 
-        let target_idx = self.document.cells.iter().position(|c| c.id == target.cell_id());
+        let target_idx = self
+            .document
+            .cells
+            .iter()
+            .position(|c| c.id == target.cell_id());
 
         enum PreviewKind {
             Cached,
@@ -3237,14 +3289,12 @@ impl KeptApp {
                 // Detach + route through `tick_embedded_cell` so a
                 // nested envelope inside this header renders
                 // recursively. Re-attach afterwards.
-                let detached = if let CellKind::Outline(oc) =
-                    &mut self.document.cells[cell_idx].kind
-                {
-                    oc.reference_header_mut()
-                        .and_then(|h| h.detach_cache())
-                } else {
-                    None
-                };
+                let detached =
+                    if let CellKind::Outline(oc) = &mut self.document.cells[cell_idx].kind {
+                        oc.reference_header_mut().and_then(|h| h.detach_cache())
+                    } else {
+                        None
+                    };
                 let mut h = 0.0;
                 if let Some(mut cache) = detached {
                     h = self.tick_embedded_cell(
@@ -3415,8 +3465,7 @@ impl KeptApp {
                     .position(|c| c.id == nested_target.cell_id());
                 if let Some(ni) = nested_idx {
                     let nested_edited_at = self.document.cells[ni].edited_at;
-                    let nested_cache =
-                        self.build_reference_cache(ni, nested_target, depth + 1);
+                    let nested_cache = self.build_reference_cache(ni, nested_target, depth + 1);
                     h.install_cache(nested_cache, Some(nested_edited_at));
                 } else {
                     h.install_cache(None, None);
@@ -3517,7 +3566,7 @@ impl KeptApp {
         footer_paint.set_color(crate::color::text_muted_grey());
         canvas.draw_str(
             footer_text,
-            Point::new(body_x, footer_baseline + 10.0*scale),
+            Point::new(body_x, footer_baseline + 10.0 * scale),
             &footer_font,
             &footer_paint,
         );
@@ -3586,9 +3635,7 @@ impl KeptApp {
         // hit during the build pass, or the target was unrenderable —
         // surface a placeholder line.
         let header_body_h = if let CellKind::Outline(oc) = &mut cell.kind {
-            let detached = oc
-                .reference_header_mut()
-                .and_then(|h| h.detach_cache());
+            let detached = oc.reference_header_mut().and_then(|h| h.detach_cache());
             match detached {
                 Some(mut nested) => {
                     let h = self.tick_embedded_cell(
@@ -3664,11 +3711,7 @@ impl KeptApp {
     /// membership-set churn. The result is consumed by
     /// `render_entity_page` and `render_thread_page`; both iterate
     /// `self.page_embeds` rather than building caches inline.
-    fn refresh_page_embeds(
-        &mut self,
-        source: PageEmbedSource,
-        targets: &[ReferenceTarget],
-    ) {
+    fn refresh_page_embeds(&mut self, source: PageEmbedSource, targets: &[ReferenceTarget]) {
         // Drain existing caches into a target-keyed map so we can
         // preserve them across the rebuild. Same-page re-renders hit
         // every entry; cross-page navigation drops the misses.
@@ -3701,8 +3744,8 @@ impl KeptApp {
                 .position(|c| c.id == target.cell_id());
             let source_edited_at = source_idx.map(|idx| self.document.cells[idx].edited_at);
             if self.page_embeds[i].cache_is_stale_for(source_edited_at) {
-                let new_cache = source_idx
-                    .and_then(|idx| self.build_reference_cache(idx, target, 0));
+                let new_cache =
+                    source_idx.and_then(|idx| self.build_reference_cache(idx, target, 0));
                 self.page_embeds[i].install_cache(new_cache, source_edited_at);
             }
         }
@@ -3900,9 +3943,7 @@ impl KeptApp {
         if show_create_new {
             if idx == 0 {
                 match target {
-                    Some(t) => {
-                        if let Some(_id) = self.create_and_attach_thread(query, t) {}
-                    }
+                    Some(t) => if let Some(_id) = self.create_and_attach_thread(query, t) {},
                     None => {
                         if let Some(id) = self.create_thread(query) {
                             self.push_view(Query::thread(id));
@@ -3937,9 +3978,7 @@ impl KeptApp {
             .rows
             .iter()
             .enumerate()
-            .find(|(_, (_, r))| {
-                x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
-            })
+            .find(|(_, (_, r))| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom)
             .map(|(i, _)| i);
         if let Some(i) = row_hit {
             if let Some(p) = self.thread_picker.as_mut() {
@@ -4089,11 +4128,10 @@ impl KeptApp {
             std::collections::HashMap::new();
         for m in self.thread_memberships.iter() {
             let (host, bid) = match m.target {
-                ReferenceTarget::Subtree { cell_id: c, bullet_id }
-                    if c == cell_id =>
-                {
-                    (c, bullet_id)
-                }
+                ReferenceTarget::Subtree {
+                    cell_id: c,
+                    bullet_id,
+                } if c == cell_id => (c, bullet_id),
                 _ => continue,
             };
             let _ = host;
@@ -4197,7 +4235,8 @@ impl KeptApp {
             ReferenceTarget::WholeCell(id) => id,
             ReferenceTarget::Subtree { cell_id, .. } => cell_id,
         };
-        let prev_inbox = self.cell_idx(cell_id)
+        let prev_inbox = self
+            .cell_idx(cell_id)
             .map(|idx| self.document.cells[idx].inbox)
             .unwrap_or(false);
         if let Some(idx) = self.cell_idx(cell_id) {
@@ -4246,7 +4285,8 @@ impl KeptApp {
             ReferenceTarget::WholeCell(cid) => cid,
             ReferenceTarget::Subtree { cell_id, .. } => cell_id,
         };
-        let prev_inbox = self.cell_idx(cell_id)
+        let prev_inbox = self
+            .cell_idx(cell_id)
             .map(|idx| self.document.cells[idx].inbox)
             .unwrap_or(false);
         if let Some(idx) = self.cell_idx(cell_id) {
@@ -4326,11 +4366,10 @@ impl KeptApp {
     /// Toggle thread close / reopen. `closed_at = Some(now)` closes;
     /// `None` reopens.
     fn set_thread_closed(&mut self, thread_id: ThreadId, close: bool) {
-        let (prev, prev_edited_at) =
-            match self.threads.iter().find(|t| t.id == thread_id) {
-                Some(t) => (t.closed_at, t.edited_at),
-                None => return,
-            };
+        let (prev, prev_edited_at) = match self.threads.iter().find(|t| t.id == thread_id) {
+            Some(t) => (t.closed_at, t.edited_at),
+            None => return,
+        };
         let new_edited_at = now_epoch_ms();
         let new = if close { Some(new_edited_at) } else { None };
         if prev == new {
@@ -4399,13 +4438,17 @@ impl KeptApp {
                 return;
             }
         }
-        self.undo_stack.push(UndoOp::DeleteThread { thread, memberships });
+        self.undo_stack.push(UndoOp::DeleteThread {
+            thread,
+            memberships,
+        });
         self.redo_stack.clear();
         self.reload_threads();
     }
 
     fn writable_context_id(&self) -> Option<Uuid> {
-        self.document.contexts
+        self.document
+            .contexts
             .iter()
             .filter(|c| c.end_time.is_none())
             .max_by_key(|c| c.start_time)
@@ -4456,9 +4499,13 @@ impl KeptApp {
         match self.pane().view.view_kind {
             ViewKind::Context(id) => {
                 let cell_ts = cell.timestamp;
-                self.document.contexts.iter().find(|c| c.id == id).map_or(false, |c| {
-                    cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
-                })
+                self.document
+                    .contexts
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map_or(false, |c| {
+                        cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
+                    })
             }
             ViewKind::Entity(eid) => self
                 .entities
@@ -4573,9 +4620,10 @@ impl KeptApp {
     /// Find the context whose window contains `cell_ts`. Used for rendering
     /// per-context section headers in Date view.
     fn context_for_timestamp(&self, cell_ts: i64) -> Option<&Context> {
-        self.document.contexts.iter().find(|c| {
-            cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
-        })
+        self.document
+            .contexts
+            .iter()
+            .find(|c| cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e))
     }
 
     /// Timestamp (epoch ms) of the most recently created cell anywhere in the
@@ -4671,7 +4719,8 @@ impl KeptApp {
         };
         let start = ctx.start_time;
         let end = ctx.end_time;
-        self.document.cells
+        self.document
+            .cells
             .iter()
             .any(|c| c.timestamp >= start && end.map(|e| c.timestamp < e).unwrap_or(true))
     }
@@ -4685,7 +4734,12 @@ impl KeptApp {
         new_context: &Context,
         new_view: Query,
     ) {
-        if let Some(ctx) = self.document.contexts.iter_mut().find(|c| c.id == closed_id) {
+        if let Some(ctx) = self
+            .document
+            .contexts
+            .iter_mut()
+            .find(|c| c.id == closed_id)
+        {
             ctx.end_time = Some(new_end_time);
         }
         self.document.mark_context_dirty(closed_id);
@@ -4714,7 +4768,12 @@ impl KeptApp {
         pre_focused: Option<Uuid>,
         pre_scroll_y: f32,
     ) {
-        if let Some(ctx) = self.document.contexts.iter_mut().find(|c| c.id == closed_id) {
+        if let Some(ctx) = self
+            .document
+            .contexts
+            .iter_mut()
+            .find(|c| c.id == closed_id)
+        {
             ctx.end_time = prev_end_time;
         }
         self.document.mark_context_dirty(closed_id);
@@ -4753,7 +4812,8 @@ impl KeptApp {
     fn context_has_cells(&self, ctx: &Context) -> bool {
         let start = ctx.start_time;
         let end = ctx.end_time;
-        self.document.cells
+        self.document
+            .cells
             .iter()
             .any(|c| c.timestamp >= start && end.map(|e| c.timestamp < e).unwrap_or(true))
     }
@@ -4913,7 +4973,9 @@ impl KeptApp {
     /// current view onto the forward stack first. No-op when the back
     /// stack is empty.
     fn nav_back(&mut self) -> bool {
-        let Some(prev) = self.pane_mut().nav_back.pop() else { return false };
+        let Some(prev) = self.pane_mut().nav_back.pop() else {
+            return false;
+        };
         let entry = HistoryEntry {
             query: self.pane_mut().view.clone(),
             focused: self.pane_mut().focused,
@@ -4931,7 +4993,9 @@ impl KeptApp {
     /// empty (which is the case until the user has gone back at least
     /// once and not yet pushed a new view).
     fn nav_forward(&mut self) -> bool {
-        let Some(next) = self.pane_mut().nav_forward.pop() else { return false };
+        let Some(next) = self.pane_mut().nav_forward.pop() else {
+            return false;
+        };
         let entry = HistoryEntry {
             query: self.pane_mut().view.clone(),
             focused: self.pane_mut().focused,
@@ -4993,11 +5057,7 @@ impl KeptApp {
     fn prev_visible(&self, id: Uuid) -> Option<Uuid> {
         let ids = self.visible_cell_ids();
         let pos = ids.iter().position(|x| *x == id)?;
-        if pos == 0 {
-            None
-        } else {
-            Some(ids[pos - 1])
-        }
+        if pos == 0 { None } else { Some(ids[pos - 1]) }
     }
 
     fn next_visible(&self, id: Uuid) -> Option<Uuid> {
@@ -5056,24 +5116,15 @@ impl KeptApp {
                 // gets cleaned up. Whole-cell rows are guaranteed
                 // valid by the cells FK cascade.
                 if let crate::cell::CellKind::Outline(oc) = &cell.kind {
-                    let bullet_ids: Vec<Uuid> =
-                        oc.bullets().iter().map(|b| b.id()).collect();
-                    if let Err(e) =
-                        db.reconcile_subtree_memberships(id, &bullet_ids)
-                    {
-                        eprintln!(
-                            "kept: reconcile_subtree_memberships failed for {id}: {e}",
-                        );
+                    let bullet_ids: Vec<Uuid> = oc.bullets().iter().map(|b| b.id()).collect();
+                    if let Err(e) = db.reconcile_subtree_memberships(id, &bullet_ids) {
+                        eprintln!("kept: reconcile_subtree_memberships failed for {id}: {e}",);
                     }
                 } else {
                     // Non-outline cell — no bullets, so any subtree
                     // membership at this cell is by definition stale.
-                    if let Err(e) =
-                        db.reconcile_subtree_memberships(id, &[])
-                    {
-                        eprintln!(
-                            "kept: reconcile_subtree_memberships failed for {id}: {e}",
-                        );
+                    if let Err(e) = db.reconcile_subtree_memberships(id, &[]) {
+                        eprintln!("kept: reconcile_subtree_memberships failed for {id}: {e}",);
                     }
                 }
             }
@@ -5478,20 +5529,18 @@ impl KeptApp {
         let mut row_top = input_top + input_h + pad;
         let mouse = self.mouse_pos;
         let emit = |row_top_ref: &mut f32,
-                        label: &str,
-                        highlighted: bool,
-                        kind: PickerRow,
-                        rows: &mut Vec<(PickerRow, Rect)>| {
+                    label: &str,
+                    highlighted: bool,
+                    kind: PickerRow,
+                    rows: &mut Vec<(PickerRow, Rect)>| {
             let r = Rect::new(
                 rect.left + pad * 0.5,
                 *row_top_ref,
                 rect.right - pad * 0.5,
                 *row_top_ref + row_h,
             );
-            let hovered = mouse.0 >= r.left
-                && mouse.0 <= r.right
-                && mouse.1 >= r.top
-                && mouse.1 <= r.bottom;
+            let hovered =
+                mouse.0 >= r.left && mouse.0 <= r.right && mouse.1 >= r.top && mouse.1 <= r.bottom;
             if highlighted || hovered {
                 let mut p = Paint::default();
                 p.set_anti_alias(true);
@@ -5506,12 +5555,7 @@ impl KeptApp {
             tp.set_anti_alias(true);
             tp.set_color(crate::color::text_menu_row());
             let baseline = r.top + (row_h + (-lm.ascent) - lm.descent) * 0.5;
-            canvas.draw_str(
-                label,
-                Point::new(r.left + pad, baseline),
-                &label_font,
-                &tp,
-            );
+            canvas.draw_str(label, Point::new(r.left + pad, baseline), &label_font, &tp);
             rows.push((kind, r));
             *row_top_ref += row_h;
         };
@@ -5520,7 +5564,13 @@ impl KeptApp {
         if show_create_new {
             let label = format!("+ Create thread \"{}\"", q_trim);
             let hl = picker.highlight == row_idx;
-            emit(&mut row_top, &label, hl, PickerRow::CreateNew, &mut hit_rows);
+            emit(
+                &mut row_top,
+                &label,
+                hl,
+                PickerRow::CreateNew,
+                &mut hit_rows,
+            );
             row_idx += 1;
         }
         for t in filtered.iter().take(cap) {
@@ -5569,9 +5619,7 @@ impl KeptApp {
         let scale = self.font_scale;
         let font = Font::from_typeface(&self.typeface, 14.0 * scale);
         let (_, fm) = font.metrics();
-        let text_w = font
-            .measure_str(&t.message, None)
-            .0;
+        let text_w = font.measure_str(&t.message, None).0;
         let pad_x = 16.0 * scale;
         let pad_y = 8.0 * scale;
         let pill_w = text_w + pad_x * 2.0;
@@ -5611,7 +5659,6 @@ impl KeptApp {
             &text_paint,
         );
     }
-
 
     /// The cell-stream view body (Ast / Context). Pre-computes per-cell
     /// visibility + section headers, then loops visible cells
@@ -5680,10 +5727,8 @@ impl KeptApp {
         let view_ref = &self.pane().view;
         let header_mode = if !matches!(view_ref.view_kind, ViewKind::Ast) {
             HeaderMode::None
-        } else if matches!(
-            view_ref.ast.include.time,
-            Some(query::TimeFilter::Day(_))
-        ) && view_ref.ast.include.tags.is_empty()
+        } else if matches!(view_ref.ast.include.time, Some(query::TimeFilter::Day(_)))
+            && view_ref.ast.include.tags.is_empty()
             && view_ref.ast.include.entities.is_empty()
             && view_ref.ast.exclude.tags.is_empty()
             && view_ref.ast.exclude.entities.is_empty()
@@ -5719,10 +5764,7 @@ impl KeptApp {
             }
         }
 
-        let header_font = Font::from_typeface(
-            &self.typeface,
-            CONTEXT_HEADER_FONT_SIZE * scale,
-        );
+        let header_font = Font::from_typeface(&self.typeface, CONTEXT_HEADER_FONT_SIZE * scale);
         let (_, hm) = header_font.metrics();
         let header_h = CONTEXT_HEADER_H * scale;
         let header_pad_top = CONTEXT_HEADER_PAD_TOP * scale;
@@ -5763,12 +5805,7 @@ impl KeptApp {
                 // shrank) so hit-tests and embed lookups stay
                 // accurate even without a full tick.
                 let cell_y_skip = y + header_advance;
-                self.document.cells[i].set_view_geometry(
-                    body_x,
-                    cell_y_skip,
-                    body_w,
-                    cached_h,
-                );
+                self.document.cells[i].set_view_geometry(body_x, cell_y_skip, body_w, cached_h);
                 y += header_advance + cached_h + CELL_GAP;
                 continue;
             }
@@ -5781,12 +5818,7 @@ impl KeptApp {
                 // Headers align with the cell content (post-bar
                 // shift) so the label sits flush with cell text
                 // below it — not floating into the bar column.
-                rec_canvas.draw_str(
-                    label,
-                    Point::new(body_x, baseline),
-                    &header_font,
-                    &hp,
-                );
+                rec_canvas.draw_str(label, Point::new(body_x, baseline), &header_font, &hp);
                 let label_w = header_font.measure_str(label, Some(&hp)).0;
                 let line_y = baseline - hm.ascent / 3.0;
                 let mut lp = Paint::default();
@@ -5807,8 +5839,7 @@ impl KeptApp {
                 &self.document.cells[i].kind,
                 CellKind::Outline(oc) if oc.has_reference_header()
             );
-            let cell_is_focused =
-                focused_id.map(|f| f == cell_id).unwrap_or(false);
+            let cell_is_focused = focused_id.map(|f| f == cell_id).unwrap_or(false);
 
             // Selection highlights are visible whenever the cell is focused
             // (so view-mode users can drag-select). Caret only renders in
@@ -5829,14 +5860,7 @@ impl KeptApp {
             let h = if is_reference {
                 // Reference cells render via the app layer (which can
                 // see the full cell list to look up the target).
-                self.render_reference_cell(
-                    rec_canvas,
-                    i,
-                    body_x,
-                    cell_y,
-                    body_w,
-                    render_focused,
-                )
+                self.render_reference_cell(rec_canvas, i, body_x, cell_y, body_w, render_focused)
             } else if is_envelope_outline {
                 // Envelope outlines: read-only embed at the
                 // top + editable bullet body. Same reason as
@@ -5868,11 +5892,7 @@ impl KeptApp {
                 let cell_id_here = self.document.cells[i].id;
                 let bullet_chip_map = self.bullet_thread_chip_map(cell_id_here);
                 let cell = &mut self.document.cells[i];
-                let filter = compute_outline_bullet_filter(
-                    cell,
-                    &include_tags,
-                    cell_is_focused,
-                );
+                let filter = compute_outline_bullet_filter(cell, &include_tags, cell_is_focused);
                 if let CellKind::Outline(oc) = &mut cell.kind {
                     oc.set_bullet_filter(filter);
                     oc.set_show_inactive(show_inactive);
@@ -5894,9 +5914,7 @@ impl KeptApp {
                 // can capture pre-merge membership snapshots.)
                 if let CellKind::Outline(oc) = &mut cell.kind {
                     for (tid, rect) in oc.take_chip_hits() {
-                        self.hit_tests_builder
-                            .cell_thread_chips
-                            .push((tid, rect));
+                        self.hit_tests_builder.cell_thread_chips.push((tid, rect));
                     }
                 }
                 h
@@ -5962,33 +5980,21 @@ impl KeptApp {
             let bar_top = cell_y - FOCUS_PAD;
             let bar_bottom = cell_y + h + FOCUS_PAD;
             let bar_color = bar_color_for_cell(&self.document.cells[i], now_ms_for_bars);
-            let bar_visual_rect = Rect::new(
-                bar_left_x,
-                bar_top,
-                bar_right_x,
-                bar_bottom,
-            );
+            let bar_visual_rect = Rect::new(bar_left_x, bar_top, bar_right_x, bar_bottom);
             let mut bar_paint = Paint::default();
             bar_paint.set_anti_alias(true);
             bar_paint.set_color(bar_color);
             let r = FOCUS_RADIUS;
             let zero = skia_safe::Vector::new(0.0, 0.0);
             let corner = skia_safe::Vector::new(r, r);
-            let bar_rr = skia_safe::RRect::new_rect_radii(
-                bar_visual_rect,
-                &[corner, zero, zero, corner],
-            );
+            let bar_rr =
+                skia_safe::RRect::new_rect_radii(bar_visual_rect, &[corner, zero, zero, corner]);
             rec_canvas.draw_rrect(&bar_rr, &bar_paint);
 
             // Hit rect extends across the visible bar AND the
             // bar_gap up to the chrome's left edge, so a click
             // anywhere in the left column registers.
-            let bar_rect = Rect::new(
-                bar_left_x,
-                bar_top,
-                body_x,
-                bar_bottom,
-            );
+            let bar_rect = Rect::new(bar_left_x, bar_top, body_x, bar_bottom);
 
             // Faint outline around non-focused cells so each one
             // reads as a distinct unit. Drawn in the same position
@@ -6018,9 +6024,7 @@ impl KeptApp {
             // Record the bar's hit rect for click dispatch
             // (left-click → focus cell view-mode, right-click →
             // BarContextMenu).
-            self.hit_tests_builder
-                .cell_bars
-                .push((cell_id, bar_rect));
+            self.hit_tests_builder.cell_bars.push((cell_id, bar_rect));
 
             y += h + CELL_GAP;
         }
@@ -6037,7 +6041,6 @@ impl KeptApp {
 
         y
     }
-
 
     pub fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
         // Any *fresh* key press cancels in-flight kinetic coast on
@@ -6328,13 +6331,8 @@ impl KeptApp {
             }
             let clipboard = self.clipboard.as_mut();
             if let Some(p) = self.thread_picker.as_mut() {
-                if apply_clipboard_shortcut(
-                    &mut p.input,
-                    clipboard,
-                    event,
-                    modifiers.state(),
-                    true,
-                ) {
+                if apply_clipboard_shortcut(&mut p.input, clipboard, event, modifiers.state(), true)
+                {
                     p.highlight = 0;
                     return true;
                 }
@@ -6357,13 +6355,7 @@ impl KeptApp {
             let input = self.people_add.as_mut();
             let clipboard = self.clipboard.as_mut();
             if let Some(input) = input {
-                if apply_clipboard_shortcut(
-                    input,
-                    clipboard,
-                    event,
-                    modifiers.state(),
-                    true,
-                ) {
+                if apply_clipboard_shortcut(input, clipboard, event, modifiers.state(), true) {
                     return true;
                 }
                 return input.handle_key(event, modifiers);
@@ -6528,25 +6520,21 @@ impl KeptApp {
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("n") => {
                     let with_title = modifiers.state().shift_key();
-                    return self
-                        .insert_cell_after_focused(NewCellKind::Plain, with_title);
+                    return self.insert_cell_after_focused(NewCellKind::Plain, with_title);
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("o") => {
                     let with_title = modifiers.state().shift_key();
-                    return self
-                        .insert_cell_after_focused(NewCellKind::Outline, with_title);
+                    return self.insert_cell_after_focused(NewCellKind::Outline, with_title);
                 }
                 Key::Character(s) if s.as_str().eq_ignore_ascii_case("p") => {
                     let with_title = modifiers.state().shift_key();
-                    return self
-                        .insert_cell_after_focused(NewCellKind::PopPop, with_title);
+                    return self.insert_cell_after_focused(NewCellKind::PopPop, with_title);
                 }
                 // Rotate context (start a new context "now"). Moved
                 // off Ctrl+Shift+N so that combo can mirror its
                 // siblings (Plain cell, title pre-focused).
                 Key::Character(s)
-                    if s.as_str().eq_ignore_ascii_case("r")
-                        && modifiers.state().shift_key() =>
+                    if s.as_str().eq_ignore_ascii_case("r") && modifiers.state().shift_key() =>
                 {
                     self.rotate_context_now();
                     return true;
@@ -6582,10 +6570,8 @@ impl KeptApp {
                     let Some(id) = self.pane_mut().focused else {
                         return false;
                     };
-                    let is_reference = matches!(
-                        self.cell(id).map(|c| &c.kind),
-                        Some(CellKind::Reference(_))
-                    );
+                    let is_reference =
+                        matches!(self.cell(id).map(|c| &c.kind), Some(CellKind::Reference(_)));
                     if is_reference {
                         return self.envelope_reference(id);
                     }
@@ -6596,7 +6582,9 @@ impl KeptApp {
                     // focused cell. Idempotent — focuses an existing title.
                     // (Cmd+H is reserved by macOS for "hide app," so title
                     // gets T and tables move to J.)
-                    let Some(id) = self.pane_mut().focused else { return false };
+                    let Some(id) = self.pane_mut().focused else {
+                        return false;
+                    };
                     let changed = self
                         .cell_mut(id)
                         .map(|c| c.toggle_title_focus())
@@ -6610,8 +6598,7 @@ impl KeptApp {
                     return changed;
                 }
                 Key::Character(s)
-                    if s.as_str().eq_ignore_ascii_case("d")
-                        && modifiers.state().shift_key() =>
+                    if s.as_str().eq_ignore_ascii_case("d") && modifiers.state().shift_key() =>
                 {
                     // Ctrl/Cmd+Shift+D: jump to today's date view.
                     let today = local_date_for_ms(now_epoch_ms());
@@ -6738,7 +6725,8 @@ impl KeptApp {
                             }
                             if let Some(next_ctx) = self.next_context_with_cells() {
                                 if self.set_active_context(next_ctx) {
-                                    self.pane_mut().focused = self.visible_cell_ids().last().copied();
+                                    self.pane_mut().focused =
+                                        self.visible_cell_ids().last().copied();
                                     return true;
                                 }
                             }
@@ -6755,7 +6743,8 @@ impl KeptApp {
                             }
                             if let Some(prev_ctx) = self.prev_context_with_cells() {
                                 if self.set_active_context(prev_ctx) {
-                                    self.pane_mut().focused = self.visible_cell_ids().first().copied();
+                                    self.pane_mut().focused =
+                                        self.visible_cell_ids().first().copied();
                                     return true;
                                 }
                             }
@@ -6854,7 +6843,9 @@ impl KeptApp {
         }
 
         let focused_id = self.pane_mut().focused;
-        let pre = focused_id.and_then(|id| self.cell(id)).map(|c| c.snapshot());
+        let pre = focused_id
+            .and_then(|id| self.cell(id))
+            .map(|c| c.snapshot());
         let popup_was_open = self.mention_popup.is_some();
         let handled = if let Some(id) = focused_id {
             if let Some(cell) = self.cell_mut(id) {
@@ -6909,19 +6900,18 @@ impl KeptApp {
         // the payload carries them across the clipboard. Paste-side
         // re-attaches the threads to the freshly-allocated bullet
         // ids.
-        let lookup =
-            |bid: Uuid| -> Vec<Uuid> {
-                self.thread_memberships
-                    .iter()
-                    .filter_map(|m| match m.target {
-                        ReferenceTarget::Subtree {
-                            cell_id: c,
-                            bullet_id,
-                        } if c == id && bullet_id == bid => Some(m.thread_id),
-                        _ => None,
-                    })
-                    .collect()
-            };
+        let lookup = |bid: Uuid| -> Vec<Uuid> {
+            self.thread_memberships
+                .iter()
+                .filter_map(|m| match m.target {
+                    ReferenceTarget::Subtree {
+                        cell_id: c,
+                        bullet_id,
+                    } if c == id && bullet_id == bid => Some(m.thread_id),
+                    _ => None,
+                })
+                .collect()
+        };
         build_copy_payload_for_cell(cell, editing, Some(&lookup))
     }
 
@@ -6981,10 +6971,7 @@ impl KeptApp {
         let Some(id) = self.pane_mut().focused else {
             return false;
         };
-        let html = self
-            .clipboard
-            .as_mut()
-            .and_then(|cb| cb.get().html().ok());
+        let html = self.clipboard.as_mut().and_then(|cb| cb.get().html().ok());
         let text = self
             .clipboard
             .as_mut()
@@ -6993,8 +6980,7 @@ impl KeptApp {
         if html.is_none() && text.is_empty() {
             return false;
         }
-        let payload =
-            crate::clipboard::from_clipboard(html.as_deref(), &text);
+        let payload = crate::clipboard::from_clipboard(html.as_deref(), &text);
 
         let pre = self.cell(id).map(|c| c.snapshot());
 
@@ -7027,11 +7013,7 @@ impl KeptApp {
     /// cell-local `apply_paste_into_cell` so the Quick-Add path
     /// can share the dispatch without going through document
     /// focus / dirty machinery.
-    fn apply_paste_default(
-        &mut self,
-        cell_id: Uuid,
-        payload: crate::clipboard::KeptPayload,
-    ) {
+    fn apply_paste_default(&mut self, cell_id: Uuid, payload: crate::clipboard::KeptPayload) {
         let bullet_threads: Vec<(Uuid, Vec<Uuid>)> = if let Some(cell) = self.cell_mut(cell_id) {
             apply_paste_into_cell(cell, payload).bullet_threads
         } else {
@@ -7052,9 +7034,7 @@ impl KeptApp {
                             bullet_id: *new_bullet_id,
                         };
                         if let Err(e) = db.attach_thread(*thread_id, target, now) {
-                            eprintln!(
-                                "kept: paste-attach thread failed: {e}",
-                            );
+                            eprintln!("kept: paste-attach thread failed: {e}",);
                         } else {
                             attached += 1;
                         }
@@ -7068,11 +7048,7 @@ impl KeptApp {
     }
 
     /// Alternate paste (Ctrl+Shift+V).
-    fn apply_paste_alternate(
-        &mut self,
-        cell_id: Uuid,
-        payload: crate::clipboard::KeptPayload,
-    ) {
+    fn apply_paste_alternate(&mut self, cell_id: Uuid, payload: crate::clipboard::KeptPayload) {
         use crate::clipboard::KeptPayload;
         match payload {
             KeptPayload::Reference { target, .. } => {
@@ -7123,7 +7099,13 @@ impl KeptApp {
         mouse_doc_x: f32,
         mouse_doc_y: f32,
     ) -> f32 {
-        let entity = match self.entities.entities.iter().find(|e| e.id == entity_id).cloned() {
+        let entity = match self
+            .entities
+            .entities
+            .iter()
+            .find(|e| e.id == entity_id)
+            .cloned()
+        {
             Some(e) => e,
             None => {
                 let font = Font::from_typeface(&self.typeface, ENTITY_META_FONT_SIZE * scale);
@@ -7187,7 +7169,11 @@ impl KeptApp {
         // the meta text; mouse_down hit-tests the pill rect alone.
         let toggle_w = 34.0 * scale;
         let toggle_h = 18.0 * scale;
-        let label = if entity.is_active { "active" } else { "inactive" };
+        let label = if entity.is_active {
+            "active"
+        } else {
+            "inactive"
+        };
         let label_w = meta_font.measure_str(label, Some(&meta_paint)).0;
         let toggle_right = cells_left + content_width;
         let toggle_left = toggle_right - toggle_w;
@@ -7220,8 +7206,7 @@ impl KeptApp {
         y += ENTITY_SECTION_GAP * scale;
 
         // BACKING CELL section header (sidebar-header styling).
-        let header_font =
-            Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
+        let header_font = Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
         let (_, hm) = header_font.metrics();
         let mut header_paint = Paint::default();
         header_paint.set_anti_alias(true);
@@ -7287,12 +7272,7 @@ impl KeptApp {
             // button just records its rect for hit-testing.
             let btn_h = ENTITY_CREATE_BTN_H * scale;
             let btn_w = (ENTITY_CREATE_BTN_W * scale).min(content_width);
-            let btn_rect = Rect::new(
-                cells_left,
-                y,
-                cells_left + btn_w,
-                y + btn_h,
-            );
+            let btn_rect = Rect::new(cells_left, y, cells_left + btn_w, y + btn_h);
             let hovered = mouse_doc_x >= btn_rect.left
                 && mouse_doc_x <= btn_rect.right
                 && mouse_doc_y >= btn_rect.top
@@ -7314,8 +7294,7 @@ impl KeptApp {
             lp.set_color(crate::color::text_muted_warm_deep());
             let label = "+ Create backing cell";
             let lw = meta_font.measure_str(label, Some(&lp)).0;
-            let label_baseline =
-                btn_rect.top + (btn_h + (-mm.ascent) - mm.descent) * 0.5;
+            let label_baseline = btn_rect.top + (btn_h + (-mm.ascent) - mm.descent) * 0.5;
             canvas.draw_str(
                 label,
                 Point::new(btn_rect.left + (btn_w - lw) * 0.5, label_baseline),
@@ -7387,7 +7366,12 @@ impl KeptApp {
                 let (body_h, restored) = match detached {
                     Some(mut cache) => {
                         let h = self.tick_embedded_cell(
-                            canvas, &mut cache, body_x, y + pad, body_w, false,
+                            canvas,
+                            &mut cache,
+                            body_x,
+                            y + pad,
+                            body_w,
+                            false,
                         );
                         (h, Some(cache))
                     }
@@ -7405,10 +7389,9 @@ impl KeptApp {
                 };
                 self.page_embeds[i].attach_cache(restored);
                 let footer_text = match target_ts {
-                    Some(ts) => format!(
-                        "↗ originally {}",
-                        format_date_label(local_date_for_ms(ts))
-                    ),
+                    Some(ts) => {
+                        format!("↗ originally {}", format_date_label(local_date_for_ms(ts)))
+                    }
                     None => "↗ source missing".to_string(),
                 };
                 let total_h = self.draw_embed_wrapper(
@@ -7500,9 +7483,7 @@ impl KeptApp {
                 &title_font,
                 &title_paint,
             );
-            let title_w = title_font
-                .measure_str(&thread.title, Some(&title_paint))
-                .0;
+            let title_w = title_font.measure_str(&thread.title, Some(&title_paint)).0;
             let title_rect = Rect::new(
                 cells_left,
                 y,
@@ -7577,8 +7558,7 @@ impl KeptApp {
             ms.sort_by(|a, b| b.attached_at.cmp(&a.attached_at));
             ms
         };
-        let header_font =
-            Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
+        let header_font = Font::from_typeface(&self.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
         let (_, hm) = header_font.metrics();
         let mut header_paint = Paint::default();
         header_paint.set_anti_alias(true);
@@ -7628,9 +7608,8 @@ impl KeptApp {
             let detached = self.page_embeds[i].detach_cache();
             let (body_h, restored) = match detached {
                 Some(mut cache) => {
-                    let h = self.tick_embedded_cell(
-                        canvas, &mut cache, body_x, y + pad, body_w, false,
-                    );
+                    let h =
+                        self.tick_embedded_cell(canvas, &mut cache, body_x, y + pad, body_w, false);
                     (h, Some(cache))
                 }
                 None => (
@@ -7663,12 +7642,7 @@ impl KeptApp {
                 false,
             );
             // Member card rect → click navigates to source.
-            let member_rect = Rect::new(
-                cells_left,
-                y,
-                cells_left + content_width,
-                y + total_h,
-            );
+            let member_rect = Rect::new(cells_left, y, cells_left + content_width, y + total_h);
             self.hit_tests_builder
                 .thread_page
                 .members
@@ -7688,22 +7662,28 @@ impl KeptApp {
                 && mouse_doc_y <= btn_rect.bottom;
             let mut btn_bg = Paint::default();
             btn_bg.set_anti_alias(true);
-            btn_bg.set_color(crate::color::dark_alpha(if btn_hovered { 0x18 } else { 0x08 }));
+            btn_bg.set_color(crate::color::dark_alpha(if btn_hovered {
+                0x18
+            } else {
+                0x08
+            }));
             canvas.draw_round_rect(btn_rect, 4.0 * scale, 4.0 * scale, &btn_bg);
             let mut btn_text = Paint::default();
             btn_text.set_anti_alias(true);
             btn_text.set_color(crate::color::text_muted_warm_deep());
             let label = "Detach";
             let lw = meta_font.measure_str(label, Some(&btn_text)).0;
-            let lbl_baseline =
-                btn_rect.top + (btn_h + (-mm.ascent) - mm.descent) * 0.5;
+            let lbl_baseline = btn_rect.top + (btn_h + (-mm.ascent) - mm.descent) * 0.5;
             canvas.draw_str(
                 label,
                 Point::new(btn_rect.left + (btn_w - lw) * 0.5, lbl_baseline),
                 &meta_font,
                 &btn_text,
             );
-            self.hit_tests_builder.thread_page.detach_buttons.push(btn_rect);
+            self.hit_tests_builder
+                .thread_page
+                .detach_buttons
+                .push(btn_rect);
             y += total_h + CELL_GAP;
         }
 
@@ -7734,8 +7714,7 @@ impl KeptApp {
         let mut y = MARGIN_TOP;
 
         // ----- Title + "Show inactive" toggle -----
-        let title_font =
-            Font::from_typeface(&self.typeface, ENTITY_TITLE_FONT_SIZE * scale);
+        let title_font = Font::from_typeface(&self.typeface, ENTITY_TITLE_FONT_SIZE * scale);
         let (_, tm) = title_font.metrics();
         let mut title_paint = Paint::default();
         title_paint.set_anti_alias(true);
@@ -7783,7 +7762,12 @@ impl KeptApp {
         // The threads list piggybacks on `show_inactive_cells` (the
         // global archived-cells toggle) — same semantics, same flag
         // closed threads use elsewhere (sidebar, picker).
-        draw_toggle(canvas, toggle_rect, self.show_inactive_cells, toggle_hovered);
+        draw_toggle(
+            canvas,
+            toggle_rect,
+            self.show_inactive_cells,
+            toggle_hovered,
+        );
         self.hit_tests_builder.thread_list_page.show_inactive_toggle = Some(toggle_rect);
 
         y += -tm.ascent + tm.descent + 24.0 * scale;
@@ -7809,8 +7793,7 @@ impl KeptApp {
         let row_h = PEOPLE_ROW_H * scale;
         let row_pad_x = PEOPLE_ROW_PAD_X * scale;
         let row_w = content_width;
-        let row_font =
-            Font::from_typeface(&self.typeface, PEOPLE_ROW_FONT_SIZE * scale);
+        let row_font = Font::from_typeface(&self.typeface, PEOPLE_ROW_FONT_SIZE * scale);
         let (_, rm) = row_font.metrics();
         let text_baseline_offset = (row_h + (-rm.ascent) - rm.descent) * 0.5;
 
@@ -7840,7 +7823,11 @@ impl KeptApp {
                 canvas.draw_rect(row_rect, &hover_paint);
             }
             let baseline = row_rect.top + text_baseline_offset;
-            let paint = if *is_open { &text_paint } else { &inactive_paint };
+            let paint = if *is_open {
+                &text_paint
+            } else {
+                &inactive_paint
+            };
             canvas.draw_str(
                 title,
                 Point::new(row_rect.left + row_pad_x, baseline),
@@ -7914,8 +7901,7 @@ impl KeptApp {
         let mut y = MARGIN_TOP;
 
         // Title + "Show inactive" toggle, sharing a baseline.
-        let title_font =
-            Font::from_typeface(&self.typeface, ENTITY_TITLE_FONT_SIZE * scale);
+        let title_font = Font::from_typeface(&self.typeface, ENTITY_TITLE_FONT_SIZE * scale);
         let (_, tm) = title_font.metrics();
         let mut title_paint = Paint::default();
         title_paint.set_anti_alias(true);
@@ -7985,8 +7971,7 @@ impl KeptApp {
         let row_h = PEOPLE_ROW_H * scale;
         let row_pad_x = PEOPLE_ROW_PAD_X * scale;
         let row_w = content_width;
-        let row_font =
-            Font::from_typeface(&self.typeface, PEOPLE_ROW_FONT_SIZE * scale);
+        let row_font = Font::from_typeface(&self.typeface, PEOPLE_ROW_FONT_SIZE * scale);
         let (_, rm) = row_font.metrics();
         let text_baseline_offset = (row_h + (-rm.ascent) - rm.descent) * 0.5;
 
@@ -8061,8 +8046,7 @@ impl KeptApp {
                 let mention_count = self.entities.mention_count(*entity_id);
                 if mention_count > 0 {
                     let count_text = format!("{}", mention_count);
-                    let count_w =
-                        row_font.measure_str(&count_text, Some(&inactive_paint)).0;
+                    let count_w = row_font.measure_str(&count_text, Some(&inactive_paint)).0;
                     canvas.draw_str(
                         &count_text,
                         Point::new(
@@ -8082,7 +8066,10 @@ impl KeptApp {
                 &divider_paint,
             );
 
-            self.hit_tests_builder.people_page.rows.push((*entity_id, row_rect));
+            self.hit_tests_builder
+                .people_page
+                .rows
+                .push((*entity_id, row_rect));
             y += row_h;
         }
 
@@ -8155,7 +8142,9 @@ impl KeptApp {
     /// the next idle window. The whole operation lands as a single
     /// `UndoOp::RenamePersonEntity` on the undo stack.
     fn commit_people_rename(&mut self) {
-        let Some(rs) = self.people_rename.take() else { return };
+        let Some(rs) = self.people_rename.take() else {
+            return;
+        };
         let new_text = rs.input.text().trim().to_string();
         if new_text.is_empty() {
             return;
@@ -8163,7 +8152,12 @@ impl KeptApp {
         let entity_id = rs.entity_id;
 
         // Snapshot pre-rename state for undo.
-        let entity_pre = self.entities.entities.iter().find(|e| e.id == entity_id).cloned();
+        let entity_pre = self
+            .entities
+            .entities
+            .iter()
+            .find(|e| e.id == entity_id)
+            .cloned();
         let Some(entity_pre) = entity_pre else { return };
         let prev_name = entity_pre.display_name.clone();
         if prev_name == new_text {
@@ -8300,11 +8294,8 @@ impl KeptApp {
         };
         self.document.cells[idx].closed_at = new;
         self.mark_cell_dirty(cell_id);
-        self.undo_stack.push(UndoOp::SetCellClosed {
-            cell_id,
-            prev,
-            new,
-        });
+        self.undo_stack
+            .push(UndoOp::SetCellClosed { cell_id, prev, new });
         self.redo_stack.clear();
         self.pane_mut().coalesce_break = true;
         self.pane_mut().pending_caret_scroll = true;
@@ -8322,9 +8313,11 @@ impl KeptApp {
             return false;
         }
         let prev_inbox = self.document.cells[idx].inbox;
-        // Snoozing (setting a future time) clears inbox;
-        // manually un-snoozing (clearing) returns note to inbox.
-        let new_inbox = when.is_none();
+        // Snoozing (setting a future time) clears inbox; manually
+        // un-snoozing (clearing) returns content notes to inbox.
+        // Reference cells are navigational — they go back to Current, not Inbox.
+        let is_reference = matches!(self.document.cells[idx].kind, CellKind::Reference(_));
+        let new_inbox = when.is_none() && !is_reference;
         self.document.cells[idx].resurface_after = when;
         self.document.cells[idx].inbox = new_inbox;
         self.mark_cell_dirty(cell_id);
@@ -8352,7 +8345,11 @@ impl KeptApp {
         }
         self.document.cells[idx].inbox = inbox;
         self.mark_cell_dirty(cell_id);
-        self.undo_stack.push(UndoOp::SetCellInbox { cell_id, prev, new: inbox });
+        self.undo_stack.push(UndoOp::SetCellInbox {
+            cell_id,
+            prev,
+            new: inbox,
+        });
         self.redo_stack.clear();
         true
     }
@@ -8364,6 +8361,11 @@ impl KeptApp {
         let now_ms = now_epoch_ms();
         let mut dirty_ids: Vec<Uuid> = Vec::new();
         for cell in &mut self.document.cells {
+            // Reference cells are navigational pointers — they go back to
+            // Current when snooze expires, not to Inbox.
+            if matches!(cell.kind, CellKind::Reference(_)) {
+                continue;
+            }
             if let Some(t) = cell.resurface_after {
                 if now_ms >= t && !cell.inbox {
                     cell.inbox = true;
@@ -8423,12 +8425,7 @@ impl KeptApp {
     }
 
     /// Set a bullet's `resurface_after`. Metadata-only.
-    fn set_bullet_resurface(
-        &mut self,
-        cell_id: Uuid,
-        bullet_id: Uuid,
-        when: Option<i64>,
-    ) -> bool {
+    fn set_bullet_resurface(&mut self, cell_id: Uuid, bullet_id: Uuid, when: Option<i64>) -> bool {
         let Some(idx) = self.cell_idx(cell_id) else {
             return false;
         };
@@ -8513,7 +8510,9 @@ impl KeptApp {
     /// person entity with the typed name and pushes a
     /// `CreateCelllessEntity` undo entry.
     fn commit_people_add(&mut self) {
-        let Some(input) = self.people_add.take() else { return };
+        let Some(input) = self.people_add.take() else {
+            return;
+        };
         let name = input.text().trim().to_string();
         if name.is_empty() {
             return;
@@ -8548,7 +8547,9 @@ impl KeptApp {
     }
 
     fn record_edit(&mut self, pre: CellSnapshot, post: CellSnapshot) {
-        let Some(cell_id) = self.pane_mut().focused else { return };
+        let Some(cell_id) = self.pane_mut().focused else {
+            return;
+        };
         let now = Instant::now();
 
         // Drain any bullet merges the cell's outline accumulated
@@ -8581,12 +8582,8 @@ impl KeptApp {
         if !merge_undos.is_empty() {
             if let Some(db) = self.db.as_mut() {
                 for m in &merge_undos {
-                    if let Err(e) =
-                        db.move_bullet_memberships(m.cell_id, m.from, m.into)
-                    {
-                        eprintln!(
-                            "kept: move_bullet_memberships failed: {e}",
-                        );
+                    if let Err(e) = db.move_bullet_memberships(m.cell_id, m.from, m.into) {
+                        eprintln!("kept: move_bullet_memberships failed: {e}",);
                     }
                 }
             }
@@ -8608,7 +8605,10 @@ impl KeptApp {
             );
 
         if can_coalesce {
-            if let Some(UndoOp::CellEdit { post: prev_post, .. }) = self.undo_stack.last_mut() {
+            if let Some(UndoOp::CellEdit {
+                post: prev_post, ..
+            }) = self.undo_stack.last_mut()
+            {
                 *prev_post = post;
             }
         } else {
@@ -8630,18 +8630,16 @@ impl KeptApp {
     /// `(thread_id, attached_at)` rows currently attached to a
     /// specific bullet. Used by `record_edit` to snapshot
     /// pre-merge state for undo.
-    fn bullet_memberships_snapshot(
-        &self,
-        cell_id: Uuid,
-        bullet_id: Uuid,
-    ) -> Vec<(ThreadId, i64)> {
+    fn bullet_memberships_snapshot(&self, cell_id: Uuid, bullet_id: Uuid) -> Vec<(ThreadId, i64)> {
         self.thread_memberships
             .iter()
-            .filter(|m| matches!(
-                m.target,
-                ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
-                    if c == cell_id && b == bullet_id
-            ))
+            .filter(|m| {
+                matches!(
+                    m.target,
+                    ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
+                        if c == cell_id && b == bullet_id
+                )
+            })
             .map(|m| (m.thread_id, m.attached_at))
             .collect()
     }
@@ -8698,9 +8696,7 @@ impl KeptApp {
             .document
             .contexts
             .iter()
-            .find(|c| {
-                cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e)
-            })
+            .find(|c| cell_ts >= c.start_time && c.end_time.map_or(true, |e| cell_ts < e))
             .cloned();
 
         // Will deleting this cell leave its containing context empty?
@@ -8711,8 +8707,7 @@ impl KeptApp {
                 .iter()
                 .filter(|c| c.id != id)
                 .filter(|c| {
-                    c.timestamp >= ctx.start_time
-                        && ctx.end_time.map_or(true, |e| c.timestamp < e)
+                    c.timestamp >= ctx.start_time && ctx.end_time.map_or(true, |e| c.timestamp < e)
                 })
                 .count();
             if others_in_ctx == 0 {
@@ -8818,7 +8813,12 @@ impl KeptApp {
                 new_start,
                 ..
             } => {
-                if let Some(c) = self.document.contexts.iter_mut().find(|c| c.id == *context_id) {
+                if let Some(c) = self
+                    .document
+                    .contexts
+                    .iter_mut()
+                    .find(|c| c.id == *context_id)
+                {
                     c.start_time = *new_start;
                 }
                 self.document.mark_context_dirty(*context_id);
@@ -8829,9 +8829,7 @@ impl KeptApp {
     fn reverse_context_side_effect(&mut self, se: &ContextSideEffect) {
         match se {
             ContextSideEffect::ContextRemoved {
-                context,
-                prev_view,
-                ..
+                context, prev_view, ..
             } => {
                 if !self.document.contexts.iter().any(|c| c.id == context.id) {
                     self.document.contexts.push(context.clone());
@@ -8845,7 +8843,12 @@ impl KeptApp {
                 prev_start,
                 ..
             } => {
-                if let Some(c) = self.document.contexts.iter_mut().find(|c| c.id == *context_id) {
+                if let Some(c) = self
+                    .document
+                    .contexts
+                    .iter_mut()
+                    .find(|c| c.id == *context_id)
+                {
                     c.start_time = *prev_start;
                 }
                 self.document.mark_context_dirty(*context_id);
@@ -9039,6 +9042,7 @@ impl KeptApp {
         let mut new_cell = Cell::new_reference(self.typeface.clone(), target);
         new_cell.set_font_scale(self.font_scale);
         new_cell.context_hint_id = self.writable_context_id();
+        new_cell.inbox = true;
         let new_id = new_cell.id;
         let snapshot = new_cell.snapshot();
         self.insert_cell_sorted(new_cell);
@@ -9052,7 +9056,7 @@ impl KeptApp {
         self.redo_stack.clear();
         self.pane_mut().coalesce_break = true;
         self.touch_cell(new_id);
-        self.show_toast("Surfaced to today");
+        self.show_toast("Surfaced");
         true
     }
 
@@ -9147,10 +9151,7 @@ impl KeptApp {
 
         let mut new_cell = Cell::from_parts(
             cell_id,
-            CellKind::Reference(cell::ReferenceCell::new(
-                self.typeface.clone(),
-                target,
-            )),
+            CellKind::Reference(cell::ReferenceCell::new(self.typeface.clone(), target)),
             None,
             timestamp,
             edited_at,
@@ -9186,7 +9187,9 @@ impl KeptApp {
     /// Bring the primary caret of the focused cell into view if it's outside
     /// the viewport. Used after edits, caret movement, and zoom changes.
     fn scroll_caret_into_view(&mut self) {
-        let Some(id) = self.pane_mut().focused else { return };
+        let Some(id) = self.pane_mut().focused else {
+            return;
+        };
         let Some(cell) = self.cell(id) else { return };
         let Some((top, bot)) = cell.caret_doc_y_band() else {
             return;
@@ -9211,7 +9214,9 @@ impl KeptApp {
     /// Uses last frame's cell geometry; on the first frame everything is at 0
     /// which results in scroll_y = 0, which is correct.
     fn scroll_to_focused(&mut self) {
-        let Some(id) = self.pane_mut().focused else { return };
+        let Some(id) = self.pane_mut().focused else {
+            return;
+        };
         let Some(cell) = self.cell(id) else { return };
         let pad = 8.0_f32;
         let cell_top = cell.y_origin();
@@ -9368,9 +9373,8 @@ impl KeptApp {
                 // For a Reference source, capture its full target so
                 // the whole-cell surface row can preserve a Subtree
                 // pointer when the user re-surfaces it.
-                let source_reference_target: Option<ReferenceTarget> = self
-                    .cell(cell_id)
-                    .and_then(|c| match &c.kind {
+                let source_reference_target: Option<ReferenceTarget> =
+                    self.cell(cell_id).and_then(|c| match &c.kind {
                         CellKind::Reference(rc) => Some(rc.target()),
                         _ => None,
                     });
@@ -9401,8 +9405,7 @@ impl KeptApp {
         // it (including the Quick-Add "click outside the card to
         // dismiss" path).
         if self.mention_popup.is_some() {
-            let in_rect =
-                |r: Rect| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+            let in_rect = |r: Rect| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
             if let Some(rect) = self.hit_tests.mention_popup.add_row {
                 if in_rect(rect) {
                     self.commit_add_mention();
@@ -9469,9 +9472,11 @@ impl KeptApp {
         // suggestions blurs all headers.
         let in_rect = |r: Rect| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
         // Click on a result row → commit it.
-        let result_click = self.hit_tests.header_results.iter().find_map(|(idx, rects)| {
-            rects.iter().position(|r| in_rect(*r)).map(|i| (*idx, i))
-        });
+        let result_click = self
+            .hit_tests
+            .header_results
+            .iter()
+            .find_map(|(idx, rects)| rects.iter().position(|r| in_rect(*r)).map(|i| (*idx, i)));
         if let Some((pane_idx, row_idx)) = result_click {
             let alt = modifiers.state().alt_key();
             self.commit_header_result(pane_idx, row_idx, alt);
@@ -9620,8 +9625,7 @@ impl KeptApp {
         // click still activate.
         let pane_idx = self.pane_at(x, y);
         let m = modifiers.state();
-        let alt_no_switch =
-            m.alt_key() && !m.shift_key() && !cell::primary_mod(m);
+        let alt_no_switch = m.alt_key() && !m.shift_key() && !cell::primary_mod(m);
         if let Some(pi) = pane_idx {
             if !alt_no_switch {
                 self.set_active_pane(pi);
@@ -9658,12 +9662,7 @@ impl KeptApp {
     /// branch, factored out so the Alt-drag-pan deferral path can
     /// replay it on `mouse_up` if the gesture didn't cross the pan
     /// threshold. Returns whether the click was consumed.
-    fn dispatch_sidebar_click(
-        &mut self,
-        x: f32,
-        y: f32,
-        modifiers: &Modifiers,
-    ) -> bool {
+    fn dispatch_sidebar_click(&mut self, x: f32, y: f32, modifiers: &Modifiers) -> bool {
         // Sidebar rects are stored in content-space; map mouse to
         // match (sidebar can scroll independently of the doc area).
         let y = y + self.sidebar_scroll.scroll_y;
@@ -9762,13 +9761,7 @@ impl KeptApp {
     /// active pane and computing `doc_y` (those depend on the
     /// click's coordinates and need to match between dispatch and
     /// any deferred replay).
-    fn dispatch_doc_click(
-        &mut self,
-        x: f32,
-        y: f32,
-        doc_y: f32,
-        modifiers: &Modifiers,
-    ) -> bool {
+    fn dispatch_doc_click(&mut self, x: f32, y: f32, doc_y: f32, modifiers: &Modifiers) -> bool {
         // Bar context menu dispatch: whole-cell operations (Surface,
         // Snooze, Envelope/Unwrap, Delete). Click anywhere else
         // dismisses and falls through to normal cell routing.
@@ -9886,10 +9879,7 @@ impl KeptApp {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.bar_context_menu.take() {
                         let target = ReferenceTarget::WholeCell(menu.cell_id);
-                        self.open_thread_attach_picker(
-                            target,
-                            (menu.anchor_x, menu.anchor_y),
-                        );
+                        self.open_thread_attach_picker(target, (menu.anchor_x, menu.anchor_y));
                     }
                     return true;
                 }
@@ -9938,9 +9928,7 @@ impl KeptApp {
                     if let Some(menu) = self.cell_context_menu.take() {
                         let target = menu
                             .source_reference_target
-                            .unwrap_or(ReferenceTarget::WholeCell(
-                                menu.reference_origin_cell_id,
-                            ));
+                            .unwrap_or(ReferenceTarget::WholeCell(menu.reference_origin_cell_id));
                         self.surface_as_reference(target);
                     }
                     return true;
@@ -10045,10 +10033,7 @@ impl KeptApp {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
                         let target = menu.whole_attach_target();
-                        self.open_thread_attach_picker(
-                            target,
-                            (menu.anchor_x, menu.anchor_y),
-                        );
+                        self.open_thread_attach_picker(target, (menu.anchor_x, menu.anchor_y));
                     }
                     return true;
                 }
@@ -10059,10 +10044,7 @@ impl KeptApp {
                 if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                     if let Some(menu) = self.cell_context_menu.take() {
                         if let Some(target) = menu.subtree_attach_target() {
-                            self.open_thread_attach_picker(
-                                target,
-                                (menu.anchor_x, menu.anchor_y),
-                            );
+                            self.open_thread_attach_picker(target, (menu.anchor_x, menu.anchor_y));
                         }
                     }
                     return true;
@@ -10126,13 +10108,12 @@ impl KeptApp {
         // `navigate_to_reference`.
         if matches!(self.pane_mut().view.view_kind, ViewKind::Entity(_)) {
             let hit = self
-                .hit_tests.entity_page.refs
+                .hit_tests
+                .entity_page
+                .refs
                 .iter()
                 .find(|(_, rect)| {
-                    x >= rect.left
-                        && x <= rect.right
-                        && doc_y >= rect.top
-                        && doc_y <= rect.bottom
+                    x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom
                 })
                 .map(|(id, _)| *id);
             if let Some(target_cell_id) = hit {
@@ -10145,11 +10126,7 @@ impl KeptApp {
         // "+ New thread…" footer row.
         if matches!(self.pane_mut().view.view_kind, ViewKind::ThreadList) {
             if let Some(rect) = self.hit_tests.thread_list_page.show_inactive_toggle {
-                if x >= rect.left
-                    && x <= rect.right
-                    && doc_y >= rect.top
-                    && doc_y <= rect.bottom
-                {
+                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     self.show_inactive_cells = !self.show_inactive_cells;
                     return true;
                 }
@@ -10159,20 +10136,14 @@ impl KeptApp {
                 .thread_list_page
                 .rows
                 .iter()
-                .find(|(_, r)| {
-                    x >= r.left && x <= r.right && doc_y >= r.top && doc_y <= r.bottom
-                })
+                .find(|(_, r)| x >= r.left && x <= r.right && doc_y >= r.top && doc_y <= r.bottom)
                 .map(|(id, _)| *id);
             if let Some(tid) = row_hit {
                 self.push_view(Query::thread(tid));
                 return true;
             }
             if let Some(rect) = self.hit_tests.thread_list_page.add_row {
-                if x >= rect.left
-                    && x <= rect.right
-                    && doc_y >= rect.top
-                    && doc_y <= rect.bottom
-                {
+                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     // Open the picker in create-only mode anchored
                     // near the footer click.
                     self.open_thread_picker(None, rect.left, rect.top);
@@ -10191,9 +10162,7 @@ impl KeptApp {
                 .hit_tests
                 .thread_page
                 .title
-                .map(|r| {
-                    x >= r.left && x <= r.right && doc_y >= r.top && doc_y <= r.bottom
-                })
+                .map(|r| x >= r.left && x <= r.right && doc_y >= r.top && doc_y <= r.bottom)
                 .unwrap_or(false);
             if self.thread_rename.is_some() && !title_hit {
                 self.commit_thread_rename();
@@ -10203,8 +10172,7 @@ impl KeptApp {
                 return true;
             }
             if let Some(rect) = self.hit_tests.thread_page.close_toggle {
-                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom
-                {
+                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     let currently_open = self
                         .threads
                         .iter()
@@ -10221,9 +10189,7 @@ impl KeptApp {
                 .thread_page
                 .detach_buttons
                 .iter()
-                .position(|r| {
-                    x >= r.left && x <= r.right && doc_y >= r.top && doc_y <= r.bottom
-                });
+                .position(|r| x >= r.left && x <= r.right && doc_y >= r.top && doc_y <= r.bottom);
             if let Some(i) = detach_hit {
                 if let Some((target, _)) = self.hit_tests.thread_page.members.get(i).copied() {
                     self.detach_from_thread(tid, target);
@@ -10236,10 +10202,7 @@ impl KeptApp {
                 .members
                 .iter()
                 .find(|(_, rect)| {
-                    x >= rect.left
-                        && x <= rect.right
-                        && doc_y >= rect.top
-                        && doc_y <= rect.bottom
+                    x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom
                 })
                 .map(|(target, _)| *target);
             if let Some(target) = member_hit {
@@ -10259,11 +10222,7 @@ impl KeptApp {
             // / add input — toggling the filter shouldn't lose typed
             // text but shouldn't get masked by the input rects either.
             if let Some(rect) = self.hit_tests.people_page.show_inactive_toggle {
-                if x >= rect.left
-                    && x <= rect.right
-                    && doc_y >= rect.top
-                    && doc_y <= rect.bottom
-                {
+                if x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom {
                     if self.people_rename.is_some() {
                         self.commit_people_rename();
                     }
@@ -10279,16 +10238,14 @@ impl KeptApp {
             let renaming_id = self.people_rename.as_ref().map(|s| s.entity_id);
             if let Some(rid) = renaming_id {
                 let rename_rect = self
-                    .hit_tests.people_page.rows
+                    .hit_tests
+                    .people_page
+                    .rows
                     .iter()
                     .find(|(eid, _)| *eid == rid)
                     .map(|(_, r)| *r);
                 if let Some(rr) = rename_rect {
-                    if x >= rr.left
-                        && x <= rr.right
-                        && doc_y >= rr.top
-                        && doc_y <= rr.bottom
-                    {
+                    if x >= rr.left && x <= rr.right && doc_y >= rr.top && doc_y <= rr.bottom {
                         if let Some(rs) = self.people_rename.as_mut() {
                             rs.input.mouse_down(x, doc_y, modifiers, true);
                         }
@@ -10301,11 +10258,7 @@ impl KeptApp {
             }
             if self.people_add.is_some() {
                 if let Some(ar) = self.hit_tests.people_page.add {
-                    if x >= ar.left
-                        && x <= ar.right
-                        && doc_y >= ar.top
-                        && doc_y <= ar.bottom
-                    {
+                    if x >= ar.left && x <= ar.right && doc_y >= ar.top && doc_y <= ar.bottom {
                         if let Some(input) = self.people_add.as_mut() {
                             input.mouse_down(x, doc_y, modifiers, true);
                         }
@@ -10340,10 +10293,7 @@ impl KeptApp {
             .cell_thread_chips
             .iter()
             .find(|(_, rect)| {
-                x >= rect.left
-                    && x <= rect.right
-                    && doc_y >= rect.top
-                    && doc_y <= rect.bottom
+                x >= rect.left && x <= rect.right && doc_y >= rect.top && doc_y <= rect.bottom
             })
             .map(|(tid, _)| *tid);
         if let Some(tid) = chip_hit {
@@ -10387,12 +10337,7 @@ impl KeptApp {
     /// Owns: pick the target cell, retire other cells' selections,
     /// shift focus, set up the cell drag binding, dispatch
     /// `cell.mouse_down`, and drain any link/tag the click stashed.
-    fn dispatch_cell_click(
-        &mut self,
-        x: f32,
-        doc_y: f32,
-        modifiers: &Modifiers,
-    ) -> bool {
+    fn dispatch_cell_click(&mut self, x: f32, doc_y: f32, modifiers: &Modifiers) -> bool {
         let Some(target) = self.find_cell_at(x, doc_y) else {
             return false;
         };
@@ -10474,7 +10419,12 @@ impl KeptApp {
     /// on free-text lands you in a substring-match view. Blurs
     /// the header on commit. No-op when the typed text is empty.
     fn commit_header_filter(&mut self, pane_idx: usize, alt: bool) {
-        let text = self.panes[pane_idx].header.textbox.text().trim().to_string();
+        let text = self.panes[pane_idx]
+            .header
+            .textbox
+            .text()
+            .trim()
+            .to_string();
         if text.is_empty() {
             self.panes[pane_idx].header.blur();
             return;
@@ -10717,11 +10667,8 @@ impl KeptApp {
         if let Some(tp) = self.tentative_pan.take() {
             match tp.target {
                 PanTarget::Sidebar => {
-                    let _ = self.dispatch_sidebar_click(
-                        tp.click_x,
-                        tp.click_y,
-                        &tp.click_modifiers,
-                    );
+                    let _ =
+                        self.dispatch_sidebar_click(tp.click_x, tp.click_y, &tp.click_modifiers);
                 }
                 PanTarget::Pane(_) => {
                     let _ = self.dispatch_doc_click(
@@ -10840,7 +10787,6 @@ fn scrollbar_alpha(last: Option<Instant>) -> f32 {
     }
 }
 
-
 /// Pill-shaped on/off switch. `on=true` paints the track in the
 /// active-blue used elsewhere with the knob on the right; `on=false` is
 /// muted gray with the knob on the left. `hovered=true` adds a subtle
@@ -10885,13 +10831,7 @@ fn local_date_for_ms(epoch_ms: i64) -> chrono::NaiveDate {
         .timestamp_millis_opt(epoch_ms)
         .single()
         .map(|dt| dt.date_naive())
-        .unwrap_or_else(|| {
-            Local
-                .timestamp_millis_opt(0)
-                .single()
-                .unwrap()
-                .date_naive()
-        })
+        .unwrap_or_else(|| Local.timestamp_millis_opt(0).single().unwrap().date_naive())
 }
 
 /// Trim a cell's full text to a single-line snippet centered around the
@@ -11034,9 +10974,7 @@ fn build_copy_payload_for_cell(
                                 depth: d,
                                 text: t,
                                 links: SerLink::spans_to_ser(&ls),
-                                thread_ids: thread_lookup
-                                    .map(|f| f(src_id))
-                                    .unwrap_or_default(),
+                                thread_ids: thread_lookup.map(|f| f(src_id)).unwrap_or_default(),
                             })
                             .collect(),
                     });
@@ -11072,11 +11010,7 @@ fn build_copy_payload_for_cell(
 /// or body, depending on `cell.title_focused`. Cell-local primitive
 /// shared by `KeptApp::paste_text_with_links` and the Quick-Add
 /// modal's paste path.
-fn paste_text_with_links_into_cell(
-    cell: &mut Cell,
-    text: &str,
-    links: &[crate::cell::LinkSpan],
-) {
+fn paste_text_with_links_into_cell(cell: &mut Cell, text: &str, links: &[crate::cell::LinkSpan]) {
     if cell.title_focused {
         if let Some(title) = cell.title_mut() {
             title.paste_with_links(text, links);
@@ -11107,10 +11041,7 @@ struct PasteResult {
 /// document path uses `surface_as_reference` for the alternate
 /// variant). Cell-local so the Quick-Add modal can paste without
 /// going through the focus-and-dirty machinery.
-fn apply_paste_into_cell(
-    cell: &mut Cell,
-    payload: crate::clipboard::KeptPayload,
-) -> PasteResult {
+fn apply_paste_into_cell(cell: &mut Cell, payload: crate::clipboard::KeptPayload) -> PasteResult {
     use crate::clipboard::{KeptPayload, SerLink};
     let mut result = PasteResult::default();
     match payload {
@@ -11132,9 +11063,8 @@ fn apply_paste_into_cell(
                         .map(|b| (b.depth, b.text, SerLink::ser_to_spans(b.links)))
                         .collect();
                     let new_ids = oc.insert_bullets_after_focused(raw);
-                    for (new_id, threads) in new_ids
-                        .into_iter()
-                        .zip(thread_ids_per_bullet.into_iter())
+                    for (new_id, threads) in
+                        new_ids.into_iter().zip(thread_ids_per_bullet.into_iter())
                     {
                         if !threads.is_empty() {
                             result.bullet_threads.push((new_id, threads));
@@ -11143,11 +11073,7 @@ fn apply_paste_into_cell(
                 }
             } else {
                 let (text, links) = flatten_outline(&bullets);
-                paste_text_with_links_into_cell(
-                    cell,
-                    &text,
-                    &SerLink::ser_to_spans(links),
-                );
+                paste_text_with_links_into_cell(cell, &text, &SerLink::ser_to_spans(links));
             }
         }
         KeptPayload::Reference { target, snippet } => {
@@ -11205,11 +11131,7 @@ fn compute_outline_bullet_filter(
         return None;
     }
     let m = oc.bullets_matching_any_tag(include_tags);
-    if m.is_empty() {
-        None
-    } else {
-        Some(m)
-    }
+    if m.is_empty() { None } else { Some(m) }
 }
 
 fn format_date_label(d: chrono::NaiveDate) -> String {
@@ -11436,11 +11358,7 @@ fn select_subtree_at_doc_y(
     top_cell_id: Uuid,
     doc_y: f32,
 ) -> Option<(Uuid, Uuid, String)> {
-    fn descend(
-        kind: &mut CellKind,
-        origin: Uuid,
-        doc_y: f32,
-    ) -> Option<(Uuid, Uuid, String)> {
+    fn descend(kind: &mut CellKind, origin: Uuid, doc_y: f32) -> Option<(Uuid, Uuid, String)> {
         match kind {
             CellKind::Outline(oc) => {
                 // Envelope outline: a click inside the header band
@@ -11454,9 +11372,7 @@ fn select_subtree_at_doc_y(
                 // wasn't in the bullet region.
                 if let Some((top, bot)) = oc.header_y_band() {
                     if doc_y >= top && doc_y < bot {
-                        let new_origin = oc
-                            .reference_header()
-                            .map(|h| h.target().cell_id())?;
+                        let new_origin = oc.reference_header().map(|h| h.target().cell_id())?;
                         return oc
                             .reference_header_mut()
                             .and_then(|h| h.cache_mut())
@@ -11480,7 +11396,6 @@ fn select_subtree_at_doc_y(
     }
     descend(&mut cell.kind, top_cell_id, doc_y)
 }
-
 
 #[cfg(test)]
 mod tests {

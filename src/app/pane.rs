@@ -18,9 +18,9 @@ use crate::query;
 
 use super::{
     CELL_GAP, DOC_BOTTOM_PAD, FOCUS_MODE_PAD, FOCUS_PAD, FOCUS_RADIUS, FOCUS_RING_ALPHA,
-    FOCUS_RING_ALPHA_EDIT, FOCUS_SHADOW_ALPHA, FOCUS_SHADOW_BLUR, FOCUS_SHADOW_DY,
-    FOCUS_STROKE, FOCUS_STROKE_EDIT, KeptApp, MARGIN_TOP, MARGIN_X, Query, ViewKind,
-    fit_text_ellipsized, format_date_label, local_date_for_ms,
+    FOCUS_RING_ALPHA_EDIT, FOCUS_SHADOW_ALPHA, FOCUS_SHADOW_BLUR, FOCUS_SHADOW_DY, FOCUS_STROKE,
+    FOCUS_STROKE_EDIT, KeptApp, MARGIN_TOP, MARGIN_X, Query, ViewKind, fit_text_ellipsized,
+    format_date_label, local_date_for_ms,
     search::{result_snippet, search_results},
 };
 
@@ -229,7 +229,10 @@ impl KeptApp {
         self.step_kinetic(pane_idx);
 
         // Clamp scroll using last frame's max_scroll before drawing this frame.
-        self.pane_mut().scroll_y = self.pane_mut().scroll_y.clamp(0.0, self.pane_mut().max_scroll);
+        self.pane_mut().scroll_y = self
+            .pane_mut()
+            .scroll_y
+            .clamp(0.0, self.pane_mut().max_scroll);
 
         let pane_rect = self.panes[pane_idx].last_rect;
         let pane_left = pane_rect.left;
@@ -330,7 +333,9 @@ impl KeptApp {
 
         // Record the pill rect so click dispatch can route a click
         // inside it to the textbox.
-        self.hit_tests_builder.pane_headers.push((pane_idx, pill_rect));
+        self.hit_tests_builder
+            .pane_headers
+            .push((pane_idx, pill_rect));
 
         // Sync the textbox text from the view's query summary, but
         // only when the view itself has changed since the last sync
@@ -365,7 +370,14 @@ impl KeptApp {
         let inner_w = (pill_rect.width() - 2.0 * PANE_HEADER_PAD_X).max(0.0);
         let tb = &mut self.panes[pane_idx].header.textbox;
         tb.set_font_scale(scale);
-        tb.tick(canvas, inner_x, inner_y, inner_w, header_focused, header_focused);
+        tb.tick(
+            canvas,
+            inner_x,
+            inner_y,
+            inner_w,
+            header_focused,
+            header_focused,
+        );
 
         // While focused with a non-empty query, drop a result
         // dropdown under the pill — same shape as the old Ctrl+K
@@ -385,12 +397,7 @@ impl KeptApp {
     /// so click / Enter dispatch can act on the same list the user
     /// is looking at. Records per-row hit rects in
     /// `hit_tests_builder.header_results`.
-    fn render_pane_header_results(
-        &mut self,
-        canvas: &Canvas,
-        pill_rect: Rect,
-        pane_idx: usize,
-    ) {
+    fn render_pane_header_results(&mut self, canvas: &Canvas, pill_rect: Rect, pane_idx: usize) {
         let scale = self.font_scale;
         let query = self.panes[pane_idx].header.textbox.text().to_string();
         // While the @-mention popup is open over the pill, keep
@@ -444,7 +451,12 @@ impl KeptApp {
         shadow.set_color(crate::color::shadow_menu());
         shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 14.0, false));
         canvas.draw_round_rect(
-            Rect::new(drop_rect.left, drop_rect.top + 4.0, drop_rect.right, drop_rect.bottom + 4.0),
+            Rect::new(
+                drop_rect.left,
+                drop_rect.top + 4.0,
+                drop_rect.right,
+                drop_rect.bottom + 4.0,
+            ),
             radius,
             radius,
             &shadow,
@@ -461,8 +473,7 @@ impl KeptApp {
         canvas.draw_round_rect(drop_rect, radius, radius, &border);
 
         // Empty-state row when the query produced no matches.
-        let result_font =
-            Font::from_typeface(&self.typeface, HEADER_RESULT_FONT_SIZE * scale);
+        let result_font = Font::from_typeface(&self.typeface, HEADER_RESULT_FONT_SIZE * scale);
         let date_font = Font::from_typeface(&self.typeface, HEADER_DATE_FONT_SIZE * scale);
         let (_, rm) = result_font.metrics();
         if visible == 0 {
@@ -531,8 +542,7 @@ impl KeptApp {
                     let name_left = drop_rect.left + pad + tag_w + 12.0 * scale;
                     let name_right = drop_rect.right - pad * 0.5;
                     let avail = (name_right - name_left).max(0.0);
-                    let fitted =
-                        fit_text_ellipsized(&name, avail, &result_font, &row_paint);
+                    let fitted = fit_text_ellipsized(&name, avail, &result_font, &row_paint);
                     canvas.draw_str(
                         &fitted,
                         Point::new(name_left, baseline),
@@ -554,8 +564,7 @@ impl KeptApp {
                         let snippet_left = drop_rect.left + pad + date_w + 12.0 * scale;
                         let snippet_right = drop_rect.right - pad * 0.5;
                         let avail = (snippet_right - snippet_left).max(0.0);
-                        let fitted =
-                            fit_text_ellipsized(&snippet, avail, &result_font, &row_paint);
+                        let fitted = fit_text_ellipsized(&snippet, avail, &result_font, &row_paint);
                         canvas.draw_str(
                             &fitted,
                             Point::new(snippet_left, baseline),
@@ -599,11 +608,7 @@ impl KeptApp {
         match &view.view_kind {
             ViewKind::Ast => {
                 let t = query::to_text(&view.ast);
-                if t.is_empty() {
-                    "(all)".to_string()
-                } else {
-                    t
-                }
+                if t.is_empty() { "(all)".to_string() } else { t }
             }
             ViewKind::Context(id) => self
                 .document
@@ -730,7 +735,14 @@ impl KeptApp {
         canvas: &Canvas,
         geom: Option<FocusedCellGeom>,
     ) {
-        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch, .. }) = geom else {
+        let Some(FocusedCellGeom {
+            x: cx,
+            y: cy,
+            w: cw,
+            h: ch,
+            ..
+        }) = geom
+        else {
             return;
         };
         let card_rect = Rect::new(
@@ -759,19 +771,13 @@ impl KeptApp {
             card_rect.right,
             card_rect.bottom + FOCUS_SHADOW_DY,
         );
-        let shadow_rr = skia_safe::RRect::new_rect_radii(
-            shadow_rect,
-            &[flat, round, round, flat],
-        );
+        let shadow_rr = skia_safe::RRect::new_rect_radii(shadow_rect, &[flat, round, round, flat]);
         canvas.draw_rrect(&shadow_rr, &shadow_paint);
         // White card fill.
         let mut fill_paint = Paint::default();
         fill_paint.set_anti_alias(true);
         fill_paint.set_color(crate::color::bg_card());
-        let card_rr = skia_safe::RRect::new_rect_radii(
-            card_rect,
-            &[flat, round, round, flat],
-        );
+        let card_rr = skia_safe::RRect::new_rect_radii(card_rect, &[flat, round, round, flat]);
         canvas.draw_rrect(&card_rr, &fill_paint);
     }
 
@@ -783,7 +789,13 @@ impl KeptApp {
     /// the edit-mode tell — without it the user can't see when
     /// they've entered edit mode. No-op when `geom` is None.
     pub(super) fn render_focus_ring(&self, canvas: &Canvas, geom: Option<FocusedCellGeom>) {
-        let Some(FocusedCellGeom { x: cx, y: cy, w: cw, h: ch, bar_left_dx }) = geom
+        let Some(FocusedCellGeom {
+            x: cx,
+            y: cy,
+            w: cw,
+            h: ch,
+            bar_left_dx,
+        }) = geom
         else {
             return;
         };
@@ -1010,10 +1022,7 @@ mod tests {
     fn shortcut_unknown_person_returns_none() {
         let alias_index: Vec<(String, Uuid, String)> = vec![];
         let ast = query::parse("@nobody");
-        assert_eq!(
-            entity_page_shortcuts_for_ast(&ast, &alias_index, &[]),
-            None
-        );
+        assert_eq!(entity_page_shortcuts_for_ast(&ast, &alias_index, &[]), None);
     }
 
     #[test]
@@ -1022,10 +1031,7 @@ mod tests {
         let alice = Uuid::new_v4();
         let alias_index = vec![person_alias("alice", alice)];
         let ast = query::parse("@alice cluster");
-        assert_eq!(
-            entity_page_shortcuts_for_ast(&ast, &alias_index, &[]),
-            None
-        );
+        assert_eq!(entity_page_shortcuts_for_ast(&ast, &alias_index, &[]), None);
     }
 
     #[test]
@@ -1033,10 +1039,7 @@ mod tests {
         let alice = Uuid::new_v4();
         let alias_index = vec![person_alias("alice", alice)];
         let ast = query::parse("@alice #urgent");
-        assert_eq!(
-            entity_page_shortcuts_for_ast(&ast, &alias_index, &[]),
-            None
-        );
+        assert_eq!(entity_page_shortcuts_for_ast(&ast, &alias_index, &[]), None);
     }
 
     #[test]
@@ -1044,10 +1047,7 @@ mod tests {
         let alice = Uuid::new_v4();
         let alias_index = vec![person_alias("alice", alice)];
         let ast = query::parse("@alice today");
-        assert_eq!(
-            entity_page_shortcuts_for_ast(&ast, &alias_index, &[]),
-            None
-        );
+        assert_eq!(entity_page_shortcuts_for_ast(&ast, &alias_index, &[]), None);
     }
 
     #[test]
@@ -1056,10 +1056,7 @@ mod tests {
         let bob = Uuid::new_v4();
         let alias_index = vec![person_alias("alice", alice), person_alias("bob", bob)];
         let ast = query::parse("@alice -@bob");
-        assert_eq!(
-            entity_page_shortcuts_for_ast(&ast, &alias_index, &[]),
-            None
-        );
+        assert_eq!(entity_page_shortcuts_for_ast(&ast, &alias_index, &[]), None);
     }
 
     #[test]

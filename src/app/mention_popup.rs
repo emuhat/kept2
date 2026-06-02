@@ -93,7 +93,10 @@ impl MentionKind {
 
 #[derive(Clone, Copy)]
 pub(super) enum MentionSource {
-    Cell { cell_id: Uuid, bullet_id: Option<Uuid> },
+    Cell {
+        cell_id: Uuid,
+        bullet_id: Option<Uuid>,
+    },
     /// The pane's URL-bar pill (replaces the old standalone
     /// Ctrl+K popup). `pane_idx` is the pane the focused header
     /// belongs to.
@@ -227,8 +230,8 @@ fn filter_mentions(
                 } else {
                     s - INACTIVE_FUZZY_PENALTY
                 };
-                let bonus = (*mention_count as i32 * MENTION_FREQUENCY_WEIGHT)
-                    .min(MENTION_FREQUENCY_CAP);
+                let bonus =
+                    (*mention_count as i32 * MENTION_FREQUENCY_WEIGHT).min(MENTION_FREQUENCY_CAP);
                 s += bonus;
                 (s, name.clone(), m, *mention_count)
             })
@@ -315,7 +318,12 @@ impl MentionPopup {
         // the window.
         let initial_top = anchor_y_below + 4.0 * scale;
         let clamped = clamp_rect_to_viewport(
-            Rect::new(anchor_x, initial_top, anchor_x + popup_w, initial_top + popup_h),
+            Rect::new(
+                anchor_x,
+                initial_top,
+                anchor_x + popup_w,
+                initial_top + popup_h,
+            ),
             view_w,
             view_h,
             4.0,
@@ -521,7 +529,12 @@ impl MentionPopup {
             } else {
                 let trigger = kind.trigger();
                 let w = body_font.measure_str(trigger, Some(&dim_paint)).0;
-                canvas.draw_str(trigger, Point::new(text_x, baseline), &body_font, &dim_paint);
+                canvas.draw_str(
+                    trigger,
+                    Point::new(text_x, baseline),
+                    &body_font,
+                    &dim_paint,
+                );
                 w
             };
             draw_runs_with_matches(
@@ -537,8 +550,7 @@ impl MentionPopup {
             // for "who you interact with often". Suppressed at 0
             // (tags + cold-start people) to avoid noise.
             if *mention_count > 0 {
-                let count_font =
-                    Font::from_typeface(ctx.typeface, MENTION_COUNT_FONT_SIZE * scale);
+                let count_font = Font::from_typeface(ctx.typeface, MENTION_COUNT_FONT_SIZE * scale);
                 let mut count_paint = Paint::default();
                 count_paint.set_anti_alias(true);
                 // Even softer than `dim_paint` — pulls the count
@@ -587,11 +599,13 @@ impl KeptApp {
             .entities
             .iter()
             .filter(|e| e.kind == "person")
-            .map(|e| (
-                e.display_name.clone(),
-                e.is_active,
-                self.entities.mention_count(e.id),
-            ))
+            .map(|e| {
+                (
+                    e.display_name.clone(),
+                    e.is_active,
+                    self.entities.mention_count(e.id),
+                )
+            })
             .collect();
         out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
         out
@@ -880,7 +894,10 @@ impl KeptApp {
         };
 
         let anchor_pos = match source {
-            MentionSource::Cell { cell_id, bullet_id: _ } => {
+            MentionSource::Cell {
+                cell_id,
+                bullet_id: _,
+            } => {
                 let Some(cell) = self.cell(cell_id) else {
                     return;
                 };
@@ -894,7 +911,9 @@ impl KeptApp {
                 (x, y - scroll_y)
             }
             MentionSource::PaneHeader { pane_idx } => {
-                let Some(pane) = self.panes.get(pane_idx) else { return };
+                let Some(pane) = self.panes.get(pane_idx) else {
+                    return;
+                };
                 let tb = &pane.header.textbox;
                 let Some((x, _)) = tb.doc_position_of_byte(anchor_byte) else {
                     return;
@@ -905,7 +924,9 @@ impl KeptApp {
                 (x, bot)
             }
             MentionSource::QuickAdd => {
-                let Some(state) = self.quick_add.as_ref() else { return };
+                let Some(state) = self.quick_add.as_ref() else {
+                    return;
+                };
                 // The modal's cell renders in window-space (the
                 // overlay isn't doc-translated), so its
                 // `anchor_doc_pos` is already a window-space point
@@ -1000,9 +1021,7 @@ impl KeptApp {
         match popup.kind {
             MentionKind::Person => {
                 let entries = self.person_entries();
-                let Some((_, source_id)) =
-                    entries.iter().find(|(n, _)| n == &chosen_name)
-                else {
+                let Some((_, source_id)) = entries.iter().find(|(n, _)| n == &chosen_name) else {
                     return true;
                 };
                 let source_id = *source_id;
@@ -1013,19 +1032,11 @@ impl KeptApp {
             }
             MentionKind::Thread => {
                 let entries = self.thread_entries();
-                let Some((_, thread_id)) =
-                    entries.iter().find(|(n, _)| n == &chosen_name)
-                else {
+                let Some((_, thread_id)) = entries.iter().find(|(n, _)| n == &chosen_name) else {
                     return true;
                 };
                 let thread_id = *thread_id;
-                self.commit_thread_mention(
-                    popup.source,
-                    start,
-                    end,
-                    chosen_name,
-                    thread_id,
-                );
+                self.commit_thread_mention(popup.source, start, end, chosen_name, thread_id);
             }
         }
         self.pane_mut().coalesce_break = true;
@@ -1063,9 +1074,7 @@ impl KeptApp {
                     Some(db) => match db.create_cell_less_person_entity(&query) {
                         Ok(id) => id,
                         Err(e) => {
-                            eprintln!(
-                                "kept: create_cell_less_person_entity failed: {e}",
-                            );
+                            eprintln!("kept: create_cell_less_person_entity failed: {e}",);
                             return false;
                         }
                     },
@@ -1118,7 +1127,10 @@ impl KeptApp {
     ) {
         let url = format!("kept://{}", thread_id);
         match source {
-            MentionSource::Cell { cell_id, bullet_id: _ } => {
+            MentionSource::Cell {
+                cell_id,
+                bullet_id: _,
+            } => {
                 let pre = match self.cell(cell_id) {
                     Some(c) => c.snapshot(),
                     None => return,
@@ -1139,22 +1151,11 @@ impl KeptApp {
                 // thread page actually contains the cell. Idempotent
                 // — a second `%` mention of the same thread is a
                 // no-op on the memberships table.
-                self.attach_to_thread(
-                    thread_id,
-                    crate::cell::ReferenceTarget::WholeCell(cell_id),
-                );
+                self.attach_to_thread(thread_id, crate::cell::ReferenceTarget::WholeCell(cell_id));
             }
             MentionSource::PaneHeader { .. } => {
-                let slug = chosen_name
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join("_");
-                self.replace_search_or_cell_text(
-                    source,
-                    start,
-                    end,
-                    format!("%{slug}"),
-                );
+                let slug = chosen_name.split_whitespace().collect::<Vec<_>>().join("_");
+                self.replace_search_or_cell_text(source, start, end, format!("%{slug}"));
             }
             MentionSource::QuickAdd => {
                 let pre = match self.quick_add.as_ref() {
@@ -1162,7 +1163,8 @@ impl KeptApp {
                     None => return,
                 };
                 if let Some(s) = self.quick_add.as_mut() {
-                    s.cell.replace_focused_with_link(start..end, chosen_name, url);
+                    s.cell
+                        .replace_focused_with_link(start..end, chosen_name, url);
                 }
                 if let Some(s) = self.quick_add.as_mut() {
                     let post = s.cell.snapshot();
@@ -1196,7 +1198,10 @@ impl KeptApp {
         source_id: Uuid,
     ) {
         match source {
-            MentionSource::Cell { cell_id, bullet_id: _ } => {
+            MentionSource::Cell {
+                cell_id,
+                bullet_id: _,
+            } => {
                 let pre = match self.cell(cell_id) {
                     Some(c) => c.snapshot(),
                     None => return,
@@ -1223,16 +1228,8 @@ impl KeptApp {
                 // whitespace and underscores, lowercases — so
                 // `@Patrick_Foy` matches the person cell titled
                 // "Patrick Foy".
-                let slug = chosen_name
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join("_");
-                self.replace_search_or_cell_text(
-                    source,
-                    start,
-                    end,
-                    format!("@{slug}"),
-                );
+                let slug = chosen_name.split_whitespace().collect::<Vec<_>>().join("_");
+                self.replace_search_or_cell_text(source, start, end, format!("@{slug}"));
             }
             MentionSource::QuickAdd => {
                 // Same link-insertion shape as the Cell arm, but
@@ -1246,7 +1243,8 @@ impl KeptApp {
                 };
                 let url = format!("kept://{}", source_id);
                 if let Some(s) = self.quick_add.as_mut() {
-                    s.cell.replace_focused_with_link(start..end, chosen_name, url);
+                    s.cell
+                        .replace_focused_with_link(start..end, chosen_name, url);
                 }
                 if let Some(s) = self.quick_add.as_mut() {
                     let post = s.cell.snapshot();
@@ -1278,7 +1276,10 @@ impl KeptApp {
     ) {
         let replacement = format!("#{chosen_name}");
         match source {
-            MentionSource::Cell { cell_id, bullet_id: _ } => {
+            MentionSource::Cell {
+                cell_id,
+                bullet_id: _,
+            } => {
                 let pre = match self.cell(cell_id) {
                     Some(c) => c.snapshot(),
                     None => return,
@@ -1331,7 +1332,10 @@ impl KeptApp {
         replacement: String,
     ) {
         match source {
-            MentionSource::Cell { cell_id, bullet_id: _ } => {
+            MentionSource::Cell {
+                cell_id,
+                bullet_id: _,
+            } => {
                 let pre = match self.cell(cell_id) {
                     Some(c) => c.snapshot(),
                     None => return,
@@ -1463,8 +1467,8 @@ mod tests {
         // captures the user complaint: the "short" initials match
         // shouldn't always pick the rarely-interacted person.
         let cands = vec![
-            ("PatrickFoy".to_string(), true, 0),   // rarely mentioned
-            ("PeterCarr".to_string(), true, 50),   // often mentioned
+            ("PatrickFoy".to_string(), true, 0), // rarely mentioned
+            ("PeterCarr".to_string(), true, 50), // often mentioned
         ];
         let ranked = filter_mentions(&cands, "p");
         assert_eq!(ranked[0].0, "PeterCarr");

@@ -127,8 +127,7 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
     canvas.clip_rect(Rect::new(0.0, 0.0, sb_w, height.max(0.0)), None, true);
     canvas.translate((0.0, -scroll_y));
 
-    let header_font =
-        Font::from_typeface(ctx.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
+    let header_font = Font::from_typeface(ctx.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
     let mut header_paint = Paint::default();
     header_paint.set_anti_alias(true);
     header_paint.set_color(crate::color::sidebar_section_header());
@@ -158,17 +157,62 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
     );
     y += header_h;
     let inbox_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
+    let inbox_is_active = matches!(ctx.view.view_kind, ViewKind::Inbox);
     draw_sidebar_row(
         canvas,
         inbox_rect,
         "Inbox",
-        matches!(ctx.view.view_kind, ViewKind::Inbox),
+        inbox_is_active,
         in_row(inbox_rect),
         radius,
         pad_x,
         &row_font,
     );
-    ctx.hit_tests.sidebar.pages.push((PageKind::Inbox, inbox_rect));
+    // Count badge — open, non-scratch cells with inbox=true.
+    let inbox_count = ctx
+        .document
+        .cells
+        .iter()
+        .filter(|c| c.inbox && c.is_open() && !c.scratch)
+        .count();
+    if inbox_count > 0 {
+        let badge_font = Font::from_typeface(ctx.typeface, 11.0 * scale);
+        let count_str = if inbox_count > 99 {
+            "99+".to_string()
+        } else {
+            inbox_count.to_string()
+        };
+        let (text_w, _) = badge_font.measure_str(&count_str, None);
+        let badge_pad_x = 5.0 * scale;
+        let badge_h = 16.0 * scale;
+        let badge_w = (text_w + badge_pad_x * 2.0).max(badge_h);
+        let badge_right = inbox_rect.right - pad_x * 0.5;
+        let badge_left = badge_right - badge_w;
+        let badge_top = inbox_rect.center_y() - badge_h * 0.5;
+        let badge_rect = Rect::new(badge_left, badge_top, badge_right, badge_top + badge_h);
+        let badge_radius = badge_h * 0.5;
+        let mut badge_bg = Paint::default();
+        badge_bg.set_anti_alias(true);
+        badge_bg.set_color(skia_safe::Color::from_rgb(0xD0, 0x2B, 0x2B));
+        canvas.draw_round_rect(badge_rect, badge_radius, badge_radius, &badge_bg);
+        let (_, bm) = badge_font.metrics();
+        let badge_baseline =
+            badge_rect.top + (badge_rect.height() + (-bm.ascent) - bm.descent) * 0.5;
+        let text_x = badge_rect.left + (badge_rect.width() - text_w) * 0.5;
+        let mut badge_text = Paint::default();
+        badge_text.set_anti_alias(true);
+        badge_text.set_color(skia_safe::Color::WHITE);
+        canvas.draw_str(
+            &count_str,
+            Point::new(text_x, badge_baseline),
+            &badge_font,
+            &badge_text,
+        );
+    }
+    ctx.hit_tests
+        .sidebar
+        .pages
+        .push((PageKind::Inbox, inbox_rect));
     y += date_h + item_gap;
     let current_rect = Rect::new(pad_x * 0.5, y, sb_w - pad_x * 0.5, y + date_h);
     draw_sidebar_row(
@@ -181,7 +225,10 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         pad_x,
         &row_font,
     );
-    ctx.hit_tests.sidebar.pages.push((PageKind::Current, current_rect));
+    ctx.hit_tests
+        .sidebar
+        .pages
+        .push((PageKind::Current, current_rect));
     y += date_h + item_gap;
 
     // Scratch sits at the end of WHAT so the principled
@@ -198,7 +245,10 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         pad_x,
         &row_font,
     );
-    ctx.hit_tests.sidebar.pages.push((PageKind::Scratch, scratch_rect));
+    ctx.hit_tests
+        .sidebar
+        .pages
+        .push((PageKind::Scratch, scratch_rect));
     y += date_h + date_gap;
 
     // ---- WHEN section ----
@@ -275,7 +325,10 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         .collect();
     if let Some(active) = active_date {
         if !dates.contains(&active) {
-            let pos = dates.iter().position(|d| *d < active).unwrap_or(dates.len());
+            let pos = dates
+                .iter()
+                .position(|d| *d < active)
+                .unwrap_or(dates.len());
             dates.insert(pos, active);
         }
     }
@@ -353,7 +406,10 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         &header_font,
         &header_paint,
     );
-    ctx.hit_tests.sidebar.pages.push((PageKind::ThreadList, threads_header_rect));
+    ctx.hit_tests
+        .sidebar
+        .pages
+        .push((PageKind::ThreadList, threads_header_rect));
     y += header_h;
 
     for t in &ctx.threads {
@@ -405,7 +461,10 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         pad_x,
         &row_font,
     );
-    ctx.hit_tests.sidebar.pages.push((PageKind::People, people_rect));
+    ctx.hit_tests
+        .sidebar
+        .pages
+        .push((PageKind::People, people_rect));
     y += date_h + item_gap;
 
     // "Show archived" toggle pill at the very bottom of the
@@ -435,8 +494,7 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
         && mouse_y <= toggle_rect.bottom;
     // Label (same muted-grey style as section headers — this row
     // is metadata, not navigation).
-    let label_font =
-        Font::from_typeface(ctx.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
+    let label_font = Font::from_typeface(ctx.typeface, SIDEBAR_HEADER_FONT_SIZE * scale);
     let mut label_paint = Paint::default();
     label_paint.set_anti_alias(true);
     label_paint.set_color(crate::color::sidebar_section_header());
@@ -462,7 +520,8 @@ pub(super) fn render(canvas: &Canvas, height: f32, ctx: &mut SidebarRenderCtx<'_
 
     // Sidebar scrollbar — anchored just inside the right-edge
     // separator (`sb_w - 1.0` is the separator itself).
-    ctx.scroll.draw_bar(canvas, sb_w - 1.0, height, total_h, 0.0);
+    ctx.scroll
+        .draw_bar(canvas, sb_w - 1.0, height, total_h, 0.0);
 }
 
 impl KeptApp {

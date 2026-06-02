@@ -39,10 +39,7 @@ pub enum KeptPayload {
     /// into a plain text context flattens with leading whitespace.
     Outline { bullets: Vec<BulletPayload> },
     /// "Copy reference" → paste-as-link or paste-as-cell.
-    Reference {
-        target: SerTarget,
-        snippet: String,
-    },
+    Reference { target: SerTarget, snippet: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,9 +305,7 @@ fn extract_payload_marker(html: &str) -> Option<KeptPayload> {
     let start = html.find(&needle)? + needle.len();
     let end = html[start..].find('"')? + start;
     let b64 = &html[start..end];
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     let json = std::str::from_utf8(&bytes).ok()?;
     serde_json::from_str::<KeptPayload>(json).ok()
 }
@@ -327,7 +322,13 @@ fn parse_html(html: &str) -> Option<KeptPayload> {
     let mut bullets: Vec<BulletPayload> = Vec::new();
     let mut plain = String::new();
     let mut plain_links: Vec<SerLink> = Vec::new();
-    walk_html(&dom.document, -1, &mut bullets, &mut plain, &mut plain_links);
+    walk_html(
+        &dom.document,
+        -1,
+        &mut bullets,
+        &mut plain,
+        &mut plain_links,
+    );
 
     if !bullets.is_empty() {
         Some(KeptPayload::Outline { bullets })
@@ -403,14 +404,12 @@ fn walk_html(
             // parent <li> rather than its child, so we have to
             // detect that shape and bump depth here).
             for child in handle.children.borrow().iter() {
-                let next_depth = if matches!(
-                    element_name(child).as_deref(),
-                    Some("ul") | Some("ol")
-                ) {
-                    depth + 1
-                } else {
-                    depth
-                };
+                let next_depth =
+                    if matches!(element_name(child).as_deref(), Some("ul") | Some("ol")) {
+                        depth + 1
+                    } else {
+                        depth
+                    };
                 walk_html(child, next_depth, bullets, plain, plain_links);
             }
         }
@@ -466,14 +465,12 @@ fn walk_html(
                 plain.push_str(&contents.borrow());
             }
             for child in handle.children.borrow().iter() {
-                let next_depth = if matches!(
-                    element_name(child).as_deref(),
-                    Some("ul") | Some("ol")
-                ) {
-                    depth + 1
-                } else {
-                    depth
-                };
+                let next_depth =
+                    if matches!(element_name(child).as_deref(), Some("ul") | Some("ol")) {
+                        depth + 1
+                    } else {
+                        depth
+                    };
                 walk_html(child, next_depth, bullets, plain, plain_links);
             }
         }
@@ -568,11 +565,7 @@ fn trim_normalize(s: &str) -> String {
 /// same substring appears twice we pick the first), but good
 /// enough for the typical case of one link per bullet with
 /// distinct anchor text.
-fn rebase_links(
-    normalized: &str,
-    raw: &str,
-    raw_links: &[SerLink],
-) -> Vec<SerLink> {
+fn rebase_links(normalized: &str, raw: &str, raw_links: &[SerLink]) -> Vec<SerLink> {
     let mut out = Vec::new();
     for l in raw_links {
         if l.start >= raw.len() || l.end > raw.len() || l.start >= l.end {
@@ -601,7 +594,11 @@ fn rebase_links(
 /// links because plain text doesn't preserve span metadata.
 pub fn from_plain_text(text: &str) -> KeptPayload {
     let lines: Vec<&str> = text.lines().collect();
-    if lines.len() >= 2 && lines.iter().any(|l| l.starts_with("    ") || l.starts_with("\t")) {
+    if lines.len() >= 2
+        && lines
+            .iter()
+            .any(|l| l.starts_with("    ") || l.starts_with("\t"))
+    {
         // Each line becomes a bullet at depth = floor(leading_spaces / 4)
         // (or count tab characters).
         let bullets: Vec<BulletPayload> = lines
@@ -757,9 +754,12 @@ mod tests {
         match from_clipboard(Some(html), "") {
             KeptPayload::Outline { bullets } => {
                 let depths: Vec<u32> = bullets.iter().map(|b| b.depth).collect();
-                let texts: Vec<String> =
-                    bullets.iter().map(|b| b.text.clone()).collect();
-                assert_eq!(depths, vec![0, 1, 0], "depths from sibling-nested Docs HTML");
+                let texts: Vec<String> = bullets.iter().map(|b| b.text.clone()).collect();
+                assert_eq!(
+                    depths,
+                    vec![0, 1, 0],
+                    "depths from sibling-nested Docs HTML"
+                );
                 assert_eq!(texts, vec!["alpha", "beta", "gamma"]);
             }
             other => panic!("expected Outline, got {:?}", other),
@@ -849,21 +849,33 @@ mod tests {
     fn html_outline_emits_nested_ul_for_nested_bullets() {
         let p = KeptPayload::Outline {
             bullets: vec![
-                BulletPayload { depth: 0, text: "alpha".into(), links: vec![], thread_ids: vec![] },
-                BulletPayload { depth: 1, text: "beta".into(), links: vec![], thread_ids: vec![] },
-                BulletPayload { depth: 0, text: "gamma".into(), links: vec![], thread_ids: vec![] },
+                BulletPayload {
+                    depth: 0,
+                    text: "alpha".into(),
+                    links: vec![],
+                    thread_ids: vec![],
+                },
+                BulletPayload {
+                    depth: 1,
+                    text: "beta".into(),
+                    links: vec![],
+                    thread_ids: vec![],
+                },
+                BulletPayload {
+                    depth: 0,
+                    text: "gamma".into(),
+                    links: vec![],
+                    thread_ids: vec![],
+                },
             ],
         };
         let html = to_html(&p);
         // After the hidden marker span, the visible content
         // should be: <ul><li>alpha<ul><li>beta</li></ul></li><li>gamma</li></ul>
-        let visible_idx = html
-            .find("<ul>")
-            .expect("emit at least one <ul>");
+        let visible_idx = html.find("<ul>").expect("emit at least one <ul>");
         let visible = &html[visible_idx..];
         assert_eq!(
-            visible,
-            "<ul><li>alpha<ul><li>beta</li></ul></li><li>gamma</li></ul>",
+            visible, "<ul><li>alpha<ul><li>beta</li></ul></li><li>gamma</li></ul>",
             "outline must round-trip through a nested-ul HTML emission"
         );
     }
@@ -874,11 +886,28 @@ mod tests {
     #[test]
     fn html_outline_roundtrip_without_marker_preserves_depths() {
         let original = vec![
-            BulletPayload { depth: 0, text: "alpha".into(), links: vec![], thread_ids: vec![] },
-            BulletPayload { depth: 1, text: "beta".into(), links: vec![], thread_ids: vec![] },
-            BulletPayload { depth: 0, text: "gamma".into(), links: vec![], thread_ids: vec![] },
+            BulletPayload {
+                depth: 0,
+                text: "alpha".into(),
+                links: vec![],
+                thread_ids: vec![],
+            },
+            BulletPayload {
+                depth: 1,
+                text: "beta".into(),
+                links: vec![],
+                thread_ids: vec![],
+            },
+            BulletPayload {
+                depth: 0,
+                text: "gamma".into(),
+                links: vec![],
+                thread_ids: vec![],
+            },
         ];
-        let p = KeptPayload::Outline { bullets: original.clone() };
+        let p = KeptPayload::Outline {
+            bullets: original.clone(),
+        };
         let html = to_html(&p);
         // Strip the marker span so we exercise the HTML parser, not
         // the marker fast-path.

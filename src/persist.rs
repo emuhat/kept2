@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use skia_safe::Typeface;
 use uuid::Uuid;
 
 use crate::cell::{
-    parse_inline_tags, Bullet, Cell, CellKind, OutlineCell, PlainCell, PopPopCell,
-    ReferenceCell, ReferenceTarget, TableCell, TextBox,
+    Bullet, Cell, CellKind, OutlineCell, PlainCell, PopPopCell, ReferenceCell, ReferenceTarget,
+    TableCell, TextBox, parse_inline_tags,
 };
 use crate::thread::{Thread, ThreadId, ThreadMembership};
 
@@ -127,9 +127,8 @@ impl Db {
             // the wrapped JSON, drop the `# ` from body text, and rebuild the
             // tag index from the now-canonical title source.
             self.migrate_extract_titles()?;
-            self.conn.execute_batch(
-                "BEGIN; PRAGMA user_version = 4; COMMIT;",
-            )?;
+            self.conn
+                .execute_batch("BEGIN; PRAGMA user_version = 4; COMMIT;")?;
             self.backfill_cell_tags()?;
         }
         if version < 5 {
@@ -403,11 +402,7 @@ impl Db {
 
     /// Replace the cell_tags rows for `cell_id_bytes` with the given tag
     /// names. Inserts any new tag names into the `tags` table on demand.
-    fn write_cell_tags(
-        &mut self,
-        cell_id_bytes: &[u8],
-        names: &[String],
-    ) -> rusqlite::Result<()> {
+    fn write_cell_tags(&mut self, cell_id_bytes: &[u8], names: &[String]) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "DELETE FROM cell_tags WHERE cell_id = ?1",
@@ -463,7 +458,15 @@ impl Db {
                     })?),
                     None => None,
                 };
-                Ok((id, timestamp, body, edited_at, hint, scratch != 0, inbox != 0))
+                Ok((
+                    id,
+                    timestamp,
+                    body,
+                    edited_at,
+                    hint,
+                    scratch != 0,
+                    inbox != 0,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -497,13 +500,21 @@ impl Db {
             // fall back to "close happened at edited_at" for legacy
             // archived rows so the imprecise migration still produces
             // a sensible timestamp.
-            let closed_at = pc.closed_at.or_else(|| {
-                if !pc.active { Some(edited_at) } else { None }
-            });
+            let closed_at =
+                pc.closed_at
+                    .or_else(|| if !pc.active { Some(edited_at) } else { None });
             let resurface_after = pc.resurface_after;
             let kind = body_to_kind(pc.body, typeface);
             cells.push(Cell::from_parts(
-                id, kind, title, timestamp, edited_at, hint, closed_at, resurface_after, scratch,
+                id,
+                kind,
+                title,
+                timestamp,
+                edited_at,
+                hint,
+                closed_at,
+                resurface_after,
+                scratch,
                 inbox,
             ));
         }
@@ -586,7 +597,9 @@ impl Db {
              WHERE ct.cell_id = ?1 ORDER BY t.name",
         )?;
         let rows = stmt
-            .query_map(params![cell_id.as_bytes().to_vec()], |row| row.get::<_, String>(0))?
+            .query_map(params![cell_id.as_bytes().to_vec()], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -618,10 +631,8 @@ impl Db {
     /// silently strip them otherwise — fine, but the right-click affordance
     /// only exposes this for empty tags).
     pub fn delete_tag(&mut self, name: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "DELETE FROM tags WHERE name = ?1",
-            params![name],
-        )?;
+        self.conn
+            .execute("DELETE FROM tags WHERE name = ?1", params![name])?;
         Ok(())
     }
 
@@ -641,13 +652,10 @@ impl Db {
     /// the in-memory `Document` can drop them too. Used by the
     /// 10-day Scratch TTL pruner (run at startup and once per
     /// session-day). `cell_tags` rows cascade via the FK.
-    pub fn prune_expired_scratch(
-        &mut self,
-        expire_before_ms: i64,
-    ) -> rusqlite::Result<Vec<Uuid>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id FROM cells WHERE scratch = 1 AND timestamp < ?1",
-        )?;
+    pub fn prune_expired_scratch(&mut self, expire_before_ms: i64) -> rusqlite::Result<Vec<Uuid>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM cells WHERE scratch = 1 AND timestamp < ?1")?;
         let ids: Vec<Uuid> = stmt
             .query_map(params![expire_before_ms], |row| {
                 let id_bytes: Vec<u8> = row.get(0)?;
@@ -692,8 +700,7 @@ impl Db {
                     id: Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::nil()),
                     kind,
                     display_name,
-                    primary_cell_id: primary_bytes
-                        .and_then(|b| Uuid::from_slice(&b).ok()),
+                    primary_cell_id: primary_bytes.and_then(|b| Uuid::from_slice(&b).ok()),
                     is_active: is_active_int != 0,
                     created_at,
                     updated_at,
@@ -727,8 +734,7 @@ impl Db {
                     id: Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::nil()),
                     kind,
                     display_name,
-                    primary_cell_id: primary_bytes
-                        .and_then(|b| Uuid::from_slice(&b).ok()),
+                    primary_cell_id: primary_bytes.and_then(|b| Uuid::from_slice(&b).ok()),
                     is_active: is_active_int != 0,
                     created_at,
                     updated_at,
@@ -825,10 +831,7 @@ impl Db {
     /// `primary_cell_id = NULL`. Used by the People page's "Add person…"
     /// affordance. Caller must subsequently `refresh_entities` so the
     /// in-memory caches see the new row.
-    pub fn create_cell_less_person_entity(
-        &mut self,
-        display_name: &str,
-    ) -> rusqlite::Result<Uuid> {
+    pub fn create_cell_less_person_entity(&mut self, display_name: &str) -> rusqlite::Result<Uuid> {
         let id = Uuid::now_v7();
         let id_bytes = id.as_bytes().to_vec();
         let now = chrono::Utc::now().timestamp_millis();
@@ -917,11 +920,7 @@ impl Db {
 
     /// Toggle the `is_active` flag on a single entity. Bumps `updated_at`
     /// so observers (sync, conflict resolution if any) see the change.
-    pub fn set_entity_active(
-        &mut self,
-        entity_id: Uuid,
-        is_active: bool,
-    ) -> rusqlite::Result<()> {
+    pub fn set_entity_active(&mut self, entity_id: Uuid, is_active: bool) -> rusqlite::Result<()> {
         let id_bytes = entity_id.as_bytes().to_vec();
         let now = chrono::Utc::now().timestamp_millis();
         let active_int: i64 = if is_active { 1 } else { 0 };
@@ -944,10 +943,7 @@ impl Db {
             "DELETE FROM entity_aliases WHERE entity_id = ?1",
             params![id_bytes],
         )?;
-        tx.execute(
-            "DELETE FROM entities WHERE id = ?1",
-            params![id_bytes],
-        )?;
+        tx.execute("DELETE FROM entities WHERE id = ?1", params![id_bytes])?;
         tx.commit()
     }
 
@@ -973,7 +969,12 @@ impl Db {
                  start_time = excluded.start_time, \
                  end_time = excluded.end_time, \
                  title = excluded.title",
-            params![ctx.id.as_bytes().to_vec(), ctx.start_time, ctx.end_time, ctx.title],
+            params![
+                ctx.id.as_bytes().to_vec(),
+                ctx.start_time,
+                ctx.end_time,
+                ctx.title
+            ],
         )?;
         Ok(())
     }
@@ -1091,15 +1092,12 @@ impl Db {
                 let bullet_bytes: Option<Vec<u8>> = row.get(2)?;
                 let attached_at: i64 = row.get(3)?;
                 let cell_id = Uuid::from_slice(&cell_bytes).unwrap_or_else(|_| Uuid::nil());
-                let target = match bullet_bytes
-                    .and_then(|b| Uuid::from_slice(&b).ok())
-                {
+                let target = match bullet_bytes.and_then(|b| Uuid::from_slice(&b).ok()) {
                     Some(bullet_id) => ReferenceTarget::Subtree { cell_id, bullet_id },
                     None => ReferenceTarget::WholeCell(cell_id),
                 };
                 Ok(ThreadMembership {
-                    thread_id: Uuid::from_slice(&thread_bytes)
-                        .unwrap_or_else(|_| Uuid::nil()),
+                    thread_id: Uuid::from_slice(&thread_bytes).unwrap_or_else(|_| Uuid::nil()),
                     target,
                     attached_at,
                 })
@@ -1150,8 +1148,7 @@ impl Db {
         // (the list is small in practice and this runs once per
         // cell save).
         let cell_bytes = cell_id.as_bytes().to_vec();
-        let valid: std::collections::HashSet<Uuid> =
-            valid_bullet_ids.iter().copied().collect();
+        let valid: std::collections::HashSet<Uuid> = valid_bullet_ids.iter().copied().collect();
         let stale: Vec<Vec<u8>> = {
             let mut stmt = self.conn.prepare(
                 "SELECT bullet_id FROM thread_memberships \
@@ -1278,10 +1275,7 @@ impl Db {
             None => self.conn.execute(
                 "DELETE FROM thread_memberships \
                  WHERE thread_id = ?1 AND cell_id = ?2 AND bullet_id IS NULL",
-                params![
-                    thread_id.as_bytes().to_vec(),
-                    cell_id.as_bytes().to_vec(),
-                ],
+                params![thread_id.as_bytes().to_vec(), cell_id.as_bytes().to_vec(),],
             )?,
         };
         Ok(())
@@ -1627,10 +1621,7 @@ fn extract_title_from_body_json(body_json: &str) -> Option<String> {
 /// and link offsets shifted to the title's local frame) and mutates `text` /
 /// `links` in place to reflect the post-heading remainder. None when the
 /// text does not start with `# `.
-fn take_heading_from_inline(
-    text: &mut String,
-    links: &mut Vec<LinkRecord>,
-) -> Option<TitleRecord> {
+fn take_heading_from_inline(text: &mut String, links: &mut Vec<LinkRecord>) -> Option<TitleRecord> {
     if !text.starts_with("# ") {
         return None;
     }
@@ -1675,7 +1666,11 @@ fn take_heading_from_inline(
 }
 
 fn take_heading_from_outline(blocks: &mut Vec<BlockRecord>) -> Option<TitleRecord> {
-    if !blocks.first().map(|b| b.text.starts_with("# ")).unwrap_or(false) {
+    if !blocks
+        .first()
+        .map(|b| b.text.starts_with("# "))
+        .unwrap_or(false)
+    {
         return None;
     }
     let first = blocks.remove(0);
@@ -1710,9 +1705,7 @@ fn take_heading_from_outline(blocks: &mut Vec<BlockRecord>) -> Option<TitleRecor
     })
 }
 
-fn take_heading_from_table(
-    cells: &mut Vec<Vec<TableEntryRecord>>,
-) -> Option<TitleRecord> {
+fn take_heading_from_table(cells: &mut Vec<Vec<TableEntryRecord>>) -> Option<TitleRecord> {
     let first = cells.first_mut()?.first_mut()?;
     if !first.text.starts_with("# ") {
         return None;
@@ -1875,7 +1868,11 @@ fn tag_names_from_persisted_legacy(pc: &PersistedCell) -> Vec<String> {
         names_from_link_records(&t.text, &t.links, sink);
         if !t.tags.is_empty() {
             names_from_tag_ranges(&t.text, &t.tags, sink);
-        } else if !t.links.iter().any(|l| l.url.starts_with(crate::cell::KEPT_TAG_SCHEME)) {
+        } else if !t
+            .links
+            .iter()
+            .any(|l| l.url.starts_with(crate::cell::KEPT_TAG_SCHEME))
+        {
             let heading_end = t.text.find('\n').unwrap_or(t.text.len());
             for r in parse_trailing_tags(&t.text, heading_end) {
                 if r.end > r.start + 1 {
@@ -1889,7 +1886,10 @@ fn tag_names_from_persisted_legacy(pc: &PersistedCell) -> Vec<String> {
             names_from_link_records(text, links, sink);
             if !tags.is_empty() {
                 names_from_tag_ranges(text, tags, sink);
-            } else if !links.iter().any(|l| l.url.starts_with(crate::cell::KEPT_TAG_SCHEME)) {
+            } else if !links
+                .iter()
+                .any(|l| l.url.starts_with(crate::cell::KEPT_TAG_SCHEME))
+            {
                 for r in parse_inline_tags(text) {
                     if r.end > r.start + 1 {
                         sink(text[r.start + 1..r.end].to_string());
@@ -2013,7 +2013,10 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
             load_body_tags(&mut tb, tags);
             CellKind::Plain(PlainCell::from_textbox(tb))
         }
-        CellBody::Outline { blocks, reference_header } => {
+        CellBody::Outline {
+            blocks,
+            reference_header,
+        } => {
             let bullets: Vec<Bullet> = blocks
                 .into_iter()
                 .map(|b| {
@@ -2030,16 +2033,15 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
                     // edited_at would be ideal — but it's not in scope here.
                     // 0 is acceptable: legacy archived bullets just sort
                     // to the bottom of any future closed-bullet view.
-                    let closed_at = b.closed_at.or_else(|| {
-                        if !b.active { Some(0) } else { None }
-                    });
+                    let closed_at = b
+                        .closed_at
+                        .or_else(|| if !b.active { Some(0) } else { None });
                     bullet.set_closed_at(closed_at);
                     bullet.set_resurface_after(b.resurface_after);
                     bullet
                 })
                 .collect();
-            let header = reference_header
-                .map(|r| crate::cell::EmbeddedReference::new(r.into()));
+            let header = reference_header.map(|r| crate::cell::EmbeddedReference::new(r.into()));
             CellKind::Outline(OutlineCell::from_bullets_with_header(
                 typeface.clone(),
                 bullets,
@@ -2054,31 +2056,38 @@ fn body_to_kind(body: CellBody, typeface: &Typeface) -> CellKind {
             }
             CellKind::PopPop(pc)
         }
-        CellBody::Table { rows: _, cols: _, cells } => {
+        CellBody::Table {
+            rows: _,
+            cols: _,
+            cells,
+        } => {
             // `rows`/`cols` are advisory; trust the actual `cells` shape so
             // a hand-edited or migrated row that disagrees still loads.
             // Build (text, links, tags, readonly) tuples for TableCell.
-            let entries: Vec<Vec<(String, Vec<(std::ops::Range<usize>, String)>, Vec<std::ops::Range<usize>>, bool)>> =
-                cells
-                    .into_iter()
-                    .map(|row| {
-                        row.into_iter()
-                            .map(|e| {
-                                let links: Vec<(std::ops::Range<usize>, String)> = e
-                                    .links
-                                    .into_iter()
-                                    .map(|l| (l.start..l.end, l.url))
-                                    .collect();
-                                let tags: Vec<std::ops::Range<usize>> = e
-                                    .tags
-                                    .into_iter()
-                                    .map(|t| t.start..t.end)
-                                    .collect();
-                                (e.text, links, tags, e.readonly)
-                            })
-                            .collect()
-                    })
-                    .collect();
+            let entries: Vec<
+                Vec<(
+                    String,
+                    Vec<(std::ops::Range<usize>, String)>,
+                    Vec<std::ops::Range<usize>>,
+                    bool,
+                )>,
+            > = cells
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|e| {
+                            let links: Vec<(std::ops::Range<usize>, String)> = e
+                                .links
+                                .into_iter()
+                                .map(|l| (l.start..l.end, l.url))
+                                .collect();
+                            let tags: Vec<std::ops::Range<usize>> =
+                                e.tags.into_iter().map(|t| t.start..t.end).collect();
+                            (e.text, links, tags, e.readonly)
+                        })
+                        .collect()
+                })
+                .collect();
             CellKind::Table(TableCell::from_records_with_tags(typeface.clone(), entries))
         }
         CellBody::Reference { target } => {
@@ -2095,10 +2104,7 @@ mod tests {
 
     fn typeface() -> Typeface {
         FontMgr::new()
-            .new_from_data(
-                include_bytes!("../resources/fonts/Figtree.ttf"),
-                None,
-            )
+            .new_from_data(include_bytes!("../resources/fonts/Figtree.ttf"), None)
             .expect("font loads")
     }
 
@@ -2125,7 +2131,11 @@ mod tests {
             tb
         });
         let closed_at = pc.closed_at.or_else(|| {
-            if !pc.active { Some(cell.edited_at) } else { None }
+            if !pc.active {
+                Some(cell.edited_at)
+            } else {
+                None
+            }
         });
         let resurface_after = pc.resurface_after;
         let inbox = pc.inbox;
@@ -2215,7 +2225,8 @@ mod tests {
         let mut cell = Cell::new_poppop(tf.clone());
         if let CellKind::PopPop(pc) = &mut cell.kind {
             pc.textbox_mut().replace_text("2 + 3\nx LINK".to_string());
-            pc.textbox_mut().add_link(8..12, "https://example.com/p".to_string());
+            pc.textbox_mut()
+                .add_link(8..12, "https://example.com/p".to_string());
         }
         let back = round_trip(&cell, &tf);
         match (&cell.kind, &back.kind) {
@@ -2306,10 +2317,7 @@ mod tests {
     fn round_trip_envelope_outline_preserves_header_and_bullets() {
         let tf = typeface();
         let target_id = Uuid::now_v7();
-        let mut oc = OutlineCell::with_envelope(
-            tf.clone(),
-            ReferenceTarget::WholeCell(target_id),
-        );
+        let mut oc = OutlineCell::with_envelope(tf.clone(), ReferenceTarget::WholeCell(target_id));
         // Type something into the seed bullet so we can verify the
         // bullet body round-trips alongside the header.
         let bullet_id = oc.bullets()[0].id();
@@ -2354,7 +2362,11 @@ mod tests {
         let mut cell = Cell::new(tf.clone(), "archived note".to_string());
         cell.closed_at = Some(987_654);
         let back = round_trip(&cell, &tf);
-        assert_eq!(back.closed_at, Some(987_654), "closed_at survives round-trip");
+        assert_eq!(
+            back.closed_at,
+            Some(987_654),
+            "closed_at survives round-trip"
+        );
         assert!(!back.is_open());
     }
 
@@ -2386,7 +2398,11 @@ mod tests {
         let pc: PersistedCell = serde_json::from_str(&json_str).expect("parses");
         // Replay the load-time backfill from `round_trip`.
         let closed_at = pc.closed_at.or_else(|| {
-            if !pc.active { Some(cell.edited_at) } else { None }
+            if !pc.active {
+                Some(cell.edited_at)
+            } else {
+                None
+            }
         });
         assert_eq!(
             closed_at,
@@ -2417,10 +2433,7 @@ mod tests {
         match kind {
             CellKind::Outline(oc) => {
                 assert_eq!(oc.bullets().len(), 1);
-                assert!(
-                    oc.bullets()[0].is_open(),
-                    "legacy bullet defaults to open"
-                );
+                assert!(oc.bullets()[0].is_open(), "legacy bullet defaults to open");
             }
             _ => panic!("expected Outline kind"),
         }
@@ -2680,9 +2693,18 @@ mod tests {
             .into_iter()
             .map(|c| c.id)
             .collect();
-        assert!(remaining.contains(&new_scratch_id), "fresh scratch survives");
-        assert!(remaining.contains(&old_regular_id), "old regular cells aren't touched");
-        assert!(!remaining.contains(&old_scratch_id), "expired scratch is gone");
+        assert!(
+            remaining.contains(&new_scratch_id),
+            "fresh scratch survives"
+        );
+        assert!(
+            remaining.contains(&old_regular_id),
+            "old regular cells aren't touched"
+        );
+        assert!(
+            !remaining.contains(&old_scratch_id),
+            "expired scratch is gone"
+        );
     }
 
     // ----- threads -------------------------------------------------------
@@ -2723,12 +2745,8 @@ mod tests {
         db.upsert_thread(&t).expect("upsert");
         db.attach_thread(t.id, ReferenceTarget::WholeCell(cell_id), 100)
             .expect("attach whole");
-        db.attach_thread(
-            t.id,
-            ReferenceTarget::Subtree { cell_id, bullet_id },
-            200,
-        )
-        .expect("attach subtree");
+        db.attach_thread(t.id, ReferenceTarget::Subtree { cell_id, bullet_id }, 200)
+            .expect("attach subtree");
         let mems = db.all_thread_memberships().expect("list");
         assert_eq!(mems.len(), 2);
         let mut targets: Vec<_> = mems.iter().map(|m| m.target).collect();
@@ -2814,13 +2832,19 @@ mod tests {
             .expect("attach whole");
         db.attach_thread(
             t.id,
-            ReferenceTarget::Subtree { cell_id, bullet_id: live_bullet },
+            ReferenceTarget::Subtree {
+                cell_id,
+                bullet_id: live_bullet,
+            },
             20,
         )
         .expect("attach live");
         db.attach_thread(
             t.id,
-            ReferenceTarget::Subtree { cell_id, bullet_id: dead_bullet },
+            ReferenceTarget::Subtree {
+                cell_id,
+                bullet_id: dead_bullet,
+            },
             30,
         )
         .expect("attach dead");
@@ -2831,7 +2855,11 @@ mod tests {
         let mems = db.all_thread_memberships().expect("list");
         assert_eq!(mems.len(), 2);
         let targets: Vec<_> = mems.iter().map(|m| m.target).collect();
-        assert!(targets.iter().any(|t| matches!(t, ReferenceTarget::WholeCell(c) if *c == cell_id)));
+        assert!(
+            targets
+                .iter()
+                .any(|t| matches!(t, ReferenceTarget::WholeCell(c) if *c == cell_id))
+        );
         assert!(targets.iter().any(|t| matches!(
             t,
             ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
@@ -2860,25 +2888,37 @@ mod tests {
         // (t2 overlaps; dedupe will trigger on move.)
         db.attach_thread(
             t1.id,
-            ReferenceTarget::Subtree { cell_id, bullet_id: from },
+            ReferenceTarget::Subtree {
+                cell_id,
+                bullet_id: from,
+            },
             10,
         )
         .expect("attach t1@from");
         db.attach_thread(
             t2.id,
-            ReferenceTarget::Subtree { cell_id, bullet_id: from },
+            ReferenceTarget::Subtree {
+                cell_id,
+                bullet_id: from,
+            },
             20,
         )
         .expect("attach t2@from");
         db.attach_thread(
             t2.id,
-            ReferenceTarget::Subtree { cell_id, bullet_id: into },
+            ReferenceTarget::Subtree {
+                cell_id,
+                bullet_id: into,
+            },
             30,
         )
         .expect("attach t2@into");
         db.attach_thread(
             t3.id,
-            ReferenceTarget::Subtree { cell_id, bullet_id: into },
+            ReferenceTarget::Subtree {
+                cell_id,
+                bullet_id: into,
+            },
             40,
         )
         .expect("attach t3@into");
@@ -2886,7 +2926,8 @@ mod tests {
         let pre_from: Vec<(Uuid, i64)> = vec![(t1.id, 10), (t2.id, 20)];
         let pre_into: Vec<(Uuid, i64)> = vec![(t2.id, 30), (t3.id, 40)];
         // Do the move.
-        db.move_bullet_memberships(cell_id, from, into).expect("move");
+        db.move_bullet_memberships(cell_id, from, into)
+            .expect("move");
         // Now restore both ends — undo path.
         db.set_bullet_memberships(cell_id, from, &pre_from)
             .expect("restore from");
@@ -2896,11 +2937,13 @@ mod tests {
         assert_eq!(mems.len(), 4);
         let at_from: Vec<_> = mems
             .iter()
-            .filter(|m| matches!(
-                m.target,
-                ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
-                    if c == cell_id && b == from
-            ))
+            .filter(|m| {
+                matches!(
+                    m.target,
+                    ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
+                        if c == cell_id && b == from
+                )
+            })
             .map(|m| (m.thread_id, m.attached_at))
             .collect();
         let mut at_from_sorted = at_from.clone();
@@ -2908,11 +2951,13 @@ mod tests {
         assert_eq!(at_from_sorted, vec![(t1.id, 10), (t2.id, 20)]);
         let at_into: Vec<_> = mems
             .iter()
-            .filter(|m| matches!(
-                m.target,
-                ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
-                    if c == cell_id && b == into
-            ))
+            .filter(|m| {
+                matches!(
+                    m.target,
+                    ReferenceTarget::Subtree { cell_id: c, bullet_id: b }
+                        if c == cell_id && b == into
+                )
+            })
             .map(|m| (m.thread_id, m.attached_at))
             .collect();
         let mut at_into_sorted = at_into.clone();
@@ -2936,7 +2981,10 @@ mod tests {
         // t1 attached at `from` only — transfers cleanly.
         db.attach_thread(
             t1.id,
-            ReferenceTarget::Subtree { cell_id, bullet_id: from },
+            ReferenceTarget::Subtree {
+                cell_id,
+                bullet_id: from,
+            },
             10,
         )
         .expect("attach t1@from");
@@ -2944,13 +2992,19 @@ mod tests {
         // the from-side row instead of duplicating.
         db.attach_thread(
             t2.id,
-            ReferenceTarget::Subtree { cell_id, bullet_id: from },
+            ReferenceTarget::Subtree {
+                cell_id,
+                bullet_id: from,
+            },
             20,
         )
         .expect("attach t2@from");
         db.attach_thread(
             t2.id,
-            ReferenceTarget::Subtree { cell_id, bullet_id: into },
+            ReferenceTarget::Subtree {
+                cell_id,
+                bullet_id: into,
+            },
             30,
         )
         .expect("attach t2@into");
@@ -2967,8 +3021,7 @@ mod tests {
                     if c == cell_id && b == into
             ));
         }
-        let thread_ids: std::collections::HashSet<_> =
-            mems.iter().map(|m| m.thread_id).collect();
+        let thread_ids: std::collections::HashSet<_> = mems.iter().map(|m| m.thread_id).collect();
         assert!(thread_ids.contains(&t1.id));
         assert!(thread_ids.contains(&t2.id));
     }

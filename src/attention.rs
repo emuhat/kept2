@@ -11,9 +11,7 @@
 //! never `+ Duration::hours(24)`, so the November fall-back and the
 //! March spring-forward don't shift the wake hour by ±1.
 
-use chrono::{
-    Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Timelike, Weekday,
-};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Timelike, Weekday};
 
 /// User-facing preset durations. Pure UX vocabulary — no fields here
 /// pin a calendar date. Resolution happens in [`resurface_at`].
@@ -74,8 +72,7 @@ pub fn resurface_at(now_local: chrono::DateTime<Local>, preset: SnoozePreset) ->
             if now_local.hour() < LATER_TODAY_CUTOFF_HOUR {
                 at(today, LATER_TODAY_EVENING_HOUR)
             } else {
-                (now_local + Duration::hours(LATER_TODAY_FALLBACK_HOURS))
-                    .timestamp_millis()
+                (now_local + Duration::hours(LATER_TODAY_FALLBACK_HOURS)).timestamp_millis()
             }
         }
         SnoozePreset::Tomorrow => {

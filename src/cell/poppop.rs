@@ -209,10 +209,7 @@ impl PopPopCell {
         //    error message. Apply identical extras to both columns so
         //    rows stay aligned. v1: assumes one body_line per source
         //    paragraph (no wrap), so paragraph_idx == body_line_idx.
-        let err_font = Font::from_typeface(
-            &self.typeface,
-            POPPOP_ERROR_FONT_SIZE * scale,
-        );
+        let err_font = Font::from_typeface(&self.typeface, POPPOP_ERROR_FONT_SIZE * scale);
         let (_, err_m) = err_font.metrics();
         let err_step = -err_m.ascent + err_m.descent + err_m.leading;
         let err_total = err_step + POPPOP_ERROR_BOTTOM_PAD * scale;
@@ -242,10 +239,7 @@ impl PopPopCell {
         let bands = self.textbox.source_line_y_bands();
 
         // 4) Alternating stripes BEHIND text.
-        let calc_bands: Vec<(f32, f32)> = bands
-            .iter()
-            .map(|&(top, bot, _)| (top, bot))
-            .collect();
+        let calc_bands: Vec<(f32, f32)> = bands.iter().map(|&(top, bot, _)| (top, bot)).collect();
         draw_alternating_row_stripes(canvas, &calc_bands, x, x + width);
 
         // 5) Draw input text on top of stripes.
@@ -359,13 +353,7 @@ impl super::body::CellBody for PopPopCell {
         PopPopCell::handle_key(self, event, modifiers)
     }
 
-    fn mouse_down(
-        &mut self,
-        abs_x: f32,
-        abs_y: f32,
-        modifiers: &Modifiers,
-        editing: bool,
-    ) -> bool {
+    fn mouse_down(&mut self, abs_x: f32, abs_y: f32, modifiers: &Modifiers, editing: bool) -> bool {
         PopPopCell::mouse_down(self, abs_x, abs_y, modifiers, editing)
     }
 
@@ -460,20 +448,11 @@ impl super::body::CellBody for PopPopCell {
         self.textbox.paste(s);
     }
 
-    fn paste_with_links(
-        &mut self,
-        text: &str,
-        links: &[super::common::LinkSpan],
-    ) {
+    fn paste_with_links(&mut self, text: &str, links: &[super::common::LinkSpan]) {
         self.textbox.paste_with_links(text, links);
     }
 
-    fn replace_at_focused_with_link(
-        &mut self,
-        range: Range<usize>,
-        text: String,
-        url: String,
-    ) {
+    fn replace_at_focused_with_link(&mut self, range: Range<usize>, text: String, url: String) {
         self.textbox.replace_with_link(range, text, url);
     }
 

@@ -141,11 +141,7 @@ impl KeptApp {
         for p in &mut self.panes {
             p.header.blur();
         }
-        let state = QuickAddState::new(
-            self.typeface.clone(),
-            self.font_scale,
-            with_title,
-        );
+        let state = QuickAddState::new(self.typeface.clone(), self.font_scale, with_title);
         self.quick_add = Some(state);
     }
 
@@ -191,11 +187,7 @@ impl KeptApp {
 
     /// Route a key event to the modal's `Cell` when open. Returns
     /// true iff the modal swallowed the event.
-    pub(super) fn handle_quick_add_key(
-        &mut self,
-        event: &KeyEvent,
-        modifiers: &Modifiers,
-    ) -> bool {
+    pub(super) fn handle_quick_add_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
         use super::MentionKind;
         use winit::event::ElementState;
         use winit::keyboard::{Key, NamedKey};
@@ -303,9 +295,7 @@ impl KeptApp {
                         .map(|s| s.cell.toggle_title_focus())
                         .unwrap_or(false);
                     if changed {
-                        if let (Some(state), Some(pre)) =
-                            (self.quick_add.as_mut(), pre)
-                        {
+                        if let (Some(state), Some(pre)) = (self.quick_add.as_mut(), pre) {
                             // doc_eq catches the "title focus
                             // shifted but no text changed" path,
                             // so we don't pile up no-op undos.
@@ -429,10 +419,7 @@ impl KeptApp {
     /// alternate behavior on the main path which doesn't apply
     /// here either.
     fn quick_add_paste(&mut self, alternate: bool) -> bool {
-        let html = self
-            .clipboard
-            .as_mut()
-            .and_then(|cb| cb.get().html().ok());
+        let html = self.clipboard.as_mut().and_then(|cb| cb.get().html().ok());
         let text = self
             .clipboard
             .as_mut()

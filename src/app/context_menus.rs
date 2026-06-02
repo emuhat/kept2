@@ -30,9 +30,7 @@ pub(super) fn threads_group_row_count(
     if is_scratch {
         return 0;
     }
-    (if show_whole_attach { 1 } else { 0 })
-        + (if has_subtree { 1 } else { 0 })
-        + attached_count
+    (if show_whole_attach { 1 } else { 0 }) + (if has_subtree { 1 } else { 0 }) + attached_count
 }
 
 /// Render the Threads group of a context menu: whole-cell "Attach to
@@ -329,14 +327,17 @@ impl CellContextMenu {
         // target's `resurface_after` to size the menu correctly; the
         // emit loop further down recomputes it for the actual row.
         let target_resurface_present = if has_bullet_toggle {
-            self.bullet_id.and_then(|bid| match &cell.kind {
-                CellKind::Outline(oc) => oc
-                    .bullets()
-                    .iter()
-                    .find(|b| b.id() == bid)
-                    .map(|b| b.resurface_after()),
-                _ => None,
-            }).flatten().is_some()
+            self.bullet_id
+                .and_then(|bid| match &cell.kind {
+                    CellKind::Outline(oc) => oc
+                        .bullets()
+                        .iter()
+                        .find(|b| b.id() == bid)
+                        .map(|b| b.resurface_after()),
+                    _ => None,
+                })
+                .flatten()
+                .is_some()
         } else {
             cell.resurface_after.is_some()
         };
@@ -363,10 +364,8 @@ impl CellContextMenu {
         // skips the Surface AND Threads groups → one fewer separator each.
         let separator_h = pad;
         let separator_count: usize = if is_scratch { 1 } else { 3 };
-        let menu_h = pad
-            + action_h * action_count as f32
-            + separator_h * separator_count as f32
-            + pad;
+        let menu_h =
+            pad + action_h * action_count as f32 + separator_h * separator_count as f32 + pad;
         let rect = clamp_rect_to_viewport(
             Rect::new(
                 self.anchor_x,
@@ -386,28 +385,25 @@ impl CellContextMenu {
         let mut row_top = rect.top + pad;
         let row_left = rect.left + pad * 0.5;
         let row_right = rect.right - pad * 0.5;
-        let emit_row = |row_top_ref: &mut f32,
-                            label: &str,
-                            color: Color,
-                            hover_bg: Color|
-         -> Rect {
-            let r = Rect::new(row_left, *row_top_ref, row_right, *row_top_ref + action_h);
-            draw_menu_row(
-                canvas,
-                r,
-                label,
-                color,
-                hover_bg,
-                true,
-                pad * 2.0,
-                true,
-                scale,
-                &action_font,
-                mouse,
-            );
-            *row_top_ref += action_h;
-            r
-        };
+        let emit_row =
+            |row_top_ref: &mut f32, label: &str, color: Color, hover_bg: Color| -> Rect {
+                let r = Rect::new(row_left, *row_top_ref, row_right, *row_top_ref + action_h);
+                draw_menu_row(
+                    canvas,
+                    r,
+                    label,
+                    color,
+                    hover_bg,
+                    true,
+                    pad * 2.0,
+                    true,
+                    scale,
+                    &action_font,
+                    mouse,
+                );
+                *row_top_ref += action_h;
+                r
+            };
         let emit_separator = |row_top_ref: &mut f32| {
             // Hairline divider with `pad/2` breathing band above
             // and below so groups read as distinct without the
@@ -462,14 +458,16 @@ impl CellContextMenu {
         // bullet when the right-click landed on one; else the cell.
         let snooze_targets_bullet = has_bullet_toggle;
         let target_resurface = if snooze_targets_bullet {
-            self.bullet_id.and_then(|bid| match &cell.kind {
-                CellKind::Outline(oc) => oc
-                    .bullets()
-                    .iter()
-                    .find(|b| b.id() == bid)
-                    .map(|b| b.resurface_after()),
-                _ => None,
-            }).flatten()
+            self.bullet_id
+                .and_then(|bid| match &cell.kind {
+                    CellKind::Outline(oc) => oc
+                        .bullets()
+                        .iter()
+                        .find(|b| b.id() == bid)
+                        .map(|b| b.resurface_after()),
+                    _ => None,
+                })
+                .flatten()
         } else {
             cell.resurface_after
         };
@@ -514,7 +512,11 @@ impl CellContextMenu {
 
         // ----- Group 4: Inbox + Close -----
         let inbox_toggle_rect = if !is_scratch {
-            let label = if cell.inbox { "Release from Inbox" } else { "Send to Inbox" };
+            let label = if cell.inbox {
+                "Release from Inbox"
+            } else {
+                "Send to Inbox"
+            };
             Some(emit_row(
                 &mut row_top,
                 label,
@@ -532,14 +534,17 @@ impl CellContextMenu {
             crate::color::embed_hover(),
         );
         let toggle_bullet_active_rect = if has_bullet_toggle {
-            let bullet_open = self.bullet_id.and_then(|bid| match &cell.kind {
-                CellKind::Outline(oc) => oc
-                    .bullets()
-                    .iter()
-                    .find(|b| b.id() == bid)
-                    .map(|b| b.is_open()),
-                _ => None,
-            }).unwrap_or(true);
+            let bullet_open = self
+                .bullet_id
+                .and_then(|bid| match &cell.kind {
+                    CellKind::Outline(oc) => oc
+                        .bullets()
+                        .iter()
+                        .find(|b| b.id() == bid)
+                        .map(|b| b.is_open()),
+                    _ => None,
+                })
+                .unwrap_or(true);
             let label = if bullet_open {
                 "Close sub-outline"
             } else {
@@ -624,8 +629,7 @@ impl BarContextMenu {
         // Threads group is shared with the cell menu — see
         // `threads_group`. Bar menu is the whole-cell home: always
         // show the whole-cell Attach row, never the subtree row.
-        action_count +=
-            threads_group_row_count(is_scratch, true, false, attached_threads.len());
+        action_count += threads_group_row_count(is_scratch, true, false, attached_threads.len());
         if !is_scratch {
             action_count += 1; // Send to Inbox / Release from Inbox
         }
@@ -661,8 +665,7 @@ impl BarContextMenu {
         info_paint.set_anti_alias(true);
         info_paint.set_color(crate::color::text_muted_grey());
         let (_, im) = info_font.metrics();
-        let line1_baseline =
-            rect.top + pad + (info_h + (-im.ascent) - im.descent) * 0.5;
+        let line1_baseline = rect.top + pad + (info_h + (-im.ascent) - im.descent) * 0.5;
         let line2_baseline = line1_baseline + info_h;
         canvas.draw_str(
             format!("Created {}", format_timestamp(cell.timestamp)),
@@ -682,28 +685,25 @@ impl BarContextMenu {
         let row_left = rect.left + pad * 0.5;
         let row_right = rect.right - pad * 0.5;
         let mut row_top = rect.top + pad + info_h * 2.0;
-        let emit_row = |row_top_ref: &mut f32,
-                        label: &str,
-                        color: Color,
-                        hover_bg: Color|
-         -> Rect {
-            let r = Rect::new(row_left, *row_top_ref, row_right, *row_top_ref + action_h);
-            draw_menu_row(
-                canvas,
-                r,
-                label,
-                color,
-                hover_bg,
-                true,
-                pad * 2.0,
-                true,
-                scale,
-                &action_font,
-                mouse,
-            );
-            *row_top_ref += action_h;
-            r
-        };
+        let emit_row =
+            |row_top_ref: &mut f32, label: &str, color: Color, hover_bg: Color| -> Rect {
+                let r = Rect::new(row_left, *row_top_ref, row_right, *row_top_ref + action_h);
+                draw_menu_row(
+                    canvas,
+                    r,
+                    label,
+                    color,
+                    hover_bg,
+                    true,
+                    pad * 2.0,
+                    true,
+                    scale,
+                    &action_font,
+                    mouse,
+                );
+                *row_top_ref += action_h;
+                r
+            };
         let emit_separator = |row_top_ref: &mut f32| {
             let band = separator_h;
             let line_y = *row_top_ref + band * 0.5;
@@ -804,8 +804,8 @@ impl BarContextMenu {
         // ----- Group 5: Threads (shared with the cell menu) -----
         let threads_hits = threads_group(
             is_scratch,
-            true,  // whole-cell Attach is the bar menu's reason for offering threads
-            None,  // bar menu has no subtree variant
+            true, // whole-cell Attach is the bar menu's reason for offering threads
+            None, // bar menu has no subtree variant
             attached_threads,
             &mut row_top,
             &emit_row,
@@ -814,7 +814,11 @@ impl BarContextMenu {
 
         // ----- Group 6: Inbox toggle + Delete (destructive, last) -----
         let inbox_toggle_rect = if !is_scratch {
-            let label = if cell.inbox { "Release from Inbox" } else { "Send to Inbox" };
+            let label = if cell.inbox {
+                "Release from Inbox"
+            } else {
+                "Send to Inbox"
+            };
             Some(emit_row(
                 &mut row_top,
                 label,

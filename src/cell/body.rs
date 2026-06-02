@@ -52,13 +52,7 @@ pub trait CellBody {
 
     fn handle_key(&mut self, event: &KeyEvent, modifiers: &Modifiers) -> bool;
 
-    fn mouse_down(
-        &mut self,
-        abs_x: f32,
-        abs_y: f32,
-        modifiers: &Modifiers,
-        editing: bool,
-    ) -> bool;
+    fn mouse_down(&mut self, abs_x: f32, abs_y: f32, modifiers: &Modifiers, editing: bool) -> bool;
 
     // ---------------------------------------------------------------------
     // Multi-textbox iteration — the keystone for the defaults below.
@@ -120,12 +114,7 @@ pub trait CellBody {
         self.paste_text(text);
     }
 
-    fn replace_at_focused_with_link(
-        &mut self,
-        range: Range<usize>,
-        text: String,
-        url: String,
-    );
+    fn replace_at_focused_with_link(&mut self, range: Range<usize>, text: String, url: String);
     fn replace_at_focused_with_text(&mut self, range: Range<usize>, text: String);
     fn replace_at_focused_with_tag(&mut self, range: Range<usize>, text: String);
 

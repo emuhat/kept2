@@ -540,7 +540,10 @@ impl TableCell {
         }
         // Clamp focused into the restored shape.
         let (fr, fc) = self.focused;
-        self.focused = (fr.min(rows.saturating_sub(1)), fc.min(cols.saturating_sub(1)));
+        self.focused = (
+            fr.min(rows.saturating_sub(1)),
+            fc.min(cols.saturating_sub(1)),
+        );
         self.cells = grid;
     }
 
@@ -586,7 +589,10 @@ impl TableCell {
                         tb.add_tag(range);
                     }
                 }
-                row.push(TableEntry { textbox: tb, readonly });
+                row.push(TableEntry {
+                    textbox: tb,
+                    readonly,
+                });
             }
             // Pad short rows with empty cells (defensive against
             // malformed JSON).
@@ -614,7 +620,6 @@ impl TableCell {
     pub fn rows_view(&self) -> &[Vec<TableEntry>] {
         &self.cells
     }
-
 }
 
 impl super::body::CellBody for TableCell {
@@ -634,13 +639,7 @@ impl super::body::CellBody for TableCell {
         TableCell::handle_key(self, event, modifiers)
     }
 
-    fn mouse_down(
-        &mut self,
-        abs_x: f32,
-        abs_y: f32,
-        modifiers: &Modifiers,
-        editing: bool,
-    ) -> bool {
+    fn mouse_down(&mut self, abs_x: f32, abs_y: f32, modifiers: &Modifiers, editing: bool) -> bool {
         TableCell::mouse_down(self, abs_x, abs_y, modifiers, editing)
     }
 
@@ -754,12 +753,7 @@ impl super::body::CellBody for TableCell {
         self.paste_focused(s);
     }
 
-    fn replace_at_focused_with_link(
-        &mut self,
-        range: Range<usize>,
-        text: String,
-        url: String,
-    ) {
+    fn replace_at_focused_with_link(&mut self, range: Range<usize>, text: String, url: String) {
         let (r, c) = self.focused_index();
         if let Some(entry) = self.cell_at_mut(r, c) {
             if !entry.readonly {

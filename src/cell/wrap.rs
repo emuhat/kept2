@@ -37,7 +37,9 @@ pub(super) fn draw_line_with_links(
     let mut pos = line.start;
     let mut x = text_x;
     while pos < line.end {
-        let in_link = links.iter().find(|l| pos >= l.range.start && pos < l.range.end);
+        let in_link = links
+            .iter()
+            .find(|l| pos >= l.range.start && pos < l.range.end);
         let run_end = match in_link {
             Some(l) => l.range.end.min(line.end),
             None => links
@@ -222,11 +224,7 @@ pub(super) fn step_horizontal(
     }
 }
 
-pub(super) fn hit_affinity(
-    line_idx: usize,
-    idx: usize,
-    body_lines: &[Range<usize>],
-) -> Affinity {
+pub(super) fn hit_affinity(line_idx: usize, idx: usize, body_lines: &[Range<usize>]) -> Affinity {
     let line = &body_lines[line_idx];
     if idx == line.start && line_idx > 0 {
         Affinity::Downstream
@@ -403,11 +401,13 @@ pub(super) fn wrap_text_styled(
     loop {
         let nl = text[start..].find('\n').map(|p| start + p);
         let para_end = nl.unwrap_or(text.len());
-        let font = if force_heading { heading_font } else { body_font };
-        let para_is_comment = enable_comment_coloring
-            && text[start..para_end]
-                .trim_start()
-                .starts_with('#');
+        let font = if force_heading {
+            heading_font
+        } else {
+            body_font
+        };
+        let para_is_comment =
+            enable_comment_coloring && text[start..para_end].trim_start().starts_with('#');
         let prev = lines.len();
         wrap_paragraph_into(text, start, para_end, font, paint, max_width, &mut lines);
         let consumed_to = nl.map(|i| i + 1).unwrap_or(text.len());
@@ -484,12 +484,7 @@ pub(super) fn wrap_paragraph_into(
         {
             let mut cursor = word.start;
             while font.measure_str(&text[cursor..word.end], Some(paint)).0 > max_width {
-                let take = largest_prefix_fitting(
-                    &text[cursor..word.end],
-                    font,
-                    paint,
-                    max_width,
-                );
+                let take = largest_prefix_fitting(&text[cursor..word.end], font, paint, max_width);
                 let next = if take == 0 {
                     // Even one char overflows (max_width is sub-glyph).
                     // Force one char so we don't loop forever.
